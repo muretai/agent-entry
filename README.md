@@ -147,6 +147,50 @@ no account).
 `baseUrl` must be the URL visitors actually dial: it is what your signed card claims, and
 a card naming a different origin proves nothing about yours.
 
+## Pairs with WebMCP: the tab conversation becomes a customer
+
+If your page already exposes [WebMCP](https://github.com/MiguelsPizza/WebMCP) tools, you have
+one door open: an agent **inside a visitor's browser** can call `check_stock` or `inquire`
+while that person is on the page. That is useful and it is also temporary — close the tab and
+nothing remains.
+
+An Agent Entry is the second door, and it is the one that keeps something:
+
+| | who is knocking | what it gets you |
+|---|---|---|
+| **WebMCP tools** | a person's agent, in a tab, right now | an answer in the moment |
+| **Agent Entry** | an agent alone, from anywhere, at any hour | a customer you still recognise next month |
+
+**They connect.** When a WebMCP tool call reaches the point of actually wanting something —
+a booking, a quote, a follow-up — the tool returns a small envelope naming your site's DID,
+and the visitor's agent then sends a **signed message to your own origin**, where your Agent
+Entry receives it:
+
+```js
+navigator.modelContext.registerTool({
+  name: 'contact_this_shop',
+  async execute() {
+    return {
+      text: 'Message the shop directly to ask about stock.',   // for a human reader
+      muretai: { v: 1, action: 'dm', to: MY_DID,               // for a visiting agent
+                 suggested_message: 'Do you have this in stock?' },
+    };
+  },
+});
+```
+
+`MY_DID` is the DID your Agent Entry prints at startup — **the same one**, from the same seed.
+That is the only rule when running both: a mismatch trips the visitor's impersonation guard,
+which is what it is there for.
+
+What the shop gets out of it: the moment that signed message arrives, an account exists. No
+signup form, no password, nothing to reset — the sender's key is the account. Come back
+tomorrow from a laptop instead of a phone and it is still the same customer, because the
+account layer resolves the owner behind both keys.
+
+A search engine makes your site **findable**. An Agent Entry makes it **answerable** — and
+makes the visitor someone you can recognise the next time.
+
 ## Before you put it in production
 
 Two things this reference implementation deliberately leaves to you, both called out in
