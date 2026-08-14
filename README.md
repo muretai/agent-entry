@@ -67,6 +67,72 @@ which is the point — you can read all of it before you trust it.
 curl -O https://raw.githubusercontent.com/muretai/agent-entry/main/muretai-agent-entry.mjs
 ```
 
+## Put one on a site you already have
+
+A visiting agent knows only your **domain**, so the three paths it walks are fixed — it
+cannot be told to look elsewhere:
+
+| # | request | why |
+|---|---|---|
+| 1 | `GET /.well-known/agent-card.json` | your card |
+| 2 | `GET /.well-known/agent-card.sig.json` | the **signed** envelope — what it actually trusts, because a plain card is a claim anyone could write |
+| 3 | `POST /` | the signed message; your signed reply comes back in the same response |
+
+One round trip. No callback, no webhook, nothing to keep awake.
+
+`POST /` is exact — a POST anywhere else is 404. But **`GET /` is not taken**, so your home
+page stays exactly as it is. A site gives up three routes and nothing else.
+
+### 1. A subdomain — the existing site is untouched
+
+Run it on `agent.example.com` behind your TLS terminator. `listen()` binds `127.0.0.1` by
+design (a demo that binds `0.0.0.0` by accident is a private key answering the whole LAN);
+pass a host explicitly to go public.
+
+### 2. Inside an existing Node app (Express, Next, Fastify)
+
+`handleRequestAsync` is the whole surface — the entry does not need a server of its own:
+
+```js
+const entry = createAgentEntry({ seedHex, name, baseUrl: 'https://studio.example', responder });
+
+const fwd = async (req, res) => {
+  const r = await entry.handleRequestAsync(req.method, req.originalUrl, req.headers, req.body);
+  res.status(r.status).set(r.headers).send(r.body);
+};
+
+app.get('/.well-known/agent-card.json', fwd);
+app.get('/.well-known/agent-card.sig.json', fwd);
+app.post('/', express.raw({ type: '*/*' }), fwd);   // GET / stays your home page
+```
+
+The body must arrive as **raw bytes**. A JSON body-parser that re-serialises the request
+has already changed the bytes the signature covers, and the only diagnostic anyone gets is
+"signature verification failed".
+
+### 3. A reverse proxy — for a site that is not Node at all
+
+WordPress, Rails, a static build. Run the entry as one small process and route three
+locations to it:
+
+```nginx
+location = /.well-known/agent-card.json     { proxy_pass http://127.0.0.1:8788; }
+location = /.well-known/agent-card.sig.json { proxy_pass http://127.0.0.1:8788; }
+location = / {
+    if ($request_method = POST) { proxy_pass http://127.0.0.1:8788; }
+    # GET keeps going to the existing site
+}
+```
+
+### Serverless
+
+The round-trip shape fits a single function well, and `handleRequestAsync` is exactly the
+handler signature those platforms want. Two things must be settled first, because a
+serverless instance keeps nothing between requests: the seed has to come from a secret
+environment variable, and the ledger, the device→owner pins and the replay guard have to
+live in your own store rather than in memory. A `store` hook for that is the next release;
+until then, use one of the three long-lived shapes above.
+
 ## Run the example
 
 ```bash

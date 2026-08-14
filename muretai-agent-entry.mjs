@@ -836,7 +836,7 @@ function wireShapeError(msg) {
   return null;
 }
 
-/** Every response carries these. A agent entry reads NO cookie, header credential or session —
+/** Every response carries these. An agent entry reads NO cookie, header credential or session —
  *  authority comes only from an Ed25519 signature inside the body — so `*` grants a browser
  *  agent exactly what curl already had, and nothing more. Never add Allow-Credentials. */
 const CORS_HEADERS = {
@@ -920,7 +920,7 @@ export function createAgentEntry({
   };
   if (openDoor) card.muretai = { open_door: true };
   // Deliberately NO `relay`/`enc_pub` on the card: those advertise a store-and-forward
-  // mailbox, and a agent entry has no listener draining one. Advertising a mailbox nobody
+  // mailbox, and an agent entry has no listener draining one. Advertising a mailbox nobody
   // reads is worse than advertising none — mail would queue at the relay forever.
 
   const cardBytes = Buffer.from(JSON.stringify(card), 'utf8');   // identical bytes on both paths
@@ -1038,7 +1038,7 @@ export function createAgentEntry({
 
   /** The FROZEN backend-handoff shape (agent/webhookwake.py::_envelope). The site's own
    *  code consumes this, so the key set must not drift: a webhook push, a drive-API read
-   *  and a agent entry callback all parse with ONE schema. */
+   *  and an agent entry callback all parse with ONE schema. */
   function backendEnvelope(msg, { verified, peerDid, ownerDid = null }) {
     const meta = msg.metadata || {};
     return {
