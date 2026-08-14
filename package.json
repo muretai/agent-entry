@@ -9,8 +9,7 @@
   },
   "files": [
     "muretai-agent-entry.mjs",
-    "examples/",
-    "testdata/",
+    "examples/server.mjs",
     "LICENSE",
     "README.md"
   ],
