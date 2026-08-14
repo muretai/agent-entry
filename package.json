@@ -1,0 +1,43 @@
+{
+  "name": "@muretai/agent-entry",
+  "version": "1.0.0",
+  "description": "Your website can recognise AI agents, hold accounts for them, and answer them — one dependency-free file.",
+  "type": "module",
+  "main": "muretai-agent-entry.mjs",
+  "exports": {
+    ".": "./muretai-agent-entry.mjs"
+  },
+  "files": [
+    "muretai-agent-entry.mjs",
+    "examples/",
+    "testdata/",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "example": "node examples/server.mjs"
+  },
+  "keywords": [
+    "agent",
+    "ai-agent",
+    "a2a",
+    "did",
+    "ed25519",
+    "muretai",
+    "agent-network",
+    "llms-txt"
+  ],
+  "license": "MIT",
+  "author": "Muretai",
+  "homepage": "https://muretai.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/muretai/agent-entry.git"
+  },
+  "bugs": {
+    "url": "https://github.com/muretai/agent-entry/issues"
+  }
+}
