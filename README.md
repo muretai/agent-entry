@@ -144,8 +144,34 @@ your site's identity**), `AGENT_ENTRY_PORT` (8788), `AGENT_ENTRY_BASE_URL`,
 `AGENT_ENTRY_NAME`, `AGENT_ENTRY_ANON` (`1` also accepts unsigned inquiries, which create
 no account).
 
+## What `baseUrl` may be
+
 `baseUrl` must be the URL visitors actually dial: it is what your signed card claims, and
 a card naming a different origin proves nothing about yours.
+
+Agent Entry does not copy it into the card — it canonicalises it, so the string it signs is
+the one a visitor computes from the URL they dialled. Where the two could differ, **it
+refuses to start**, naming the rule and the value to paste instead. That is deliberate: the
+alternative is a card that fails on a stranger's machine, where the only diagnostic is
+"signature verification failed" and nothing at all appears on yours.
+
+Tidied up for you: surrounding spaces, the case of the scheme and host, a default port
+(`:443`, `:80`), a trailing dot on the host, and any trailing slashes.
+`https://studio.example/` and `https://Studio.Example:443` both publish as
+`https://studio.example`.
+
+Refused, with the fix in the message: a scheme other than `http`/`https`, a missing host,
+`user@host`, a query string, a `#` fragment, non-ASCII characters, a stray tab or space, a
+backslash, `.` or `..` in the path, a broken `%` escape, and a port outside 1–65535.
+
+Two rules worth knowing before you pick a URL:
+
+- **Paths are case-sensitive.** `https://studio.example/Alice` and `.../alice` are different
+  sites to a visitor. Choose one spelling and use it in every link, invite and QR code.
+- **Write an international domain in its `xn--` form** — `https://xn--eckwd4c7c.example`,
+  not the Unicode spelling — and publish your links in that same form. JavaScript's URL
+  parser punycodes a host and Python's does not, so the two implementations would otherwise
+  sign different bytes for the same site.
 
 ## Pairs with WebMCP: the tab conversation becomes a customer
 

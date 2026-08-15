@@ -870,6 +870,234 @@ function isThenable(v) {
   return v !== null && typeof v === 'object' && typeof v.then === 'function';
 }
 
+// ---------------------------------------------------------------- baseUrl canonicalisation
+
+/** RFC 3986 `pchar` plus '/' — the only characters an accepted path may carry. Everything
+ *  outside this set is percent-encoded by `new URL()` and left verbatim by Python's
+ *  urlsplit, which is precisely the divergence canonicalBaseUrl exists to prevent. */
+const PATH_OK = new Set(
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~!$&'()*+,;=:@/");
+const HEX = new Set('0123456789abcdefABCDEF');
+/** A host is lowercased before this is applied. '_' is not legal in a hostname but is real
+ *  in the wild and both parsers keep it verbatim, so it is not a divergence. */
+const HOST_OK = new Set('abcdefghijklmnopqrstuvwxyz0123456789.-_');
+const DEFAULT_PORT = { http: 80, https: 443 };
+
+/** Raise the one refusal shape, in the order an operator can act on at 2am: what they gave
+ *  (JSON-quoted, so an invisible tab is VISIBLE), which rule in words, the fix as a string
+ *  they can paste, and one clause of why. `base_url is not publishable:` is the greppable
+ *  stem the Python twin shares. */
+function refuseBaseUrl(given, rule, why, fix) {
+  const lines = [`base_url is not publishable: ${rule}`, `  given: ${JSON.stringify(given)}`];
+  if (fix) lines.push(`  use:   ${JSON.stringify(fix)}`);
+  lines.push(`  ${why}`);
+  throw new TypeError(lines.join('\n'));
+}
+
+/**
+ * canonicalBaseUrl(baseUrl) -> the exact string this entry may publish as its card `url`.
+ *
+ * The contract, and the only reason this function exists: **the returned value equals what
+ * a VISITOR computes** from the url they dialled (`Outbox.card_scope` in agent/outbox.py)
+ * when deciding whether this card is about this site. An entry that publishes anything else
+ * fails verification on a stranger's machine, with "signature verification failed" as the
+ * only diagnostic and nothing at all on the operator's screen.
+ *
+ * So every input on which the operator's spelling and the visitor's arithmetic could
+ * disagree — or on which this file and its Python twin (examples/agent_entry_reference.py)
+ * could disagree — is REFUSED here, loudly, at construction. The two are held byte-identical
+ * by an acceptance suite; a value they canonicalise differently is a signed-bytes split for
+ * identical operator input, which is the bug this whole function is about.
+ *
+ * It HAND-PARSES rather than using `new URL()`, which is not a candidate: it keeps a trailing
+ * DNS dot (`https://x.`) that the verifier drops, punycodes hosts, percent-encodes non-ASCII,
+ * spaces and `|^{}`, removes dot segments, and rewrites `\` to `/` — five spellings Python
+ * does not produce. `new URL()` runs at the END instead, as a tripwire: if a future Node
+ * changes the parser out from under the hand-parse, that is a loud startup failure here
+ * rather than silent byte drift discovered by a customer whose card stopped verifying.
+ *
+ * The gate (steps 1-7) runs before any folding, which is what makes the folds safe: it
+ * removes exactly the inputs the two languages disagree about, so every remaining fold is
+ * one they already agree on.
+ */
+export function canonicalBaseUrl(baseUrl, { warn = true } = {}) {
+  if (typeof baseUrl !== 'string' || !baseUrl.trim()) {
+    refuseBaseUrl(baseUrl, 'it is empty.', undefined,
+      'Set it to the URL visitors actually dial — it is what your signed card claims, and '
+      + 'a card naming a different origin proves nothing about yours.');
+  }
+  const s = baseUrl.trim();
+
+  for (const ch of s) {
+    const c = ch.codePointAt(0);
+    if (c >= 0x21 && c <= 0x7e) continue;
+    if (c > 0x7e) {
+      const hostGuess = (s.split('://')[1] ?? s).split('/')[0];
+      let fix;
+      try {                                     // best-effort A-label, for the message only
+        const asciiHost = new URL(`https://${hostGuess}`).hostname;
+        if (asciiHost && asciiHost !== hostGuess) fix = s.replace(hostGuess, asciiHost);
+      } catch { /* not a host we can suggest a spelling for */ }
+      refuseBaseUrl(s, 'it is not ASCII.', fix,
+        'Python and JavaScript disagree on how to spell this (Python keeps it as typed, '
+        + 'JavaScript percent-encodes or punycodes it), so the two Agent Entry '
+        + 'implementations would sign different bytes for the same site. Supply the ASCII '
+        + 'form, and publish your links and QR codes in that same form.');
+    }
+    refuseBaseUrl(s, 'it contains whitespace or a control character.', undefined,
+      'Both URL parsers DELETE a tab or newline silently and mid-string, so the value you '
+      + 'meant and the value that gets signed are not the same string and nothing tells you.');
+  }
+
+  if (s.includes('\\')) {
+    refuseBaseUrl(s, 'it contains a backslash.', s.replaceAll('\\', '/'),
+      "JavaScript reads '\\' as '/' and Python does not, so the two Agent Entry "
+      + 'implementations would disagree about where the host ends.');
+  }
+  for (const [bad, label] of [['?', 'a query string'], ['#', 'a fragment']]) {
+    if (s.includes(bad)) {
+      refuseBaseUrl(s, `it carries ${label}.`, s.split(bad)[0] || undefined,
+        'This string is signed into your Agent Card, and every visitor compares it to the '
+        + 'URL they dialled — which never carries one.');
+    }
+  }
+
+  const sep = s.indexOf('://');
+  const scheme = sep < 0 ? '' : s.slice(0, sep).toLowerCase();
+  if (sep < 0 || !(scheme in DEFAULT_PORT)) {
+    refuseBaseUrl(s, 'it is not an http(s) URL.',
+      sep < 0 && !s.startsWith('/') ? `https://${s}` : undefined,
+      'An Agent Card names an origin a visitor can dial over HTTP.');
+  }
+  const rest = s.slice(sep + 3);
+  const cut = rest.indexOf('/');
+  const authority = cut < 0 ? rest : rest.slice(0, cut);
+  let path = cut < 0 ? '' : rest.slice(cut);
+
+  if (authority.includes('@')) {
+    refuseBaseUrl(s, "it carries userinfo (a '@' before the host).",
+      `${scheme}://${authority.slice(authority.lastIndexOf('@') + 1)}${path}`,
+      "The part before '@' is not the host: a visitor dials the part AFTER it, so a card "
+      + 'built from this string would name a different site than the one being served.');
+  }
+  if (authority.includes('%')) {
+    refuseBaseUrl(s, 'the host contains a percent-escape.', undefined,
+      'Python lowercases it into the host and JavaScript refuses the URL outright, so the '
+      + 'two Agent Entry implementations cannot agree.');
+  }
+
+  let host;
+  let portS;
+  if (authority.startsWith('[')) {              // IPv6 literal — brackets are part of it
+    const close = authority.indexOf(']');
+    if (close < 0) {
+      refuseBaseUrl(s, "the IPv6 host is missing its closing ']'.", undefined,
+        'An address literal must be bracketed, e.g. http://[::1]:9000');
+    }
+    host = authority.slice(0, close + 1).toLowerCase();
+    const tail = authority.slice(close + 1);
+    if (tail && !tail.startsWith(':')) {
+      refuseBaseUrl(s, 'there is text after the IPv6 address.', undefined,
+        "Only ':<port>' may follow a bracketed address.");
+    }
+    portS = tail ? tail.slice(1) : '';
+  } else {
+    const colon = authority.lastIndexOf(':');
+    host = (colon < 0 ? authority : authority.slice(0, colon)).toLowerCase();
+    portS = colon < 0 ? '' : authority.slice(colon + 1);
+  }
+
+  let port = null;
+  if (portS) {
+    const n = Number(portS);
+    if (!/^[0-9]+$/.test(portS) || !Number.isInteger(n) || n < 1 || n > 65535) {
+      refuseBaseUrl(s, `the port ${JSON.stringify(portS)} is not a number in 1-65535.`,
+        undefined, 'A visitor dials a real port; anything else cannot be reached.');
+    }
+    port = n;
+  }
+  host = host.replace(/\.+$/, '');              // trailing dot: DNS-equal, byte-different
+  if (!host || (!host.startsWith('[') && [...host].some((c) => !HOST_OK.has(c)))) {
+    refuseBaseUrl(s, 'the host is missing or contains characters that are not a hostname.',
+      undefined, 'A card must name a host a visitor can resolve.');
+  }
+
+  path = path.replace(/\/+$/, '');              // ALL of them: card_scope uses rstrip too
+  if (path) {
+    for (let i = 0; i < path.length;) {
+      const ch = path[i];
+      if (ch === '%') {
+        if (path.length - i < 3 || !HEX.has(path[i + 1]) || !HEX.has(path[i + 2])) {
+          refuseBaseUrl(s, 'the path has a malformed percent-escape.', undefined,
+            "'%' must be followed by exactly two hex digits, or the two URL parsers "
+            + 'disagree about what the path is.');
+        }
+        i += 3;
+        continue;
+      }
+      if (!PATH_OK.has(ch)) {
+        refuseBaseUrl(s, `the path contains ${JSON.stringify(ch)}, which is not allowed `
+          + 'unencoded.', undefined,
+        'JavaScript percent-encodes this character and Python leaves it verbatim, so the '
+        + 'two Agent Entry implementations would sign different bytes. Percent-encode it '
+        + 'yourself.');
+      }
+      i += 1;
+    }
+    const parts = path.split('/');
+    if (parts.some((seg) => seg === '.' || seg === '..')) {
+      const segs = [];                          // RFC 3986 remove_dot_segments, for the fix
+      for (const seg of parts) {
+        if (seg === '.') continue;
+        if (seg === '..') { if (segs.length > 1) segs.pop(); continue; }
+        segs.push(seg);
+      }
+      refuseBaseUrl(s, "the path contains '.' or '..' segments.",
+        `${scheme}://${authority}${segs.join('/').replace(/\/+$/, '')}`,
+        'JavaScript collapses these segments and Python does not, so the two Agent Entry '
+        + 'implementations would sign different bytes.');
+    }
+  }
+
+  const originOut = `${scheme}://${host}${port !== null && port !== DEFAULT_PORT[scheme] ? `:${port}` : ''}`;
+  const out = originOut + path;
+
+  // The tripwire. Not redundant with the hand-parse: it is what turns a future Node/WHATWG
+  // change into a loud startup failure instead of silent byte drift. If this ever fires,
+  // the hand-parse and the platform parser have diverged on an input the gate let through.
+  const probe = new URL(out);
+  if (probe.origin !== originOut || probe.pathname !== (path || '/')
+      || probe.search || probe.hash) {
+    throw new TypeError(
+      `base_url canonicalisation is broken (a bug in this file, not in your input): `
+      + `${JSON.stringify(baseUrl)} -> ${JSON.stringify(out)}, which this runtime's URL `
+      + `parser reads as ${JSON.stringify(probe.origin + probe.pathname)}. `
+      + `Please report this at https://github.com/muretai/agent-entry/issues`);
+  }
+
+  if (warn) {
+    if (/[A-Z]/.test(path)) {
+      process.stderr.write(`warning: base_url path ${JSON.stringify(path)} contains `
+        + `uppercase letters. Paths are case-SENSITIVE and are not folded by the visitor's `
+        + `check, so a visitor who dials ${JSON.stringify(path.toLowerCase())} will fail to `
+        + `verify your card. Make sure every link, invite and QR code you publish spells it `
+        + `exactly ${JSON.stringify(path)}.\n`);
+    }
+    if (path.includes('%')) {
+      process.stderr.write(`warning: base_url path ${JSON.stringify(path)} contains a `
+        + `percent-escape. It is compared verbatim, case included, so a visitor who dials `
+        + `another spelling of the same path will fail to verify your card.\n`);
+    }
+    if (scheme === 'http' && !['localhost', '127.0.0.1', '[::1]'].includes(host)) {
+      process.stderr.write(`warning: base_url ${JSON.stringify(out)} is plain HTTP on a `
+        + `public host. A visiting agent refuses a plain-http open door (the message text `
+        + `would cross the wire in the clear), so this entry will be skipped by every `
+        + `well-behaved visitor. Use https.\n`);
+    }
+  }
+  return out;
+}
+
 /**
  * createAgentEntry(opts) -> { did, card, ledger, handleRequest, handleRequestAsync, listen }
  *
@@ -904,13 +1132,17 @@ export function createAgentEntry({
 } = {}) {
   if (!seedHex) throw new TypeError('createAgentEntry: seedHex is required');
   if (!baseUrl) throw new TypeError('createAgentEntry: baseUrl is required (it is signed into the card)');
+  // The ONE string this entry publishes as its card url. Canonicalised, not echoed: it must
+  // equal what a visitor's Outbox.card_scope computes for the url they dialled, or the card
+  // fails verification on THEIR machine with nothing on ours.
+  const canonUrl = canonicalBaseUrl(baseUrl);
   const did = didFromSeedHex(seedHex);
 
   const card = {
     protocolVersion: PROTOCOL_VERSION,
     name,
     description,
-    url: baseUrl,
+    url: canonUrl,
     did,
     version,
     capabilities: { streaming: false, pushNotifications: false },
@@ -1259,7 +1491,7 @@ export function createAgentEntry({
       if (pathname === '/') {
         const body = Buffer.from(
           `${name}\n\nThis origin is agent-reachable (Muretai agent entry).\n`
-          + `DID:  ${did}\nCard: ${baseUrl.replace(/\/+$/, '')}${AGENT_CARD_PATH}\n`
+          + `DID:  ${did}\nCard: ${canonUrl}${AGENT_CARD_PATH}\n`
           + 'POST a signed A2A message/send request to / for a signed reply.\n', 'utf8');
         return { status: 200,
           headers: { 'Content-Type': 'text/plain; charset=utf-8',

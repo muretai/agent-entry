@@ -1,7 +1,7 @@
 {
   "name": "@muretai/agent-entry",
-  "version": "1.0.0",
-  "description": "Your website can recognise AI agents, hold accounts for them, and answer them — one dependency-free file.",
+  "version": "1.1.0",
+  "description": "Your website can recognise AI agents, hold accounts for them, and answer them \u2014 one dependency-free file.",
   "type": "module",
   "main": "muretai-agent-entry.mjs",
   "exports": {

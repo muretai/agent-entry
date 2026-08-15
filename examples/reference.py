@@ -13,7 +13,7 @@ port it, ignore it: core stays byte-unchanged.
 ## The idea
 
 The adoption bottleneck is that BOTH ends must run a node. A site cannot: it has an origin,
-a deploy pipeline and no always-on process it wants to babysit. A agent entry is ~one file on
+a deploy pipeline and no always-on process it wants to babysit. An agent entry is ~one file on
 the origin the site already has. It:
 
   - serves its own Agent Card (plain + SIGNED), so a visitor can prove this DID owns this
@@ -49,7 +49,7 @@ the origin the site already has. It:
 
 `responder(envelope) -> str | dict` is the seam. `envelope` is the FROZEN verified-envelope
 shape (`agent/webhookwake.py::_envelope`), so a backend parses a webhook push, a drive-API
-read and a agent entry call with ONE schema. In production `responder` would POST that dict to
+read and an agent entry call with ONE schema. In production `responder` would POST that dict to
 your backend behind a bearer token (exactly what WebhookWake does) and return what it says;
 here it is called in-process to keep the sample runnable in one file.
 
@@ -76,7 +76,7 @@ from shared import crypto                        # noqa: E402  Ed25519 + did:key
 from shared import keybinding                     # noqa: E402  countersigned v2 device binding
 from shared import protocol as p                 # noqa: E402  the wire contract
 
-#: The SITE's software version, not a muretai build number: a agent entry is not a node and
+#: The SITE's software version, not a muretai build number: an agent entry is not a node and
 #: has no installed release. It rides in the card's `version` because A2A expects the field.
 AGENT_ENTRY_VERSION = "1.0.0"
 
@@ -89,6 +89,244 @@ AGENT_ENTRY_VERSION = "1.0.0"
 ANON_RATE_PER_MIN = 30
 
 
+def _int_epoch(v):
+    """An integer epoch, or None. Accepts an integer-valued float (JSON has one number
+    type, and a JS re-serialisation yields one) and normalises it; refuses bool, a true
+    fraction, and anything non-numeric. The one spelling both implementations agree on."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    if isinstance(v, float) and not v.is_integer():
+        return None
+    return int(v)
+
+
+#: RFC 3986 `pchar` plus '/' — the only characters an accepted path may carry. Everything
+#: outside this set is percent-encoded by JavaScript's URL parser and left verbatim by
+#: Python's, which is precisely the divergence `canonical_base_url` exists to prevent.
+_PATH_OK = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~!$&'()*+,;=:@/")
+_HEX = frozenset("0123456789abcdefABCDEF")
+#: A host is already lowercased when this is applied. `_` is not legal in a hostname but is
+#: real in the wild (internal names, some CDNs) and both parsers keep it verbatim, so it is
+#: not a divergence — accept it rather than break a working deployment.
+_HOST_OK = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-_")
+_DEFAULT_PORT = {"http": 80, "https": 443}
+
+
+def _refuse(given, rule: str, why: str, fix: "str | None" = None):
+    """Raise the one refusal shape, in the order an operator can act on at 2am: what they
+    gave (quoted, so an invisible tab is VISIBLE), which rule in words, the fix as a string
+    they can paste, and one clause of why. `base_url is not publishable:` is the greppable
+    stem the JavaScript twin shares."""
+    lines = [f"base_url is not publishable: {rule}", f"  given: {given!r}"]
+    if fix:
+        lines.append(f"  use:   {fix!r}")
+    lines.append("  " + why)
+    raise ValueError("\n".join(lines))
+
+
+def canonical_base_url(base_url, *, warn: bool = True) -> str:
+    """The exact string this entry may publish as its card `url`, or ValueError.
+
+    The contract, and the only reason this function exists: **the returned value equals
+    `Outbox.card_scope(base_url)`** — the arithmetic a VISITOR runs on the url they dialled
+    to decide whether this card is about this site (`agent/outbox.py`). An entry that
+    publishes anything else fails verification on a stranger's machine, with "signature
+    verification failed" as the only diagnostic and nothing at all on the operator's screen.
+
+    So every input on which the operator's spelling and the visitor's arithmetic could
+    disagree — or on which this file and its JavaScript twin could disagree — is REFUSED
+    here, loudly, at construction. The two implementations are held byte-identical by an
+    acceptance suite; a value they canonicalise differently is a signed-bytes split for
+    identical operator input, which is the bug this whole function is about.
+
+    The algorithm, written out because a third implementation (Go, Rust) has no `neturl`
+    to call and this file is the reference:
+
+      0. must be a non-empty string
+      1. strip outer ASCII whitespace                                       (silent)
+      2. every character in 0x21..0x7E — one rule that kills interior spaces, TAB/CR/LF
+         (BOTH parsers DELETE these mid-string, so the operator never sees them), NUL,
+         and all non-ASCII
+      3. no '\\'      (JavaScript reads it as '/', Python keeps it in the host)
+      4. no '?' and no '#', tested on the RAW string — a bare trailing '#' parses to an
+         EMPTY fragment, so a parsed-component test waves through the one input that
+         makes the trick work (`shared/neturl.peer_base_ok` tests the raw string too)
+      5. scheme is http or https, case-insensitive -> lowercased
+      6. authority = up to the first '/'; the rest (with that '/') = path
+      7. no '@' in the authority (userinfo), no '%' in the authority
+      8. host lowercased, ALL trailing '.' dropped, IPv6 brackets kept; port 1..65535 with
+         the scheme's default dropped
+      9. ALL trailing '/' stripped from the path; empty stays "" and never becomes "/";
+         no '.' or '..' segment; every character in pchar+'/' or a well-formed '%HH'.
+         Path case and percent-escape case are PRESERVED, never folded — `card_scope`
+         does not fold them either, and folding here would publish a value the visitor
+         does not compute
+     10. reassemble, then assert the result is a fixed point of the verifier's arithmetic
+
+    Steps 0-7 run BEFORE `neturl.origin` is called, which is what makes reusing it safe:
+    `origin()` silently folds userinfo, query and fragment away — correct for a consumer
+    reading a stranger's card, wrong for a producer, since it would quietly publish
+    something other than what the operator typed. It never sees those inputs here.
+
+    `warn=False` silences the advisory notes (they go to stderr and are never fatal).
+    """
+    if not isinstance(base_url, str) or not base_url.strip():
+        _refuse(base_url, "it is empty.",
+                "Set it to the URL visitors actually dial — it is what your signed card "
+                "claims, and a card naming a different origin proves nothing about yours.")
+    s = base_url.strip()
+
+    for ch in s:
+        if ch < "\x21" or ch > "\x7e":
+            if ch > "\x7e":
+                host_guess = s.split("://", 1)[-1].split("/", 1)[0]
+                fix = None
+                try:                              # best-effort A-label for the message only
+                    ascii_host = host_guess.encode("idna").decode()
+                    if ascii_host != host_guess:
+                        fix = s.replace(host_guess, ascii_host, 1)
+                except Exception:
+                    pass
+                _refuse(s, "it is not ASCII.", fix=fix,
+                        why="Python and JavaScript disagree on how to spell this (Python "
+                            "keeps it as typed, JavaScript percent-encodes or punycodes "
+                            "it), so the two Agent Entry implementations would sign "
+                            "different bytes for the same site. Supply the ASCII form, and "
+                            "publish your links and QR codes in that same form.")
+            _refuse(s, "it contains whitespace or a control character.",
+                    "Both URL parsers DELETE a tab or newline silently and mid-string, so "
+                    "the value you meant and the value that gets signed are not the same "
+                    "string and nothing tells you.")
+
+    if "\\" in s:
+        _refuse(s, "it contains a backslash.", fix=s.replace("\\", "/"),
+                why="JavaScript reads '\\' as '/' and Python does not, so the two Agent "
+                    "Entry implementations would disagree about where the host ends.")
+    for bad, label in (("?", "a query string"), ("#", "a fragment")):
+        if bad in s:
+            _refuse(s, f"it carries {label}.", fix=s.split(bad, 1)[0] or None,
+                    why="This string is signed into your Agent Card, and every visitor "
+                        "compares it to the URL they dialled — which never carries one.")
+
+    scheme, sep, rest = s.partition("://")
+    scheme = scheme.lower()
+    if not sep or scheme not in _DEFAULT_PORT:
+        _refuse(s, "it is not an http(s) URL.",
+                fix=("https://" + s) if (not sep and "/" not in s.split("?")[0][:1]) else None,
+                why="An Agent Card names an origin a visitor can dial over HTTP.")
+    authority, slash, tail = rest.partition("/")
+    path = slash + tail
+
+    if "@" in authority:
+        _refuse(s, "it carries userinfo (a '@' before the host).",
+                fix=f"{scheme}://{authority.rsplit('@', 1)[1]}{path}",
+                why="The part before '@' is not the host: a visitor dials the part AFTER "
+                    "it, so a card built from this string would name a different site than "
+                    "the one being served.")
+    if "%" in authority:
+        _refuse(s, "the host contains a percent-escape.",
+                "Python lowercases it into the host and JavaScript refuses the URL "
+                "outright, so the two Agent Entry implementations cannot agree.")
+
+    if authority.startswith("["):                 # IPv6 literal — brackets are part of it
+        close = authority.find("]")
+        if close < 0:
+            _refuse(s, "the IPv6 host is missing its closing ']'.",
+                    "An address literal must be bracketed, e.g. http://[::1]:9000")
+        host, port_part = authority[:close + 1].lower(), authority[close + 1:]
+        if port_part and not port_part.startswith(":"):
+            _refuse(s, "there is text after the IPv6 address.",
+                    "Only ':<port>' may follow a bracketed address.")
+        port_s = port_part[1:] if port_part else ""
+    elif ":" in authority:
+        host, _, port_s = authority.rpartition(":")
+        host = host.lower()
+    else:
+        host, port_s = authority.lower(), ""
+
+    if port_s:
+        if not port_s.isdigit() or not (1 <= int(port_s) <= 65535):
+            _refuse(s, f"the port {port_s!r} is not a number in 1-65535.",
+                    "A visitor dials a real port; anything else cannot be reached.")
+        port = int(port_s)
+    else:
+        port = None
+    host = host.rstrip(".")                       # trailing dot: DNS-equal, byte-different
+    if not host or (not host.startswith("[") and set(host) - _HOST_OK):
+        _refuse(s, "the host is missing or contains characters that are not a hostname.",
+                "A card must name a host a visitor can resolve.")
+
+    path = path.rstrip("/")                       # ALL of them: card_scope uses rstrip too
+    if path:
+        i = 0
+        while i < len(path):
+            ch = path[i]
+            if ch == "%":
+                if len(path) - i < 3 or path[i + 1] not in _HEX or path[i + 2] not in _HEX:
+                    _refuse(s, "the path has a malformed percent-escape.",
+                            "'%' must be followed by exactly two hex digits, or the two "
+                            "URL parsers disagree about what the path is.")
+                i += 3
+                continue
+            if ch not in _PATH_OK:
+                _refuse(s, f"the path contains {ch!r}, which is not allowed unencoded.",
+                        "JavaScript percent-encodes this character and Python leaves it "
+                        "verbatim, so the two Agent Entry implementations would sign "
+                        "different bytes. Percent-encode it yourself.")
+            i += 1
+        if any(seg in (".", "..") for seg in path.split("/")):
+            segs: list[str] = []                  # RFC 3986 remove_dot_segments, for the fix
+            for seg in path.split("/"):
+                if seg == ".":
+                    continue
+                if seg == "..":
+                    if len(segs) > 1:
+                        segs.pop()
+                    continue
+                segs.append(seg)
+            _refuse(s, "the path contains '.' or '..' segments.",
+                    fix=f"{scheme}://{authority}" + "/".join(segs).rstrip("/"),
+                    why="JavaScript collapses these segments and Python does not, so the "
+                        "two Agent Entry implementations would sign different bytes.")
+
+    out = f"{scheme}://{host}"
+    if port is not None and port != _DEFAULT_PORT[scheme]:
+        out += f":{port}"
+    out += path
+
+    # The property, asserted rather than assumed: what we publish IS what the verifier
+    # computes, and it is a fixed point. `Outbox.card_scope` is `neturl.origin(u) +
+    # urlsplit(u).path.rstrip("/")`; inlined (three lines) so this file needs nothing from
+    # agent/, and cross-checked against the real card_scope by test_agent_entry_contract.
+    from shared import neturl                    # noqa: PLC0415  local: keeps the top light
+    scope = neturl.origin(out) + urllib.parse.urlsplit(out).path.rstrip("/")
+    if scope != out:
+        raise ValueError(
+            f"base_url canonicalisation is broken (a bug in this file, not in your input): "
+            f"{base_url!r} -> {out!r} but the verifier computes {scope!r}. "
+            f"Please report this at https://github.com/muretai/agent-entry/issues")
+
+    if warn:
+        if any(c.isupper() for c in path):
+            print(f"warning: base_url path {path!r} contains uppercase letters. Paths are "
+                  f"case-SENSITIVE and are not folded by the visitor's check, so a visitor "
+                  f"who dials {path.lower()!r} will fail to verify your card. Make sure "
+                  f"every link, invite and QR code you publish spells it exactly {path!r}.",
+                  file=sys.stderr)
+        if "%" in path:
+            print(f"warning: base_url path {path!r} contains a percent-escape. It is "
+                  f"compared verbatim, case included, so a visitor who dials another "
+                  f"spelling of the same path will fail to verify your card.",
+                  file=sys.stderr)
+        if scheme == "http" and host not in ("localhost", "127.0.0.1", "[::1]"):
+            print(f"warning: base_url {out!r} is plain HTTP on a public host. A visiting "
+                  f"agent refuses a plain-http open door (the message text would cross the "
+                  f"wire in the clear), so this entry will be skipped by every well-behaved "
+                  f"visitor. Use https.", file=sys.stderr)
+    return out
+
+
 class _BindingRejected(Exception):
     """A PRESENT device binding failed one of the v2 checks (T102).
 
@@ -98,7 +336,7 @@ class _BindingRejected(Exception):
     downgrade to "unbound" — admitting it as merely unbound would let an attacker
     probe checks one at a time at no cost, and handing the backend a proven owner
     it never proved is worse. Mirrors agent/inbox.py::_resolve_account's
-    per-failure VerifyError one tier down (a agent entry holds no trust DB)."""
+    per-failure VerifyError one tier down (an agent entry holds no trust DB)."""
 
     def __init__(self, reason: str):
         super().__init__(reason)
@@ -120,7 +358,7 @@ class AgentEntry:
     """
 
     #: ±window on the signed timestamp. Mirrors agent/inbox.CLOCK_WINDOW — the two must not
-    #: drift, or a message a node accepts is one a agent entry refuses (and vice versa).
+    #: drift, or a message a node accepts is one an agent entry refuses (and vice versa).
     CLOCK_WINDOW = 300.0
     #: How long a messageId is remembered. Mirrors agent/replay.py's TTL.
     REPLAY_TTL = 600.0
@@ -143,7 +381,10 @@ class AgentEntry:
         self.identity = identity
         self.did: str = identity.did
         self.name = name
-        self.base_url = base_url.rstrip("/") or base_url
+        #: The ONE string this entry publishes as its card url. Canonicalised, not echoed:
+        #: it must equal what a visitor's `Outbox.card_scope` computes for the url they
+        #: dialled, or the card fails verification on THEIR machine with nothing on ours.
+        self.base_url = canonical_base_url(base_url)
         self.responder = responder
         self.open_door = bool(open_door)
         self.anonymous_lane = bool(anonymous_lane)
@@ -188,7 +429,7 @@ class AgentEntry:
     def _build_card(self) -> dict[str, Any]:
         """The plain A2A Agent Card, built HERE rather than imported from `agent/`.
 
-        A agent entry is the tier that has no node, so the card must be constructible from the
+        An agent entry is the tier that has no node, so the card must be constructible from the
         published field list alone — a site porting this to Go or JS has no `build_agent_card`
         to call. Keeping the sample honest about that is the whole point of the constraint.
 
@@ -200,7 +441,7 @@ class AgentEntry:
             "name": self.name,
             "description": self.description,
             # The origin visitors dial. `Outbox.card_binds_to` requires this to name the
-            # url that was actually dialled, so a agent entry behind a proxy must advertise
+            # url that was actually dialled, so an agent entry behind a proxy must advertise
             # the PUBLIC url, not its internal bind address.
             "url": self.base_url,
             "did": self.did,
@@ -365,7 +606,7 @@ class AgentEntry:
             "verified": bool(verified),
             "peer_did": msg.from_did,
             "owner_did": owner_did,     # T102: the resolved account (owner) DID, or None
-            "peer_name": None,          # a agent entry holds no address book to resolve one
+            "peer_name": None,          # an agent entry holds no address book to resolve one
             "context_id": msg.contextId,
             "text": msg.text,
             "msg_id": msg.messageId,
@@ -415,10 +656,19 @@ class AgentEntry:
         if binding.get("deviceDid") != msg.from_did:
             # The anti-copy pin: a binding lifted off another device's message.
             raise _BindingRejected("device binding does not name the sender")
-        ts, valid_until = binding.get("ts"), binding.get("validUntil")
-        if isinstance(ts, bool) or not isinstance(ts, int) \
-                or isinstance(valid_until, bool) or not isinstance(valid_until, int):
+        # NORMALISE an integer-valued float, exactly as the message path does at step 6 —
+        # and for the same reason. JSON has one number type: a sender that writes `1.0`
+        # (or any JS runtime re-serialising a Number) produces a float here, while
+        # `JSON.parse` in the JS twin yields the Number 1 and `Number.isSafeInteger(1)` is
+        # true. Rejecting the float here and accepting it there made the SAME POST create
+        # a customer on one implementation and 401 on the other — the double-book class the
+        # wire-shape machinery exists to close, reopened one layer down (found by the
+        # security audit, ISSUE(agent-entry-binding-float-ts-divergence)). A TRUE fraction
+        # is still refused by both: it cannot be canonicalised identically outside Python.
+        ts, valid_until = _int_epoch(binding.get("ts")), _int_epoch(binding.get("validUntil"))
+        if ts is None or valid_until is None:
             raise _BindingRejected("device binding timestamps must be integers")
+        binding = {**binding, "ts": ts, "validUntil": valid_until}
         now = time.time()
         if ts > now + self.CLOCK_WINDOW:
             raise _BindingRejected("device binding ts is in the future")
@@ -541,7 +791,7 @@ class AgentEntry:
 
         Step 6 is STRICTER THAN A NODE on purpose. `agent/inbox.py` still accepts a float
         timestamp because the deployed fleet contains nodes that mint them and the signature
-        is over whatever type the wire carried. A agent entry is the tier whose verifiers are
+        is over whatever type the wire carried. An agent entry is the tier whose verifiers are
         NOT all Python — a float renders through Python's repr and no other language
         reproduces those bytes — so here the INTEGER spelling is the contract: a string or
         boolean timestamp is refused (-32002) and a fractional one is unverifiable (-32001),
@@ -573,7 +823,7 @@ class AgentEntry:
         req_id = req.get("id")
         if req.get("method") != "message/send":
             return 200, p.rpc_error(req_id, p.METHOD_NOT_FOUND,
-                                    "a agent entry implements message/send only")
+                                    "an agent entry implements message/send only")
         params = req.get("params")
         m = params.get("message") if isinstance(params, dict) else None
         if not isinstance(m, dict):
