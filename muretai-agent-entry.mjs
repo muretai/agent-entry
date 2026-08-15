@@ -1010,6 +1010,13 @@ export function createAgentEntry({
       return { ok: false, reason: 'device binding does not name the sender' };
     }
     const { ts, validUntil, rootDid } = binding;
+    // `Number.isSafeInteger` is the SAME predicate the Python twin now applies after
+    // normalising an integer-valued float: both accept `1` and `1.0`, both refuse a true
+    // fraction, and both refuse a magnitude that cannot round-trip (Python because such a
+    // float is not integer-valued once it loses precision, JS at the safe-integer bound).
+    // They disagreed before: Python refused `1.0` outright while this accepted it, so the
+    // same POST created a customer here and 401'd there
+    // (ISSUE(agent-entry-binding-float-ts-divergence)).
     if (!Number.isSafeInteger(ts) || !Number.isSafeInteger(validUntil)) {
       return { ok: false, reason: 'device binding timestamps must be integers' };
     }
