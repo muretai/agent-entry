@@ -8,6 +8,9 @@ person replaces their phone, your site still knows it is them.
 
 One file. Zero dependencies. Node 20+.
 
+Questions are welcome — mention [@muretaiai](https://x.com/muretaiai) on X, or
+[open an issue](https://github.com/muretai/agent-entry/issues).
+
 ```js
 import { createAgentEntry } from '@muretai/agent-entry';
 
@@ -385,5 +388,14 @@ that has to stay awake.
 
 You do not need the rest of the network to use this file. It is useful on its own the
 moment an agent knocks.
+
+## Questions
+
+Ask — there is no wrong question about this, and the answers usually improve the docs.
+
+- **X:** [@muretaiai](https://x.com/muretaiai) — mention us, we read them
+- **Issues:** [github.com/muretai/agent-entry/issues](https://github.com/muretai/agent-entry/issues)
+- **Security:** please report privately first, at
+  [muretai.com/.well-known/security.txt](https://muretai.com/.well-known/security.txt)
 
 MIT.
