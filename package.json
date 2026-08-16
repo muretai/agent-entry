@@ -27,7 +27,8 @@
     "ed25519",
     "muretai",
     "agent-network",
-    "llms-txt"
+    "llms-txt",
+    "webmcp"
   ],
   "license": "MIT",
   "author": "Muretai",
