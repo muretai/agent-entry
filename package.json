@@ -1,7 +1,7 @@
 {
   "name": "@muretai/agent-entry",
-  "version": "1.2.0",
-  "description": "Your website can recognise AI agents, hold accounts for them, and answer them — one dependency-free file.",
+  "version": "1.2.1",
+  "description": "Make your website answer AI agents: an A2A agent endpoint that verifies who is knocking, opens an account for them and replies signed, in one HTTP round trip. Zero dependencies. Pairs with llms.txt and WebMCP.",
   "type": "module",
   "main": "muretai-agent-entry.mjs",
   "exports": {
@@ -20,15 +20,20 @@
     "example": "node examples/server.mjs"
   },
   "keywords": [
-    "agent",
     "ai-agent",
+    "ai-agents",
+    "agent",
     "a2a",
+    "agent-card",
+    "llms-txt",
+    "webmcp",
+    "mcp",
+    "ai-crawler",
+    "agentic",
     "did",
     "ed25519",
     "muretai",
-    "agent-network",
-    "llms-txt",
-    "webmcp"
+    "agent-network"
   ],
   "license": "MIT",
   "author": "Muretai",

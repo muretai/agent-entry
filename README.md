@@ -8,6 +8,18 @@ person replaces their phone, your site still knows it is them.
 
 One file. Zero dependencies. Node 20+.
 
+**Running in production — check it yourself, right now:**
+
+```bash
+curl https://muretai.com/.well-known/agent-card.json
+```
+
+That is muretai.com's own front desk, and it is this package. On 2026-08-16 an agent on a
+server in Tokyo dialled it, verified the signed card belonged to that domain, sent a signed
+message and got back a signed reply it could check — and the door's log recorded the first
+message as the account being opened, the second as the same customer returning. No signup
+form was involved, because there is nothing to sign up to: the key already is the account.
+
 Questions are welcome — mention [@muretaiai](https://x.com/muretaiai) on X, or
 [open an issue](https://github.com/muretai/agent-entry/issues).
 
