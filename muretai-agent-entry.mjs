@@ -54,6 +54,12 @@ export const CARD_SIG_REFRESH_S = 3600;
  *  wrote. Must match `ANON_RATE_PER_MIN` in examples/agent_entry_reference.py: one contract,
  *  two implementations, one bound. */
 export const ANON_RATE_PER_MIN = 30;
+/** How many domains one card may advertise (agent/domainstore.MAX_CARD_DOMAINS, and the
+ *  same ceiling shared/protocol.build_agent_card applies to a node's card). Every name
+ *  listed is an outbound HTTPS fetch this entry asks strangers to make, so the cap bounds
+ *  the work an entry can push onto its visitors — not how many domains a site may own.
+ *  Must match `MAX_CARD_DOMAINS` in examples/agent_entry_reference.py. */
+export const MAX_CARD_DOMAINS = 5;
 
 export const AGENT_CARD_PATH = '/.well-known/agent-card.json';
 export const AGENT_CARD_PATH_LEGACY = '/.well-known/agent.json';
@@ -797,6 +803,20 @@ class RateBound {
 }
 
 /**
+ * An unpaired UTF-16 surrogate — a string with no UTF-8 encoding at all.
+ *
+ * `"\ud800"` is legal JSON and both parsers accept it, but Python's `.encode("utf-8")`
+ * RAISES on it while a JavaScript Buffer quietly substitutes U+FFFD. Measured: a one-shot
+ * POST carrying `"text": "\ud800"` from a stranger with no key killed the Python reference
+ * entry's request with no HTTP response, and was answered -32001 here — same bytes, two
+ * verdicts, one of them a dead socket. It is not text; the shape gate refuses it on both.
+ *
+ * Written without the `u` flag on purpose: in a Unicode-mode pattern these ranges are not
+ * matchable as isolated code units, which is exactly what has to be matched here.
+ */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+/**
  * The STRICT type check on the fields that end up inside the signed payload. Returns a
  * reason string, or null when the shape is acceptable.
  *
@@ -808,6 +828,16 @@ class RateBound {
  * sells. Likewise a non-string `contextId` (the reproduced case was the float `1.0`):
  * JavaScript renders it `1` and Python renders it `1.0`, so exactly one of them can verify
  * the signature — and we would then ECHO it into our own signed reply.
+ *
+ * Also here, and for the same reason, are the ENVELOPE fields — `metadata` and the
+ * `from`/`to`/`sig` inside it. Step 4 below can only ask "is it there", and a wrongly-typed
+ * one answered that question WRONG on both twins in opposite directions: `metadata: "x"`
+ * read as an EMPTY envelope here (so -32001, or — with the anonymous lane on — a SIGNED
+ * ANONYMOUS REPLY, a malformed envelope silently downgraded to a walk-in) while the Python
+ * reference answered -32600; and `metadata.to = 1` survived Python's presence test and
+ * reached `to_did[:24]`, a TypeError that closed the socket with no HTTP response at all.
+ * A partial or malformed envelope is never an absent one — that rule is already written
+ * down for a stripped `sig` in docs/AGENT_ENTRY.md, and it holds for the type too.
  *
  * -32600 (Invalid Request) for all of them: a wrongly-typed field is a malformed request,
  * not a failed signature. `examples/agent_entry_reference.py::_wire_shape_error` answers the
@@ -825,14 +855,49 @@ function wireShapeError(msg) {
     if ('text' in part && typeof part.text !== 'string') {
       return 'a text part\'s `text` must be a string';
     }
+    if (typeof part.text === 'string' && LONE_SURROGATE.test(part.text)) {
+      return 'a text part\'s `text` is not encodable UTF-8 (a lone surrogate)';
+    }
   }
   if (typeof msg.messageId !== 'string' || !msg.messageId) {
     return 'messageId must be a non-empty string';
+  }
+  if (LONE_SURROGATE.test(msg.messageId)) {
+    return 'messageId is not encodable UTF-8 (a lone surrogate)';
   }
   if (msg.contextId !== undefined && msg.contextId !== null
       && typeof msg.contextId !== 'string') {
     return 'contextId must be a string or null';
   }
+  if (typeof msg.contextId === 'string' && LONE_SURROGATE.test(msg.contextId)) {
+    return 'contextId is not encodable UTF-8 (a lone surrogate)';
+  }
+  // The ENVELOPE fields. `null` reads as ABSENT (the stripped-sig case the ladder answers
+  // -32001 for, and the shape of a walk-in on the anonymous lane); PRESENT-but-not-a-string
+  // is a malformed request and is never an absent envelope. `typeof null === 'object'` and
+  // an Array is an object too, so both are excluded explicitly.
+  const meta = msg.metadata;
+  if (meta !== undefined && meta !== null
+      && (typeof meta !== 'object' || Array.isArray(meta))) {
+    return 'metadata must be an object';
+  }
+  for (const field of ['from', 'to', 'sig']) {
+    const v = (meta ?? {})[field];
+    if (v === undefined || v === null) continue;
+    if (typeof v !== 'string') return `metadata.${field} must be a string`;
+    if (LONE_SURROGATE.test(v)) {
+      return `metadata.${field} is not encodable UTF-8 (a lone surrogate)`;
+    }
+  }
+  // LAST, because the Python reference reaches the equivalent refusal last: its shape gate
+  // runs and THEN `Message.from_a2a` raises. `kind: "message"` is what makes this an A2A
+  // Message rather than some other object that happens to carry a `parts` array, and
+  // `shared/protocol.py::from_a2a` has always required it — while this file had no check at
+  // all. Measured with a valid signature and a fresh timestamp: a message with `kind`
+  // removed was ACCEPTED here, BOOKED AN ACCOUNT and got a signed reply, where the reference
+  // answered -32600. A muretai NODE refuses the same bytes, so accepting them would also
+  // mean the entry tier and the node tier disagree about what an A2A message is.
+  if (msg.kind !== 'message') return 'not an A2A message object';
   return null;
 }
 
@@ -845,6 +910,61 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Content-Type',
   'Access-Control-Max-Age': '600',
 };
+
+/** The refusal text for a request-target that is not in origin form. Shared with
+ *  `ORIGIN_FORM_ONLY` in examples/agent_entry_reference.py so the two twins return the same
+ *  diagnostic for the same request. */
+const ORIGIN_FORM_ONLY = 'the request-target must be an origin-form path: this entry answers '
+  + 'exactly the address its card names, and that address has no other spelling';
+
+/** Transport bounds. Node bounds the first three by DEFAULT (300 s / 60 s / 5 s) and the
+ *  Python reference bounded NONE, which made it the only tier a stranger could wedge with no
+ *  key and no request body — 40 trickle connections took it from 2 threads to 42 with 0
+ *  responses. These are the numbers BOTH twins now use, spelled here so the two files can be
+ *  read against each other: `AgentEntry.HEADER_TIMEOUT` / `BODY_BUDGET` /
+ *  `KEEPALIVE_TIMEOUT` / `MAX_CONNECTIONS`. */
+const HEADERS_TIMEOUT_MS = 20_000;
+const REQUEST_TIMEOUT_MS = 20_000;
+const KEEPALIVE_TIMEOUT_MS = 5_000;
+const MAX_CONNECTIONS = 64;
+
+/** What the (MAX_CONNECTIONS+1)-th connection is answered with, byte for byte the same
+ *  response `_BoundedThreadingHTTPServer` writes in the Python reference. */
+const OVERLOADED_BODY = '{"error":"too many concurrent connections"}';
+const OVERLOADED_RESPONSE = 'HTTP/1.1 503 Service Unavailable\r\n'
+  + 'Content-Type: application/json; charset=utf-8\r\n'
+  + `Content-Length: ${OVERLOADED_BODY.length}\r\n`
+  + 'Connection: close\r\n\r\n' + OVERLOADED_BODY;
+
+/** The stdlib's STRICT UTF-8 decoder: it THROWS on an invalid byte instead of substituting
+ *  U+FFFD, which is what `Buffer.toString('utf8')` does and what let a body neither
+ *  implementation could agree about reach the ladder. Node global since v11 — no dependency. */
+const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true });
+
+/**
+ * The JSON-RPC `id` we may ECHO, or null.
+ *
+ * JSON-RPC 2.0 says an id is a String, a Number or Null — never an object or an array — and
+ * this enforces exactly that, for a reason larger than pedantry: the id is the ONE field no
+ * signature covers and it is written straight back out, so whatever the two runtimes
+ * disagree about here becomes a disagreement about the whole response. Two measured cases,
+ * both closed by refusing the SHAPE rather than the instance:
+ *   - `id = {"x":"\ud800"}`. `JSON.stringify` escapes the lone surrogate happily; Python's
+ *     `p.dumps` RAISES, so the reference booked the account and then died in serialisation
+ *     (HTTP 500, no reply, customer on the books) while this file answered 200 and signed.
+ *   - a number outside ±2^53. `10**400` arrives here as `Infinity` and re-serialises as
+ *     `null`, while Python echoes the bigint verbatim.
+ * `null` is what JSON-RPC allows for an unusable id, and it keeps the VERDICT — not the
+ * echo — as the thing the two implementations have to agree on.
+ * Mirrors `AgentEntry._safe_id` in examples/agent_entry_reference.py.
+ */
+function safeId(id) {
+  if (typeof id === 'string') return LONE_SURROGATE.test(id) ? null : id;
+  if (typeof id === 'number') {
+    return (Number.isFinite(id) && Math.abs(id) <= 2 ** 53) ? id : null;
+  }
+  return null;
+}
 
 function jsonResponse(status, obj, extraHeaders = {}) {
   const body = Buffer.from(JSON.stringify(obj), 'utf8');
@@ -883,12 +1003,30 @@ const HEX = new Set('0123456789abcdefABCDEF');
 const HOST_OK = new Set('abcdefghijklmnopqrstuvwxyz0123456789.-_');
 const DEFAULT_PORT = { http: 80, https: 443 };
 
+/**
+ * `'.'` or `'..'` if this path segment is a dot segment AS THE URL PARSERS SEE IT, else null.
+ *
+ * Raw `.` and `..` are the obvious spellings; `new URL()` ALSO removes `%2e`, `%2E` and every
+ * mixture (`.%2e`, `%2e.`, `%2e%2e`), and Python's `urlsplit` removes none of them. A segment
+ * test written against the raw text therefore lets exactly that family through: measured,
+ * `https://shop.example/a/%2e%2e/support` started and published on the Python side, and was
+ * refused here only by the `new URL()` tripwire at the bottom of canonicalBaseUrl — which
+ * announced "a bug in this file, not in your input" for an input problem with a paste-able
+ * fix. Decoding just this one escape (never the whole segment — `%41` must stay `%41`, it is
+ * a different path) makes both implementations refuse the same family, for the right reason.
+ */
+function dotSegment(seg) {
+  const decoded = seg.replaceAll('%2e', '.').replaceAll('%2E', '.');
+  return (decoded === '.' || decoded === '..') ? decoded : null;
+}
+
 /** Raise the one refusal shape, in the order an operator can act on at 2am: what they gave
  *  (JSON-quoted, so an invisible tab is VISIBLE), which rule in words, the fix as a string
- *  they can paste, and one clause of why. `base_url is not publishable:` is the greppable
- *  stem the Python twin shares. */
-function refuseBaseUrl(given, rule, why, fix) {
-  const lines = [`base_url is not publishable: ${rule}`, `  given: ${JSON.stringify(given)}`];
+ *  they can paste, and one clause of why. `<field> is not publishable:` is the greppable
+ *  stem the Python twin shares — `base_url` for the address, `domains` for the names this
+ *  entry claims to speak for, `base_path` for the mount override. */
+function refuseBaseUrl(given, rule, why, fix, field = 'base_url') {
+  const lines = [`${field} is not publishable: ${rule}`, `  given: ${JSON.stringify(given)}`];
   if (fix) lines.push(`  use:   ${JSON.stringify(fix)}`);
   lines.push(`  ${why}`);
   throw new TypeError(lines.join('\n'));
@@ -1045,17 +1183,19 @@ export function canonicalBaseUrl(baseUrl, { warn = true } = {}) {
       i += 1;
     }
     const parts = path.split('/');
-    if (parts.some((seg) => seg === '.' || seg === '..')) {
+    if (parts.some((seg) => dotSegment(seg) !== null)) {
       const segs = [];                          // RFC 3986 remove_dot_segments, for the fix
       for (const seg of parts) {
-        if (seg === '.') continue;
-        if (seg === '..') { if (segs.length > 1) segs.pop(); continue; }
+        const dot = dotSegment(seg);
+        if (dot === '.') continue;
+        if (dot === '..') { if (segs.length > 1) segs.pop(); continue; }
         segs.push(seg);
       }
-      refuseBaseUrl(s, "the path contains '.' or '..' segments.",
-        `${scheme}://${authority}${segs.join('/').replace(/\/+$/, '')}`,
-        'JavaScript collapses these segments and Python does not, so the two Agent Entry '
-        + 'implementations would sign different bytes.');
+      refuseBaseUrl(s, "the path contains '.' or '..' segments "
+        + "(the percent-encoded spellings '%2e' and '%2E' count).",
+      `${scheme}://${authority}${segs.join('/').replace(/\/+$/, '')}`,
+      'JavaScript collapses these segments — encoded ones included — and Python does not, '
+      + 'so the two Agent Entry implementations would sign different bytes.');
     }
   }
 
@@ -1065,14 +1205,24 @@ export function canonicalBaseUrl(baseUrl, { warn = true } = {}) {
   // The tripwire. Not redundant with the hand-parse: it is what turns a future Node/WHATWG
   // change into a loud startup failure instead of silent byte drift. If this ever fires,
   // the hand-parse and the platform parser have diverged on an input the gate let through.
+  //
+  // It must NOT claim to know which of the two is at fault. It used to open with "a bug in
+  // this file, not in your input" and send the operator to an issue tracker — and the input
+  // that actually fired it was `https://shop.example/a/%2e%2e/support`, an encoded dot
+  // segment, which is an input problem with a paste-able fix (now refused above, by name).
+  // A tripwire sees a disagreement, not a culprit. Name both, input first.
   const probe = new URL(out);
   if (probe.origin !== originOut || probe.pathname !== (path || '/')
       || probe.search || probe.hash) {
     throw new TypeError(
-      `base_url canonicalisation is broken (a bug in this file, not in your input): `
-      + `${JSON.stringify(baseUrl)} -> ${JSON.stringify(out)}, which this runtime's URL `
-      + `parser reads as ${JSON.stringify(probe.origin + probe.pathname)}. `
-      + `Please report this at https://github.com/muretai/agent-entry/issues`);
+      `base_url is not publishable: canonicalising it produces a value this runtime's URL `
+      + `parser reads differently.\n`
+      + `  given: ${JSON.stringify(baseUrl)}\n`
+      + `  this file canonicalises it to ${JSON.stringify(out)}, which the URL parser reads `
+      + `as ${JSON.stringify(probe.origin + probe.pathname)}.\n`
+      + `  Check the address first — a spelling this gate does not know how to fold lands `
+      + `here. If it is an ordinary http(s) URL with no unusual escaping, this is a bug in `
+      + `this file: please report it at https://github.com/muretai/agent-entry/issues`);
   }
 
   if (warn) {
@@ -1098,6 +1248,217 @@ export function canonicalBaseUrl(baseUrl, { warn = true } = {}) {
   return out;
 }
 
+// ---------------------------------------------------------------- domains + the mount
+
+/** The outer whitespace BOTH languages strip identically. Python's `str.strip()` also
+ *  removes \x1c-\x1f, U+0085 and U+00A0; JavaScript's `trim()` removes a different tail of
+ *  Unicode spaces. Folding only this intersection — and refusing every other character
+ *  outside 0x21..0x7E — is what stops the twins accepting different strings for the same
+ *  operator input. Must match `_OUTER_WS` in examples/agent_entry_reference.py. */
+const OUTER_WS = ' \t\n\r\f\v';
+/** Characters that betray a URL, an authority or whitespace smuggling where a bare domain
+ *  was expected (shared/domainbind._NOT_IN_DOMAIN). */
+const NOT_IN_DOMAIN = ['/', '?', '#', '@', '\\', ' ', '\t', '\r', '\n', '%', '[', ']'];
+const LDH = new Set('abcdefghijklmnopqrstuvwxyz0123456789-');
+/** RFC 1035 total length of a domain name, applied to the HOST only, plus the longest
+ *  legal ":<port>" for the raw-input bound (shared/domainbind.MAX_DOMAIN_LEN). */
+const MAX_DOMAIN_LEN = 253;
+
+/** Exported because the RUNNER needs the same fold: `examples/agent_entry_server.mjs` decides
+ *  whether `AGENT_ENTRY_DOMAINS` is blank at all, and it used `trim()`. That is a different
+ *  set from Python's `strip()` in BOTH directions, so one variable got two verdicts — a
+ *  `\x1c` started the Python runner with no domains and made this one exit 2, and a BOM
+ *  (what a paste out of a spreadsheet or a Windows `.env` carries) did the reverse. */
+export function trimOuter(s) {
+  let a = 0;
+  let b = s.length;
+  while (a < b && OUTER_WS.includes(s[a])) a += 1;
+  while (b > a && OUTER_WS.includes(s[b - 1])) b -= 1;
+  return s.slice(a, b);
+}
+
+/**
+ * The JS twin of `shared/domainbind.valid_domain` — the ONE definition of "is this a bare
+ * domain" in this system, and therefore the one both halves of a domain binding must agree
+ * on. Total on untrusted input; never throws.
+ *
+ * A domain here is not a URL: ASCII LDH labels only (a-z, 0-9, '-'), LOWERCASE (case is
+ * folded by the caller, visibly, because `valid_domain` REJECTS an uppercase spelling
+ * rather than folding it), 1..63 characters per label, no leading or trailing '-', at
+ * least two labels (a single-label name has no owner a verifier could hold responsible),
+ * host <= 253 with no trailing dot, and an optional ':<port>' 1..65535 with no leading
+ * zero. Ports exist only because a loopback or staging box cannot use 443.
+ *
+ * Re-implemented rather than imported for the same reason everything else in this file is:
+ * a site copies ONE file. `test_agent_entry_contract.py` is what holds the two spellings to
+ * the same verdicts.
+ */
+function validBareDomain(domain) {
+  if (typeof domain !== 'string' || !domain || domain.length > MAX_DOMAIN_LEN + 6) {
+    return false;
+  }
+  if (NOT_IN_DOMAIN.some((ch) => domain.includes(ch))) return false;
+  for (const ch of domain) if (ch.codePointAt(0) > 0x7f) return false;   // IDN U-labels
+  let host = domain;
+  const colon = domain.indexOf(':');            // the FIRST one: `str.partition` semantics
+  if (colon >= 0) {
+    host = domain.slice(0, colon);
+    const portS = domain.slice(colon + 1);      // a second ':' leaves a non-numeric tail
+    if (!/^[0-9]+$/.test(portS)) return false;
+    if (portS.length > 1 && portS.startsWith('0')) return false;
+    const port = Number(portS);
+    if (port < 1 || port > 65535) return false;
+  }
+  if (!host || host.length > MAX_DOMAIN_LEN || host.endsWith('.')) return false;
+  const labels = host.split('.');
+  if (labels.length < 2) return false;
+  for (const label of labels) {
+    if (label.length < 1 || label.length > 63) return false;
+    if (label.startsWith('-') || label.endsWith('-')) return false;
+    for (const ch of label) if (!LDH.has(ch)) return false;
+  }
+  return true;
+}
+
+/** A pasteable repair for a domain we refused, or undefined when we cannot guess one.
+ *  Only ever suggests something `validBareDomain` accepts, so a wrong guess produces no
+ *  suggestion rather than a second bad value to paste. */
+function domainFix(candidate) {
+  try {
+    let guess = trimOuter(String(candidate)).toLowerCase();
+    guess = guess.includes('://') ? guess.slice(guess.indexOf('://') + 3) : guess;
+    for (const cut of ['/', '?', '#']) {
+      const at = guess.indexOf(cut);
+      if (at >= 0) guess = guess.slice(0, at);
+    }
+    if (guess.includes('@')) guess = guess.slice(guess.lastIndexOf('@') + 1);
+    guess = guess.replace(/\.+$/, '');
+    return (guess && guess !== candidate && validBareDomain(guess)) ? guess : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * canonicalDomains(domains) -> the exact list this entry may publish as its card `domains`.
+ *
+ * WHAT IT IS FOR. A domain binding is BILATERAL and neither half is worth anything alone
+ * (shared/domainbind.py, agent/domainverify.py): the DOMAIN publishes a credential naming
+ * this DID at /.well-known/did-configuration.json, and the AGENT's own live card names the
+ * domain back. This list is that second half. Without it a verifier holding the domain's
+ * file answers `card-withdrawn` — the domain vouches for an agent that does not claim the
+ * domain — so an entry with no `domains` can never be proven to belong to the site it is
+ * serving from. Because the halves are written by different parties, EITHER can end the
+ * binding alone: the domain owner deletes a line from the file, or the entry drops the name.
+ *
+ * Absent or empty -> `[]`, and the card then carries NO `domains` key at all, so an entry
+ * from before this option existed publishes byte-identical bytes and nobody has to
+ * re-publish or re-sign anything.
+ *
+ * Anything else is REFUSED at construction, loudly, exactly like `canonicalBaseUrl`: a
+ * name the credential can never bind is not something to warn about and publish anyway.
+ * The rule is `validBareDomain` — deliberately the same predicate core uses, because a
+ * second opinion here produces an entry that starts happily and can never verify.
+ * `strip().lower()` is the ONLY canonicalization, matching agent/domainverify._norm_domain.
+ *
+ * Names are de-duplicated (operator order kept), and MORE THAN `MAX_CARD_DOMAINS` distinct
+ * names is a REFUSAL, not a truncation — even though `build_agent_card` truncates at the
+ * same 5. That function renders a card for many callers at runtime and must not blow up
+ * mid-render; this one validates an argument an operator just typed, and it already
+ * refuses every other bad value there. Truncating would start the entry with a claim that
+ * is USABLE and NOT WHAT THEY SAID.
+ */
+export function canonicalDomains(domains, { warn = true } = {}) {
+  if (domains === undefined || domains === null) return [];
+  if (!Array.isArray(domains)) {
+    refuseBaseUrl(domains, 'it is not a list of domain names.',
+      'Pass an array, e.g. ["example.com"] — a single string is refused rather than '
+      + 'wrapped, so this file and its Python twin cannot disagree about what was meant.',
+      undefined, 'domains');
+  }
+  const out = [];
+  for (const entry of domains) {
+    if (typeof entry !== 'string') {
+      refuseBaseUrl(entry, 'it is not a string.', 'A domain is a name, e.g. "example.com".',
+        undefined, 'domains');
+    }
+    const s = trimOuter(entry);
+    for (const ch of s) {
+      const c = ch.codePointAt(0);
+      if (c < 0x21 || c > 0x7e) {
+        refuseBaseUrl(entry,
+          'it contains whitespace, a control character or a non-ASCII character.',
+          'A domain here is compared byte for byte against the origin in the credential '
+          + 'the domain itself serves, so an internationalized name must be given in its '
+          + 'punycode (xn--…) A-label form and nothing else may travel with it.',
+          domainFix(s), 'domains');
+      }
+    }
+    const lowered = s.toLowerCase();
+    if (!validBareDomain(lowered)) {
+      refuseBaseUrl(entry, 'it is not a bare domain name.',
+        "Give the HOST only: ASCII letters, digits and '-', at least two labels (each "
+        + "1-63 characters, not starting or ending with '-'), at most 253 characters, "
+        + "optionally ':<port>' 1-65535 — no scheme, no path, no query, no '@', no "
+        + 'trailing dot. The domain\'s own credential binds https://<this exact string>, '
+        + 'so anything else can never match it.',
+        domainFix(lowered), 'domains');
+    }
+    if (!out.includes(lowered)) out.push(lowered);
+  }
+  if (out.length > MAX_CARD_DOMAINS) {
+    refuseBaseUrl(domains,
+      `it names ${out.length} distinct domains, more than the ${MAX_CARD_DOMAINS} a card `
+      + 'may advertise.',
+      'Every name listed is an outbound HTTPS fetch this entry asks strangers to make, so '
+      + `a card carries at most ${MAX_CARD_DOMAINS}. Publishing the first `
+      + `${MAX_CARD_DOMAINS} and dropping the rest would start this entry with a claim `
+      + 'that is usable and NOT what you said: the names that vanished fail for whoever '
+      + 'verifies them and nothing anywhere says why. Drop names, or run a second entry '
+      + '(its own key) for the rest.',
+      undefined, 'domains');
+  }
+  return out;
+}
+
+/**
+ * canonicalMount(canonUrl, basePath) -> the path prefix this entry ANSWERS at. `''` for a
+ * bare origin; otherwise `'/support'`-shaped, taken from the already-canonicalised url.
+ *
+ * WHY IT IS DERIVED AND NOT CONFIGURED. A mount the operator spells separately from
+ * `baseUrl` is a second place to write the same fact, and the failure it produces is the
+ * worst one this system has: the entry answers at one path while its signed card claims
+ * another, so every visitor fails `Outbox.card_binds_to` and the only diagnostic anyone
+ * gets is "cannot prove that … owns …". Deriving it makes the router's mount and the
+ * card's advertised address THE SAME STRING by construction. (Measured before this
+ * existed: an entry given `baseUrl: 'http://h:p/support'` printed that address, signed
+ * `/support` into its card, and then answered the BARE HOST — three answers to one
+ * question.)
+ *
+ * THE ONE OVERRIDE. A reverse proxy that STRIPS the prefix hands this process `/…` while
+ * the public address is still `https://h/support`. That deployment is real, so `basePath:
+ * ''` is allowed — but ONLY `''` or exactly the canonical url's own path. Any other value
+ * would be a third spelling of the address, which is what this function exists to prevent.
+ */
+export function canonicalMount(canonUrl, basePath) {
+  const path = new URL(canonUrl).pathname.replace(/\/+$/, '');
+  if (basePath === undefined || basePath === null) return path;
+  if (typeof basePath !== 'string') {
+    refuseBaseUrl(basePath, 'it is not a string.',
+      'Pass "" (a proxy that strips the prefix) or the same path as baseUrl.',
+      undefined, 'base_path');
+  }
+  const given = trimOuter(basePath).replace(/\/+$/, '');
+  if (given !== '' && given !== path) {
+    refuseBaseUrl(basePath, 'it is neither empty nor the path baseUrl already names.',
+      `This entry publishes ${JSON.stringify(canonUrl)}, so a visitor dials `
+      + `${JSON.stringify(path || '/')} and nothing else. Use "" only when a proxy strips `
+      + 'the prefix before the request reaches this process.',
+      path || '', 'base_path');
+  }
+  return given;
+}
+
 /**
  * createAgentEntry(opts) -> { did, card, ledger, handleRequest, handleRequestAsync, listen }
  *
@@ -1107,6 +1468,15 @@ export function canonicalBaseUrl(baseUrl, { warn = true } = {}) {
  *                  REQUIRES card.url to name the origin+path it dialled (Outbox.card_binds_to)
  *                  — that binding is what stops an attacker re-serving your signed card at
  *                  their own host. Get it wrong and Path A verification fails, silently.
+ *                  It MAY carry a path (`https://example.com/support`): every route then
+ *                  hangs off that path and the bare host is 404, so one hostname holds a
+ *                  front desk, support and sales as three agents with three keys.
+ *   domains        the bare domains this entry claims to speak for, e.g. ['example.com']
+ *                  (default none, and then the card carries no `domains` key at all). A
+ *                  CLAIM, never evidence: the proof is the credential the DOMAIN serves at
+ *                  /.well-known/did-configuration.json, and a verifier requires both halves.
+ *   basePath       ONLY for a proxy that strips the prefix: '' or exactly baseUrl's path.
+ *                  See canonicalMount for why this is not a general knob.
  *   responder      (envelope) => string | {text, contextId?, timestamp?} | Promise<…>
  *   openDoor       advertise `muretai.open_door` (default true) — the flag that tells a
  *                  visiting agent it may contact you without an introduction.
@@ -1128,6 +1498,8 @@ export function createAgentEntry({
   anonymousLane = false,
   anonRatePerMin = ANON_RATE_PER_MIN,
   skills = [],
+  domains = null,
+  basePath = null,
   maxAccounts = 50000,
 } = {}) {
   if (!seedHex) throw new TypeError('createAgentEntry: seedHex is required');
@@ -1136,6 +1508,13 @@ export function createAgentEntry({
   // equal what a visitor's Outbox.card_scope computes for the url they dialled, or the card
   // fails verification on THEIR machine with nothing on ours.
   const canonUrl = canonicalBaseUrl(baseUrl);
+  // The path prefix this entry ANSWERS at, DERIVED from that same string so the router and
+  // the signed card cannot disagree. '' for a bare origin — every route below is then the
+  // byte-identical string this module always matched.
+  const mount = canonicalMount(canonUrl, basePath);
+  // The agent half of a T88 domain binding. Refuses to start on anything that is not a
+  // bare domain: a name the domain's credential can never bind is not worth publishing.
+  const canonDomains = canonicalDomains(domains);
   const did = didFromSeedHex(seedHex);
 
   const card = {
@@ -1150,6 +1529,11 @@ export function createAgentEntry({
     defaultOutputModes: ['text/plain'],
     skills,
   };
+  // T88, the REVERSE EDGE only, in the same top-level field and the same position
+  // shared/protocol.build_agent_card uses, so one verifier rule reads a node's card and an
+  // entry's card. Omitted entirely when no domain was named — that is what keeps an
+  // already-deployed entry's published bytes unchanged.
+  if (canonDomains.length) card.domains = canonDomains;
   if (openDoor) card.muretai = { open_door: true };
   // Deliberately NO `relay`/`enc_pub` on the card: those advertise a store-and-forward
   // mailbox, and an agent entry has no listener draining one. Advertising a mailbox nobody
@@ -1337,15 +1721,33 @@ export function createAgentEntry({
    * size checks come BEFORE any parsing or crypto — a check placed after the signature is
    * a check the attacker simply skips.
    */
-  function handlePost(bodyBuffer) {
+  function handlePost(rawBody) {
+    // RAW BYTES, always. A host app that hands us a decoded string has already destroyed
+    // the evidence the strict decode below exists to find, so normalise once and measure
+    // the SIZE in bytes rather than in UTF-16 code units.
+    const bodyBuffer = Buffer.isBuffer(rawBody) ? rawBody
+      : (ArrayBuffer.isView(rawBody)
+        ? Buffer.from(rawBody.buffer, rawBody.byteOffset, rawBody.byteLength)
+        : Buffer.from(String(rawBody ?? ''), 'utf8'));
     // 1. body over 1 MiB — refused WITHOUT parsing.
     if (bodyBuffer.length > MAX_BODY_BYTES) {
       return jsonResponse(413, { error: 'request body too large' });
     }
     // 2. unparseable or non-object JSON — a transport-level refusal, not a JSON-RPC one.
+    //
+    // STRICT UTF-8, and `Buffer.toString('utf8')` — what this used to be — is why:
+    // it SILENTLY SUBSTITUTES U+FFFD for every invalid byte and parses on, where
+    // `shared/protocol.loads` does `raw.decode("utf-8")` and raises. Measured with a valid
+    // signature over the six frozen fields and a single raw 0xFF byte in the JSON-RPC `id`
+    // (a field no signature covers): the Python reference answered HTTP 400 and booked
+    // nothing, this file answered 200, CREATED THE ACCOUNT and returned a signed reply.
+    // The class is larger than the id — a substituted byte anywhere means the bytes we
+    // verified are not the bytes that arrived, which is precisely the thing a signature is
+    // supposed to make impossible to be wrong about. `TextDecoder` with `fatal` is the
+    // stdlib's strict decoder (global since Node 11); no dependency is added.
     let req;
     try {
-      req = JSON.parse(bodyBuffer.toString('utf8'));
+      req = JSON.parse(STRICT_UTF8.decode(bodyBuffer));
     } catch {
       return jsonResponse(400, { error: 'malformed JSON' });
     }
@@ -1353,14 +1755,26 @@ export function createAgentEntry({
       return jsonResponse(400, { error: 'JSON-RPC request must be an object' });
     }
     // 3. From here every refusal is HTTP 200 with a JSON-RPC error object.
-    const reqId = req.id ?? null;
-    if (typeof req.method === 'string' && req.method !== 'message/send') {
+    const reqId = safeId(req.id);
+    // STRICT, and the `typeof` guard this replaces is why: it short-circuited, so a
+    // NON-STRING `method` skipped the check entirely and fell into the message ladder.
+    // Measured with a valid signature and a fresh timestamp — `"method": null`, `1` and
+    // `{}` each returned a SIGNED REPLY and CREATED AN ACCOUNT here, while the Python
+    // reference answered -32601 for all three. That is the double-book class this file's
+    // `wireShapeError` docstring is about, one field above where it was looking. An
+    // absent method lands here too, which is also -32601 on the Python side.
+    if (req.method !== 'message/send') {
       return rpcError(reqId, ERRORS.METHOD_NOT_FOUND,
-        `${req.method} — this agent entry serves message/send only`);
+        'an agent entry implements message/send only');
     }
-    const msg = (req.params && typeof req.params === 'object') ? req.params.message : null;
-    if (!msg || typeof msg !== 'object') {
-      return rpcError(reqId, ERRORS.INVALID_PARAMS, 'params.message is required');
+    // A plain OBJECT, never an Array: `typeof [] === 'object'`, so an array `message` used
+    // to reach the shape gate and be refused -32600 where Python answered -32602.
+    const params = (req.params && typeof req.params === 'object' && !Array.isArray(req.params))
+      ? req.params : null;
+    const msg = params ? params.message : null;
+    if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+      return rpcError(reqId, ERRORS.INVALID_PARAMS,
+        'params.message must be an A2A message object');
     }
     // 3a. wrongly-TYPED wire fields, on the raw object and before anything measures or
     //     hashes it. These are the fields that end up inside a signed payload — theirs and,
@@ -1369,6 +1783,9 @@ export function createAgentEntry({
     const shape = wireShapeError(msg);
     if (shape !== null) return rpcError(reqId, ERRORS.INVALID_REQUEST, shape);
 
+    // Absent metadata reads as an empty envelope — the walk-in shape. A PRESENT one that
+    // is not an object never gets here: the shape gate above refused it (-32600), so this
+    // fallback can no longer turn a malformed envelope into an anonymous one.
     const meta = (msg.metadata && typeof msg.metadata === 'object') ? msg.metadata : {};
     const text = messageText(msg);
 
@@ -1477,22 +1894,51 @@ export function createAgentEntry({
     return finishReply(reqId, answer, { inbound, toDid });
   }
 
+  /** Is this the message endpoint — the base the card's `url` names? EXACT, because a
+   *  wandering endpoint is not this contract: with a bare origin that is `/` and nothing
+   *  else (byte-for-byte what this module always accepted), and with a mount it is
+   *  `/support` plus its trailing-slash spelling, since `card_scope` folds the two and a
+   *  visitor may legitimately have been handed either. */
+  function isMountPath(pathname) {
+    if (!mount) return pathname === '/';
+    return pathname === mount || pathname === `${mount}/`;
+  }
+
   function route(method, path, bodyBuffer) {
-    const pathname = String(path || '/').split('?')[0].split('#')[0];
+    const target = String(path || '/');
+    // ORIGIN FORM ONLY, and SAY SO. HTTP/1.1 lets a client write the request-target in
+    // absolute form (`POST http://elsewhere.example/support HTTP/1.1`) and RFC 9112 §3.2.2
+    // says a server MUST accept it; this contract deliberately does not, because this entry
+    // answers exactly the address its card names and that address has no other spelling.
+    // A refusal that is legal-per-RFC to make and illegal-per-RFC to make silently is
+    // exactly the one that has to carry a diagnostic: `{"error":"not found"}` for a target
+    // an integrator believes is correct costs an afternoon and teaches nothing.
+    if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(target) || target.startsWith('//')) {
+      return jsonResponse(404, { error: 'not found', detail: ORIGIN_FORM_ONLY });
+    }
+    const pathname = target.split('?')[0].split('#')[0];
+    // EVERY route hangs off the mount — the path the signed card already claims. A visitor
+    // builds the same strings (Outbox's fetcher keeps the base's path prefix when it
+    // appends a well-known path), so this is not a new convention; it is the one the
+    // fetcher already follows. With mount === '' these are the original constants.
     if (method === 'GET' || method === 'HEAD') {
-      if (pathname === AGENT_CARD_PATH || pathname === AGENT_CARD_PATH_LEGACY) {
+      if (pathname === mount + AGENT_CARD_PATH || pathname === mount + AGENT_CARD_PATH_LEGACY) {
         // Byte-identical on both paths: the current A2A path and the legacy alias.
         return { status: 200, headers: cardHeaders(cardBytes.length), body: cardBytes };
       }
-      if (pathname === AGENT_CARD_SIG_PATH) {
+      if (pathname === mount + AGENT_CARD_SIG_PATH) {
         const env = cardEnvelopeBytes();
         return { status: 200, headers: cardHeaders(env.length), body: env };
       }
-      if (pathname === '/') {
+      if (isMountPath(pathname)) {
         const body = Buffer.from(
-          `${name}\n\nThis origin is agent-reachable (Muretai agent entry).\n`
+          // "This ADDRESS", not "this origin": once an entry can be mounted under a
+          // path, the origin may hold several agents and this notice speaks for exactly
+          // one of them. A bare-origin entry reads the same either way.
+          `${name}\n\nThis address is agent-reachable (Muretai agent entry).\n`
           + `DID:  ${did}\nCard: ${canonUrl}${AGENT_CARD_PATH}\n`
-          + 'POST a signed A2A message/send request to / for a signed reply.\n', 'utf8');
+          + `POST a signed A2A message/send request to ${mount || '/'} for a signed reply.\n`,
+          'utf8');
         return { status: 200,
           headers: { 'Content-Type': 'text/plain; charset=utf-8',
             'Content-Length': String(body.length) },
@@ -1501,8 +1947,10 @@ export function createAgentEntry({
       return jsonResponse(404, { error: 'not found' });
     }
     if (method === 'POST') {
-      // EXACTLY the root path. A POST anywhere else is not this contract.
-      if (pathname !== '/') return jsonResponse(404, { error: 'not found' });
+      // EXACTLY the address the card names. A POST anywhere else is not this contract —
+      // and when this entry is mounted under a path, "anywhere else" INCLUDES the bare
+      // host, which belongs to the site (or to the neighbour agent) and not to us.
+      if (!isMountPath(pathname)) return jsonResponse(404, { error: 'not found' });
       return handlePost(bodyBuffer || Buffer.alloc(0));
     }
     if (method === 'OPTIONS') {
@@ -1546,7 +1994,17 @@ export function createAgentEntry({
    * (behind a TLS terminator) to go public.
    */
   function listen(port = 8788, host = '127.0.0.1', onReady) {
-    const server = createServer((req, res) => {
+    const server = createServer({
+      // Node checks its request/headers timeouts on an interval, not on a per-connection
+      // timer, and the DEFAULT interval is 30 s — so a 20 s bound measured on the wire fires
+      // somewhere between 20 s and 50 s. Tightening the interval is what makes the number
+      // above the number a stranger actually observes; measured against the trickle, this
+      // takes the 408 from ~58 s to ~22 s, next to the Python twin's ~20.6 s.
+      connectionsCheckingInterval: 2_000,
+      headersTimeout: HEADERS_TIMEOUT_MS,
+      requestTimeout: REQUEST_TIMEOUT_MS,
+      keepAliveTimeout: KEEPALIVE_TIMEOUT_MS,
+    }, (req, res) => {
       const chunks = [];
       let total = 0;
       let oversize = false;
@@ -1579,11 +2037,33 @@ export function createAgentEntry({
           .catch(() => { try { res.destroy(); } catch { /* already gone */ } });
       });
     });
+    // Also as properties, for a Node old enough to ignore the options above. Explicit
+    // rather than inherited: Node's defaults are generous (300 s / 60 s / 5 s) and unstated,
+    // and the Python twin has to spell the same numbers out anyway. Writing them in both
+    // files is what makes "the two entries bound a stranger identically" a fact a reader can
+    // check instead of a claim.
+    server.headersTimeout = HEADERS_TIMEOUT_MS;
+    server.requestTimeout = REQUEST_TIMEOUT_MS;
+    server.keepAliveTimeout = KEEPALIVE_TIMEOUT_MS;
+    // The CONNECTION CEILING. There is no Node default, and the timeouts above do not
+    // supply one: they bound how LONG each connection lives, not how MANY exist at once.
+    // Written by hand rather than with `server.maxConnections`, which DESTROYS the socket
+    // silently — an unauthenticated stranger always gets an HTTP response here (the promise
+    // in docs/AGENT_ENTRY.md), an operator behind a proxy gets a 503 in the log instead of
+    // "upstream closed the connection", and the Python twin can say the same sentence.
+    let live = 0;
+    server.on('connection', (socket) => {
+      live += 1;
+      socket.once('close', () => { live -= 1; });
+      if (live > MAX_CONNECTIONS) socket.end(OVERLOADED_RESPONSE);
+    });
     server.listen(port, host, () => { if (onReady) onReady(server); });
     return server;
   }
 
-  return { did, card, ledger, handleRequest, handleRequestAsync, listen,
+  // `mount` is exported so a host app can route exactly what this entry answers (and log
+  // it): it is derived, so reading it here can never disagree with the signed card.
+  return { did, card, ledger, mount, handleRequest, handleRequestAsync, listen,
     cardEnvelope: () => JSON.parse(cardEnvelopeBytes().toString('utf8')) };
 }
 

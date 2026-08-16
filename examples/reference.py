@@ -60,6 +60,7 @@ Run it standalone:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -73,6 +74,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from shared import cardpub                       # noqa: E402  signed Agent Card envelope
 from shared import crypto                        # noqa: E402  Ed25519 + did:key
+from shared import domainbind                    # noqa: E402  THE definition of a bare domain
 from shared import keybinding                     # noqa: E402  countersigned v2 device binding
 from shared import protocol as p                 # noqa: E402  the wire contract
 
@@ -87,6 +89,102 @@ AGENT_ENTRY_VERSION = "1.0.0"
 #: `ANON_RATE_PER_MIN` in web/agent-entry/muretai-agent-entry.mjs — the two agent entries are one
 #: contract, and a bound that differs between them is a bound a site cannot reason about.
 ANON_RATE_PER_MIN = 30
+
+#: How many domains one card may advertise. Mirrors `agent/domainstore.MAX_CARD_DOMAINS`
+#: and the same ceiling `shared/protocol.build_agent_card` applies to a node's card: every
+#: name listed is an outbound HTTPS fetch this entry asks strangers to make, so the cap is
+#: a bound on the work an entry can push onto its visitors, not on how many domains a site
+#: may own. Must match `MAX_CARD_DOMAINS` in web/agent-entry/muretai-agent-entry.mjs.
+MAX_CARD_DOMAINS = 5
+
+#: The outer whitespace BOTH languages strip identically. Python's `str.strip()` also
+#: removes \x1c-\x1f, U+0085 and U+00A0; JavaScript's `trim()` removes a different tail of
+#: Unicode spaces. Folding only this intersection — and refusing everything else outside
+#: 0x21..0x7E — is what stops the two twins from accepting different strings for the same
+#: operator input (the same reasoning as `canonical_base_url`'s character gate).
+_OUTER_WS = " \t\n\r\f\v"
+
+#: Every response carries these. An agent entry reads NO cookie, header credential or
+#: session — authority comes only from an Ed25519 signature inside the body — so `*` grants
+#: a browser-resident agent exactly what curl already had, and nothing more. NEVER add
+#: `Access-Control-Allow-Credentials`: it is the one header that would turn `*` into an
+#: instruction to attach the visitor's ambient authority, and there is no ambient authority
+#: here to attach. Must match `CORS_HEADERS` in web/agent-entry/muretai-agent-entry.mjs.
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Max-Age": "600",
+}
+
+#: What `Allow:` says on an OPTIONS and on a 405. HEAD is not listed because RFC 9110 makes
+#: it identical to GET; the twin's `Access-Control-Allow-Methods` spells the same three.
+ALLOWED_METHODS = "GET, POST, OPTIONS"
+
+JSON_CTYPE = "application/json; charset=utf-8"
+
+#: The refusal text for a request-target that is not in origin form, shared with the JS twin
+#: so the two return the same diagnostic for the same request.
+ORIGIN_FORM_ONLY = ("the request-target must be an origin-form path: this entry answers "
+                    "exactly the address its card names, and that address has no other "
+                    "spelling")
+
+#: The refusal text when a body does not arrive inside `BODY_BUDGET`.
+TOO_SLOW = "the request body did not arrive within the time budget"
+
+#: Longest chunk-size (or trailer) line a chunked body may carry. Generous for a size in hex
+#: plus extensions, and small enough that an endless line cannot be a memory attack.
+_MAX_CHUNK_LINE = 8192
+
+_OVERLOADED_BODY = b'{"error":"too many concurrent connections"}'
+_OVERLOADED = (b"HTTP/1.1 503 Service Unavailable\r\n"
+               b"Content-Type: application/json; charset=utf-8\r\n"
+               b"Content-Length: " + str(len(_OVERLOADED_BODY)).encode() + b"\r\n"
+               b"Connection: close\r\n\r\n" + _OVERLOADED_BODY)
+
+
+class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """`ThreadingHTTPServer` with a CEILING on live connections.
+
+    A thread-per-connection server with no ceiling is a thread bomb any unauthenticated
+    stranger can set off, and the timeouts alone do not close it: they bound how LONG each
+    connection lives, not how MANY exist at once. Past the ceiling a connection is answered
+    503 and closed on the accept loop, WITHOUT starting a thread — so the refusal costs
+    strictly less than the attack, which is the only property that makes a bound useful.
+
+    Stdlib only, deliberately: the whole file is copyable, and a dependency here would be a
+    dependency in every site that copies it (CLAUDE.md principle 1)."""
+
+    daemon_threads = True
+    max_connections = 64
+
+    def __init__(self, *args, **kwargs):
+        # Before super().__init__, which binds and activates the socket: the accept loop
+        # must never see this object without its counter.
+        self._live = 0
+        self._live_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        with self._live_lock:
+            live = self._live
+            if live < self.max_connections:
+                self._live = live + 1
+        if live >= self.max_connections:
+            try:
+                request.sendall(_OVERLOADED)
+            except OSError:
+                pass                             # they hung up first; nothing to say
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._live_lock:
+                self._live -= 1
 
 
 def _int_epoch(v):
@@ -113,12 +211,31 @@ _HOST_OK = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-_")
 _DEFAULT_PORT = {"http": 80, "https": 443}
 
 
-def _refuse(given, rule: str, why: str, fix: "str | None" = None):
+def _dot_segment(seg: str) -> "str | None":
+    """`'.'` or `'..'` if this path segment is a dot segment AS THE URL PARSERS SEE IT,
+    else None.
+
+    Raw `.` and `..` are the obvious spellings; WHATWG's `new URL()` ALSO removes `%2e`,
+    `%2E` and every mixture (`.%2e`, `%2e.`, `%2e%2e`), and Python's `urlsplit` removes
+    none of them. So a segment test written against the raw text lets exactly that family
+    through: measured, `https://shop.example/a/%2e%2e/support` started and published here
+    while the JavaScript twin refused it — and refused it by ACCUSING ITSELF, since the
+    only thing that noticed was its `new URL()` tripwire. Decoding just this one escape
+    (never the whole segment — `%41` must stay `%41`, it is a different path) makes the
+    two implementations refuse the same family, on the operator's screen, with a reason
+    about the input."""
+    decoded = seg.replace("%2e", ".").replace("%2E", ".")
+    return decoded if decoded in (".", "..") else None
+
+
+def _refuse(given, rule: str, why: str, fix: "str | None" = None, *,
+            field: str = "base_url"):
     """Raise the one refusal shape, in the order an operator can act on at 2am: what they
     gave (quoted, so an invisible tab is VISIBLE), which rule in words, the fix as a string
-    they can paste, and one clause of why. `base_url is not publishable:` is the greppable
-    stem the JavaScript twin shares."""
-    lines = [f"base_url is not publishable: {rule}", f"  given: {given!r}"]
+    they can paste, and one clause of why. `<field> is not publishable:` is the greppable
+    stem the JavaScript twin shares — `base_url` for the address, `domains` for the names
+    this entry claims to speak for."""
+    lines = [f"{field} is not publishable: {rule}", f"  given: {given!r}"]
     if fix:
         lines.append(f"  use:   {fix!r}")
     lines.append("  " + why)
@@ -275,20 +392,24 @@ def canonical_base_url(base_url, *, warn: bool = True) -> str:
                         "verbatim, so the two Agent Entry implementations would sign "
                         "different bytes. Percent-encode it yourself.")
             i += 1
-        if any(seg in (".", "..") for seg in path.split("/")):
+        segments = path.split("/")
+        if any(_dot_segment(seg) is not None for seg in segments):
             segs: list[str] = []                  # RFC 3986 remove_dot_segments, for the fix
-            for seg in path.split("/"):
-                if seg == ".":
+            for seg in segments:
+                dot = _dot_segment(seg)
+                if dot == ".":
                     continue
-                if seg == "..":
+                if dot == "..":
                     if len(segs) > 1:
                         segs.pop()
                     continue
                 segs.append(seg)
-            _refuse(s, "the path contains '.' or '..' segments.",
+            _refuse(s, "the path contains '.' or '..' segments "
+                       "(the percent-encoded spellings '%2e' and '%2E' count).",
                     fix=f"{scheme}://{authority}" + "/".join(segs).rstrip("/"),
-                    why="JavaScript collapses these segments and Python does not, so the "
-                        "two Agent Entry implementations would sign different bytes.")
+                    why="JavaScript collapses these segments — encoded ones included — and "
+                        "Python does not, so the two Agent Entry implementations would "
+                        "sign different bytes.")
 
     out = f"{scheme}://{host}"
     if port is not None and port != _DEFAULT_PORT[scheme]:
@@ -302,10 +423,21 @@ def canonical_base_url(base_url, *, warn: bool = True) -> str:
     from shared import neturl                    # noqa: PLC0415  local: keeps the top light
     scope = neturl.origin(out) + urllib.parse.urlsplit(out).path.rstrip("/")
     if scope != out:
+        # The wording matters, and it is the JavaScript twin's tripwire that taught us:
+        # it asserted "a bug in this file, NOT in your input" and sent the operator to an
+        # issue tracker for `https://shop.example/a/%2e%2e/support`, which is an input
+        # problem with a paste-able fix. A tripwire cannot know which it is looking at, so
+        # it must not claim to. Name both, input first.
         raise ValueError(
-            f"base_url canonicalisation is broken (a bug in this file, not in your input): "
-            f"{base_url!r} -> {out!r} but the verifier computes {scope!r}. "
-            f"Please report this at https://github.com/muretai/agent-entry/issues")
+            f"base_url is not publishable: canonicalising it produces a value the "
+            f"verifier does not compute.\n"
+            f"  given: {base_url!r}\n"
+            f"  this file canonicalises it to {out!r}, but the verifier "
+            f"(Outbox.card_scope) computes {scope!r}.\n"
+            f"  Check the address first — a spelling this gate does not know how to fold "
+            f"lands here. If it is an ordinary http(s) URL with no unusual escaping, this "
+            f"is a bug in this file: please report it at "
+            f"https://github.com/muretai/agent-entry/issues")
 
     if warn:
         if any(c.isupper() for c in path):
@@ -325,6 +457,166 @@ def canonical_base_url(base_url, *, warn: bool = True) -> str:
                   f"wire in the clear), so this entry will be skipped by every well-behaved "
                   f"visitor. Use https.", file=sys.stderr)
     return out
+
+
+def canonical_domains(domains, *, warn: bool = True) -> "list[str]":
+    """The exact list this entry may publish as its card's `domains`, or ValueError.
+
+    WHAT IT IS FOR. A domain binding is BILATERAL and neither half is worth anything
+    alone (`shared/domainbind.py`, `agent/domainverify.py`): the DOMAIN publishes a
+    credential naming this DID at `/.well-known/did-configuration.json`, and the AGENT's
+    own live card names the domain back. This list is that second half. Without it a
+    verifier that already holds the domain's file answers `card-withdrawn` — the domain
+    vouches for an agent that does not claim the domain — so an entry with no `domains`
+    can never be proven to belong to the site it is serving from. And because the two
+    halves are written by different parties, EITHER can end the binding alone: the domain
+    owner deletes one line from the file, or the entry drops the name from this list.
+
+    WHY THE RULE IS BORROWED, NOT RESTATED. `shared/domainbind.valid_domain` is the one
+    definition of "is this a bare domain" in this codebase — it is what mints the
+    credential, what `agent/domainverify._norm_domain` re-checks, and therefore what
+    decides whether the two halves can ever name the same string. A second opinion here
+    would produce an entry that starts happily and can never verify, which is precisely
+    the failure the whole canonicalise-or-refuse posture exists to move onto the
+    operator's screen. So this function CALLS it, and only adds the canonicalization
+    `_norm_domain` makes around it: `strip().lower()`, nothing else.
+
+    The algorithm, written out because a third implementation (Go, Rust) has no
+    `domainbind` to call and this file is the reference:
+
+      0. absent / empty -> `[]`, and the card then carries NO `domains` key at all.
+         Byte-identical to an entry from before this option existed: nobody already
+         running one has to re-publish or re-sign anything.
+      1. the input is a LIST of strings (a bare string is refused, not wrapped: one
+         accepted spelling, so the twins cannot disagree about what "a domain" was)
+      2. per entry: strip the outer whitespace BOTH languages agree on (`_OUTER_WS`),
+         then REFUSE any remaining character outside 0x21..0x7E — that one rule kills
+         interior spaces, tabs, control characters and every non-ASCII (an IDN must be
+         supplied as its punycode A-label, exactly as `valid_domain` demands)
+      3. lowercase (DNS is case-insensitive; `valid_domain` REJECTS an uppercase
+         spelling rather than folding it, so the fold happens here, visibly)
+      4. `domainbind.valid_domain` decides: ASCII LDH labels, 1..63 each, no leading or
+         trailing '-', at least two labels, host <= 253 and no trailing dot, an optional
+         ':<port>' 1..65535 with no leading zero, and no scheme, path, query, fragment
+         or userinfo anywhere
+      5. de-duplicate, keeping the operator's order
+      6. REFUSE more than MAX_CARD_DOMAINS distinct names, naming the count and the
+         ceiling
+
+    WHY (6) REFUSES INSTEAD OF TRUNCATING, though `build_agent_card` truncates at the
+    same 5: that function renders a card for many callers at runtime and must not blow up
+    mid-render, while this one validates an argument an operator just typed — and it
+    already refuses every other bad value there. Truncating would start the entry with a
+    claim that is USABLE and NOT WHAT THEY SAID: the names that vanished fail for whoever
+    verifies them, and nothing anywhere says why. Same failure as publishing a `base_url`
+    that is not the one the operator meant, one field over.
+
+    `warn=False` silences the advisory notes (stderr, never fatal)."""
+    if domains is None:
+        return []
+    if isinstance(domains, str) or not isinstance(domains, (list, tuple)):
+        _refuse(domains, "it is not a list of domain names.", field="domains",
+                fix=None,
+                why="Pass a list, e.g. [\"example.com\"] — a single string is refused "
+                    "rather than wrapped, so this file and its JavaScript twin cannot "
+                    "disagree about what was meant.")
+    out: list[str] = []
+    for entry in domains:
+        if not isinstance(entry, str):
+            _refuse(entry, "it is not a string.", field="domains",
+                    why="A domain is a name, e.g. \"example.com\".")
+        s = entry.strip(_OUTER_WS)
+        for ch in s:
+            if ch < "\x21" or ch > "\x7e":
+                _refuse(entry, "it contains whitespace, a control character or a "
+                               "non-ASCII character.", field="domains",
+                        fix=_domain_fix(s),
+                        why="A domain here is compared byte for byte against the origin "
+                            "in the credential the domain itself serves, so an "
+                            "internationalized name must be given in its punycode "
+                            "(xn--…) A-label form and nothing else may travel with it.")
+        lowered = s.lower()
+        if not domainbind.valid_domain(lowered):
+            _refuse(entry, "it is not a bare domain name.", field="domains",
+                    fix=_domain_fix(lowered),
+                    why="Give the HOST only: ASCII letters, digits and '-', at least "
+                        "two labels (each 1-63 characters, not starting or ending with "
+                        "'-'), at most 253 characters, optionally ':<port>' 1-65535 — "
+                        "no scheme, no path, no query, no '@', no trailing dot. "
+                        "The domain's own credential binds https://<this exact string>, "
+                        "so anything else can never match it.")
+        if lowered not in out:
+            out.append(lowered)
+    if len(out) > MAX_CARD_DOMAINS:
+        _refuse(list(domains),
+                f"it names {len(out)} distinct domains, more than the "
+                f"{MAX_CARD_DOMAINS} a card may advertise.", field="domains",
+                why="Every name listed is an outbound HTTPS fetch this entry asks "
+                    "strangers to make, so a card carries at most "
+                    f"{MAX_CARD_DOMAINS}. Publishing the first {MAX_CARD_DOMAINS} and "
+                    "dropping the rest would start this entry with a claim that is "
+                    "usable and NOT what you said: the names that vanished fail for "
+                    "whoever verifies them and nothing anywhere says why. Drop names, "
+                    "or run a second entry (its own key) for the rest.")
+    return out
+
+
+def _domain_fix(candidate: str) -> "str | None":
+    """A pasteable repair for a domain we refused, or None when we cannot guess one.
+
+    Only ever suggests something our own validator accepts: strip a scheme, a path, a
+    query/fragment and any userinfo, then re-ask `valid_domain`. Guessing is safe
+    precisely because the guess is re-validated — a wrong guess simply produces no
+    suggestion rather than a second bad value to paste."""
+    try:
+        guess = candidate.strip(_OUTER_WS).lower()
+        guess = guess.split("://", 1)[-1]
+        for cut in ("/", "?", "#"):
+            guess = guess.split(cut, 1)[0]
+        if "@" in guess:
+            guess = guess.rsplit("@", 1)[1]
+        guess = guess.rstrip(".")
+        return guess if guess and guess != candidate and domainbind.valid_domain(guess) \
+            else None
+    except Exception:
+        return None
+
+
+def canonical_mount(base_url: str, base_path=None) -> str:
+    """The path prefix this entry ANSWERS at: derived from the canonical `base_url`, or
+    the one documented override. `""` for a bare origin; otherwise `"/support"`-shaped.
+
+    WHY IT IS DERIVED AND NOT CONFIGURED. A mount the operator spells separately from
+    `base_url` is a second place to write the same fact, and the failure it produces is
+    the worst one this system has: the entry answers at one path while its signed card
+    claims another, so every visitor fails `Outbox.card_binds_to` and the only diagnostic
+    anyone gets is "cannot prove that … owns …". Deriving it makes the router's mount and
+    the card's advertised address THE SAME STRING by construction. (Measured before this
+    existed: an entry given `--base-url http://h:p/support` printed that address, signed
+    `/support` into its card, and then answered the BARE HOST — three different answers to
+    one question.)
+
+    THE ONE OVERRIDE, and why it is not a general knob. A reverse proxy that STRIPS the
+    prefix (`location /support/ { proxy_pass http://127.0.0.1:8788/; }`) hands us `/…`
+    while the public address is still `https://h/support`. That deployment is real, so
+    `base_path=""` is allowed — but ONLY `""` or exactly the canonical url's own path.
+    Any other value would be a third spelling of the address, which is the thing this
+    function exists to make impossible. Raises ValueError on anything else."""
+    path = urllib.parse.urlsplit(base_url).path.rstrip("/")
+    if base_path is None:
+        return path
+    if not isinstance(base_path, str):
+        _refuse(base_path, "it is not a string.", field="base_path",
+                why="Pass \"\" (a proxy that strips the prefix) or the same path as "
+                    "base_url.")
+    given = base_path.strip(_OUTER_WS).rstrip("/")
+    if given not in ("", path):
+        _refuse(base_path, "it is neither empty nor the path base_url already names.",
+                field="base_path", fix=path or "",
+                why=f"This entry publishes {base_url!r}, so a visitor dials {path or '/'} "
+                    f"and nothing else. Use \"\" only when a proxy strips the prefix "
+                    f"before the request reaches this process.")
+    return given
 
 
 class _BindingRejected(Exception):
@@ -354,7 +646,14 @@ class AgentEntry:
     `base_url` MUST be the url visitors dial, because it is what the signed card claims and
     what `Outbox.card_binds_to` compares against: a card naming a different origin proves
     nothing about THIS one (that is exactly how a re-served copy of someone else's genuine
-    envelope is caught).
+    envelope is caught). It may carry a PATH — `https://example.com/support` — and then
+    every route this entry answers hangs off that path and the bare host is 404, so one
+    hostname can hold a front desk, support and sales as three separate agents with three
+    separate keys (`canonical_mount`).
+
+    `domains` are the names this entry claims to speak for. A claim only: the proof is the
+    credential the DOMAIN itself serves, and a verifier requires both halves
+    (`canonical_domains`).
     """
 
     #: ±window on the signed timestamp. Mirrors agent/inbox.CLOCK_WINDOW — the two must not
@@ -372,11 +671,42 @@ class AgentEntry:
     #: signing per request would be a signing oracle any stranger can drive (the reason
     #: agent/inbox.py caches its own signed card the same way).
     CARD_SIG_REFRESH = 3600.0
+    #: The largest |timestamp| this entry will do ARITHMETIC on (~year 36812). A bigint is
+    #: perfectly signable — canonical JSON writes it and Ed25519 covers it — so it reaches
+    #: the freshness step, where `abs(time.time() - wire_ts)` raises OverflowError and the
+    #: blanket net turns a SPECIFIC refusal into "internal error" (-32603) while the JS twin
+    #: sees `Infinity`, fails `Number.isInteger` and answers -32002. Refusing the magnitude
+    #: HERE, at the step that means it, is what keeps the two verdicts the same one.
+    MAX_EPOCH = 1 << 40
+
+    # ---- transport bounds. Node bounds all three of these BY DEFAULT (`headersTimeout`,
+    # `requestTimeout`, `keepAliveTimeout`) and this handler bounded NONE, which made the
+    # reference the only tier a stranger could wedge with no key and no request body.
+    # Measured: 40 unauthenticated trickle connections (`Content-Length: 1000000`, one body
+    # byte, then silence) took it from 2 threads to 42, and 0 of the 40 got any response.
+    # These numbers are mirrored in web/agent-entry/muretai-agent-entry.mjs `listen()`.
+
+    #: Per-recv socket timeout while a request line and its headers are read. Bounds the
+    #: connection that opens and says nothing at all.
+    HEADER_TIMEOUT = 20.0
+    #: WALL-CLOCK ceiling on reading one request body. The socket timeout above is a
+    #: per-recv bound and a trickle resets it forever — this is the deadline that does not
+    #: reset. 1 MiB in 20 s is a floor of ~52 KB/s, which no honest client is under.
+    BODY_BUDGET = 20.0
+    #: How long an IDLE keep-alive connection is held between requests. Node's default.
+    KEEPALIVE_TIMEOUT = 5.0
+    #: Concurrent connections this entry will serve. A thread-per-connection server with no
+    #: ceiling is a thread bomb an unauthenticated stranger can set off; past this a
+    #: connection is answered 503 and closed WITHOUT a thread, so the refusal is cheaper
+    #: than the attack. Mirrors `maxConnections` in the JS twin.
+    MAX_CONNECTIONS = 64
 
     def __init__(self, *, identity, base_url: str, name: str,
                  responder: Callable[[dict], "str | dict"],
                  open_door: bool = True, anonymous_lane: bool = False,
                  description: str | None = None,
+                 domains: "list[str] | None" = None,
+                 base_path: "str | None" = None,
                  anon_rate_per_min: int = ANON_RATE_PER_MIN):
         self.identity = identity
         self.did: str = identity.did
@@ -385,6 +715,20 @@ class AgentEntry:
         #: it must equal what a visitor's `Outbox.card_scope` computes for the url they
         #: dialled, or the card fails verification on THEIR machine with nothing on ours.
         self.base_url = canonical_base_url(base_url)
+        #: The path prefix this entry ANSWERS at, derived from `base_url` (see
+        #: `canonical_mount`), so the router and the signed card cannot disagree. "" for a
+        #: bare origin, which reproduces every string this file matched before the mount
+        #: existed.
+        self.mount = canonical_mount(self.base_url, base_path)
+        #: The exact strings this entry answers GET on, built ONCE from the mount so the
+        #: request path is a lookup and never string arithmetic per request.
+        self._card_paths = tuple(self.mount + q for q in p.AGENT_CARD_PATHS)
+        self._sig_path = self.mount + p.AGENT_CARD_SIG_PATH
+        #: The domains this entry CLAIMS to speak for — the agent half of a T88 binding.
+        #: Never auto-derived from `base_url`: a card claiming a domain the domain has not
+        #: claimed back is a self-assertion, and deriving it would change the signed bytes
+        #: of every entry already deployed.
+        self.domains = canonical_domains(domains)
         self.responder = responder
         self.open_door = bool(open_door)
         self.anonymous_lane = bool(anonymous_lane)
@@ -435,7 +779,15 @@ class AgentEntry:
 
         `muretai.open_door` is the additive capability bit the visitor path reads: it says
         "you may message me without an introduction or a contact grant". Absent (or false)
-        means the ordinary contact-grant handshake still applies."""
+        means the ordinary contact-grant handshake still applies.
+
+        `domains` (T88) is the reverse half of a domain binding — the names this entry
+        claims to speak for, in the same top-level field and the same position
+        `shared/protocol.build_agent_card` puts them in, so a verifier reads a node's card
+        and an entry's card with one rule. It is a CLAIM and never evidence: the proof is
+        the credential the DOMAIN serves, signed by this key. OMITTED ENTIRELY when no
+        domain was named, which is what keeps an existing entry's published bytes
+        unchanged."""
         card: dict[str, Any] = {
             "protocolVersion": p.PROTOCOL_VERSION,       # "0.2" — hard-code it in a port
             "name": self.name,
@@ -456,6 +808,8 @@ class AgentEntry:
                 "tags": ["chat", "signed"],
             }],
         }
+        if self.domains:
+            card["domains"] = list(self.domains)
         if self.open_door:
             card["muretai"] = {"open_door": True}
         return card
@@ -539,7 +893,25 @@ class AgentEntry:
     # ------------------------------------------------------------------ wire shape
 
     @staticmethod
-    def _wire_shape_error(m: dict) -> str | None:
+    def _not_utf8(s: str) -> bool:
+        """True iff this string cannot be written as UTF-8 — i.e. it holds a LONE SURROGATE.
+
+        `"\\ud800"` is legal JSON and `json.loads` hands it back as a Python str, but there
+        is no UTF-8 encoding of it: every `.encode("utf-8")` downstream raises
+        UnicodeEncodeError. Measured: a one-shot POST carrying `"text": "\\ud800"` from a
+        stranger with no key reached `p.text_too_large` -> `.encode("utf-8")` and killed the
+        request with no HTTP response at all, while the JavaScript twin — whose strings are
+        UTF-16 and whose `Buffer.byteLength` substitutes U+FFFD — answered normally. So a
+        lone surrogate is BOTH a crash input here and a divergence: refuse it in the shape
+        gate, where every other "this is not the type the wire promised" lives."""
+        try:
+            s.encode("utf-8")
+        except UnicodeEncodeError:
+            return True
+        return False
+
+    @classmethod
+    def _wire_shape_error(cls, m: dict) -> str | None:
         """The STRICT type check on the fields that end up inside the signed payload.
         Returns a reason string, or None when the shape is acceptable.
 
@@ -558,6 +930,16 @@ class AgentEntry:
             re-renders `1.0`, JS renders `1`, so one verifies the signature and the other
             cannot. It is also echoed into our SIGNED reply, so accepting it would make us
             sign bytes only Python can check.
+          * a non-object `metadata`, or a non-string `from`/`to`/`sig` inside it — the
+            envelope FIELDS, checked here rather than at step 4, because step 4 can only
+            ask "is it there". `metadata: "x"` read as an EMPTY envelope on the JS side and
+            became either -32001 or, with the anonymous lane on, a SIGNED ANONYMOUS REPLY:
+            a malformed envelope silently downgraded to a walk-in. `metadata.to = 1` was
+            worse here — it survived the presence test and reached `to_did[:24]`, which is
+            a TypeError out of `rpc()` and therefore no HTTP response at all.
+          * a LONE SURROGATE in any of those strings (`_not_utf8`) — legal JSON, not
+            encodable text; it raised UnicodeEncodeError out of the text-size check on this
+            side while JS quietly substituted U+FFFD and answered -32001.
 
         Refusals here are INVALID_REQUEST (-32600), the code this agent entry already answers
         for "not an A2A message object": a wrongly-TYPED field is a malformed request, not
@@ -573,12 +955,32 @@ class AgentEntry:
             # a coercion — a coercion signs a reply to text the sender never wrote.
             if "text" in part and not isinstance(part["text"], str):
                 return "a text part's `text` must be a string"
+            if isinstance(part.get("text"), str) and cls._not_utf8(part["text"]):
+                return "a text part's `text` is not encodable UTF-8 (a lone surrogate)"
         mid = m.get("messageId")
         if not isinstance(mid, str) or not mid:
             return "messageId must be a non-empty string"
+        if cls._not_utf8(mid):
+            return "messageId is not encodable UTF-8 (a lone surrogate)"
         ctx = m.get("contextId")
         if ctx is not None and not isinstance(ctx, str):
             return "contextId must be a string or null"
+        if isinstance(ctx, str) and cls._not_utf8(ctx):
+            return "contextId is not encodable UTF-8 (a lone surrogate)"
+        # The ENVELOPE fields. `null` reads as ABSENT (that is the stripped-sig case the
+        # ladder answers -32001 for, and the shape of a walk-in on the anonymous lane);
+        # PRESENT-but-not-a-string is a malformed request and never an absent envelope.
+        meta = m.get("metadata")
+        if meta is not None and not isinstance(meta, dict):
+            return "metadata must be an object"
+        for field in ("from", "to", "sig"):
+            v = (meta or {}).get(field)
+            if v is None:
+                continue
+            if not isinstance(v, str):
+                return f"metadata.{field} must be a string"
+            if cls._not_utf8(v):
+                return f"metadata.{field} is not encodable UTF-8 (a lone surrogate)"
         return None
 
     # ------------------------------------------------------------------ the contract
@@ -812,7 +1214,75 @@ class AgentEntry:
         an UNSIGNED timestamp is a number the sender chose, so refusing an old one buys
         nothing; the dedup is what makes a replayed walk-in cost a refusal instead of a
         signature, and the rate bound is what makes a NEW walk-in cost a bounded number of
-        them."""
+        them.
+
+        THE NET. Everything above is a ladder of explicit refusals; this method also
+        promises something weaker and more important — that an UNAUTHENTICATED stranger
+        always gets an HTTP RESPONSE. It is the promise the other two tiers already keep
+        and this one did not: `agent/inbox.py::handle_rpc` ends in a blanket
+        `except Exception -> -32603` and the JavaScript twin wraps `handleRequestAsync` in
+        a `.catch(...)`, while an exception here escaped into `BaseHTTPRequestHandler`,
+        which closes the socket with no status line and prints a traceback. Measured: two
+        one-shot POSTs from a stranger with no key did exactly that (`metadata.to = 1` ->
+        `to_did[:24]`, and `"text": "\\ud800"` -> `.encode("utf-8")`). Both are refused by
+        name now, in the shape gate; the NET is what makes the NEXT such input a -32603
+        instead of a dead socket — and this file is the one a merchant copies.
+
+        The detail is printed LOCALLY and never returned (`agent/inbox.py` learned that the
+        same way): an exception string carries field names, values and file paths, and an
+        unauthenticated caller proved nothing that entitles them to any of it."""
+        try:
+            return self._ladder(raw, too_large=too_large)
+        except Exception as e:                  # noqa: BLE001 — the net, deliberately blanket
+            print(f"agent entry: internal error handling a request: {e!r}",
+                  file=sys.stderr, flush=True)
+            return 200, p.rpc_error(self._recovered_id(raw), p.INTERNAL_ERROR,
+                                    "internal error")
+
+    @classmethod
+    def _recovered_id(cls, raw: bytes):
+        """The JSON-RPC `id` to answer an INTERNAL error under, or None.
+
+        Re-parsing costs nothing because this runs only on the net's error path, and a
+        client that pipelines requests needs the id to know which one died."""
+        try:
+            return cls._safe_id(p.loads_object(raw).get("id"))
+        except Exception:
+            return None
+
+    @classmethod
+    def _safe_id(cls, rid):
+        """The JSON-RPC `id` we may ECHO, or None.
+
+        JSON-RPC 2.0 says an id is a String, a Number or Null — never an object or an
+        array — and this enforces exactly that, for a reason larger than pedantry: the id
+        is the ONE field no signature covers and it is written straight back out, so
+        whatever the two runtimes disagree about here becomes a disagreement about the
+        whole response.
+
+        Three refusals, each measured:
+          - a LONE SURROGATE anywhere inside it has no UTF-8 encoding, so `p.dumps` raises
+            while `JSON.stringify` escapes it happily. `id = {"x":"\\ud800"}` BOOKED THE
+            ACCOUNT and then died in serialisation — HTTP 500, no reply, the customer on
+            the books — while the JS twin answered 200 with a signed reply. The old check
+            looked at a TOP-LEVEL string only, so a nested one walked straight past it;
+            refusing the whole non-scalar SHAPE is what closes the class rather than the
+            instance.
+          - a number outside ±2^53 is not representable in JavaScript, where `10**400`
+            parses to `Infinity` and re-serialises as `null` while Python echoes the
+            bigint verbatim.
+          - anything else that is not a scalar.
+
+        `null` is what JSON-RPC allows for an unusable id, and it keeps the VERDICT — not
+        the echo — as the thing the two implementations have to agree on."""
+        if isinstance(rid, str):
+            return None if cls._not_utf8(rid) else rid
+        if isinstance(rid, bool) or not isinstance(rid, (int, float)):
+            return None
+        return None if abs(rid) > (1 << 53) else rid
+
+    def _ladder(self, raw: bytes, *, too_large: bool = False) -> tuple[int, dict]:
+        """The ladder itself. Called only by `rpc()`, whose docstring IS the contract."""
         if too_large:
             return 413, {"error": f"request body over {self.MAX_BODY_BYTES} bytes"}
         try:
@@ -820,7 +1290,8 @@ class AgentEntry:
         except Exception:
             return 400, {"error": "unparseable request body (expected a JSON-RPC object)"}
 
-        req_id = req.get("id")
+        # An id we could not write back out is answered under `null` — see `_safe_id`.
+        req_id = self._safe_id(req.get("id"))
         if req.get("method") != "message/send":
             return 200, p.rpc_error(req_id, p.METHOD_NOT_FOUND,
                                     "an agent entry implements message/send only")
@@ -899,6 +1370,15 @@ class AgentEntry:
                 "timestamp must be an integer epoch (a fractional, string or boolean "
                 "timestamp cannot be canonicalized identically outside Python)")
         wire_ts = int(wire_ts)
+        # ...and an epoch outside any plausible clock is refused BEFORE the arithmetic that
+        # cannot survive it. `abs(time.time() - wire_ts)` on a signable bigint raises
+        # OverflowError, and the blanket net below converts that into -32603 while the JS
+        # twin (where `JSON.parse` yields `Infinity`) answers -32002. A net that turns a
+        # specific refusal into "internal error" is a divergence generator: the fix is to
+        # refuse at the step that MEANS it, under the code this whole rung already carries.
+        if abs(wire_ts) > self.MAX_EPOCH:
+            return 200, p.rpc_error(req_id, p.REPLAY_REJECTED,
+                                    "timestamp out of range (clock skew or replay)")
         msg.timestamp = wire_ts     # the backend envelope sees the canonical spelling too
         skew = abs(time.time() - wire_ts)
         if skew > self.CLOCK_WINDOW:
@@ -938,67 +1418,325 @@ class AgentEntry:
 
     # ------------------------------------------------------------------ HTTP
 
+    def is_mount_path(self, path: str) -> bool:
+        """True iff `path` is the message endpoint — the base the card's `url` names.
+
+        Exact, because a wandering endpoint is not this contract: with a bare origin that
+        is `/` and nothing else (byte-for-byte what this file always accepted), and with
+        a mount it is `/support` plus its trailing-slash spelling, since `card_scope`
+        folds the two and a visitor may legitimately have been handed either."""
+        if not self.mount:
+            return path == "/"
+        return path == self.mount or path == self.mount + "/"
+
+    def notice_bytes(self) -> bytes:
+        """The one-line plain-text notice `GET <mount>` answers with.
+
+        BYTE-IDENTICAL to the JS twin's (`route()` in muretai-agent-entry.mjs). It exists
+        because a person who pastes the address into a browser deserves to be told what
+        this address is; it is not a route a visiting agent walks. "This ADDRESS", not
+        "this origin": once an entry can be mounted under a path the origin may hold
+        several agents and this notice speaks for exactly one of them."""
+        return (f"{self.name}\n\nThis address is agent-reachable (Muretai agent entry).\n"
+                f"DID:  {self.did}\nCard: {self.base_url}{p.AGENT_CARD_PATH}\n"
+                f"POST a signed A2A message/send request to {self.mount or '/'} "
+                f"for a signed reply.\n").encode("utf-8")
+
     def _handler_class(self):
         entry = self
 
         class _Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
             server_version = f"muretai-agent-entry/{AGENT_ENTRY_VERSION}"
+            #: A per-recv SOCKET timeout, applied by `StreamRequestHandler.setup()`. Without
+            #: it a connection that opens and sends nothing holds a thread forever, which is
+            #: half of the wedge measured in the class constants above.
+            timeout = entry.HEADER_TIMEOUT
 
             def log_message(self, fmt, *args):   # quiet by default (a sample, not a server)
                 pass
 
+            # ---------------------------------------------------------- response plumbing
+
+            def setup(self):
+                super().setup()
+                #: The bound on the wait for the NEXT request line. The header timeout for
+                #: the first request on a connection, the (much shorter) keep-alive timeout
+                #: once we have already answered on it.
+                self._idle_timeout = entry.HEADER_TIMEOUT
+
+            def handle_one_request(self):
+                """One request, with the IDLE bound applied to the wait for its head.
+
+                Node bounds three separate waits by default — `headersTimeout`,
+                `requestTimeout` and `keepAliveTimeout` — and this handler bounded none.
+                `timeout` above covers the head of a request; this narrows it to
+                KEEPALIVE_TIMEOUT once we have already answered on this socket, so a client
+                that gets its reply and then sits there does not go on holding a thread for
+                the full header timeout as well."""
+                try:
+                    self.connection.settimeout(self._idle_timeout)
+                except OSError:
+                    pass
+                super().handle_one_request()
+                self._idle_timeout = entry.KEEPALIVE_TIMEOUT
+
             def _send(self, status: int, body: bytes,
-                      ctype: str = "application/json; charset=utf-8") -> None:
+                      ctype: "str | None" = "application/json; charset=utf-8",
+                      extra: "dict[str, str] | None" = None) -> None:
                 self.send_response(status)
-                self.send_header("Content-Type", ctype)
+                if ctype is not None:
+                    self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
+                for key, value in CORS_HEADERS.items():
+                    self.send_header(key, value)
+                for key, value in (extra or {}).items():
+                    self.send_header(key, value)
                 self.end_headers()
-                self.wfile.write(body)
+                # A HEAD response carries the headers a GET would and NO body (RFC 9110):
+                # writing one here is what makes the next response on this socket start
+                # inside the previous one's body.
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+
+            def _request_path(self) -> "tuple[str | None, str | None]":
+                """`(path, refusal)` — the PATH of the request-target, or why it is not one.
+
+                HTTP/1.1 lets a client write the target in absolute form
+                (`GET http://elsewhere.example/x HTTP/1.1`) and `urlsplit` obligingly
+                STRIPS the scheme and authority, leaving `/x` — so this entry answered for
+                an address it does not name. Measured against an entry mounted at
+                `/victim`: `GET http://attacker.example/victim/.well-known/agent-card.json`
+                returned the card (HTTP 200) while the JavaScript twin, which compares the
+                target as written, answered 404. Both are refusals of the same kind the
+                mount check already makes — this module answers EXACTLY the address its
+                card names — so a target carrying a scheme or an authority is refused.
+
+                RFC 9112 §3.2.2 says a server MUST accept absolute form. This contract
+                deliberately does not, and therefore has to SAY SO: a bare "not found" for
+                a syntactically legal target is the kind of diagnostic that costs an
+                integrator an afternoon and teaches them nothing."""
+                parts = urllib.parse.urlsplit(self.path)
+                if parts.scheme or parts.netloc:
+                    return None, ORIGIN_FORM_ONLY
+                return parts.path, None
+
+            def _guarded(self, fn) -> None:
+                """Run one route and ALWAYS answer. The transport-level twin of `rpc()`'s
+                net (and of the JS module's `.catch()` around `handleRequestAsync`): `rpc()`
+                itself no longer raises, so what is left here is a failure while ROUTING or
+                serialising — and the alternative to answering is the dead socket that made
+                the reference entry the only tier with no net at all. The detail is logged
+                locally, never returned."""
+                try:
+                    status, body, close, ctype, extra = fn()
+                except Exception as e:          # noqa: BLE001 — the net, deliberately blanket
+                    print(f"agent entry: internal error handling a request: {e!r}",
+                          file=sys.stderr, flush=True)
+                    status, body, close = 500, b'{"error":"internal error"}', True
+                    ctype, extra = "application/json; charset=utf-8", {}
+                if close:
+                    self.close_connection = True
+                self._send(status, body, ctype, extra)
+
+            # ---------------------------------------------------------- the method table
 
             def do_GET(self):                    # noqa: N802 (BaseHTTPRequestHandler API)
-                path = urllib.parse.urlsplit(self.path).path
-                if path in p.AGENT_CARD_PATHS:
+                self._guarded(self._get)
+
+            def do_HEAD(self):                   # noqa: N802
+                # SAME route, same headers, no body (`_send` drops it). RFC 9110 §9.3.2
+                # makes HEAD mandatory for a general-purpose server, and the twin has
+                # always answered it; this handler used to answer 501, so a client that
+                # probes with HEAD before fetching read one entry as alive and the other
+                # as not implementing the card at all.
+                self._guarded(self._get)
+
+            def do_OPTIONS(self):                # noqa: N802
+                self._guarded(self._options)
+
+            def do_POST(self):                   # noqa: N802
+                self._guarded(self._post)
+
+            def __getattr__(self, attr):
+                """Any OTHER method is 405, never 501.
+
+                `BaseHTTPRequestHandler` dispatches by looking up `do_<METHOD>` and calls
+                `send_error(501)` when it is absent — a different answer from the twin's
+                405, and one that skips `_send` and so carries no CORS headers either.
+                Answering here keeps the method table in ONE place. Only `do_*` is
+                synthesised; every other missing attribute still raises, because silently
+                answering an internal typo with an HTTP response is how a router starts
+                lying about what it implements."""
+                if attr.startswith("do_"):
+                    return lambda: self._guarded(self._not_allowed)
+                raise AttributeError(attr)
+
+            def _not_allowed(self) -> tuple:
+                return (405, p.dumps({"error": "method not allowed"}), False,
+                        "application/json; charset=utf-8", {"Allow": ALLOWED_METHODS})
+
+            def _options(self) -> tuple:
+                # 204, no Content-Type, and the CORS preflight headers `_send` adds to
+                # everything. A browser-resident agent cannot POST to this entry at all
+                # without an answer here.
+                return 204, b"", False, None, {"Allow": ALLOWED_METHODS}
+
+            def _get(self) -> tuple:
+                path, refusal = self._request_path()
+                # EVERY route hangs off the mount, which is the path the signed card
+                # already claims (`canonical_mount`). With a bare origin the mount is ""
+                # and these are byte-for-byte the strings this handler always matched;
+                # with `/support` the entry answers THERE and 404s the bare host, so two
+                # different agents can hold two paths on one hostname without either
+                # answering for the other. A visitor builds the same strings
+                # (`neturl.join` keeps the base's path prefix), so this is not a new
+                # convention — it is the one the fetcher already follows.
+                if refusal is not None:
+                    return self._not_found(refusal)
+                if path in entry._card_paths:
                     # IDENTICAL BYTES on both paths: the canonical A2A path and its legacy
                     # alias must not be two subtly different cards, or which one a client
                     # happened to fetch would change what it believes about this DID.
-                    self._send(200, entry._card_bytes)
-                elif path == p.AGENT_CARD_SIG_PATH:
-                    self._send(200, entry.signed_card_bytes())
-                else:
-                    self._send(404, p.dumps({"error": "not found"}))
+                    return 200, entry._card_bytes, False, JSON_CTYPE, {}
+                if path == entry._sig_path:
+                    return 200, entry.signed_card_bytes(), False, JSON_CTYPE, {}
+                if entry.is_mount_path(path):
+                    # The human notice. `POST <mount>` is the contract; `GET <mount>` is a
+                    # courtesy for whoever pastes the address into a browser, and a site
+                    # that keeps its own home page simply does not route GET here.
+                    return (200, entry.notice_bytes(), False,
+                            "text/plain; charset=utf-8", {})
+                return self._not_found()
 
-            def do_POST(self):                   # noqa: N802
-                path = urllib.parse.urlsplit(self.path).path
-                if path != "/":
-                    self._send(404, p.dumps({"error": "not found"}))
-                    return
-                raw, too_large = self._read_body()
+            def _not_found(self, detail: "str | None" = None) -> tuple:
+                body = {"error": "not found"}
+                if detail:
+                    body["detail"] = detail
+                return 404, p.dumps(body), False, JSON_CTYPE, {}
+
+            def _post(self) -> tuple:
+                path, refusal = self._request_path()
+                if refusal is not None:
+                    return self._not_found(refusal)
+                if not entry.is_mount_path(path):
+                    return self._not_found()
+                raw, too_large, denial = self._read_body()
+                if denial is not None:
+                    # A FRAMING refusal always closes the connection: once the two ends
+                    # could disagree about where this request ends, whatever follows on
+                    # this socket is not ours to read. That is the whole of the smuggling
+                    # defence — the refusal is worth nothing if we then keep parsing.
+                    status, why = denial
+                    return status, p.dumps({"error": why}), True, JSON_CTYPE, {}
                 status, body = entry.rpc(raw, too_large=too_large)
-                if too_large:
-                    self.close_connection = True
-                self._send(status, p.dumps(body))
+                return status, p.dumps(body), too_large, JSON_CTYPE, {}
 
-            def _read_body(self) -> tuple[bytes, bool]:
-                """Read the body, capped. Returns (body, too_large).
+            # ---------------------------------------------------------- reading the body
+
+            def _framing(self) -> "tuple[str | None, int, str | None]":
+                """How is this body framed — and is the framing UNAMBIGUOUS?
+
+                Returns `(mode, length, refusal)` with mode in `none|length|chunked`.
+
+                THIS IS THE SMUGGLING GATE. `int(self.headers.get("Content-Length") or 0)`
+                — what this used to be — takes the FIRST of several headers, accepts `+5`,
+                and ignores `Transfer-Encoding` entirely. Those are exactly the two
+                canonical request-smuggling desyncs:
+
+                  CL.CL  two Content-Lengths. Whichever of the proxy and the origin reads
+                         the other one is parsing a second request out of this one's body.
+                  CL.TE  Content-Length AND Transfer-Encoding. Same outcome, and the
+                         RFC's "ignore the Content-Length" rule is honoured by nobody
+                         uniformly enough to rely on.
+
+                and `+5` is a length a strict parser refuses and a lax one accepts, which
+                is the same disagreement wearing a smaller hat. Measured before this
+                existed: the JS twin (Node's llhttp) answered 400 to all three while this
+                reference ACCEPTED THEM AND BOOKED THE ACCOUNT — and this is the tier whose
+                documented deployment is behind a proxy.
+
+                A single `Transfer-Encoding: chunked` is NOT ambiguous and is accepted (see
+                `_read_chunked` for why that is the right half of the choice)."""
+                lengths = self.headers.get_all("Content-Length") or []
+                encodings = self.headers.get_all("Transfer-Encoding") or []
+                if encodings and lengths:
+                    return None, 0, ("Transfer-Encoding and Content-Length must not both "
+                                     "be present")
+                if len(lengths) > 1:
+                    return None, 0, "a repeated Content-Length is ambiguous"
+                if encodings:
+                    codings = [c.strip().lower()
+                               for value in encodings for c in value.split(",") if c.strip()]
+                    if codings != ["chunked"]:
+                        return None, 0, ("chunked is the only Transfer-Encoding this entry "
+                                         "accepts")
+                    return "chunked", 0, None
+                if not lengths:
+                    return "none", 0, None
+                value = lengths[0].strip()
+                if not value or any(c not in "0123456789" for c in value):
+                    # `+5`, `5, 5`, ` 0x5`, and every other spelling two parsers read
+                    # differently. Note `str.isdigit()` would ACCEPT Arabic-Indic digits.
+                    return None, 0, "Content-Length must be a plain decimal number"
+                return "length", int(value), None
+
+            def _read_body(self) -> "tuple[bytes, bool, tuple[int, str] | None]":
+                """Read the body. Returns `(body, too_large, denial)`.
+
+                `denial` is `(status, message)` — 400 for a framing refusal, 408 for a body
+                that did not arrive inside the budget — and is None on the happy path.
+
+                TWO BOUNDS, and neither existed before. `timeout` is a PER-RECV socket
+                timeout: a client that sends one byte every 19 s resets it forever, which is
+                precisely the trickle round 1 fixed on the OUTBOUND fetch and left standing
+                on this INBOUND read. `deadline` is the wall-clock ceiling that actually
+                ends such a connection. `read1` rather than `read` because a BufferedReader's
+                `read(n)` blocks until it has all n bytes — with `read` the loop below never
+                gets to re-check the deadline at all.
 
                 The oversized body is DRAINED rather than ignored: if we answered 413 while
                 the client was still writing megabytes, its socket buffer would fill, it
                 would block on send() and never read our response — a self-inflicted hang
                 that looks exactly like a dead server. So we read and discard past the cap
                 (keeping nothing), up to a hard ceiling past which we simply hang up."""
+                mode, length, refusal = self._framing()
+                if refusal is not None:
+                    return b"", False, (400, refusal)
+                # The head is read under the idle bound (5 s on a reused connection); the
+                # BODY gets the full header timeout per recv, with the deadline below as the
+                # bound that a trickle cannot reset.
+                try:
+                    self.connection.settimeout(entry.HEADER_TIMEOUT)
+                except OSError:
+                    pass
+                deadline = time.monotonic() + entry.BODY_BUDGET
                 cap = entry.MAX_BODY_BYTES
                 try:
-                    length = int(self.headers.get("Content-Length") or 0)
-                except (TypeError, ValueError):
-                    return b"", False
+                    if mode == "chunked":
+                        return self._read_chunked(cap, deadline)
+                    return self._read_length(length, cap, deadline)
+                except OSError:
+                    # The per-recv timeout fired (or the peer vanished mid-body). Either way
+                    # the body did not arrive, and that is a 408 the sender can act on — not
+                    # the 500 an escaping exception produced before, which reads as "the
+                    # site is broken" for what is in fact "you did not finish your request".
+                    # `OSError` rather than `TimeoutError`: on Python 3.9 `socket.timeout` is
+                    # an OSError and NOT a TimeoutError.
+                    return b"", False, (408, TOO_SLOW)
+
+            def _read_length(self, length: int, cap: int,
+                             deadline: float) -> "tuple[bytes, bool, tuple[int, str] | None]":
+                """A Content-Length-framed body. See `_read_body` for the two bounds."""
                 if length <= 0:
-                    return b"", False
+                    return b"", False, None
                 drain_ceiling = 16 * cap
                 chunks: list[bytes] = []
                 read = 0
                 while read < length:
-                    chunk = self.rfile.read(min(length - read, 65536))
+                    if time.monotonic() > deadline:
+                        return b"", False, (408, TOO_SLOW)
+                    chunk = self.rfile.read1(min(length - read, 65536))
                     if not chunk:
                         break
                     read += len(chunk)
@@ -1007,8 +1745,78 @@ class AgentEntry:
                     elif read >= drain_ceiling:
                         break                    # absurd body: stop reading, answer, close
                 if read > cap:
-                    return b"", True
-                return b"".join(chunks), False
+                    return b"", True, None
+                return b"".join(chunks), False, None
+
+            def _read_chunked(self, cap: int,
+                              deadline: float) -> "tuple[bytes, bool, tuple[int, str] | None]":
+                """A BOUNDED chunked reader. Same return shape as `_read_body`.
+
+                WHY BOTH TWINS ACCEPT CHUNKED (the decision, recorded where it is enforced).
+                The documented deployment for an agent entry is behind a reverse proxy or a
+                TLS terminator, and a proxy legitimately RE-FRAMES a request: nginx buffers
+                and sends a Content-Length, Caddy/Envoy/Node forward the client's chunking
+                through. Refusing chunked would therefore refuse honest traffic depending on
+                which proxy the site happens to run — a failure the operator cannot see,
+                cannot reproduce from curl, and would debug as "the agent entry is broken".
+                Node already dechunks correctly, so refusing would ALSO mean adding a
+                rejection to the twin that handles it properly. The signature covers the
+                DECODED body either way, so chunking changes nothing a verifier checks.
+                What is refused is only the AMBIGUITY (`_framing`): chunked together with a
+                Content-Length, or a repeated one.
+
+                Bounded three ways, because a decoder a stranger drives is a decoder that
+                must not be able to spend unbounded time or memory: the wall-clock deadline,
+                the same 1 MiB body cap, and a ceiling on the total WIRE bytes (payload plus
+                framing overhead) so a stream of one-byte chunks is bounded too."""
+                body: list[bytes] = []
+                body_bytes = 0
+                wire_bytes = 0
+                wire_ceiling = 16 * cap
+                while True:
+                    if time.monotonic() > deadline:
+                        return b"", False, (408, TOO_SLOW)
+                    line = self.rfile.readline(_MAX_CHUNK_LINE + 1)
+                    wire_bytes += len(line)
+                    if not line or len(line) > _MAX_CHUNK_LINE or wire_bytes > wire_ceiling:
+                        return b"", False, (400, "malformed or oversized chunked body")
+                    head = line.split(b";", 1)[0].strip()
+                    if not head or any(c not in b"0123456789abcdefABCDEF" for c in head):
+                        return b"", False, (400, "malformed chunked body (chunk size)")
+                    size = int(head, 16)
+                    if size == 0:
+                        break
+                    body_bytes += size
+                    wire_bytes += size + 2
+                    if wire_bytes > wire_ceiling:
+                        return b"", False, (400, "malformed or oversized chunked body")
+                    got = b""
+                    while len(got) < size:
+                        if time.monotonic() > deadline:
+                            return b"", False, (408, TOO_SLOW)
+                        piece = self.rfile.read1(size - len(got))
+                        if not piece:
+                            return b"", False, (400, "truncated chunked body")
+                        got += piece
+                    if body_bytes <= cap:
+                        body.append(got)
+                    if self.rfile.read(2) != b"\r\n":
+                        return b"", False, (400, "malformed chunked body (missing CRLF)")
+                # Trailers, bounded by the same wire ceiling. They are read and DISCARDED:
+                # a trailer arrives after the body a signature covers, so nothing in it can
+                # be trusted and nothing in this contract reads one.
+                while True:
+                    if time.monotonic() > deadline:
+                        return b"", False, (408, TOO_SLOW)
+                    line = self.rfile.readline(_MAX_CHUNK_LINE + 1)
+                    wire_bytes += len(line)
+                    if not line or len(line) > _MAX_CHUNK_LINE or wire_bytes > wire_ceiling:
+                        return b"", False, (400, "malformed or oversized chunked body")
+                    if line in (b"\r\n", b"\n"):
+                        break
+                if body_bytes > cap:
+                    return b"", True, None
+                return b"".join(body), False, None
 
         return _Handler
 
@@ -1016,8 +1824,9 @@ class AgentEntry:
         """Bind 127.0.0.1:port and serve on a daemon thread. Loopback ON PURPOSE: a real
         deployment puts TLS in front (the open-door visitor path refuses a plain-http public
         endpoint, because a direct POST carries the message text in the clear)."""
-        self._server = ThreadingHTTPServer(("127.0.0.1", port), self._handler_class())
-        self._server.daemon_threads = True
+        server = _BoundedThreadingHTTPServer(("127.0.0.1", port), self._handler_class())
+        server.max_connections = self.MAX_CONNECTIONS
+        self._server = server
         self._thread = threading.Thread(target=self._server.serve_forever,
                                         name=f"agent entry-{self.name}", daemon=True)
         self._thread.start()
@@ -1044,6 +1853,30 @@ def _demo_responder(env: dict) -> str:
             f"you are now a known customer of this site.")
 
 
+def domains_from_env(raw: "str | None") -> "list[str] | None":
+    """Split an `AGENT_ENTRY_DOMAINS`-style variable, or None when nothing was named.
+
+    THE SPLIT RULE, which must match `examples/agent_entry_server.mjs` exactly — the two
+    runners are one operator surface and a difference here is a difference in what the
+    product does with the same input. Absent or blank -> None (no `domains` key at all).
+    Otherwise split on ',' and hand on EVERY segment AS WRITTEN: an empty segment
+    (`a,,b`, a trailing comma) is REFUSED downstream by `canonical_domains`, never
+    silently skipped. A name lost in an edit looks exactly like a harmless typo, and
+    starting with fewer domains than the operator named is the same silent mismatch
+    `canonical_base_url` refuses one field over.
+
+    "Blank" is `_OUTER_WS` — the intersection `canonical_domains` folds with — and NOT
+    `str.strip()`, which is where the two runners drifted apart. `strip()` also removes
+    \\x1c-\\x1f and U+0085, `trim()` also removes U+FEFF, and neither removes the other's
+    set, so the same variable decided the question two ways: `AGENT_ENTRY_DOMAINS="\\x1c"`
+    started the Python runner with no domains while the JS runner refused to start
+    (exit 2), and a BOM — what a paste out of a spreadsheet or a Windows `.env` carries —
+    did exactly the reverse. One fold, one verdict."""
+    if not isinstance(raw, str) or not raw.strip(_OUTER_WS):
+        return None
+    return raw.split(",")
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -1055,17 +1888,42 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--as", dest="key_name", default="agent entry",
                     help="key file to sign with (keys/<name>.key)")
     ap.add_argument("--base-url", default=None,
-                    help="the PUBLIC url visitors dial (default http://127.0.0.1:<port>)")
+                    help="the PUBLIC url visitors dial, INCLUDING any path it is mounted "
+                         "under (e.g. https://example.com/support). The entry answers "
+                         "there and nowhere else. Default http://127.0.0.1:<port>")
+    ap.add_argument("--domain", dest="domains", action="append", default=None,
+                    metavar="DOMAIN",
+                    help="a bare domain this entry speaks for, e.g. example.com "
+                         "(repeatable, at most 5). The domain must ALSO serve a "
+                         "credential naming this DID at "
+                         "/.well-known/did-configuration.json — one half proves nothing")
     ap.add_argument("--anonymous-lane", action="store_true",
                     help="also accept unsigned inquiries (creates no account row)")
     args = ap.parse_args(argv)
 
-    base = args.base_url or f"http://127.0.0.1:{args.port}"
-    rc = AgentEntry(identity=Identity.load_or_create(args.key_name), base_url=base,
-                  name=args.name, responder=_demo_responder,
-                  open_door=True, anonymous_lane=args.anonymous_lane)
+    # The same two environment variables examples/agent_entry_server.mjs reads, so both
+    # runners can be started identically; an explicit flag always wins over the variable.
+    base = (args.base_url or os.environ.get("AGENT_ENTRY_BASE_URL")
+            or f"http://127.0.0.1:{args.port}")
+    domains = args.domains
+    if domains is None:
+        domains = domains_from_env(os.environ.get("AGENT_ENTRY_DOMAINS"))
+    # A bad --base-url or --domain raises ValueError HERE, before the socket is bound:
+    # the entry never starts and never publishes a claim no visitor could use.
+    try:
+        rc = AgentEntry(identity=Identity.load_or_create(args.key_name), base_url=base,
+                        name=args.name, responder=_demo_responder,
+                        domains=domains,
+                        open_door=True, anonymous_lane=args.anonymous_lane)
+    except ValueError as e:
+        print(str(e), file=sys.stderr, flush=True)
+        return 2
     rc.serve_in_background(args.port)
-    print(f"agent entry listening on {base}  did={rc.did}", flush=True)
+    print(f"agent entry listening on {rc.base_url}  did={rc.did}", flush=True)
+    if rc.domains:
+        print(f"  speaking for: {', '.join(rc.domains)}  "
+              f"(each domain must serve a credential naming this DID at "
+              f"{domainbind.WELL_KNOWN_PATH})", flush=True)
     try:
         while True:
             time.sleep(3600)

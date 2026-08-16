@@ -162,7 +162,15 @@ Tidied up for you: surrounding spaces, the case of the scheme and host, a defaul
 
 Refused, with the fix in the message: a scheme other than `http`/`https`, a missing host,
 `user@host`, a query string, a `#` fragment, non-ASCII characters, a stray tab or space, a
-backslash, `.` or `..` in the path, a broken `%` escape, and a port outside 1–65535.
+backslash, `.` or `..` in the path **including their `%2e` spellings**, a broken `%` escape,
+and a port outside 1–65535.
+
+> **Upgrading from 1.1.x?** The `%2e` rule is new. A `baseUrl` like
+> `https://shop.example/a/%2e%2e/support` used to start on the Python reference and now
+> refuses on both — because a browser's URL parser removes those segments and Python's does
+> not, so the address you publish and the address a visitor computes were already two
+> different things. The refusal names the string to paste instead. **Check your `baseUrl`
+> before you deploy:** this turns a running entry into one that will not boot.
 
 Two rules worth knowing before you pick a URL:
 
@@ -172,6 +180,87 @@ Two rules worth knowing before you pick a URL:
   not the Unicode spelling — and publish your links in that same form. JavaScript's URL
   parser punycodes a host and Python's does not, so the two implementations would otherwise
   sign different bytes for the same site.
+
+## One host, many agents
+
+A domain can hold a **fleet** — a front desk, support, sales — each its own agent, its own
+key, its own address, each contactable directly. Give each one a `baseUrl` that carries its
+path:
+
+```js
+createAgentEntry({ seedHex: SUPPORT_SEED, name: 'Support',
+                   baseUrl: 'https://studio.example/support', responder });
+```
+
+Every route then hangs off that path — `GET /support/.well-known/agent-card.json`, the
+signed envelope beside it, and `POST /support` — and **the bare host is a 404 for that
+entry**. On a shared host the bare host belongs to your site or to a neighbour, and an entry
+that answered there would be answering for someone else.
+
+The mount is **derived from `baseUrl`**, never configured beside it, so the address the
+router answers on and the address the signed card claims are the same string by
+construction. Two settings would let you spell them differently, and that produces the worst
+error message this system has: every visitor fails with *"cannot prove that … owns …"* and
+nothing says why.
+
+A visitor handed `https://studio.example/support` reaches support and **only** support. If
+sales re-served support's genuine, correctly-signed envelope at `/sales`, the visitor
+refuses it — the signature is real, but the signed address says `/support` and the visitor
+dialled `/sales`. That is what lets two agents share a hostname safely.
+
+Routing a fleet with nginx — pass the prefix **through** (no trailing slash on `proxy_pass`)
+so each entry sees the path its card claims:
+
+```nginx
+location /support/ { proxy_pass http://127.0.0.1:8788; }
+location = /support { proxy_pass http://127.0.0.1:8788; }
+location /sales/   { proxy_pass http://127.0.0.1:8789; }
+location = /sales  { proxy_pass http://127.0.0.1:8789; }
+```
+
+If your proxy **strips** the prefix instead (`proxy_pass http://127.0.0.1:8788/` — note the
+trailing slash), pass `basePath: ''`. That is the one override, and it may only be `''` or
+exactly the path `baseUrl` already names; anything else refuses at startup, because a third
+spelling of your address is the thing this design exists to prevent.
+
+Inside one Express app, use `req.originalUrl` — never `req.url`, which a mounted router has
+already stripped:
+
+```js
+const fwd = (entry) => async (req, res) => {
+  const r = await entry.handleRequestAsync(req.method, req.originalUrl, req.headers, req.body);
+  res.status(r.status).set(r.headers).send(r.body);
+};
+```
+
+## Which domains this entry speaks for
+
+An entry can name the domains it belongs to:
+
+```js
+createAgentEntry({ seedHex, baseUrl: 'https://studio.example',
+                   domains: ['studio.example'], responder });
+```
+
+This is **one half of a two-sided proof**, and it is worth being clear about what each half
+does. Your card says "I speak for studio.example". The domain says, in a
+`/.well-known/did-configuration.json` it serves, "this DID speaks for me". A verifier accepts
+the binding only when **both** halves agree — so neither a domain that lists a DID it does
+not own, nor an agent that claims a domain it has never touched, proves anything alone. And
+either side can withdraw: the domain owner deletes one line from a file they already control,
+and that agent — and only that agent — stops verifying.
+
+That is why a domain may name many agents. Revoking one is a one-line edit, not a migration.
+
+Names are checked at startup: a bare host, at least two labels, ASCII only, an optional
+`:port`, at most five of them. Anything else — a scheme, a path, a stray space, an empty
+entry from a trailing comma — **refuses to start**. So does naming more than five, rather
+than quietly publishing the first five: a claim that is usable and is not what you said is
+worse than a refusal you can read.
+
+Naming no domain is the default and publishes exactly what 1.1.x did.
+
+Set it from the environment with `AGENT_ENTRY_DOMAINS=studio.example,support.studio.example`.
 
 ## Pairs with WebMCP: the tab conversation becomes a customer
 
@@ -230,6 +319,25 @@ the source:
   visitor. Bindings carry an expiry, and a full node checks published revocations within
   seconds; if your site needs that speed, put the check in the backend your `responder`
   calls.
+
+What the entry now handles for you at the HTTP layer, so you do not have to:
+
+- **A stranger always gets an HTTP response.** Never a silently closed socket, whatever they
+  send. A request that stalls gets `408`; past a connection ceiling a new one gets `503`.
+- **Slow-drip connections cannot pile up.** Headers, body and idle keep-alives each have a
+  wall-clock bound. A socket timeout alone does not stop this: a caller sending one byte per
+  interval resets it forever, and the read only ends when it has everything it asked for.
+- **Ambiguous framing is refused, not guessed.** A repeated `Content-Length`, a
+  `Content-Length` alongside `Transfer-Encoding`, or a length that is not plain digits is a
+  `400`. Those are the shapes that make a proxy and an origin disagree about where one
+  request ends and the next begins. Chunked bodies on their own are accepted and decoded,
+  bounded by the same limits, because a reverse proxy may legitimately re-frame a request.
+- **The body must be real UTF-8.** Invalid bytes are refused rather than silently replaced,
+  so the two implementations cannot disagree about what you were sent.
+- **The request target must be in origin form.** `POST /` — not
+  `POST https://elsewhere.example/`. This is a deliberate departure from RFC 9112 §3.2.2,
+  which says a server must accept the absolute form: this endpoint answers exactly the
+  address its card names, and the refusal says so.
 
 ## Two implementations, pinned to each other
 

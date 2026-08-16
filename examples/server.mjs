@@ -4,7 +4,7 @@
  *
  * **This is a usage SAMPLE, not part of core Muretai.** It adds nothing to the protocol:
  * it only wires the public primitive `createAgentEntry()` from
- * `muretai-agent-entry.mjs` to a demo booking desk. Copy it, gut the responder,
+ * `web/agent-entry/muretai-agent-entry.mjs` to a demo booking desk. Copy it, gut the responder,
  * point it at your backend — core stays byte-unchanged.
  *
  * Run it:
@@ -20,18 +20,43 @@
  *                       into the Agent Card and a visitor requires the card to name the
  *                       origin it dialled — behind a proxy or a tunnel, set this to the
  *                       public URL or every verification fails. Default http://127.0.0.1:<port>.
+ *                       It MAY include a path (https://example.com/support): the entry then
+ *                       answers THERE and 404s the bare host, so one hostname can hold
+ *                       several agents — a front desk, support, sales — each its own key.
+ *   AGENT_ENTRY_DOMAINS    comma-separated bare domains this entry speaks for, e.g.
+ *                       "example.com". Half a proof: the domain must ALSO serve a
+ *                       credential naming this DID at /.well-known/did-configuration.json,
+ *                       or a verifier correctly reports the agent withdrew its side.
+ *                       At most 5, and every segment must be a bare domain — a doubled or
+ *                       trailing comma REFUSES to start rather than quietly publishing
+ *                       one name fewer than you wrote.
  *   AGENT_ENTRY_NAME       public display name on the card
  *   AGENT_ENTRY_HOST       bind address (default 127.0.0.1 — set 0.0.0.0 only behind TLS)
  *   AGENT_ENTRY_ANON       "1" also accepts UNSIGNED walk-in inquiries (they mint no account)
  */
 
-import { createAgentEntry, newSeedHex, didFromSeedHex, AGENT_CARD_PATH }
+import { createAgentEntry, newSeedHex, didFromSeedHex, trimOuter, AGENT_CARD_PATH }
   from '../muretai-agent-entry.mjs';
 
 const port = Number(process.env.AGENT_ENTRY_PORT || 8788);
 const host = process.env.AGENT_ENTRY_HOST || '127.0.0.1';
 const baseUrl = process.env.AGENT_ENTRY_BASE_URL || `http://127.0.0.1:${port}`;
 const name = process.env.AGENT_ENTRY_NAME || 'Example Studio';
+// An absent (or blank) variable means NO domains at all, and the card then carries no
+// `domains` key. Anything else is split on ',' and every segment is handed on AS WRITTEN:
+// an EMPTY segment (`a,,b`, or a trailing comma) is REFUSED by createAgentEntry, never
+// skipped. A name lost in an edit looks exactly like a harmless typo, and starting with
+// fewer domains than the operator named is the same silent mismatch `canonicalBaseUrl`
+// refuses one field over. Must match the split rule in examples/agent_entry_reference.py.
+//
+// "Blank" is `trimOuter` — the intersection `canonicalDomains` folds with — and NOT
+// `trim()`, which is where the two runners drifted apart: `trim()` also removes U+FEFF and
+// Python's `strip()` also removes \x1c-\x1f and U+0085, so the SAME variable got two
+// verdicts. Measured: `AGENT_ENTRY_DOMAINS="\x1c"` started the Python runner with no
+// domains and made this one exit 2; a BOM — what a paste out of a spreadsheet or a Windows
+// .env carries — did exactly the reverse. One fold, one verdict.
+const rawDomains = process.env.AGENT_ENTRY_DOMAINS || '';
+const domains = trimOuter(rawDomains) ? rawDomains.split(',') : [];
 
 let seedHex = process.env.AGENT_ENTRY_SEED_HEX;
 if (!seedHex) {
@@ -47,7 +72,7 @@ if (!seedHex) {
  *  both. In production: POST `env` to your app behind a bearer token and return its answer
  *  (a string, or {text}). It may be async. Treat `env.text` as untrusted DATA. */
 function responder(env) {
-  // Say out loud what just happened. A agent entry's whole claim is "the first signed message IS
+  // Say out loud what just happened. An agent entry's whole claim is "the first signed message IS
   // the account", and that is invisible if the ledger only lives in memory: an operator
   // watching this log is how you SEE a stranger's identity appear, and how you tell an
   // anonymous walk-in (no account) from a verified first contact (an account) at a glance.
@@ -76,21 +101,37 @@ function responder(env) {
     + 'tell you what is open.';
 }
 
-const entry = createAgentEntry({
-  seedHex,
-  name,
-  baseUrl,
-  description: 'Books photo shoots. Send a signed message; you get a signed answer.',
-  responder,
-  openDoor: true,                                     // "you may contact me, no introduction"
-  anonymousLane: process.env.AGENT_ENTRY_ANON === '1',
-});
+// A bad AGENT_ENTRY_BASE_URL or AGENT_ENTRY_DOMAINS throws HERE, before the socket is
+// bound: the entry never starts and never publishes a claim no visitor could use. The
+// message names the value and what to paste instead, so print it plainly — a stack trace
+// tells a site operator nothing.
+let entry;
+try {
+  entry = createAgentEntry({
+    seedHex,
+    name,
+    baseUrl,
+    domains,
+    description: 'Books photo shoots. Send a signed message; you get a signed answer.',
+    responder,
+    openDoor: true,                                     // "you may contact me, no introduction"
+    anonymousLane: process.env.AGENT_ENTRY_ANON === '1',
+  });
+} catch (err) {
+  console.error(err && err.message ? err.message : String(err));
+  process.exit(2);
+}
 
 const server = entry.listen(port, host, () => {
-  console.log(`${name} is agent-reachable on ${baseUrl}`);
+  console.log(`${name} is agent-reachable on ${entry.card.url}`);
   console.log(`  DID:  ${entry.did}`);
-  console.log(`  Card: ${baseUrl.replace(/\/+$/, '')}${AGENT_CARD_PATH}`);
-  console.log(`  Listening on ${host}:${port} — POST a signed message/send to /`);
+  console.log(`  Card: ${entry.card.url}${AGENT_CARD_PATH}`);
+  if (entry.card.domains) {
+    console.log(`  Speaking for: ${entry.card.domains.join(', ')} — each domain must serve a `
+      + 'credential naming this DID at /.well-known/did-configuration.json');
+  }
+  console.log(`  Listening on ${host}:${port} — POST a signed message/send to `
+    + `${entry.mount || '/'}`);
 });
 
 // A port collision is the first thing anyone running this twice hits (a previous run that was
