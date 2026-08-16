@@ -1,3 +1,8 @@
 node_modules/
 *.log
 .DS_Store
+
+# A standalone `python3 examples/reference.py` writes its identity here. A seed IS the
+# private key: it must never be committed, and regenerating it makes every returning
+# visitor a stranger.
+*.seed

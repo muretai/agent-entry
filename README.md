@@ -341,15 +341,40 @@ What the entry now handles for you at the HTTP layer, so you do not have to:
 
 ## Two implementations, pinned to each other
 
-`examples/reference.py` is the Python reference. It is not a port — the two are held
-byte-identical by an acceptance suite that runs the same attack battery against both,
-drives this module against `testdata/wire_vectors.json`, posts identical bytes to each,
-and requires identical verdicts. If you write a third implementation, that suite is the
-gate.
+This module is not alone. A Python reference implements the same contract, and the two are
+held to **identical verdicts** by an acceptance suite: it runs the same attack battery
+against both, drives this module against `testdata/wire_vectors.json` byte for byte, posts
+identical bytes to each over real sockets — down to the HTTP framing — and requires the same
+status, the same account outcome and the same signed reply from both. If you write a third
+implementation, that suite is the gate.
 
 The bytes are the contract: every signed payload must match Python's canonical JSON
 exactly, or a signature is unverifiable and the only diagnostic anyone gets is
 "signature verification failed".
+
+**What ships here, and what does not.** This repo is the **site side**: the door a website runs.
+It is one file, it depends on nothing, and it carries everything it needs including its own
+Ed25519.
+
+The other implementation is a Python one, and it lives with Muretai core, where it is the
+executable specification the acceptance suite drives. It is not published here on purpose. A
+door needs a signer, a card, a binding verifier and a domain-name check; core's copy reaches
+for a URL guard, a JWS minter and a release module that a door never touches, and shipping
+those here would put the *visiting-agent* and *node* sides of the network into an artifact that
+is only ever the site side.
+
+The visiting side needs nothing from this package either: an agent already has a runtime — a
+Muretai node, or whatever framework it runs on — and that is what knocks on your door.
+
+So the two implementations share no code at all, by design. **What holds them to identical
+verdicts is the acceptance suite, not a shared library** — which is the honest arrangement,
+because a shared library would only ever have covered the parts they happen to share. The
+suite posts identical bytes to both, down to the HTTP framing, and requires the same status,
+the same account outcome and the same signed reply.
+
+`testdata/wire_vectors.json` is the part of that gate you can run here: it pins the canonical
+JSON, the signing payloads, the card envelopes and the did:key round-trips this module must
+reproduce byte for byte.
 
 ## What this is part of
 
