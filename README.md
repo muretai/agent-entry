@@ -69,6 +69,52 @@ resolves it and files them under `owner_did`, so a replaced phone is not a new c
 Your entry does not need to poll or be told: a node that carries the account learns it on
 its own, and refuses that key.
 
+## Say what your door answers
+
+A visiting agent reads your card **before** it knocks. Left alone, that card says something
+answers here and nothing about what it answers, so the visitor has to guess and learns your
+menu only from whatever comes back when it guesses wrong.
+
+```js
+createAgentEntry({
+  seedHex, name: 'Example Studio', baseUrl: 'https://studio.example', responder,
+  skills: [{
+    id: 'ask',
+    name: 'signed-answers-about-the-studio',
+    description: 'Ask what a shoot costs, what the studio does, and how to book. '
+      + 'The answer comes back in the same HTTP response, signed by this domain.',
+    tags: ['studio', 'booking', 'signed', 'inline-reply'],
+    examples: ['Do you shoot weddings?', 'What does a half-day cost?', 'How do I book?'],
+  }],
+});
+```
+
+It is an A2A `AgentSkill` list, so an agent that already speaks A2A reads it without being
+taught anything new, and it goes into the plain card **and** the signed envelope — the menu
+is signed too.
+
+Two rules worth holding yourself to. **Every example must be answerable:** an example is a
+promise printed on your card, and the visitor who copies one verbatim is the best-behaved
+visitor you will get, so drive your examples through your own responder in your tests.
+**Declare only what the responder does:** a skill that mentions booking, on an entry that
+answers questions and hands off nothing, is a signed claim you cannot keep.
+
+### The rest of the settings
+
+| option | default | what it does |
+|---|---|---|
+| `skills` | `[]` | the menu above — what a visitor learns before knocking |
+| `openDoor` | `true` | publishes `muretai.open_door`: the field that tells a visiting agent it may message you with no introduction |
+| `anonymousLane` | `false` | also answer **unsigned** inquiries. They create no account row, and the lane is capped entry-wide — an unauthenticated caller must never become an unmetered signing oracle |
+| `anonRatePerMin` | `30` | anonymous replies per minute, entry-wide. Signed senders are not bound by it: they are attributable and already in your ledger |
+| `maxAccounts` | `50000` | how many accounts the in-process ledger holds |
+| `domains` | none | the domains this entry speaks for (see below) |
+| `basePath` | from `baseUrl` | the path this entry answers at, derived rather than set beside it |
+| `name`, `description`, `version` | — | the card's own words. `description` is the line a person reads in a directory listing |
+
+`seedHex` and `baseUrl` are the two an entry refuses to start without: the seed **is** the
+address, and the url it publishes must equal the origin the visitor dialled.
+
 ## Install
 
 ```bash
