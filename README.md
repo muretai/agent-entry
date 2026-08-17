@@ -6,7 +6,7 @@ It verifies who is knocking, opens an account for them, and answers — in the s
 response. No signup form, because the visitor's key already is the account. When that
 person replaces their phone, your site still knows it is them.
 
-One file. Zero dependencies. Node 20+.
+One file. Zero dependencies. No database. Node 20+.
 
 **Running in production — check it yourself, right now:**
 
@@ -110,10 +110,59 @@ answers questions and hands off nothing, is a signed claim you cannot keep.
 | `maxAccounts` | `50000` | how many accounts the in-process ledger holds |
 | `domains` | none | the domains this entry speaks for (see below) |
 | `basePath` | from `baseUrl` | the path this entry answers at, derived rather than set beside it |
+| `wbaVerifiers` | none | a JWKS document (`{"keys":[…]}`) of Ed25519 keys whose holders this entry should **recognise** on inbound signed requests (Web Bot Auth / RFC 9421 — see *Who is knocking*). Recognition only adds `env.wba_did` and a visit count; it never changes a verdict |
 | `name`, `description`, `version` | — | the card's own words. `description` is the line a person reads in a directory listing |
 
 `seedHex` and `baseUrl` are the two an entry refuses to start without: the seed **is** the
 address, and the url it publishes must equal the origin the visitor dialled.
+
+## Who is knocking — observation, never identity
+
+The person who found you often never opens a browser: they hand your link to their
+agent, and the agent fetches your card and knocks. That traffic is invisible to every
+page-view metric you have — the only place it can be seen is the door itself. So the
+door counts it:
+
+```js
+entry.stats()
+// { gptbot:  { card_get: 12, signed_post: 3 },
+//   browser: { notice_get: 5 } }
+```
+
+Each request's `User-Agent` is classified into a fixed family (`claude-user`,
+`claudebot`, `gptbot`, `openai`, `perplexity`, `google-extended`, `muretai-node`,
+`curl`, `browser`, `none`/`other`) and counted by stage. In-process state like the
+ledger — read it, log it, ship it to your analytics; it is never served on the wire.
+An AI-agent family also gets one nudge: `GET /` answers it with
+`Link: </.well-known/agent-card.json>; rel="service-desc"` (RFC 8631), so a crawler
+that landed on prose is handed the machine-readable door. The body stays
+byte-identical for every caller.
+
+One rule holds this together, enforced by the contract suite rather than promised:
+**a User-Agent never affects `verified`, an account row, a rate limit, or any
+refusal.** A UA string is written by the client; a door that trusted it would be a
+door anyone could talk their way through.
+
+### From hint to proof: recognising signed crawlers (Web Bot Auth)
+
+Major AI crawlers now **sign** their requests (HTTP Message Signatures, RFC 9421).
+Hand your entry the public keys you trust — the body of a key directory you fetched
+and verified out of band — and it verifies them, with no network call at answer time:
+
+```js
+createAgentEntry({
+  seedHex, name, baseUrl, responder,
+  wbaVerifiers: { keys: [{ kty: 'OKP', crv: 'Ed25519', x: '…' }] },
+});
+```
+
+A verified fetch is counted (`entry.wbaVisits`); a verified message hands your
+responder `env.wba_did` — the identity whose key signed the *request*, beside
+`env.peer_did`, the identity that signed the *message*. The same rule holds:
+recognition never changes a verdict, mints no account, and lifts no rate limit. A
+signature over the transport proves who fetched — not who wrote the text, and a
+captured header set is replayable until it expires (minutes), which is why `wba_did`
+is identification, never authorship.
 
 ## Install
 
@@ -127,6 +176,13 @@ which is the point — you can read all of it before you trust it.
 ```bash
 curl -O https://raw.githubusercontent.com/muretai/agent-entry/main/muretai-agent-entry.mjs
 ```
+
+That is the whole footprint. **There is no database to install** and no schema to create —
+an entry runs, in production, on its bounded in-process state, which is how muretai.com's
+own door runs. Once your door is answering, a store of your own is the **recommended**
+upgrade — the ledger is your customer list, and more features stand on keeping it — while
+an analytics tool covers statistics without one. Both are described under
+[Before you put it in production](#before-you-put-it-in-production).
 
 ## Put one on a site you already have
 
@@ -369,12 +425,39 @@ makes the visitor someone you can recognise the next time.
 
 ## Before you put it in production
 
-Two things this reference implementation deliberately leaves to you, both called out in
-the source:
+**Nothing here is needed to start** — an entry runs, and every exchange stays correct,
+on its in-process state alone; some installers have read this section as a prerequisite,
+and it is not one. It is the upgrade path:
 
-- **Persist the ledger and the device→owner pins.** The sample keeps them in memory, so a
-  restart forgets which owner a device belongs to and trusts the next claim it sees. A
-  real site puts both in its own database, keyed by exactly the account DID it is handed.
+- **Recommended — persist the ledger in a store of your own: it is your customer list.**
+  Every row is keyed by a customer's DID, which is their address: what you need to
+  recognise a returning customer and to contact them again later. In memory that list
+  evaporates on restart. Kept in the database your site already has — keyed by exactly
+  the account DID you are handed — it is what the features beyond answering stand on:
+  greeting a returning account by its history, following up on yesterday's inquiry,
+  pricing by relationship. Keep the device→owner pins and the replay guard beside it and
+  the security rules — a device is never re-owned, a message is never accepted twice —
+  survive restarts as well; those two are read on every message, so only a real store
+  can carry them.
+- **Statistics without a store: an analytics sink.** Nothing in the entry reads the
+  ledger back to gate, greet or rate-limit, so a fire-and-forget sink records visiting
+  agents with no database anywhere. Your `responder` is handed the account DID; Google
+  Analytics 4 over the Measurement Protocol is one `fetch` inside it:
+
+  ```js
+  fetch('https://www.google-analytics.com/mp/collect?measurement_id=G-XXXXXXXXXX'
+      + '&api_secret=' + process.env.GA_API_SECRET, {
+    method: 'POST',
+    body: JSON.stringify({ client_id: env.owner_did || env.peer_did,
+                           events: [{ name: 'agent_contact' }] }),
+  }).catch(() => {});   // analytics must never block a reply
+  ```
+
+  Keyed by `client_id`, GA tells new from returning visitors by itself — and a DID is a
+  public key, not personal data, though the record then lives with a third party, which
+  is your call. A sink cannot be read back during a request: it counts customers, it
+  cannot recognise one. It replaces a log line, not the store above — none of the
+  recommended features stand on it.
 - **Revocation reaches you through your backend, not through this file.** An Agent Entry
   is deliberately network-free on the hot path: it never dials out while answering a
   visitor. Bindings carry an expiry, and a full node checks published revocations within

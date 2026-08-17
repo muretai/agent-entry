@@ -33,6 +33,11 @@
  *   AGENT_ENTRY_NAME       public display name on the card
  *   AGENT_ENTRY_HOST       bind address (default 127.0.0.1 — set 0.0.0.0 only behind TLS)
  *   AGENT_ENTRY_ANON       "1" also accepts UNSIGNED walk-in inquiries (they mint no account)
+ *   AGENT_ENTRY_WBA_JWKS   OPTIONAL: a JWKS document {"keys":[…]} as one JSON string —
+ *                       the Web Bot Auth key directory (verified out of band) whose
+ *                       holders this entry should RECOGNISE on inbound requests. Off
+ *                       when absent. Recognition only ADDS identity (env.wba_did);
+ *                       it never changes a verdict.
  */
 
 import { createAgentEntry, newSeedHex, didFromSeedHex, trimOuter, AGENT_CARD_PATH }
@@ -76,6 +81,11 @@ function responder(env) {
   // the account", and that is invisible if the ledger only lives in memory: an operator
   // watching this log is how you SEE a stranger's identity appear, and how you tell an
   // anonymous walk-in (no account) from a verified first contact (an account) at a glance.
+  // `[WBA]` is the transport-level identity (T107): the request's HTTP signature named a
+  // key we were configured to recognise — identification, never authorship of the text.
+  if (env.wba_did) {
+    console.log(`[WBA]         transport signed by ${env.wba_did}`);
+  }
   // NOTE for anyone copying this file: `ledger` here is a **Map** (the Python reference in
   // examples/agent_entry_reference.py uses a dict) — use .get()/.size, not obj[key]/Object.keys.
   // The row is written BEFORE the backend is called, so `messages === 1` means "this very
@@ -107,6 +117,17 @@ function responder(env) {
 // tells a site operator nothing.
 let entry;
 try {
+  // A malformed AGENT_ENTRY_WBA_JWKS refuses to start, same posture as a bad domain
+  // list: silently starting without the keys the operator named only looks protective.
+  let wbaVerifiers = null;
+  if (process.env.AGENT_ENTRY_WBA_JWKS) {
+    try {
+      wbaVerifiers = JSON.parse(process.env.AGENT_ENTRY_WBA_JWKS);
+    } catch {
+      throw new TypeError('AGENT_ENTRY_WBA_JWKS is not valid JSON — paste the key '
+        + 'directory body ({"keys":[…]}) as one JSON string');
+    }
+  }
   entry = createAgentEntry({
     seedHex,
     name,
@@ -116,6 +137,7 @@ try {
     responder,
     openDoor: true,                                     // "you may contact me, no introduction"
     anonymousLane: process.env.AGENT_ENTRY_ANON === '1',
+    wbaVerifiers,
   });
 } catch (err) {
   console.error(err && err.message ? err.message : String(err));
@@ -133,6 +155,23 @@ const server = entry.listen(port, host, () => {
   console.log(`  Listening on ${host}:${port} — POST a signed message/send to `
     + `${entry.mount || '/'}`);
 });
+
+// The observation counters, surfaced the way the ledger is: on this runner's stdout,
+// printed only when they changed. `[ua]` is greppable; the shape is entry.stats()
+// verbatim ({family: {stage: n}}). `unref()` so the timer never holds the process open.
+let lastStats = '';
+setInterval(() => {
+  // Sorted keys at every level so the line is stable run to run (and diffable against
+  // the Python runner's `json.dumps(..., sort_keys=True)` spelling of the same shape).
+  const line = JSON.stringify(entry.stats(), (k, v) =>
+    (v && typeof v === 'object' && !Array.isArray(v))
+      ? Object.fromEntries(Object.keys(v).sort().map((key) => [key, v[key]]))
+      : v);
+  if (line !== '{}' && line !== lastStats) {
+    console.log(`[ua] ${line}`);
+    lastStats = line;
+  }
+}, 60_000).unref();
 
 // A port collision is the first thing anyone running this twice hits (a previous run that was
 // backgrounded and orphaned, usually). An unhandled 'error' event prints a Node stack trace,

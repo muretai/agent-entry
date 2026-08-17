@@ -65,6 +65,82 @@ export const AGENT_CARD_PATH = '/.well-known/agent-card.json';
 export const AGENT_CARD_PATH_LEGACY = '/.well-known/agent.json';
 export const AGENT_CARD_SIG_PATH = '/.well-known/agent-card.sig.json';
 
+/** The User-Agent FAMILY table — OBSERVATION AND SIGNPOSTING, NEVER IDENTITY. A UA string
+ *  is written by the client, so nothing here may ever affect `verified`, a ledger row, a
+ *  rate lane or any refusal verdict (that is the Web Bot Auth / signed-envelope layer's
+ *  job). What it buys: an owner-facing count of who is knocking (`stats()`), and a `Link`
+ *  signpost on the notice route for the families that are AI agents.
+ *
+ *  Ordered, FIRST MATCH WINS, and the order is load-bearing twice: real crawler UAs start
+ *  with "Mozilla/5.0 …" so every bot needle must come before `mozilla`, and GPTBot's UA
+ *  contains "openai.com/gptbot" so `gptbot` must come before `openai`. Needles are matched
+ *  as substrings after an ASCII-ONLY lowercase fold (`asciiLower`, not `toLowerCase()` —
+ *  Unicode case folding differs between runtimes and none of these needles needs it).
+ *  FIXED table, deliberately not an option: an option would invite making UA matter, and
+ *  the fixed table is what bounds the stats keyspace — an attacker-chosen UA string must
+ *  never become a key. Must match `UA_FAMILIES` in examples/agent_entry_reference.py:
+ *  one contract, two implementations, one verdict per string. */
+export const UA_FAMILIES = [
+  ['claude-user', 'claude-user'],
+  ['claudebot', 'claudebot'],
+  ['gptbot', 'gptbot'],
+  ['chatgpt-user', 'openai'],
+  ['openai', 'openai'],
+  ['perplexity', 'perplexity'],
+  ['google-extended', 'google-extended'],
+  ['muretai-node', 'muretai-node'],
+  ['curl', 'curl'],
+  ['mozilla', 'browser'],
+];
+
+/** The families that read as an AI agent — the ones the notice route signposts with a
+ *  `Link` header. `muretai-node` is deliberately absent: its Outbox already walks the
+ *  well-known card paths, so a signpost buys it nothing. Must match the same set in
+ *  examples/agent_entry_reference.py. */
+export const AI_AGENT_FAMILIES = new Set([
+  'claude-user', 'claudebot', 'gptbot', 'openai', 'perplexity', 'google-extended',
+]);
+
+/** ASCII-only lowercase fold. NOT `toLowerCase()`: Unicode casing is runtime- and
+ *  locale-shaped (the Turkish-I class of surprise), and no needle in the table needs it —
+ *  folding only A-Z is what makes the same UA string classify identically in both twins. */
+function asciiLower(s) {
+  let out = '';
+  for (let i = 0; i < s.length; i += 1) {
+    const c = s.charCodeAt(i);
+    out += (c >= 65 && c <= 90) ? String.fromCharCode(c + 32) : s[i];
+  }
+  return out;
+}
+
+/** UA string -> family. Absent/empty/non-string -> 'none'; no needle matched -> 'other'.
+ *  Total on untrusted input, and the RETURN VALUE is always one of the twelve fixed
+ *  family names — never a substring of the input (bounded stats keyspace). */
+export function uaFamily(ua) {
+  if (typeof ua !== 'string' || !ua) return 'none';
+  const folded = asciiLower(ua);
+  for (const [needle, family] of UA_FAMILIES) {
+    if (folded.includes(needle)) return family;
+  }
+  return 'other';
+}
+
+/** The FIRST User-Agent value out of a headers mapping, or null. Case-insensitive key
+ *  scan so an in-process host can pass any casing; Node's own `req.headers` already
+ *  lowercases keys and keeps only the FIRST user-agent of a duplicated pair — the Python
+ *  twin's `email.Message.get` does the same, which is the parity this relies on. A
+ *  non-string value (an array, a number) reads as absent, never coerced. */
+function uaOf(headers) {
+  if (!headers || typeof headers !== 'object') return null;
+  for (const key of Object.keys(headers)) {
+    if (asciiLower(key) === 'user-agent') {
+      const v = headers[key];
+      return typeof v === 'string' ? v : null;
+    }
+  }
+  return null;
+}
+
 const CARD_ENVELOPE_VERSION = 1;
 const CARD_ENVELOPE_TYPE = 'agentcard';
 
@@ -435,6 +511,382 @@ export function verifyEnvelope(fields, opts = {}) {
     return verifyEnvelopeSignature(fields);
   } catch {
     return false;
+  }
+}
+
+// ================================================================ Web Bot Auth (RFC 9421 subset, verify-only) — T107
+//
+// The INBOUND half only: did the holder of one of the keys this entry was GIVEN sign
+// THIS request, for THIS authority, as a `web-bot-auth` request? It mirrors EXACTLY the
+// subset shared/webbotauth.py::verify_request implements — no more (content digests,
+// @query-param, per-item parameters and every other RFC 9421 feature are refused, not
+// ignored) and no less. The two are pinned to one fixture, testdata/wba_vectors.json:
+// a vector one twin accepts and the other refuses is a red suite. Verification is
+// BYTE-FAITHFUL, not canonical: the signature base is rebuilt from the RECEIVED
+// `@signature-params` text, so a peer who orders or spaces parameters differently still
+// verifies (signing is canonical, verifying is byte-faithful — the shared/jws.py split).
+//
+// One rule governs every caller in this file: WBA never changes a verdict — it only
+// ever ADDS identity (`wba_did` on the backend envelope, a `wbaVisits` count). Absent,
+// invalid, expired, unknown-key and tampered all behave exactly like "no WBA".
+
+const WBA_TAG_REQUEST = 'web-bot-auth';
+/** RFC 9421's HTTP-signature-registry name — NOT JOSE's "EdDSA". Same curve, two
+ *  registries; mixing the spellings is a silent interop failure. */
+const WBA_ALG = 'ed25519';
+/** Tolerance for the peer's clock being ahead, applied to `created` only. */
+const WBA_CLOCK_SKEW = 300;
+/** The loosest accepted `expires - created`: these headers are a bearer credential
+ *  while they live (webbotauth.REQUEST_SIG_WINDOW + CLOCK_SKEW). */
+const WBA_MAX_REQUEST_LIFETIME = 600;
+/** Refuse to even tokenize an absurd header — bounds parser work on hostile input. */
+const WBA_MAX_HEADER_CHARS = 8192;
+/** Standard base64, padded — what Python's base64.b64decode(validate=True) accepts.
+ *  Node's Buffer.from(s, 'base64') silently IGNORES invalid characters and tolerates
+ *  any padding, which is the classic twin-divergence; pre-validating is what keeps one
+ *  Signature value from being two different byte strings. */
+const WBA_B64_STANDARD = /^[A-Za-z0-9+/]*={0,2}$/;
+/** Unpadded base64url — what shared/jws.unb64url accepts for a JWK `x` ("+", "/" and
+ *  "=" refused; a length ≡ 1 (mod 4) has no byte decoding). */
+const WBA_B64URL = /^[A-Za-z0-9_-]*$/;
+
+/** Serialize an RFC 8941 sf-string: quoted, `\` and `"` escaped — the only two escapes
+ *  the RFC defines. */
+function wbaSfString(s) {
+  return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+}
+
+/** Python str.strip()'s default whitespace set, exactly — NOT String.prototype.trim().
+ *  The two runtimes disagree at the edges (Python also strips \x1c-\x1f and \x85; JS
+ *  also strips U+FEFF), and a covered header value the twins trim differently is a
+ *  signature base only one of them can rebuild. */
+const WBA_PY_WS_CLASS = '[\\t\\n\\v\\f\\r \\x1c-\\x1f\\x85\\xa0\\u1680'
+  + '\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]+';
+const WBA_PY_WS = new RegExp(`^${WBA_PY_WS_CLASS}|${WBA_PY_WS_CLASS}$`, 'g');
+function wbaPyStrip(s) {
+  return s.replace(WBA_PY_WS, '');
+}
+
+function wbaIsKeyFirst(ch) { return (ch >= 'a' && ch <= 'z') || ch === '*'; }
+function wbaIsKeyRest(ch) {
+  return (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')
+    || ch === '_' || ch === '-' || ch === '.' || ch === '*';
+}
+
+/** An RFC 8941 key (a dictionary label or a parameter name) -> [key, next] or null. */
+function wbaParseKey(s, i) {
+  if (i >= s.length || !wbaIsKeyFirst(s[i])) return null;
+  let j = i + 1;
+  while (j < s.length && wbaIsKeyRest(s[j])) j += 1;
+  return [s.slice(i, j), j];
+}
+
+/** A quoted sf-string. Only `\"` and `\\` are escapes; every other character must be
+ *  printable ASCII — rejecting the rest is what keeps one byte string from having two
+ *  spellings. */
+function wbaParseSfString(s, i) {
+  if (i >= s.length || s[i] !== '"') return null;
+  i += 1;
+  let out = '';
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === '\\') {
+      i += 1;
+      if (i >= s.length || (s[i] !== '"' && s[i] !== '\\')) return null;
+      out += s[i];
+      i += 1;
+    } else if (ch === '"') {
+      return [out, i + 1];
+    } else if (ch >= ' ' && ch <= '~') {
+      out += ch;
+      i += 1;
+    } else {
+      return null;
+    }
+  }
+  return null;
+}
+
+/** An sf-integer: optional `-`, at most 15 ASCII digits (safely inside 2^53). */
+function wbaParseInteger(s, i) {
+  let j = i;
+  if (j < s.length && s[j] === '-') j += 1;
+  let k = j;
+  while (k < s.length && s[k] >= '0' && s[k] <= '9') k += 1;
+  if (k === j || (k - j) > 15) return null;
+  return [parseInt(s.slice(i, k), 10), k];
+}
+
+/** The only parameter value types in this profile: sf-string and sf-integer. */
+function wbaParseBareItem(s, i) {
+  if (i < s.length && s[i] === '"') return wbaParseSfString(s, i);
+  return wbaParseInteger(s, i);
+}
+
+/** `*( ";" *SP key [ "=" bare-item ] )`. A repeated name is REFUSED rather than
+ *  last-wins; a valueless parameter is boolean true. */
+function wbaParseParams(s, i) {
+  const params = new Map();
+  while (i < s.length && s[i] === ';') {
+    i += 1;
+    while (i < s.length && s[i] === ' ') i += 1;
+    const gotKey = wbaParseKey(s, i);
+    if (gotKey === null) return null;
+    const name = gotKey[0];
+    i = gotKey[1];
+    if (params.has(name)) return null;
+    if (i < s.length && s[i] === '=') {
+      const val = wbaParseBareItem(s, i + 1);
+      if (val === null) return null;
+      params.set(name, val[0]);
+      i = val[1];
+    } else {
+      params.set(name, true);
+    }
+  }
+  return [params, i];
+}
+
+/** The covered components: `"(" *SP [ sf-string *( 1*SP sf-string ) *SP ] ")"`.
+ *  Per-item parameters are refused — they change what a component MEANS, and a profile
+ *  that does not implement them must not silently ignore them. */
+function wbaParseInnerList(s, i) {
+  if (i >= s.length || s[i] !== '(') return null;
+  i += 1;
+  const items = [];
+  for (;;) {
+    while (i < s.length && s[i] === ' ') i += 1;
+    if (i >= s.length) return null;
+    if (s[i] === ')') return [items, i + 1];
+    const got = wbaParseSfString(s, i);
+    if (got === null) return null;
+    i = got[1];
+    if (i < s.length && s[i] !== ' ' && s[i] !== ')') return null;  // incl. ';' per-item
+    items.push(got[0]);
+  }
+}
+
+function wbaSkipOws(s, i) {
+  while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i += 1;
+  return i;
+}
+
+/** Parse a `Signature-Input` value into entries, PRESERVING the raw text of each
+ *  entry's value — RFC 9421 signs that text, so rebuilding it from the parsed
+ *  structure would only work for peers who serialize exactly as we do. */
+function wbaParseSignatureInput(value) {
+  const s = value;
+  const n = s.length;
+  let i = wbaSkipOws(s, 0);
+  if (i >= n) return null;
+  const entries = [];
+  for (;;) {
+    const gotKey = wbaParseKey(s, i);
+    if (gotKey === null) return null;
+    const label = gotKey[0];
+    i = gotKey[1];
+    if (i >= n || s[i] !== '=') return null;
+    i += 1;
+    const start = i;
+    const gotList = wbaParseInnerList(s, i);
+    if (gotList === null) return null;
+    const components = gotList[0];
+    i = gotList[1];
+    const gotParams = wbaParseParams(s, i);
+    if (gotParams === null) return null;
+    const params = gotParams[0];
+    i = gotParams[1];
+    entries.push({ label, components, params, signatureParams: s.slice(start, i) });
+    i = wbaSkipOws(s, i);
+    if (i >= n) return entries;
+    if (s[i] !== ',') return null;
+    i = wbaSkipOws(s, i + 1);
+    if (i >= n) return null;                 // trailing comma
+  }
+}
+
+/** Parse a `Signature` value: `label=:<standard base64>:` entries. */
+function wbaParseSignature(value) {
+  const s = value;
+  const n = s.length;
+  let i = wbaSkipOws(s, 0);
+  if (i >= n) return null;
+  const out = [];
+  for (;;) {
+    const got = wbaParseKey(s, i);
+    if (got === null) return null;
+    const label = got[0];
+    i = got[1];
+    if (i + 1 >= n || s[i] !== '=' || s[i + 1] !== ':') return null;
+    i += 2;
+    const end = s.indexOf(':', i);
+    if (end < 0) return null;
+    const b64 = s.slice(i, end);
+    if (!WBA_B64_STANDARD.test(b64) || b64.length % 4 !== 0) return null;
+    const raw = Buffer.from(b64, 'base64');
+    i = end + 1;
+    if (i < n && s[i] === ';') return null;   // parameters on a signature member
+    out.push([label, raw]);
+    i = wbaSkipOws(s, i);
+    if (i >= n) return out;
+    if (s[i] !== ',') return null;
+    i = wbaSkipOws(s, i + 1);
+    if (i >= n) return null;
+  }
+}
+
+/** The `(Signature-Input, Signature)` pair as verifiable entries, or null. Duplicate
+ *  labels, a label present in one header but not the other, and every unexpected byte
+ *  return null — each is a case where two implementations could disagree about what
+ *  was signed. Never throws. */
+function wbaParseSignatureHeaders(sigInput, sig) {
+  try {
+    if (typeof sigInput !== 'string' || typeof sig !== 'string') return null;
+    if (sigInput.length > WBA_MAX_HEADER_CHARS || sig.length > WBA_MAX_HEADER_CHARS) {
+      return null;
+    }
+    const entries = wbaParseSignatureInput(sigInput);
+    const sigs = wbaParseSignature(sig);
+    if (entries === null || sigs === null) return null;
+    const labels = entries.map((e) => e.label);
+    if (new Set(labels).size !== labels.length) return null;
+    const byLabel = new Map();
+    for (const [label, raw] of sigs) {
+      if (byLabel.has(label)) return null;
+      byLabel.set(label, raw);
+    }
+    if (byLabel.size !== labels.length) return null;
+    for (const label of labels) { if (!byLabel.has(label)) return null; }
+    for (const e of entries) e.sig = byLabel.get(e.label);
+    return entries;
+  } catch {
+    return null;
+  }
+}
+
+/** Case-insensitive header lookup over a plain mapping. A non-string value (an array,
+ *  a number) reads as absent, never coerced. */
+function wbaHeaderGet(headers, name) {
+  if (!headers || typeof headers !== 'object') return null;
+  for (const key of Object.keys(headers)) {
+    if (asciiLower(key) === name) {
+      const v = headers[key];
+      return typeof v === 'string' ? v : null;
+    }
+  }
+  return null;
+}
+
+/** The 32 raw key bytes of an Ed25519 OKP JWK, or null — the strict gate every
+ *  untrusted key passes through (mirrors shared/webbotauth.public_from_jwk). */
+function wbaPublicFromJwk(jwk) {
+  try {
+    if (!jwk || typeof jwk !== 'object' || Array.isArray(jwk)) return null;
+    if (jwk.kty !== 'OKP' || jwk.crv !== 'Ed25519') return null;
+    const x = jwk.x;
+    if (typeof x !== 'string') return null;
+    if (!WBA_B64URL.test(x) || x.length % 4 === 1) return null;
+    const raw = Buffer.from(x, 'base64url');
+    return raw.length === 32 ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+/** RFC 7638 thumbprint of an Ed25519 public key — the `keyid` on the wire. Built from
+ *  the CANONICAL re-encoding of the key bytes, so a differently-spelled (but valid) `x`
+ *  still names the same key. The literal member order crv,kty,x IS Python's
+ *  sort_keys+compact form (x is base64url, so no JSON escaping can differ). */
+function wbaThumbprint(publicRaw) {
+  const payload = `{"crv":"Ed25519","kty":"OKP","x":"${publicRaw.toString('base64url')}"}`;
+  return createHash('sha256').update(payload, 'utf8').digest('base64url');
+}
+
+/** Resolve each covered component to the value to re-sign over, or null. `@authority`
+ *  comes from the VERIFIER (our canonical baseUrl) — never from the message; every
+ *  other derived component is refused; header values are stripped with Python's set. */
+function wbaComponentValues(components, authority, headers) {
+  const out = [];
+  const seen = new Set();
+  for (const name of components) {
+    if (typeof name !== 'string' || name !== asciiLower(name) || seen.has(name)) {
+      return null;
+    }
+    seen.add(name);
+    if (name === '@authority') {
+      out.push([name, authority]);
+    } else if (name.startsWith('@')) {
+      return null;
+    } else {
+      const value = wbaHeaderGet(headers, name);
+      if (value === null) return null;
+      out.push([name, wbaPyStrip(value)]);
+    }
+  }
+  return out;
+}
+
+/** The exact bytes covered by the signature (RFC 9421 §2.5): one `"name": value` line
+ *  per component, then `"@signature-params": <received text>`, LF-joined, no trailing
+ *  newline. */
+function wbaSignatureBase(pairs, paramsText) {
+  const lines = pairs.map(([name, value]) => `${wbaSfString(asciiLower(name))}: ${value}`);
+  lines.push(`${wbaSfString('@signature-params')}: ${paramsText}`);
+  return Buffer.from(lines.join('\n'), 'utf8');
+}
+
+/** One parsed entry, checked end to end against one key. Order matters only for cost:
+ *  the cheap policy checks run before the Ed25519 verification. */
+function wbaEntryVerifies(entry, { keyid, publicRaw, authority, headers, now }) {
+  const params = entry.params;
+  if (params.get('keyid') !== keyid || params.get('tag') !== WBA_TAG_REQUEST) return false;
+  const alg = params.get('alg');
+  if (alg !== undefined && alg !== WBA_ALG) return false;
+  const created = params.get('created');
+  const expires = params.get('expires');
+  if (!Number.isInteger(created) || !Number.isInteger(expires)) return false;
+  if (created > now + WBA_CLOCK_SKEW || now >= expires) return false;
+  if (expires <= created || (expires - created) > WBA_MAX_REQUEST_LIFETIME) return false;
+  const components = entry.components || [];
+  // Without @authority the signature says nothing about WHERE it was served.
+  if (!components.includes('@authority')) return false;
+  const pairs = wbaComponentValues(components, authority, headers);
+  if (pairs === null) return false;
+  return verifyBytes(publicRaw, entry.sig, wbaSignatureBase(pairs, entry.signatureParams));
+}
+
+/** The DID that signed this inbound request, or null. Never throws. `jwks` is a
+ *  directory document ({keys:[…]}) already established as trustworthy — who the keys
+ *  belong to was decided before this was called (DECISION 2: keys are GIVEN, never
+ *  fetched on the hot path). Mirrors shared/webbotauth.verify_request exactly;
+ *  testdata/wba_vectors.json holds the two to one verdict per input. */
+export function wbaVerifyRequest(headers, { authority, jwks, now } = {}) {
+  try {
+    const entries = wbaParseSignatureHeaders(
+      wbaHeaderGet(headers, 'signature-input') || '',
+      wbaHeaderGet(headers, 'signature') || '');
+    if (!entries || !entries.length) return null;
+    const keys = (jwks && typeof jwks === 'object' && !Array.isArray(jwks))
+      ? jwks.keys : null;
+    if (!Array.isArray(keys)) return null;
+    const auth = wbaPyStrip(String(authority || '')).toLowerCase();
+    if (!auth) return null;
+    const moment = Math.floor(
+      (now === undefined || now === null) ? Date.now() / 1000 : now);
+    for (const jwk of keys) {
+      const publicRaw = wbaPublicFromJwk(jwk);
+      if (publicRaw === null) continue;
+      const keyid = wbaThumbprint(publicRaw);
+      for (const entry of entries) {
+        if (wbaEntryVerifies(entry, { keyid, publicRaw, authority: auth,
+                                      headers, now: moment })) {
+          return didFromPublicKeyHex(publicRaw);
+        }
+      }
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
 
@@ -1486,6 +1938,13 @@ export function canonicalMount(canonUrl, basePath) {
  *                  oracle. Signed senders are not rate-bound here: they are attributable,
  *                  and every one of them is already in the ledger.
  *   anonRatePerMin anonymous replies per minute for the WHOLE agent entry (default 30).
+ *   wbaVerifiers   OPTIONAL inbound Web Bot Auth (T107): a JWKS document {keys:[…]} of
+ *                  Ed25519 keys whose holders this entry should RECOGNISE — the body of
+ *                  a key directory you verified out of band. Absent (the default) the
+ *                  feature is entirely off: no header is read, bytes are unchanged.
+ *                  Recognition only ever ADDS identity (env.wba_did, the wbaVisits
+ *                  count); it never changes verified, a ledger row, a rate lane or any
+ *                  refusal verdict.
  */
 export function createAgentEntry({
   seedHex,
@@ -1501,6 +1960,7 @@ export function createAgentEntry({
   domains = null,
   basePath = null,
   maxAccounts = 50000,
+  wbaVerifiers = null,
 } = {}) {
   if (!seedHex) throw new TypeError('createAgentEntry: seedHex is required');
   if (!baseUrl) throw new TypeError('createAgentEntry: baseUrl is required (it is signed into the card)');
@@ -1542,17 +2002,133 @@ export function createAgentEntry({
   const cardBytes = Buffer.from(JSON.stringify(card), 'utf8');   // identical bytes on both paths
   // ACCOUNT DID -> {first_seen, last_seen, messages}. Keyed by the RESOLVED account (T102):
   // the OWNER DID when a valid v2 binding rides along, else the device DID — so an owner's
-  // sibling devices are ONE customer row.
+  // sibling devices are ONE customer row. The entry never reads it back to gate, greet, or
+  // rate-limit, so it runs fine unpersisted — but keeping it in the site's own store is
+  // RECOMMENDED: it is the customer list (recognise a returning account, contact it again
+  // later). An analytics sink records visits too, but can never be read back.
   const ledger = new Map();
   // device DID -> owner DID, the in-process TOFU pin (T102). The first VALID binding pins a
   // device to its owner; a later binding for the same device naming a DIFFERENT owner is
-  // refused. Per-process on purpose for v1.5 — a real site PERSISTS this (and the fold), or
-  // the conflict rule resets to trust-on-first-use every restart.
+  // refused. Per-process on purpose for v1.5 — persisting it (and the fold) is RECOMMENDED,
+  // not required: without it the conflict rule resets to trust-on-first-use every restart.
+  // Unlike the ledger it is READ on every message, so only a real store can carry it.
   const deviceOwner = new Map();
   const replay = new ReplayGuard();
   const anonRate = new RateBound(anonRatePerMin);
   let sigEnvelope = null;
   let sigMintedAt = 0;
+
+  // T107: inbound Web Bot Auth, verify-only, against keys GIVEN at construction — the
+  // entry never fetches a directory on the hot path (network-free while answering).
+  // Refuse-to-start posture, house style: a key the entry can never match is config the
+  // operator believes protects them and does not.
+  let wbaKeys = null;
+  let wbaAuthority = null;
+  // DID -> count of WBA-verified GET/HEAD fetches. DECISION 1: a signed GET IDENTIFIES
+  // but never ENROLS — a crawler fetching 10,000 pages mints zero ledger rows; this
+  // count is bounded by the configured key list, never by attacker choice. Exposed on
+  // the returned object like `ledger` (in-process sample state, never on the wire).
+  const wbaVisits = new Map();
+  if (wbaVerifiers !== null && wbaVerifiers !== undefined) {
+    const keys = (wbaVerifiers && typeof wbaVerifiers === 'object'
+      && !Array.isArray(wbaVerifiers)) ? wbaVerifiers.keys : null;
+    if (!Array.isArray(keys) || keys.length === 0) {
+      throw new TypeError('createAgentEntry: wbaVerifiers must be a JWKS document '
+        + '{keys:[…]} — the key-directory body you verified out of band');
+    }
+    if (keys.length > 64) {
+      throw new TypeError(`createAgentEntry: wbaVerifiers holds ${keys.length} keys — `
+        + 'more than 64 is not a verifier list, it is a directory dump');
+    }
+    keys.forEach((jwk, i) => {
+      if (wbaPublicFromJwk(jwk) === null) {
+        throw new TypeError(`createAgentEntry: wbaVerifiers.keys[${i}] is not an `
+          + 'Ed25519 OKP JWK (kty "OKP", crv "Ed25519", x = unpadded base64url of '
+          + '32 bytes)');
+      }
+    });
+    wbaKeys = { keys: keys.map((k) => ({ kty: k.kty, crv: k.crv, x: k.x })) };
+    // @authority derives from the CANONICAL baseUrl, NEVER a Host header — a header a
+    // client can set is not a fact about where we were reached. canonUrl already
+    // lowercased the host and stripped the scheme's default port, so URL.host IS the
+    // RFC 9421 authority (shared/webbotauth.authority_of computes the same string).
+    wbaAuthority = new URL(canonUrl).host;
+  }
+
+  /** The WBA-verified caller DID for this request's headers, or null. Total on hostile
+   *  input; costs one keyid comparison per configured key and an Ed25519 verify only on
+   *  a keyid match. */
+  function wbaIdentify(headers) {
+    if (!wbaKeys) return null;
+    return wbaVerifyRequest(headers, { authority: wbaAuthority, jwks: wbaKeys });
+  }
+
+  function wbaObserve(headers) {
+    const did = wbaIdentify(headers);
+    if (did) wbaVisits.set(did, (wbaVisits.get(did) || 0) + 1);
+  }
+
+  // family -> stage -> count. OBSERVATION ONLY, and out-of-contract sample state like the
+  // ledger's row shape: `stats()` is how a site owner sees who is knocking, it is never
+  // served on the wire (a stats route would be new unauthenticated surface leaking traffic
+  // composition to any stranger). Keyspace bounded by the fixed UA_FAMILIES table times
+  // five stage names — an attacker choosing UA strings cannot grow it.
+  const uaStats = new Map();
+
+  function tally(family, stage) {
+    let row = uaStats.get(family);
+    if (!row) { row = new Map(); uaStats.set(family, row); }
+    row.set(stage, (row.get(stage) || 0) + 1);
+  }
+
+  /** A plain JSON-able copy of the counters: { family: { stage: n } }. */
+  function stats() {
+    const out = {};
+    for (const [family, row] of uaStats) {
+      out[family] = {};
+      for (const [stage, n] of row) out[family][stage] = n;
+    }
+    return out;
+  }
+
+  /** The steering header for the notice route, or nothing. AI-agent families get a
+   *  signpost to the machine-readable door; a browser or curl gets the same bytes it
+   *  always got. HEADER-ONLY on purpose: the notice BODY is byte-identical for every
+   *  caller, so observation stays invisible on the wire except for this one additive
+   *  header — and `rel="service-desc"` is RFC 8631's registered relation for exactly
+   *  this ("service description … primarily intended for consumption by machines"). */
+  function steerHeaders(family) {
+    if (!AI_AGENT_FAMILIES.has(family)) return {};
+    return { Link: `<${mount}${AGENT_CARD_PATH}>; rel="service-desc"` };
+  }
+
+  /** Which stage a finished POST was, from OBSERVABLES only — the request bytes and the
+   *  response we are about to return — so the refusal ladder in `handlePost` stays
+   *  byte-untouched by observation. A signed reply whose REQUEST carried metadata.sig is
+   *  a signed_post; a signed reply for a request without one is the anonymous lane; every
+   *  other outcome (413/400/any JSON-RPC error) is refused_post. Must decide identically
+   *  to `_post_stage` in examples/agent_entry_reference.py. */
+  function postStage(bodyBuffer, out) {
+    let signedReplyOut = false;
+    try {
+      const body = JSON.parse(out.body.toString('utf8'));
+      const result = (body && typeof body === 'object') ? body.result : null;
+      const meta = (result && typeof result === 'object') ? result.metadata : null;
+      signedReplyOut = Boolean(meta && typeof meta === 'object' && typeof meta.sig === 'string');
+    } catch { signedReplyOut = false; }
+    if (!signedReplyOut) return 'refused_post';
+    let hadSig = false;
+    try {
+      const req = JSON.parse(bodyBuffer.toString('utf8'));
+      const params = (req && typeof req === 'object' && !Array.isArray(req)) ? req.params : null;
+      const msg = (params && typeof params === 'object' && !Array.isArray(params))
+        ? params.message : null;
+      const meta = (msg && typeof msg === 'object' && !Array.isArray(msg)) ? msg.metadata : null;
+      hadSig = Boolean(meta && typeof meta === 'object'
+        && typeof meta.sig === 'string' && meta.sig);
+    } catch { hadSig = false; }
+    return hadSig ? 'signed_post' : 'anon_post';
+  }
 
   /** The signed card, re-minted at most hourly. A CONSUMER REJECTS AN ENVELOPE OLDER THAN
    *  6h (and one dated in the FUTURE), so this is a freshness window, not a cache tweak:
@@ -1662,7 +2238,7 @@ export function createAgentEntry({
   /** The FROZEN backend-handoff shape (agent/webhookwake.py::_envelope). The site's own
    *  code consumes this, so the key set must not drift: a webhook push, a drive-API read
    *  and an agent entry callback all parse with ONE schema. */
-  function backendEnvelope(msg, { verified, peerDid, ownerDid = null }) {
+  function backendEnvelope(msg, { verified, peerDid, ownerDid = null, wbaDid = null }) {
     const meta = msg.metadata || {};
     return {
       to_agent: name,
@@ -1674,6 +2250,12 @@ export function createAgentEntry({
       // belongs to an owner, else null. `peer_did` STAYS the device that signed; sibling
       // devices share one owner_did, which is how a merchant reads them as one account.
       owner_did: ownerDid,
+      // T107: the DID whose Web Bot Auth signature covered this REQUEST's transport
+      // (@authority + signature-agent), or null. TRANSPORT-LEVEL identification only: it
+      // does not prove the DID wrote `text` — `verified`/`peer_did` do that — and a WBA
+      // header set is replayable until it expires, so it must never be read as
+      // authorship. Additive; null whenever no verifier is configured.
+      wba_did: wbaDid,
       peer_name: null,
       context_id: msg.contextId ?? null,
       text: messageText(msg),
@@ -1721,7 +2303,7 @@ export function createAgentEntry({
    * size checks come BEFORE any parsing or crypto — a check placed after the signature is
    * a check the attacker simply skips.
    */
-  function handlePost(rawBody) {
+  function handlePost(rawBody, reqHeaders) {
     // RAW BYTES, always. A host app that hands us a decoded string has already destroyed
     // the evidence the strict decode below exists to find, so normalise once and measure
     // the SIZE in bytes rather than in UTF-16 code units.
@@ -1826,8 +2408,13 @@ export function createAgentEntry({
       if (!replay.checkAndRemember(msg.messageId)) {
         return rpcError(reqId, ERRORS.REPLAY_REJECTED, 'duplicate messageId (replay) detected');
       }
-      return respond(backendEnvelope(msg, { verified: false, peerDid: null }),
-        reqId, msg, '');
+      // T107: the interesting case — an anonymous inquiry whose TRANSPORT a known key
+      // signed. `verified` STAYS false (the WBA signature covers @authority +
+      // signature-agent, not the text), no ledger row is minted (the header set is a
+      // bearer credential and replayable while it lives), and the anon rate bound
+      // above already applied. Identify, don't enrol.
+      return respond(backendEnvelope(msg, { verified: false, peerDid: null,
+        wbaDid: wbaIdentify(reqHeaders) }), reqId, msg, '');
     }
     // 5. addressed to someone else. Checked BEFORE decoding `from`, so a junk DID in a
     //    misaddressed message never reaches the base58 decoder.
@@ -1874,8 +2461,10 @@ export function createAgentEntry({
     const ownerDid = account !== from ? account : null;
 
     noteContact(account);
-    return respond(backendEnvelope(msg, { verified: true, peerDid: from, ownerDid }),
-      reqId, msg, from);
+    // T107: `wba_did` may legitimately differ from `peer_did` (the transport signer vs
+    // the message signer) — both facts are honest, and the schema says which is which.
+    return respond(backendEnvelope(msg, { verified: true, peerDid: from, ownerDid,
+      wbaDid: wbaIdentify(reqHeaders) }), reqId, msg, from);
   }
 
   function respond(env, reqId, msg, toDid) {
@@ -1904,7 +2493,10 @@ export function createAgentEntry({
     return pathname === mount || pathname === `${mount}/`;
   }
 
-  function route(method, path, bodyBuffer) {
+  function route(method, path, bodyBuffer, headers) {
+    // Classified ONCE per request, used only to count and to signpost. Everything the
+    // ladder decides is decided exactly as if this line did not exist.
+    const family = uaFamily(uaOf(headers));
     const target = String(path || '/');
     // ORIGIN FORM ONLY, and SAY SO. HTTP/1.1 lets a client write the request-target in
     // absolute form (`POST http://elsewhere.example/support HTTP/1.1`) and RFC 9112 §3.2.2
@@ -1924,13 +2516,21 @@ export function createAgentEntry({
     if (method === 'GET' || method === 'HEAD') {
       if (pathname === mount + AGENT_CARD_PATH || pathname === mount + AGENT_CARD_PATH_LEGACY) {
         // Byte-identical on both paths: the current A2A path and the legacy alias.
+        tally(family, 'card_get');
+        // T107: identify (count), never enrol, never change a byte. Runs only after a
+        // route MATCHED, so refused/404 paths never pay for crypto.
+        wbaObserve(headers);
         return { status: 200, headers: cardHeaders(cardBytes.length), body: cardBytes };
       }
       if (pathname === mount + AGENT_CARD_SIG_PATH) {
         const env = cardEnvelopeBytes();
+        tally(family, 'card_get');
+        wbaObserve(headers);
         return { status: 200, headers: cardHeaders(env.length), body: env };
       }
       if (isMountPath(pathname)) {
+        tally(family, 'notice_get');
+        wbaObserve(headers);
         const body = Buffer.from(
           // "This ADDRESS", not "this origin": once an entry can be mounted under a
           // path, the origin may hold several agents and this notice speaks for exactly
@@ -1941,7 +2541,10 @@ export function createAgentEntry({
           'utf8');
         return { status: 200,
           headers: { 'Content-Type': 'text/plain; charset=utf-8',
-            'Content-Length': String(body.length) },
+            'Content-Length': String(body.length),
+            // The ONE wire-visible thing observation adds: an AI-agent UA is pointed at
+            // the machine-readable door. The body above is byte-identical either way.
+            ...steerHeaders(family) },
           body };
       }
       return jsonResponse(404, { error: 'not found' });
@@ -1951,7 +2554,15 @@ export function createAgentEntry({
       // and when this entry is mounted under a path, "anywhere else" INCLUDES the bare
       // host, which belongs to the site (or to the neighbour agent) and not to us.
       if (!isMountPath(pathname)) return jsonResponse(404, { error: 'not found' });
-      return handlePost(bodyBuffer || Buffer.alloc(0));
+      const buf = bodyBuffer || Buffer.alloc(0);
+      const out = handlePost(buf, headers);
+      // The stage is read off the finished answer, so an async responder tallies when it
+      // resolves. Known micro-skew, accepted: in the misconfigured sync-caller-with-async-
+      // responder case `handleRequest` replaces the thenable with -32603 AFTER this wrap,
+      // so a stage is tallied for a reply that was then replaced. Sample state only.
+      if (isThenable(out)) return out.then((o) => { tally(family, postStage(buf, o)); return o; });
+      tally(family, postStage(buf, out));
+      return out;
     }
     if (method === 'OPTIONS') {
       return { status: 204,
@@ -1975,7 +2586,7 @@ export function createAgentEntry({
    *  If `responder` returned a Promise, this answers -32603 rather than serializing
    *  "[object Promise]" into a signed reply — use `handleRequestAsync` for an async responder. */
   function handleRequest(method, path, headers, bodyBuffer) {
-    const out = route(method, path, bodyBuffer);
+    const out = route(method, path, bodyBuffer, headers);
     if (isThenable(out)) {
       return rpcError(null, ERRORS.INTERNAL_ERROR,
         'responder is async — serve this agent entry through listen()/handleRequestAsync()');
@@ -1985,7 +2596,7 @@ export function createAgentEntry({
 
   /** Same contract, awaiting an async responder. This is what `listen()` uses. */
   async function handleRequestAsync(method, path, headers, bodyBuffer) {
-    return route(method, path, bodyBuffer);
+    return route(method, path, bodyBuffer, headers);
   }
 
   /**
@@ -2063,7 +2674,10 @@ export function createAgentEntry({
 
   // `mount` is exported so a host app can route exactly what this entry answers (and log
   // it): it is derived, so reading it here can never disagree with the signed card.
-  return { did, card, ledger, mount, handleRequest, handleRequestAsync, listen,
+  // `stats` is the owner-facing UA-family counters and `wbaVisits` the DID->count of
+  // WBA-verified fetches — both in-process only, like `ledger`.
+  return { did, card, ledger, mount, stats, wbaVisits,
+    handleRequest, handleRequestAsync, listen,
     cardEnvelope: () => JSON.parse(cardEnvelopeBytes().toString('utf8')) };
 }
 
