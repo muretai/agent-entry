@@ -4,7 +4,7 @@
  *
  * **This is a usage SAMPLE, not part of core Muretai.** It adds nothing to the protocol:
  * it only wires the public primitive `createAgentEntry()` from
- * `web/agent-entry/muretai-agent-entry.mjs` to a demo booking desk. Copy it, gut the responder,
+ * `muretai-agent-entry.mjs` to a demo booking desk. Copy it, gut the responder,
  * point it at your backend — core stays byte-unchanged.
  *
  * Run it:
@@ -33,6 +33,12 @@
  *   AGENT_ENTRY_NAME       public display name on the card
  *   AGENT_ENTRY_HOST       bind address (default 127.0.0.1 — set 0.0.0.0 only behind TLS)
  *   AGENT_ENTRY_ANON       "1" also accepts UNSIGNED walk-in inquiries (they mint no account)
+ *   AGENT_ENTRY_GUEST      "1" = GUEST MOUNT: coexist with a site that keeps its own front
+ *                       page. The entry serves its card paths and the POST door named by
+ *                       AGENT_ENTRY_BASE_URL (which must then carry that path, e.g.
+ *                       https://example.com/agent) and answers NOTHING at `/` — no notice,
+ *                       no OPTIONS, no POST. Point your proxy at the door path and the
+ *                       well-known paths; the site keeps everything else, unchanged.
  *   AGENT_ENTRY_WBA_JWKS   OPTIONAL: a JWKS document {"keys":[…]} as one JSON string —
  *                       the Web Bot Auth key directory (verified out of band) whose
  *                       holders this entry should RECOGNISE on inbound requests. Off
@@ -137,6 +143,7 @@ try {
     responder,
     openDoor: true,                                     // "you may contact me, no introduction"
     anonymousLane: process.env.AGENT_ENTRY_ANON === '1',
+    guest: process.env.AGENT_ENTRY_GUEST === '1',
     wbaVerifiers,
   });
 } catch (err) {
@@ -154,6 +161,10 @@ const server = entry.listen(port, host, () => {
   }
   console.log(`  Listening on ${host}:${port} — POST a signed message/send to `
     + `${entry.mount || '/'}`);
+  if (process.env.AGENT_ENTRY_GUEST === '1') {
+    console.log(`  Guest mount: the site keeps GET / — this entry answers the card at `
+      + `${AGENT_CARD_PATH} (and under ${entry.mount}) and POST ${entry.mount} only`);
+  }
 });
 
 // The observation counters, surfaced the way the ledger is: on this runner's stdout,

@@ -65,6 +65,198 @@ export const AGENT_CARD_PATH = '/.well-known/agent-card.json';
 export const AGENT_CARD_PATH_LEGACY = '/.well-known/agent.json';
 export const AGENT_CARD_SIG_PATH = '/.well-known/agent-card.sig.json';
 
+/** The name of the ONE way in this door accepts today — the card's `securitySchemes` key,
+ *  its `type`, and the `scheme` of the refusal's `accepts[]` entry are all this string. The
+ *  card and the refusal MUST name the same scheme or a visitor learns one thing from the
+ *  menu and another from the door. Must match `SIGNED_ENVELOPE_SCHEME` in
+ *  examples/agent_entry_reference.py. */
+export const SIGNED_ENVELOPE_SCHEME = 'did-key-ed25519';
+
+/** The stable link relation that names an agent door, emitted on the notice route (and the
+ *  one line a SITE adds to its own front page to coexist with an entry — see
+ *  docs/AGENT_ENTRY.md). An ABSOLUTE URI on purpose: RFC 8288 §2.1.2 allows a bare token
+ *  only for an IANA-registered relation, so `rel="agent-entry"` would be non-conformant and
+ *  a strict parser is entitled to drop it. Must match `AGENT_ENTRY_REL` in
+ *  examples/agent_entry_reference.py. */
+export const AGENT_ENTRY_REL = 'https://muretai.net/rel/agent-entry';
+
+/** Where a keyless visitor is sent to learn how to mint an identity and sign. It rides in
+ *  the card AND in the refusal, so an agent that has only one of the two still has the URL.
+ *
+ *  EMPTY MEANS OMITTED, and that is the safe default. NEVER EMIT A URL THAT DOES NOT
+ *  RESOLVE: a real third-party agent (2026-08-18 proof run) received the complete
+ *  requirement object, printed every field of it, went straight to `howTo`, hit a 404 and
+ *  stopped — "since the provided 'howTo' link is broken, I have no way to get this
+ *  information" — while holding `identity`, `signedFields`, `canonicalization`,
+ *  `signature`, `timestamp` and `recipient` in the object it had just printed. A dangling
+ *  pointer OUT-COMPETES the data beside it and reads as terminal. So the field is emitted
+ *  only when this constant is set, and it is set only AFTER the page is live: ship the page
+ *  first, or ship no pointer. Verified live before this value was set (200 at the URL
+ *  below, 404 at a control path under the same prefix); `entry-howto-resolves` in
+ *  .claude/skills/ship-check/checks.py re-checks it on every ship report. Must match
+ *  `FIRST_KNOCK_URL` in examples/agent_entry_reference.py. */
+export const FIRST_KNOCK_URL = 'https://docs.muretai.com/guides/first-knock/';
+
+/** `Allow:` per RESOURCE, not per server. RFC 9110 §10.2.1 makes `Allow` a statement about
+ *  the target resource, and §15.5.6 REQUIRES it on a 405 — a generic list is a wrong answer
+ *  to a right question, and on a guest mount it would also claim verbs on addresses the SITE
+ *  owns. HEAD is listed wherever GET is (RFC 9110 §9.3.2 makes it mandatory alongside GET,
+ *  and both twins have always answered it). Wherever `Allow` is emitted,
+ *  `Access-Control-Allow-Methods` is set to the SAME value (`allowHeaders`) — the two are
+ *  one fact for two readers, and a response carrying `Allow: POST, OPTIONS` beside the
+ *  origin-wide `Access-Control-Allow-Methods: GET, POST, OPTIONS` contradicts itself in one
+ *  message. Everywhere else (a card GET, a signed reply, a 404) the CORS default stands.
+ *  Must match the `ALLOW_*` constants in examples/agent_entry_reference.py. */
+export const ALLOW_CARD = 'GET, HEAD, OPTIONS';
+/** A guest mount's door: the entry owns the POST and nothing else there. */
+export const ALLOW_DOOR = 'POST, OPTIONS';
+/** A site-owning mount: ONE address that is both the human notice (GET) and the door (POST),
+ *  so the truthful Allow is the union — listing only the GET half would hide the very door
+ *  the card names. */
+export const ALLOW_MOUNT = 'GET, HEAD, POST, OPTIONS';
+
+/**
+ * The machine-readable terms of THIS door, in one object used on BOTH surfaces: the card's
+ * `securitySchemes` entry (before the knock) and the `accepts[]` array of the no-envelope
+ * refusal (after it). One object, two surfaces, so the two can never drift apart — the
+ * property a visitor's test can assert without knowing what the scheme string is.
+ *
+ * The shape is x402's lesson turned into an identity vocabulary: a refusal that is the
+ * SPECIFICATION of what to do next, as an ARRAY so "sign", "arrive with an introduction"
+ * and later "pay" are siblings in one frame rather than three bespoke refusals.
+ *
+ * Everything a keyless visitor needs is here on purpose — the acceptance bar is that an
+ * agent holding ONLY this object, plus the crypto tooling on any machine, can mint a
+ * did:key, sign correctly and be answered on its NEXT post. That is why `recipient` is
+ * present (nobody can address a message without it) and why the canonicalization rule is
+ * spelled out rather than merely named.
+ *
+ * IT IS WRITTEN IN THE IMPERATIVE, and that is the fix a proof run bought (2026-08-18).
+ * Every field above was already correct and complete, and a real third-party agent read
+ * them, restated them accurately, and STOPPED: "since I don't have a way to generate
+ * cryptographic keys within this environment, I am stuck" — with `node` and `python3`
+ * both installed. A requirement object that describes a FORMAT tells a keyless visitor
+ * what it lacks; it does not tell it to ACT. So `instruction` leads with the sentence
+ * that unblocks a general-purpose agent — MAKE A KEY NOW, nobody's permission is needed,
+ * any crypto library will do — and every descriptive string below gained an imperative
+ * PREFIX. The old value of each is still a SUBSTRING of the new one, so a client that
+ * substring-matched on the format text keeps matching; no field was removed or renamed,
+ * and `howTo` is the only one whose presence is conditional (see FIRST_KNOCK_URL).
+ *
+ * IT TEACHES THE CARRIER AS WELL AS THE SIGNATURE, and that is the fix proof run 3 bought
+ * (2026-08-18, `exampleRequest`). The recipe was walked end to end — a third-party agent ran
+ * `identityCode`, minted a computed DID, signed the six canonical fields — and TWO runs were
+ * still refused, holding a correct key, a correct DID and correct signed bytes, on the A2A
+ * ENVELOPE: "not an A2A message object", "messageId must be a non-empty string". `in`
+ * ("params.message.metadata") plus six `signedFields` reads as "put these six in metadata",
+ * which is exactly what they built. One of them named the gap precisely: "the agent card is
+ * ambiguous on the precise nesting of messageId… This is a guess at a format, which goes
+ * against the rules." So the complete body a door accepts is emitted BESIDE `in` — the
+ * counter-example on the very next line of the object whose reading caused the mistake.
+ *
+ * `exampleRequest` IS A NESTED OBJECT, NOT A JSON STRING, and the choice is the same law
+ * again. A string of JSON arrives on the wire as `{\"jsonrpc\":\"2.0\",…}` — every quote
+ * escaped — and every agent in every proof run met this door through `curl`, i.e. reading
+ * the RAW response. An escaped document has to be UNESCAPED before it can be copied, which
+ * is one more transformation performed in the model's head, which is the precise failure
+ * mode base58-as-a-formula already cost two runs. A nested object IS the artifact: it
+ * renders as the thing to send, and `JSON.stringify(way.exampleRequest)` is a body. Nesting
+ * costs nothing here — the block already sits two levels deep under `securitySchemes`, and
+ * `signedFields` is already a non-string value, so no consumer needs a new capability.
+ *
+ * A copier fills FIVE `<…>` blanks (messageId, text, from, timestamp, sig); `to` is already
+ * this door's DID, `contextId` is already `null`, and `id`/`kind`/`role`/`parts` are already
+ * correct. `contextId: null` is deliberate and doubles as the answer to "what do I send when
+ * I have no conversation yet" — the same clause `canonicalization` now states in words.
+ *
+ * Must match `signed_envelope_requirement` in examples/agent_entry_reference.py field for
+ * field, string for string: the card and the refusal are one object, and two twins that
+ * teach a keyless visitor differently are two doors.
+ */
+export function signedEnvelopeRequirement(did) {
+  const requirement = {
+    scheme: SIGNED_ENVELOPE_SCHEME,
+    instruction: 'Generate an Ed25519 keypair NOW, locally, and knock again with it. You '
+      + 'need no account, no registration and no permission from this site: any crypto '
+      + 'library on the machine you are already running on will do (node:crypto '
+      + 'generateKeyPairSync("ed25519"), Python cryptography or PyNaCl, Go crypto/ed25519, '
+      + 'libsodium). Then work down the fields below in order - derive your did:key '
+      + '(identity), build the canonical bytes over signedFields (canonicalization), sign '
+      + 'them (signature), address the message to recipient with a fresh timestamp - and '
+      + 'POST the same request again. Having no key yet is the normal starting state, not '
+      + 'a refusal: minting one is step 1, and it is a few lines of code. The COMPLETE '
+      + 'request body to POST is exampleRequest below: copy it and fill in its five <...> '
+      + 'blanks. The A2A envelope AROUND your signature is checked too, so send that shape '
+      + 'and do not improvise one.',
+    in: 'params.message.metadata',
+    // THE CARRIER, not just the signature. `in` tells you where the six envelope fields go
+    // and says nothing about the message that carries them, and two proof-run agents read it
+    // as the whole answer: they put the six in `metadata` and were refused on the A2A object
+    // itself ("not an A2A message object", "messageId must be a non-empty string") while
+    // holding a correct key and correct signed bytes. This is the body, whole, next to the
+    // line that misled them. A NESTED OBJECT on purpose (see the note above): a JSON string
+    // of JSON arrives escaped, and an agent reading a raw curl response would have to
+    // unescape it in its head before it could copy it.
+    exampleRequest: {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'message/send',
+      params: {
+        message: {
+          kind: 'message',
+          role: 'user',
+          messageId: '<a fresh unique string, e.g. a UUID>',
+          // Already filled in, and it is the answer to "what if I have no conversation
+          // yet": null. It is still one of the six signed fields; never omit it.
+          contextId: null,
+          parts: [{ kind: 'text', text: '<your message>' }],
+          metadata: {
+            from: '<your did:key>',
+            to: did,
+            timestamp: '<integer epoch seconds - a JSON number, not this string>',
+            sig: '<base64 signature over the canonical six fields>',
+          },
+        },
+      },
+    },
+    recipient: did,
+    identity: 'Derive your DID from the public key you just generated and send it as '
+      + 'metadata.from: did:key:z + base58btc(0xed01 || <32-byte Ed25519 public key>)',
+    // RUN this, do not write the address by hand. Measured 2026-08-18: a real agent minted a
+    // correct keypair, then "converted" the bytes in its head and produced the DOOR'S OWN DID
+    // with two characters changed — three times — and signed correct bytes under an address
+    // that was never its own. base58btc was the one step in this recipe stated as a formula
+    // instead of made runnable, and it is exactly the step a language model fabricates.
+    identityCode: 'Run this; do not encode base58btc by hand. node, no packages, `pub` = the '
+      + '32 raw public-key bytes: '
+      + "const A='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'; "
+      + 'let n=0n; for (const b of Buffer.concat([Buffer.from([0xed,0x01]),pub])) '
+      + 'n=n*256n+BigInt(b); '
+      + "let s=''; while (n>0n) { s=A[Number(n%58n)]+s; n/=58n; } "
+      + "const did='did:key:z'+s;   // 0xed leads, so no leading-zero '1' case can arise",
+    signedFields: ['contextId', 'from', 'messageId', 'text', 'timestamp', 'to'],
+    // The trailing clause is proof run 3's third fix: the verifier has always signed
+    // `contextId ?? null`, and "exactly those six fields" never said what a visitor with no
+    // conversation yet is supposed to put there. One run spent an entire refusal deducing
+    // it. The previous value is still a PREFIX of this one, so a substring matcher on the
+    // format text keeps matching.
+    canonicalization: 'Build the bytes to sign as a JSON object of exactly those six '
+      + 'fields, keys sorted by Unicode code point, separators "," and ":", no whitespace, '
+      + 'non-ASCII literal, UTF-8. When you have no conversation yet, contextId is JSON '
+      + 'null - it is still one of the six and is still signed, so never omit it (see '
+      + 'exampleRequest, which already has it right)',
+    signature: 'Sign those bytes with your private key and set metadata.sig = base64 '
+      + '(standard alphabet, padded) of the 64-byte Ed25519 signature over those bytes',
+    timestamp: 'Set metadata.timestamp = integer epoch seconds, within 300 s of this '
+      + 'entry\'s clock',
+  };
+  // Emitted ONLY when it is known to resolve — an unresolvable pointer out-competes every
+  // field beside it (see FIRST_KNOCK_URL). Appended last so the object's other bytes and
+  // their positions do not move when a site turns the pointer off.
+  if (FIRST_KNOCK_URL) requirement.howTo = FIRST_KNOCK_URL;
+  return requirement;
+}
+
 /** The User-Agent FAMILY table — OBSERVATION AND SIGNPOSTING, NEVER IDENTITY. A UA string
  *  is written by the client, so nothing here may ever affect `verified`, a ledger row, a
  *  rate lane or any refusal verdict (that is the Web Bot Auth / signed-envelope layer's
@@ -1355,7 +1547,9 @@ function wireShapeError(msg) {
 
 /** Every response carries these. An agent entry reads NO cookie, header credential or session —
  *  authority comes only from an Ed25519 signature inside the body — so `*` grants a browser
- *  agent exactly what curl already had, and nothing more. Never add Allow-Credentials. */
+ *  agent exactly what curl already had, and nothing more. Never add Allow-Credentials.
+ *  `Access-Control-Allow-Methods` is the ORIGIN-WIDE default and is overridden per resource
+ *  on any response that also carries `Allow` (see `allowHeaders`). */
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -1929,6 +2123,15 @@ export function canonicalMount(canonUrl, basePath) {
  *                  /.well-known/did-configuration.json, and a verifier requires both halves.
  *   basePath       ONLY for a proxy that strips the prefix: '' or exactly baseUrl's path.
  *                  See canonicalMount for why this is not a general knob.
+ *   guest          GUEST MOUNT: the SITE keeps its own front page and this entry claims
+ *                  only its card paths and the POST door (default false). It requires a
+ *                  baseUrl WITH a path — the door — because a guest entry at a bare origin
+ *                  would claim `/`, which is the one thing this mode exists to give back.
+ *                  Three differences from the ordinary (site-owning) mount, and no others:
+ *                  the GET notice is not served (the entry never shadows a page the site
+ *                  owns), the card is ALSO served at the ORIGIN's well-known paths (where a
+ *                  stranger's agent looks — RFC 8615), and `Allow` on the door names POST
+ *                  only. `GET /` and `POST /` are not this entry's contract in this mode.
  *   responder      (envelope) => string | {text, contextId?, timestamp?} | Promise<…>
  *   openDoor       advertise `muretai.open_door` (default true) — the flag that tells a
  *                  visiting agent it may contact you without an introduction.
@@ -1959,6 +2162,7 @@ export function createAgentEntry({
   skills = [],
   domains = null,
   basePath = null,
+  guest = false,
   maxAccounts = 50000,
   wbaVerifiers = null,
 } = {}) {
@@ -1972,10 +2176,27 @@ export function createAgentEntry({
   // the signed card cannot disagree. '' for a bare origin — every route below is then the
   // byte-identical string this module always matched.
   const mount = canonicalMount(canonUrl, basePath);
+  const guestMount = Boolean(guest);
+  // A guest entry with NO path would claim the origin — `isMountPath('/')` is the door and
+  // the notice both — which is exactly the front page this mode exists to leave alone.
+  // Refuse to start rather than take it: an operator who asked for coexistence and silently
+  // got occupation finds out from their own home page.
+  if (guestMount && !mount) {
+    refuseBaseUrl(canonUrl, 'a guest mount needs a door path, and this url has none.',
+      'A guest entry leaves GET / to the site and answers at a path beside it, so the '
+      + 'address it publishes must name that path — the mount, the card url and the POST '
+      + 'door are then one string by construction. Give the door in baseUrl (the card names '
+      + 'it, so a visitor that read the card posts to the right place with no other '
+      + 'knowledge), or drop `guest` and let this entry own its origin.',
+      `${canonUrl}/agent`);
+  }
   // The agent half of a T88 domain binding. Refuses to start on anything that is not a
   // bare domain: a name the domain's credential can never bind is not worth publishing.
   const canonDomains = canonicalDomains(domains);
   const did = didFromSeedHex(seedHex);
+  // The terms of this door, built ONCE: the card publishes it (E1, before the knock) and
+  // the no-envelope refusal returns the same object (E2, after it).
+  const requirement = signedEnvelopeRequirement(did);
 
   const card = {
     protocolVersion: PROTOCOL_VERSION,
@@ -1998,6 +2219,41 @@ export function createAgentEntry({
   // Deliberately NO `relay`/`enc_pub` on the card: those advertise a store-and-forward
   // mailbox, and an agent entry has no listener draining one. Advertising a mailbox nobody
   // reads is worse than advertising none — mail would queue at the relay forever.
+  //
+  // THE DOOR'S TERMS, IN STANDARD A2A SHAPE (E1). `securitySchemes` + `security` are the
+  // fields A2A has for exactly this, and until now both were absent — so a card that
+  // advertised a skill said nothing at all about HOW to call it, and the only way to learn
+  // the requirement was to knock and be refused. That is the discovery step an HTTP-402
+  // style protocol structurally cannot have and a card CAN; publishing it is what turns the
+  // refusal below into a fallback instead of the only teacher.
+  //
+  // APPENDED LAST so every field an already-deployed entry publishes keeps its bytes AND
+  // its position. `type` is deliberately NOT one of OpenAPI's five: `http` would claim an
+  // `Authorization` header this door never reads, and a standard-but-wrong type makes a
+  // conformant client do the wrong thing, where an unknown one makes it read the block
+  // beside it. The scheme is named three times (key, `type`, `muretai.scheme`) and every
+  // spelling is the same string the refusal returns.
+  //
+  // The description is IMPERATIVE for the same reason the requirement object is: a real
+  // agent that started here read the terms, concluded correctly that it could not sign,
+  // and stopped — "the card does not offer an alternative communication method". A card
+  // that states a requirement and nothing about how to come to meet it is a locked door
+  // with the lock documented. The worked-example clause appears only when the page it
+  // names is known to resolve (see FIRST_KNOCK_URL); a 404 here would out-compete the
+  // block beside it.
+  card.securitySchemes = {
+    [SIGNED_ENVELOPE_SCHEME]: {
+      type: SIGNED_ENVELOPE_SCHEME,
+      description: 'Generate an Ed25519 keypair if you do not have one - no account, no '
+        + 'registration, any crypto library will do - then sign every message/send with '
+        + 'the did:key you present as metadata.from. The step-by-step instruction, the '
+        + 'signed fields, the canonical bytes and the address to send to are in `muretai` '
+        + 'beside this line'
+        + (FIRST_KNOCK_URL ? `; a worked example is at ${FIRST_KNOCK_URL}` : ''),
+      muretai: requirement,
+    },
+  };
+  card.security = [{ [SIGNED_ENVELOPE_SCHEME]: [] }];
 
   const cardBytes = Buffer.from(JSON.stringify(card), 'utf8');   // identical bytes on both paths
   // ACCOUNT DID -> {first_seen, last_seen, messages}. Keyed by the RESOLVED account (T102):
@@ -2091,15 +2347,26 @@ export function createAgentEntry({
     return out;
   }
 
-  /** The steering header for the notice route, or nothing. AI-agent families get a
-   *  signpost to the machine-readable door; a browser or curl gets the same bytes it
-   *  always got. HEADER-ONLY on purpose: the notice BODY is byte-identical for every
-   *  caller, so observation stays invisible on the wire except for this one additive
-   *  header — and `rel="service-desc"` is RFC 8631's registered relation for exactly
-   *  this ("service description … primarily intended for consumption by machines"). */
+  /** The `Link` header the notice route carries. TWO relations with different audiences,
+   *  in ONE header field (RFC 8288 allows several link-values in one field, and one field
+   *  is what keeps the two twins' bytes identical through their single-header plumbing):
+   *
+   *    - the DOOR pointer, `rel="https://muretai.net/rel/agent-entry"`, for EVERY caller.
+   *      This is the coexistence primitive (E4): an agent that fetched a page finds the
+   *      machine-readable door in the RESPONSE, with no HTML to parse and no prose to
+   *      read, and a browser ignores it — which is what lets a site keep its own front
+   *      page and add ONE header instead of migrating. An absolute URI because RFC 8288
+   *      §2.1.2 permits a bare token only for an IANA-registered relation.
+   *    - `rel="service-desc"` (RFC 8631's registered relation for "service description …
+   *      primarily intended for consumption by machines"), FIRST and only for the UA
+   *      families that read as an AI agent — the T119 signpost, unchanged in meaning.
+   *
+   *  HEADER-ONLY on purpose: the notice BODY is byte-identical for every caller, so what
+   *  the UA changes is still only this one additive relation and never a verdict. */
   function steerHeaders(family) {
-    if (!AI_AGENT_FAMILIES.has(family)) return {};
-    return { Link: `<${mount}${AGENT_CARD_PATH}>; rel="service-desc"` };
+    const door = `<${mount}${AGENT_CARD_PATH}>; rel="${AGENT_ENTRY_REL}"`;
+    if (!AI_AGENT_FAMILIES.has(family)) return { Link: door };
+    return { Link: `<${mount}${AGENT_CARD_PATH}>; rel="service-desc", ${door}` };
   }
 
   /** Which stage a finished POST was, from OBSERVABLES only — the request bytes and the
@@ -2388,6 +2655,23 @@ export function createAgentEntry({
     if (!from || !to || !sig) {
       const bare = !from && !to && !sig;
       if (!(anonymousLane && bare)) {
+        // THE REFUSAL TEACHES (E2) — but only the keyless walk-in. `data` keeps the human
+        // string it always carried, under `detail`, and gains `accepts[]`: the ways in,
+        // as an array, each naming its scheme. A visitor that has only this can mint a
+        // did:key, sign the six fields and be answered on its next POST — which is the
+        // whole point, because refusing an agent for not having a key it was never told
+        // how to make is the error, not the key.
+        //
+        // A PARTIAL envelope (from/to present, sig stripped) gets the old refusal
+        // unchanged. It is a DOWNGRADE ATTEMPT, not a walk-in: whoever sent it already
+        // holds a key and already knows the shape, so there is nothing to teach and no
+        // reason to hand a prober a machine-readable map of what to try next.
+        if (bare) {
+          return rpcError(reqId, ERRORS.UNAUTHENTICATED, {
+            detail: 'missing signing envelope (from/to/sig)',
+            accepts: [requirement],
+          });
+        }
         return rpcError(reqId, ERRORS.UNAUTHENTICATED, 'missing signing envelope (from/to/sig)');
       }
       // Anonymous: answer, signed by us, addressed to nobody. NO ledger row — an
@@ -2493,6 +2777,44 @@ export function createAgentEntry({
     return pathname === mount || pathname === `${mount}/`;
   }
 
+  /** The GET routes this entry owns, built ONCE from the mount so a request path is a
+   *  lookup and never string arithmetic. On a GUEST mount the card is served at the
+   *  ORIGIN's well-known paths TOO — that is the only address a stranger's agent knows to
+   *  try (RFC 8615), and a door nobody can find is not a door. The card's `url` still names
+   *  the DOOR, which is ordinary A2A: the well-known location is where a card is
+   *  DISCOVERED, not the endpoint it describes. */
+  const CARD_ROUTES = new Set([mount + AGENT_CARD_PATH, mount + AGENT_CARD_PATH_LEGACY]);
+  const SIG_ROUTES = new Set([mount + AGENT_CARD_SIG_PATH]);
+  if (guestMount) {
+    CARD_ROUTES.add(AGENT_CARD_PATH).add(AGENT_CARD_PATH_LEGACY);
+    SIG_ROUTES.add(AGENT_CARD_SIG_PATH);
+  }
+
+  /** What `Allow:` may truthfully say about THIS path, or null when the entry does not own
+   *  it at all. RFC 9110 §10.2.1 makes `Allow` a statement about the target RESOURCE, so a
+   *  single server-wide list is a wrong answer to a right question — and on a guest mount
+   *  it would be worse than wrong: answering for `/` at all, even with a 204 and a header,
+   *  is speaking for the site's own front page, which is the one thing a guest mount must
+   *  never do. Whatever the GET route does for an address we do not own (404), OPTIONS and
+   *  the method table do the same. */
+  function allowFor(pathname) {
+    if (CARD_ROUTES.has(pathname) || SIG_ROUTES.has(pathname)) return ALLOW_CARD;
+    if (isMountPath(pathname)) return guestMount ? ALLOW_DOOR : ALLOW_MOUNT;
+    return null;
+  }
+
+  /** The headers that state a resource's methods — BOTH spellings, always the same value.
+   *  `Allow` and `Access-Control-Allow-Methods` answer the same question for two different
+   *  readers, and a response that says `Allow: POST, OPTIONS` beside
+   *  `Access-Control-Allow-Methods: GET, POST, OPTIONS` contradicts itself in one message:
+   *  a browser-resident agent preflighting the guest door was told GET was on the menu at
+   *  the exact address whose GET is 405. `CORS_HEADERS` stays the origin-wide default
+   *  everywhere else (a card GET, a signed reply, a 404); it is narrowed only where the
+   *  resource's real method list is known, which is exactly where `Allow` is emitted. */
+  function allowHeaders(allow) {
+    return { Allow: allow, 'Access-Control-Allow-Methods': allow };
+  }
+
   function route(method, path, bodyBuffer, headers) {
     // Classified ONCE per request, used only to count and to signpost. Everything the
     // ladder decides is decided exactly as if this line did not exist.
@@ -2514,21 +2836,27 @@ export function createAgentEntry({
     // appends a well-known path), so this is not a new convention; it is the one the
     // fetcher already follows. With mount === '' these are the original constants.
     if (method === 'GET' || method === 'HEAD') {
-      if (pathname === mount + AGENT_CARD_PATH || pathname === mount + AGENT_CARD_PATH_LEGACY) {
-        // Byte-identical on both paths: the current A2A path and the legacy alias.
+      if (CARD_ROUTES.has(pathname)) {
+        // Byte-identical on every path: the current A2A path, the legacy alias, and (on a
+        // guest mount) the origin's well-known copy of both. Which address a client
+        // happened to fetch must never change what it believes about this DID.
         tally(family, 'card_get');
         // T107: identify (count), never enrol, never change a byte. Runs only after a
         // route MATCHED, so refused/404 paths never pay for crypto.
         wbaObserve(headers);
         return { status: 200, headers: cardHeaders(cardBytes.length), body: cardBytes };
       }
-      if (pathname === mount + AGENT_CARD_SIG_PATH) {
+      if (SIG_ROUTES.has(pathname)) {
         const env = cardEnvelopeBytes();
         tally(family, 'card_get');
         wbaObserve(headers);
         return { status: 200, headers: cardHeaders(env.length), body: env };
       }
-      if (isMountPath(pathname)) {
+      // The human notice — NOT served on a guest mount, where GET belongs to the site (E3).
+      // Falling through to 404 is deliberate and is the same non-disclosure the POST route
+      // already makes: an entry beside other agents does not confirm what lives at an
+      // address it was not given.
+      if (!guestMount && isMountPath(pathname)) {
         tally(family, 'notice_get');
         wbaObserve(headers);
         const body = Buffer.from(
@@ -2547,6 +2875,22 @@ export function createAgentEntry({
             ...steerHeaders(family) },
           body };
       }
+      // A GUEST MOUNT'S DOOR ANSWERS GET WITH 405, NOT 404 (proof run 3, 2026-08-18).
+      // Run A guessed the door path CORRECTLY, GET it, and was told nothing was there —
+      // its one correct guess, refuted. This is NOT the
+      // DECISION(non-door-post-answers-404-not-405) non-disclosure case, and the
+      // difference is where the address came from: that decision protects a path a caller
+      // GUESSED AT RANDOM, where a 405 would confirm a door it has no right to know about.
+      // The door's address is PUBLISHED, in the card, signed, at a well-known path — so
+      // hiding it from a GET conceals nothing from anyone and costs a visitor the one
+      // thing it got right. `allowFor` is non-null here only for the guest door: card and
+      // signature routes matched above, and a site-owning mount already returned its
+      // notice. A path this entry does not own still falls through to 404, and a guest
+      // mount still answers nothing it does not own.
+      const getAllow = allowFor(pathname);
+      if (getAllow !== null) {
+        return jsonResponse(405, { error: 'method not allowed' }, allowHeaders(getAllow));
+      }
       return jsonResponse(404, { error: 'not found' });
     }
     if (method === 'POST') {
@@ -2564,12 +2908,23 @@ export function createAgentEntry({
       tally(family, postStage(buf, out));
       return out;
     }
+    // Everything below answers for a RESOURCE, so an address this entry does not own is a
+    // 404 first — the same answer GET and POST give it. Before this, OPTIONS 204'd for
+    // EVERY path (a guest mount would have spoken for the site's front page one verb over)
+    // and the 405 carried no `Allow` at all, which RFC 9110 §15.5.6 REQUIRES.
+    const allow = allowFor(pathname);
+    if (allow === null) return jsonResponse(404, { error: 'not found' });
     if (method === 'OPTIONS') {
+      // The CORS PREFLIGHT lands here: a browser-resident agent POSTing application/json
+      // is not a simple request, so this answer is what decides whether the POST is ever
+      // sent. BOTH method statements narrow to the resource: `Allow` and
+      // `Access-Control-Allow-Methods` are the same fact for two readers, and this is the
+      // one response where the browser reader acts on it.
       return { status: 204,
-        headers: { Allow: 'GET, POST, OPTIONS', 'Content-Length': '0', ...CORS_HEADERS },
+        headers: { 'Content-Length': '0', ...CORS_HEADERS, ...allowHeaders(allow) },
         body: Buffer.alloc(0) };
     }
-    return jsonResponse(405, { error: 'method not allowed' });
+    return jsonResponse(405, { error: 'method not allowed' }, allowHeaders(allow));
   }
 
   function cardHeaders(length) {
