@@ -2318,6 +2318,10 @@ export function createAgentEntry({
   // entry's card. Omitted entirely when no domain was named — that is what keeps an
   // already-deployed entry's published bytes unchanged.
   if (canonDomains.length) card.domains = canonDomains;
+  // Neutral key first, vendor key beside it for one release. See the securitySchemes block
+  // below for why the old spelling stays: a consumer must learn the new name BEFORE
+  // producers stop emitting the old one, never after.
+  if (openDoor) card.agentEntry = { open_door: true };
   if (openDoor) card.muretai = { open_door: true };
   // Deliberately NO `relay`/`enc_pub` on the card: those advertise a store-and-forward
   // mailbox, and an agent entry has no listener draining one. Advertising a mailbox nobody
@@ -2344,15 +2348,28 @@ export function createAgentEntry({
   // with the lock documented. The worked-example clause appears only when the page it
   // names is known to resolve (see FIRST_KNOCK_URL); a 404 here would out-compete the
   // block beside it.
+  //
+  // THE TERMS ARE PUBLISHED UNDER A NEUTRAL KEY, and under the vendor one BESIDE it for a
+  // release. A standard whose core machine-readable object is KEYED BY A VENDOR is not a
+  // standard; a standard that carries vendor BLOCKS is healthy — so the object moves to
+  // `agentEntry` and `muretai` stays as a byte-identical alias until consumers have turned
+  // over. Additive on purpose: removing the old spelling first would split doors from
+  // visitors, and a reader who learned one name must keep finding the terms where they
+  // looked. `muretai` is dropped at the next MAJOR, not at a minor. Settle this BEFORE a
+  // second scheme exists: whatever ships next would otherwise land inside the vendor key
+  // and entrench it at exactly the moment neutrality is the point.
   card.securitySchemes = {
     [SIGNED_ENVELOPE_SCHEME]: {
       type: SIGNED_ENVELOPE_SCHEME,
       description: 'Generate an Ed25519 keypair if you do not have one - no account, no '
         + 'registration, any crypto library will do - then sign every message/send with '
         + 'the did:key you present as metadata.from. The step-by-step instruction, the '
-        + 'signed fields, the canonical bytes and the address to send to are in `muretai` '
-        + 'beside this line'
+        + 'signed fields, the canonical bytes and the address to send to are in '
+        + '`agentEntry` beside this line'
         + (howToUrl ? `; a worked example is at ${howToUrl}` : ''),
+      agentEntry: requirement,
+      // The vendor spelling, byte-identical, kept for one release so a consumer that
+      // learned this name still finds the terms. Dropped at the next MAJOR.
       muretai: requirement,
     },
   };
