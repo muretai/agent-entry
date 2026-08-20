@@ -54,6 +54,33 @@ export const CARD_SIG_REFRESH_S = 3600;
  *  wrote. Must match `ANON_RATE_PER_MIN` in examples/agent_entry_reference.py: one contract,
  *  two implementations, one bound. */
 export const ANON_RATE_PER_MIN = 30;
+/** Ceilings on the SIGNED lane: replies per minute per ACCOUNT, and per minute for the
+ *  whole entry. Both default ON.
+ *
+ *  WHY A SIGNED SENDER NEEDS A BOUND AT ALL. The reason not to have one used to be that a
+ *  signed sender "is attributable, and every one of them is already in the ledger". Both
+ *  clauses are true and neither is load-bearing: the ledger is never read back before the
+ *  responder runs, so attribution is RECORDED and never ENFORCED — and attribution to a
+ *  did:key minted thirty seconds ago and never reused is attribution to nothing, because
+ *  holding one costs nothing. That is the correct, deliberate property of a permissionless
+ *  door (this card TELLS strangers to mint one, with runnable code), so the bound has to
+ *  come from somewhere else. Naming a caller is a precondition for limiting it, never a
+ *  substitute for limiting it.
+ *
+ *  WHY TWO TIERS. Verifying a signature is ~40 microseconds; what the ceiling protects is
+ *  whatever the operator put behind `responder`, which may be a model call costing seconds
+ *  and real money. Per-ACCOUNT (the T102-resolved account, so an owner's devices share one
+ *  budget exactly as their ledger row does) stops one peer, honest or not, from taking the
+ *  whole door. It CANNOT stop a flood from fresh keys — free identity defeats per-identity
+ *  metering by definition — which is what the whole-entry ceiling is for. Ship both or
+ *  neither; each one alone has an obvious hole.
+ *
+ *  Defaults are deliberately generous: no conversational peer meets them, and a site whose
+ *  responder calls a model should lower them. A reference implementation's defaults are the
+ *  deployed posture of everyone who copies it. Must match examples/agent_entry_reference.py:
+ *  one contract, two implementations, one bound. */
+export const SIGNED_RATE_PER_MIN = 60;
+export const SIGNED_RATE_PER_MIN_TOTAL = 600;
 /** How many domains one card may advertise (agent/domainstore.MAX_CARD_DOMAINS, and the
  *  same ceiling shared/protocol.build_agent_card applies to a node's card). Every name
  *  listed is an outbound HTTPS fetch this entry asks strangers to make, so the cap bounds
@@ -173,7 +200,7 @@ export const ALLOW_MOUNT = 'GET, HEAD, POST, OPTIONS';
  * field, string for string: the card and the refusal are one object, and two twins that
  * teach a keyless visitor differently are two doors.
  */
-export function signedEnvelopeRequirement(did) {
+export function signedEnvelopeRequirement(did, endpoint = '') {
   const requirement = {
     scheme: SIGNED_ENVELOPE_SCHEME,
     instruction: 'Generate an Ed25519 keypair NOW, locally, and knock again with it. You '
@@ -187,7 +214,11 @@ export function signedEnvelopeRequirement(did) {
       + 'a refusal: minting one is step 1, and it is a few lines of code. The COMPLETE '
       + 'request body to POST is exampleRequest below: copy it and fill in its five <...> '
       + 'blanks. The A2A envelope AROUND your signature is checked too, so send that shape '
-      + 'and do not improvise one.',
+      + 'and do not improvise one. KEEP THE PRIVATE HALF: write it to a file only you '
+      + 'can read (mode 600). It is the whole of your identity - this site will address '
+      + 'you by the did:key you derive from it, losing it makes you a stranger here, and '
+      + 'the same seed is what later upgrades you into a full muretai node with this SAME '
+      + 'address rather than a second one.',
     in: 'params.message.metadata',
     // THE CARRIER, not just the signature. `in` tells you where the six envelope fields go
     // and says nothing about the message that carries them, and two proof-run agents read it
@@ -220,6 +251,17 @@ export function signedEnvelopeRequirement(did) {
       },
     },
     recipient: did,
+    // WHERE to send it. Everything else in this object describes the MESSAGE — the six
+    // signed fields, the canonical bytes, the whole example body — and none of it said
+    // the address, so a first-time caller guessed. Measured 2026-08-19 (L1 dogfooding,
+    // fresh-user run): the guess was `/rpc`, the most plausible path for a JSON-RPC
+    // body, which on muretai.com is the RELAY transport. It reads `to`/`from`/`blob`/
+    // `sig` off the TOP level, finds none of them in an A2A envelope, and answers
+    // `{"error":"bad signature"}` — a routing mismatch reported as a crypto failure, at
+    // the exact moment the caller has the least context to tell the two apart. They
+    // went off to re-check canonicalization, base64 padding and clock skew; none of it
+    // was wrong. One field costs nothing and removes the guess.
+    endpoint,
     identity: 'Derive your DID from the public key you just generated and send it as '
       + 'metadata.from: did:key:z + base58btc(0xed01 || <32-byte Ed25519 public key>)',
     // RUN this, do not write the address by hand. Measured 2026-08-18: a real agent minted a
@@ -1446,6 +1488,35 @@ class RateBound {
   }
 }
 
+/** Per-ACCOUNT sliding windows, in a map that is itself bounded — because the keys are
+ *  free to mint, an unbounded map here would be the memory-growth vector the bound exists
+ *  to close. Eviction is oldest-first, the ledger's own discipline.
+ *
+ *  Read the eviction honestly: a caller cycling fresh keys is evicted and re-admitted with
+ *  a clean window every time, so this tier alone stops NOTHING it was not already unable to
+ *  stop. That is not a flaw to fix here — it is why the whole-entry ceiling is not optional. */
+class AccountRateBounds {
+  constructor(perMinute, maxKeys) {
+    this.perMinute = perMinute;
+    this.maxKeys = Math.max(1, Number(maxKeys) || 1);
+    this.byAccount = new Map();
+  }
+
+  /** Consume one token for `account`. False when that account's window is full. */
+  allow(account) {
+    let bound = this.byAccount.get(account);
+    if (!bound) {
+      if (this.byAccount.size >= this.maxKeys) {
+        const oldest = this.byAccount.keys().next().value;
+        if (oldest !== undefined) this.byAccount.delete(oldest);
+      }
+      bound = new RateBound(this.perMinute);
+      this.byAccount.set(account, bound);
+    }
+    return bound.allow();
+  }
+}
+
 /**
  * An unpaired UTF-16 surrogate — a string with no UTF-8 encoding at all.
  *
@@ -2138,9 +2209,15 @@ export function canonicalMount(canonUrl, basePath) {
  *   anonymousLane  also accept UNSIGNED inquiries (default false). They create no account,
  *                  and the lane as a whole is capped at `anonRatePerMin` signed replies per
  *                  minute — it is unauthenticated, so it must not be an unmetered signing
- *                  oracle. Signed senders are not rate-bound here: they are attributable,
- *                  and every one of them is already in the ledger.
+ *                  oracle.
  *   anonRatePerMin anonymous replies per minute for the WHOLE agent entry (default 30).
+ *   signedRatePerMin / signedRatePerMinTotal
+ *                  the SIGNED lane's ceilings: replies per minute per ACCOUNT (default 60)
+ *                  and for the whole entry (default 600). Both ON by default; pass 0 or a
+ *                  non-number to disable a tier. Checked AFTER the signature, so no
+ *                  stranger can spend another account's budget, and BEFORE the ledger and
+ *                  the responder, so a refused flood grows neither. See
+ *                  SIGNED_RATE_PER_MIN for why being attributable is not being bounded.
  *   wbaVerifiers   OPTIONAL inbound Web Bot Auth (T107): a JWKS document {keys:[…]} of
  *                  Ed25519 keys whose holders this entry should RECOGNISE — the body of
  *                  a key directory you verified out of band. Absent (the default) the
@@ -2159,6 +2236,8 @@ export function createAgentEntry({
   openDoor = true,
   anonymousLane = false,
   anonRatePerMin = ANON_RATE_PER_MIN,
+  signedRatePerMin = SIGNED_RATE_PER_MIN,
+  signedRatePerMinTotal = SIGNED_RATE_PER_MIN_TOTAL,
   skills = [],
   domains = null,
   basePath = null,
@@ -2194,9 +2273,18 @@ export function createAgentEntry({
   // bare domain: a name the domain's credential can never bind is not worth publishing.
   const canonDomains = canonicalDomains(domains);
   const did = didFromSeedHex(seedHex);
+  // WHERE A VISITOR POSTS — derived from the PUBLISHED url, never from `mount`. The two
+  // are different questions and the answers legitimately differ: `mount` is the path THIS
+  // PROCESS matches (a prefix-stripping proxy makes it '' while the public address still
+  // carries the path), and this is the address a stranger dials. Appending `mount` to a
+  // url that already carries that same path published `https://h/support/support` on every
+  // default path mount — a 404 signed into a public card, on the one field that exists to
+  // stop a caller guessing. It stayed invisible because the only per-twin assertion ran at
+  // a bare origin, where `mount` is '' and the wrong formula is accidentally right.
+  const doorUrl = canonUrl + (canonicalMount(canonUrl) ? '' : '/');
   // The terms of this door, built ONCE: the card publishes it (E1, before the knock) and
   // the no-envelope refusal returns the same object (E2, after it).
-  const requirement = signedEnvelopeRequirement(did);
+  const requirement = signedEnvelopeRequirement(did, doorUrl);
 
   const card = {
     protocolVersion: PROTOCOL_VERSION,
@@ -2271,6 +2359,14 @@ export function createAgentEntry({
   const deviceOwner = new Map();
   const replay = new ReplayGuard();
   const anonRate = new RateBound(anonRatePerMin);
+  // A tier is ON unless its ceiling is a non-positive or non-finite number. Constructed
+  // rather than clamped, so "disabled" is one absent object and never a bound of 0 — which
+  // RateBound reads as refuse-everything, the opposite of what an operator passing 0 means.
+  const perMin = (n) => (Number.isFinite(Number(n)) && Number(n) > 0 ? Number(n) : 0);
+  const signedAccountRate = perMin(signedRatePerMin)
+    ? new AccountRateBounds(perMin(signedRatePerMin), maxAccounts) : null;
+  const signedTotalRate = perMin(signedRatePerMinTotal)
+    ? new RateBound(perMin(signedRatePerMinTotal)) : null;
   let sigEnvelope = null;
   let sigMintedAt = 0;
 
@@ -2743,6 +2839,23 @@ export function createAgentEntry({
     if (!acct.ok) return rpcError(reqId, ERRORS.UNAUTHENTICATED, acct.reason);
     const account = acct.account;
     const ownerDid = account !== from ? account : null;
+
+    // 10. THE SIGNED LANE'S CEILING. Here and not earlier: before the signature a stranger
+    //     could spend somebody else's budget by naming them, and before `resolveAccount` an
+    //     owner's devices would each get their own. Here and not later: a refused flood must
+    //     grow neither the ledger nor whatever the responder costs.
+    //     PER-ACCOUNT FIRST, deliberately — one loud peer is then stopped by ITS OWN window
+    //     without drawing down the shared one, so it cannot starve everybody else on its way
+    //     to being refused. Neither refusal names its ceiling: a published number is a
+    //     calibration table telling a flood exactly how many keys to mint.
+    if (signedAccountRate && !signedAccountRate.allow(account)) {
+      return rpcError(reqId, ERRORS.RATE_LIMITED,
+        'you are sending faster than this door answers — slow down and retry');
+    }
+    if (signedTotalRate && !signedTotalRate.allow()) {
+      return rpcError(reqId, ERRORS.RATE_LIMITED,
+        'this entry is at its ceiling right now — retry shortly');
+    }
 
     noteContact(account);
     // T107: `wba_did` may legitimately differ from `peer_did` (the transport signer vs

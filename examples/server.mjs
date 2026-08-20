@@ -33,6 +33,10 @@
  *   AGENT_ENTRY_NAME       public display name on the card
  *   AGENT_ENTRY_HOST       bind address (default 127.0.0.1 — set 0.0.0.0 only behind TLS)
  *   AGENT_ENTRY_ANON       "1" also accepts UNSIGNED walk-in inquiries (they mint no account)
+ *   AGENT_ENTRY_SIGNED_RATE / AGENT_ENTRY_SIGNED_RATE_TOTAL
+ *                       signed replies per minute per ACCOUNT and for the whole entry.
+ *                       Defaults are generous; LOWER THEM if your responder calls a model —
+ *                       the signature costs microseconds, the answer may not. 0 disables a tier.
  *   AGENT_ENTRY_GUEST      "1" = GUEST MOUNT: coexist with a site that keeps its own front
  *                       page. The entry serves its card paths and the POST door named by
  *                       AGENT_ENTRY_BASE_URL (which must then carry that path, e.g.
@@ -143,6 +147,14 @@ try {
     responder,
     openDoor: true,                                     // "you may contact me, no introduction"
     anonymousLane: process.env.AGENT_ENTRY_ANON === '1',
+    // The SIGNED lane's ceilings. Left unset they are the library defaults, which no
+    // conversational peer meets. LOWER THEM if this responder calls a model: verifying a
+    // signature costs microseconds, and what the ceiling actually protects is whatever you
+    // put behind `responder`.
+    ...(process.env.AGENT_ENTRY_SIGNED_RATE
+      ? { signedRatePerMin: Number(process.env.AGENT_ENTRY_SIGNED_RATE) } : {}),
+    ...(process.env.AGENT_ENTRY_SIGNED_RATE_TOTAL
+      ? { signedRatePerMinTotal: Number(process.env.AGENT_ENTRY_SIGNED_RATE_TOTAL) } : {}),
     guest: process.env.AGENT_ENTRY_GUEST === '1',
     wbaVerifiers,
   });
