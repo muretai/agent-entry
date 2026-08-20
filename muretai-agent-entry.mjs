@@ -121,8 +121,17 @@ export const AGENT_ENTRY_REL = 'https://muretai.net/rel/agent-entry';
  *  first, or ship no pointer. Verified live before this value was set (200 at the URL
  *  below, 404 at a control path under the same prefix); `entry-howto-resolves` in
  *  .claude/skills/ship-check/checks.py re-checks it on every ship report. Must match
- *  `FIRST_KNOCK_URL` in examples/agent_entry_reference.py. */
-export const FIRST_KNOCK_URL = 'https://docs.muretai.com/guides/first-knock/';
+ *  `FIRST_KNOCK_URL` in examples/agent_entry_reference.py.
+ *
+ *  DEFAULT EMPTY, and the paragraph above is why: this file already calls empty "the safe
+ *  default" and then shipped a vendor's docs host as the value, so every door built from it
+ *  stamped that host into its own public card. A reference implementation names no host —
+ *  the recipe travels IN the refusal (the contract suite strips every `http` value and
+ *  requires what is left to still be a complete recipe), and the worked example now travels
+ *  in the package itself as `conformance/`. Pass `howToUrl` to point at a page you operate;
+ *  ship the page FIRST and verify it 200s, because a dangling pointer is the one failure
+ *  measured here. */
+export const FIRST_KNOCK_URL = '';
 
 /** `Allow:` per RESOURCE, not per server. RFC 9110 §10.2.1 makes `Allow` a statement about
  *  the target resource, and §15.5.6 REQUIRES it on a 405 — a generic list is a wrong answer
@@ -200,7 +209,7 @@ export const ALLOW_MOUNT = 'GET, HEAD, POST, OPTIONS';
  * field, string for string: the card and the refusal are one object, and two twins that
  * teach a keyless visitor differently are two doors.
  */
-export function signedEnvelopeRequirement(did, endpoint = '') {
+export function signedEnvelopeRequirement(did, endpoint = '', howTo = FIRST_KNOCK_URL) {
   const requirement = {
     scheme: SIGNED_ENVELOPE_SCHEME,
     instruction: 'Generate an Ed25519 keypair NOW, locally, and knock again with it. You '
@@ -295,7 +304,7 @@ export function signedEnvelopeRequirement(did, endpoint = '') {
   // Emitted ONLY when it is known to resolve — an unresolvable pointer out-competes every
   // field beside it (see FIRST_KNOCK_URL). Appended last so the object's other bytes and
   // their positions do not move when a site turns the pointer off.
-  if (FIRST_KNOCK_URL) requirement.howTo = FIRST_KNOCK_URL;
+  if (howTo) requirement.howTo = howTo;
   return requirement;
 }
 
@@ -2218,6 +2227,11 @@ export function canonicalMount(canonUrl, basePath) {
  *                  stranger can spend another account's budget, and BEFORE the ledger and
  *                  the responder, so a refused flood grows neither. See
  *                  SIGNED_RATE_PER_MIN for why being attributable is not being bounded.
+ *   howToUrl       OPTIONAL page a keyless visitor is pointed at (`howTo` on the card and
+ *                  the refusal). DEFAULT EMPTY and the field is then omitted entirely: a
+ *                  reference implementation names no host, and the refusal is a complete
+ *                  recipe without it. SHIP THE PAGE FIRST — a pointer that 404s
+ *                  out-competes every field beside it and reads as terminal.
  *   wbaVerifiers   OPTIONAL inbound Web Bot Auth (T107): a JWKS document {keys:[…]} of
  *                  Ed25519 keys whose holders this entry should RECOGNISE — the body of
  *                  a key directory you verified out of band. Absent (the default) the
@@ -2243,6 +2257,7 @@ export function createAgentEntry({
   basePath = null,
   guest = false,
   maxAccounts = 50000,
+  howToUrl = FIRST_KNOCK_URL,
   wbaVerifiers = null,
 } = {}) {
   if (!seedHex) throw new TypeError('createAgentEntry: seedHex is required');
@@ -2284,7 +2299,7 @@ export function createAgentEntry({
   const doorUrl = canonUrl + (canonicalMount(canonUrl) ? '' : '/');
   // The terms of this door, built ONCE: the card publishes it (E1, before the knock) and
   // the no-envelope refusal returns the same object (E2, after it).
-  const requirement = signedEnvelopeRequirement(did, doorUrl);
+  const requirement = signedEnvelopeRequirement(did, doorUrl, howToUrl);
 
   const card = {
     protocolVersion: PROTOCOL_VERSION,
@@ -2337,7 +2352,7 @@ export function createAgentEntry({
         + 'the did:key you present as metadata.from. The step-by-step instruction, the '
         + 'signed fields, the canonical bytes and the address to send to are in `muretai` '
         + 'beside this line'
-        + (FIRST_KNOCK_URL ? `; a worked example is at ${FIRST_KNOCK_URL}` : ''),
+        + (howToUrl ? `; a worked example is at ${howToUrl}` : ''),
       muretai: requirement,
     },
   };
