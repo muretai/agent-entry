@@ -9,6 +9,7 @@
   },
   "files": [
     "muretai-agent-entry.mjs",
+    "conformance/",
     "examples/server.mjs",
     "LICENSE",
     "README.md"
@@ -17,6 +18,7 @@
     "node": ">=20"
   },
   "scripts": {
+    "test": "node conformance/run.mjs",
     "example": "node examples/server.mjs"
   },
   "keywords": [
