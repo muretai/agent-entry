@@ -2239,6 +2239,25 @@ export function canonicalMount(canonUrl, basePath) {
  *                  Recognition only ever ADDS identity (env.wba_did, the wbaVisits
  *                  count); it never changes verified, a ledger row, a rate lane or any
  *                  refusal verdict.
+ *   observer       OPTIONAL `(env) => void` — a WATCHER, called once per message with the
+ *                  same frozen envelope the responder gets. It exists so that OBSERVING a
+ *                  visit is not the same edit as ANSWERING one: wanting a counter should
+ *                  not mean reaching into the code that decides what to say.
+ *
+ *                  IT CANNOT AFFECT ANYTHING. It is called AFTER the verdict is settled,
+ *                  its return value is discarded, a thrown error is swallowed, and a
+ *                  promise is never awaited — so a slow or broken watcher cannot delay,
+ *                  fail, or change one byte of the signed reply. That is the whole contract
+ *                  and it is not a formality: this door answers in ONE round trip with no
+ *                  callback, and a watcher that dialled out on the hot path would make the
+ *                  visitor's answer depend on somebody else's uptime.
+ *
+ *                  WHAT NOT TO PUT IN IT. The envelope carries `peer_did`/`owner_did`,
+ *                  which a visitor handed you to transact with YOU. Forwarding a raw DID to
+ *                  a third party shares a durable identifier its owner never offered them;
+ *                  if you need a metric, send a salted, site-scoped digest and keep the DID
+ *                  in your own store. This module ships no sink and names no vendor — the
+ *                  slot is here so an adapter can live outside it.
  */
 export function createAgentEntry({
   seedHex,
@@ -2258,6 +2277,7 @@ export function createAgentEntry({
   guest = false,
   maxAccounts = 50000,
   howToUrl = FIRST_KNOCK_URL,
+  observer = null,
   wbaVerifiers = null,
 } = {}) {
   if (!seedHex) throw new TypeError('createAgentEntry: seedHex is required');
@@ -2896,7 +2916,27 @@ export function createAgentEntry({
       wbaDid: wbaIdentify(reqHeaders) }), reqId, msg, from);
   }
 
+  /** Hand the envelope to the watcher, and make sure it can cost nothing.
+   *
+   *  Called BEFORE the responder on purpose: observing that a visit HAPPENED must not
+   *  depend on the answer succeeding, or the one request worth counting — the one where
+   *  the site's own code threw — is the one that goes uncounted.
+   *
+   *  Everything here is a refusal to let a watcher matter: the return value is discarded,
+   *  a synchronous throw is swallowed, and a returned promise is given a rejection handler
+   *  and then DROPPED rather than awaited. That last one is not tidiness — an unhandled
+   *  rejection can take a Node process down, so the watcher must not be able to end the
+   *  door by failing quietly in the background. */
+  function observe(env) {
+    if (typeof observer !== 'function') return;
+    try {
+      const r = observer(env);
+      if (isThenable(r)) r.then(undefined, () => {});
+    } catch { /* a watcher never changes what this door does */ }
+  }
+
   function respond(env, reqId, msg, toDid) {
+    observe(env);
     let answer;
     try {
       answer = responder(env);
