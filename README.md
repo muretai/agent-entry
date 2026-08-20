@@ -111,7 +111,9 @@ answers questions and hands off nothing, is a signed claim you cannot keep.
 | `domains` | none | the domains this entry speaks for (see below) |
 | `basePath` | from `baseUrl` | the path this entry answers at, derived rather than set beside it |
 | `wbaVerifiers` | none | a JWKS document (`{"keys":[…]}`) of Ed25519 keys whose holders this entry should **recognise** on inbound signed requests (Web Bot Auth / RFC 9421 — see *Who is knocking*). Recognition only adds `env.wba_did` and a visit count; it never changes a verdict |
-| `name`, `description`, `version` | — | the card's own words. `description` is the line a person reads in a directory listing |
+| `observer` | none | called once per message with the same envelope your responder gets, **after** the verdict — for counting, logging, analytics. It cannot matter: its return is discarded, a throw is swallowed, a promise is never awaited, so a slow or broken watcher cannot delay or change one byte of the signed reply. See [Counting visits](#counting-visits-without-handing-over-who-they-are) |
+| `howToUrl` | none | a page a keyless visitor is pointed at as a worked example. **Empty means omitted** — the refusal already teaches the whole recipe without it, and a reference implementation must not stamp somebody else's docs host into every door built from it. Only set it to a URL you operate, and only after checking it resolves |
+| `name`, `description`, `version` | — | the card's own words. `description` is the line a person reads in a directory listing — and the right place to say what you record about visitors, since it is fetched **before** the knock |
 
 `seedHex` and `baseUrl` are the two an entry refuses to start without: the seed **is** the
 address, and the url it publishes must equal the origin the visitor dialled.
@@ -525,23 +527,14 @@ and it is not one. It is the upgrade path:
   can carry them.
 - **Statistics without a store: an analytics sink.** Nothing in the entry reads the
   ledger back to gate, greet or rate-limit, so a fire-and-forget sink records visiting
-  agents with no database anywhere. Your `responder` is handed the account DID; Google
-  Analytics 4 over the Measurement Protocol is one `fetch` inside it:
-
-  ```js
-  fetch('https://www.google-analytics.com/mp/collect?measurement_id=G-XXXXXXXXXX'
-      + '&api_secret=' + process.env.GA_API_SECRET, {
-    method: 'POST',
-    body: JSON.stringify({ client_id: env.owner_did || env.peer_did,
-                           events: [{ name: 'agent_contact' }] }),
-  }).catch(() => {});   // analytics must never block a reply
-  ```
-
-  Keyed by `client_id`, GA tells new from returning visitors by itself — and a DID is a
-  public key, not personal data, though the record then lives with a third party, which
-  is your call. A sink cannot be read back during a request: it counts customers, it
-  cannot recognise one. It replaces a log line, not the store above — none of the
-  recommended features stand on it.
+  agents with no database anywhere. Use `observer` for it, never your responder: watching
+  a visit should not be an edit to the code that decides what to say. See
+  [Counting visits](#counting-visits-without-handing-over-who-they-are) below for the
+  whole pattern, including the one rule that shapes it — **a DID is not a page view**,
+  so what leaves your box is a salted digest, never the identifier itself. A sink cannot
+  be read back during a request: it counts customers, it cannot recognise one. It
+  replaces a log line, not the store above — none of the recommended features stand
+  on it.
 - **Revocation reaches you through your backend, not through this file.** An Agent Entry
   is deliberately network-free on the hot path: it never dials out while answering a
   visitor. Bindings carry an expiry, and a full node checks published revocations within
@@ -566,6 +559,84 @@ What the entry now handles for you at the HTTP layer, so you do not have to:
   `POST https://elsewhere.example/`. This is a deliberate departure from RFC 9112 §3.2.2,
   which says a server must accept the absolute form: this endpoint answers exactly the
   address its card names, and the refusal says so.
+
+## Counting visits without handing over who they are
+
+You will want to know how many agents knocked, how many came back, and what they asked. All
+three are answerable — and how you answer them decides whether you are counting your visitors
+or contributing to a profile of them.
+
+**Use `observer`, not your responder.** The door calls it once per message with the same
+envelope, after the verdict, so watching a visit stops being an edit to the code that decides
+what to say. It cannot matter: its return is discarded, a throw is swallowed, a promise is
+never awaited — a slow or broken watcher cannot delay or change one byte of the signed reply.
+
+**The rule that shapes everything else: a DID is not a page view.** A visitor hands you one in
+order to transact with **you**, and here first contact *is* the account — there is no signup
+form where they agreed to anything else. Forwarding the raw value to an analytics vendor shares
+a durable identifier its owner never offered them, silently, on a surface with no consent
+dialog and no visitor who could decline. So split it:
+
+- **What leaves** — a salted digest and a few shape facts. Never the DID, never the text.
+- **What stays** — the relationship (who, how many, first and last seen) in your own store,
+  which is the only place it was ever offered to.
+
+**Salt the digest, and treat the salt as a secret.** A bare `sha256(did)` is a *stable global*
+pseudonym: anyone else who hashes the same DID gets the same string, so two properties could
+join their records on it. An HMAC under a secret only you hold makes the pseudonym meaningless
+anywhere else — the whole difference between "we count returning visitors" and "we helped build
+a profile".
+
+Google Analytics 4 over the Measurement Protocol, as an example of any sink:
+
+```js
+import crypto from 'node:crypto';
+
+const pseudonym = (did) =>
+  crypto.createHmac('sha256', process.env.PSEUDONYM_SALT).update(did).digest('hex').slice(0, 32);
+
+const observer = (env) => {
+  const account = env.owner_did || env.peer_did;
+  if (!account) return;                       // an unsigned walk-in is traffic, not a visitor
+  const first = (entry.ledger.get(account)?.messages ?? 1) === 1;
+
+  // `client_id` is the pseudonym, so the vendor can tell a returning visitor from a new one
+  // WITHOUT ever holding the DID that distinguishes them.
+  fetch(`https://www.google-analytics.com/mp/collect?measurement_id=${GA_ID}&api_secret=${GA_SECRET}`, {
+    method: 'POST',
+    body: JSON.stringify({
+      client_id: pseudonym(account),
+      non_personalized_ads: true,
+      events: [{ name: 'agent_knock', params: { verified: env.verified ? 1 : 0,
+                                                first_contact: first ? 1 : 0,
+                                                intent: classify(env.text) }}],
+    }),
+  }).catch(() => {});                          // a dropped metric, never a dropped answer
+};
+```
+
+Four details there are load-bearing:
+
+- **`classify(env.text)`, never `env.text`.** Send *your own* bounded label, not what a stranger
+  typed. An attacker-chosen string must never become a dimension in your analytics.
+- **`.catch(() => {})` and no `await`.** Your door answers in one round trip; nothing on that
+  path may wait on somebody else's uptime. The `observer` contract already guarantees this — do
+  not lean on that generosity to be correct.
+- **Give it a timeout too** (an `AbortController` at a second or two). A hung connection is not
+  an error, so `catch` alone never fires.
+- **Say at boot whether the sink is on.** A sink silently off because a secret was never set
+  looks exactly like a sink that is on and receiving nothing, and a dashboard reading zero
+  cannot tell you which.
+
+**Say it on the card, because that is the surface your visitor reads.** Whatever you record, the
+party whose identifier it is arrives as an agent and will never open a privacy page written for
+people. Your card is fetched *before* the knock — that is the point of publishing terms up front
+— so it is the one place a visitor can learn what happens to its DID and still decide not to
+knock. Two or three sentences in `description`: what you keep, what leaves, what never does. A
+disclosure that arrives after the visit is not a disclosure, it is a receipt.
+
+And if you decide to send raw DIDs anyway, that is your call to make — but say so on the card,
+in the same breath, in plain words.
 
 ## Two implementations, pinned to each other
 
