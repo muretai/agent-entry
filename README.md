@@ -198,7 +198,91 @@ cannot be told to look elsewhere:
 One round trip. No callback, no webhook, nothing to keep awake.
 
 `POST /` is exact — a POST anywhere else is 404. But **`GET /` is not taken**, so your home
-page stays exactly as it is. A site gives up three routes and nothing else.
+page stays exactly as it is.
+
+### The fourth step, and it is not optional
+
+Three routes make the door **work**. They do not make it **findable**, and those are separate
+problems with separate fixes.
+
+A visiting agent knows your domain, so it can guess the card path — but only if something told
+it there is an agent here at all. Normally that something is this module's own `GET /` notice.
+**If your pages are served by a different process than the door — a CDN, a static host, a
+framework, an edge worker — that notice never renders**, and your home page is HTML written for
+people with nothing machine-readable in it. The address ends up published in a card nobody was
+told to fetch.
+
+So put the pointer on every page a visitor might land on, in **both** spellings. Neither is a
+fallback for the other:
+
+```
+Link: </.well-known/agent-card.json>; rel="https://muretai.net/rel/agent-entry"
+```
+
+```html
+<link rel="https://muretai.net/rel/agent-entry" href="/.well-known/agent-card.json">
+```
+
+The relation is an opaque **identifier**, matched as a string — nothing about resolving an agent
+endpoint requires a request to that host. The two spellings exist because the two kinds of client
+have opposite blind spots: an agent that fetches with a plain `curl` (no `-i`) never sees the
+header, and one that reads only headers never parses the HTML. Shipping one is a coin flip on
+which kind arrived.
+
+We know because we shipped one. An agent that had never been told about our door was handed only
+the domain, fetched the page, read the copy written for humans, and stopped — while the door had
+been answering signed messages correctly the whole time, at the address on that very page.
+
+Then check it from outside, because this is exactly the class of thing that looks installed:
+
+```bash
+curl -sI https://studio.example/ | grep -i '^link:'         # the header half
+curl -s  https://studio.example/ | grep 'rel/agent-entry'   # the tag half
+```
+
+Worth knowing before you call it done: **both halves disappear in a fetch that converts the page
+to markdown**, which is a common way an agent reads the web — headers are dropped and so is
+everything in `<head>`. No tag survives that. The only remedy is prose: say in the visible body
+that agents are answered here, and name the card path in text a reader can act on.
+
+### Check that your own CDN is not refusing your door
+
+The failure you are least likely to look for, because everything you control is correct.
+
+Most sites sit behind something that turns away suspicious traffic, and much of that judging is
+done on the **User-Agent** — which a client writes about itself, so the honest defaults are what
+get caught. Ours refused the default agent Python's standard library sends, and not only on the
+home page: on the **card** and on `POST /` too. The door was published, correct, and answering —
+to nobody using the stdlib client that "zero dependencies" produces.
+
+**The tell is the body of the refusal.** A door refuses in JSON and says how to qualify. An
+intermediary refuses in a line of plain text — `error code: 1010`, seventeen bytes, no `Link`, no
+card path, nothing a visitor can act on. If that is what strangers get, the door never saw them.
+
+**Do not check with `curl`.** It sends its own agent string and sails through, so "reproduce it
+with curl" turns a broken door into evidence that the visitor is at fault. Use a plain
+standard-library client, from outside your network:
+
+```bash
+UA='Python-urllib/3.11'   # or your language's default — the point is that it IS the default
+curl -s -A "$UA" -X POST https://studio.example/ -H 'content-type: application/json' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{}}' | head -c 80
+```
+
+That must come back as JSON. Anything else is your edge, not your entry.
+
+**The exemption is simpler than it looks, and its shape is the point.** You never have to ask
+your CDN whether a caller is a bot — only to name three things it already knows: **host, method,
+path.** Because this door partitions by method, `POST /` and the card paths are exactly the
+surface to exempt, and your pages keep whatever protection they have. Write the rule with no
+user-agent field in it at all — the same rule the door lives by, one layer out.
+
+Two limits worth stating plainly. Some protections cannot be exempted by any rule at any tier;
+find out which yours is before promising yourself a carve-out. And **never let your CDN tell your
+responder who it is talking to** — some will forward a bot score or a "verified" flag to your
+origin, and if your origin is reachable without going through them (most are), that header is
+written by whoever dials it directly. Authority is the signature on the message; nothing else
+gets a vote.
 
 ### 1. A subdomain — the existing site is untouched
 
