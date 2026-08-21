@@ -114,7 +114,7 @@ answers questions and hands off nothing, is a signed claim you cannot keep.
 | `domains` | none | the domains this entry speaks for (see below) |
 | `basePath` | from `baseUrl` | the path this entry answers at, derived rather than set beside it |
 | `wbaVerifiers` | none | a JWKS document (`{"keys":[…]}`) of Ed25519 keys whose holders this entry should **recognise** on inbound signed requests (Web Bot Auth / RFC 9421 — see *Who is knocking*). Recognition only adds `env.wba_did` and a visit count; it never changes a verdict |
-| `observer` | none | called once per message with the same envelope your responder gets, **after** the verdict — for counting, logging, analytics. It cannot matter: its return is discarded, a throw is swallowed, a promise is never awaited, so a slow or broken watcher cannot delay or change one byte of the signed reply. See [Counting visits](#counting-visits-without-handing-over-who-they-are) |
+| `observer` | none | called once per message with the same envelope your responder gets, **after** the verdict — for counting, logging, analytics. It cannot matter: its return is discarded, a throw is swallowed, a promise is never awaited, so a slow or broken watcher cannot delay or change one byte of the signed reply. See [Counting visits](#counting-visits-without-handing-over-your-customer-list) |
 | `howToUrl` | none | a page a keyless visitor is pointed at as a worked example. **Empty means omitted** — the refusal already teaches the whole recipe without it, and a reference implementation must not stamp somebody else's docs host into every door built from it. Only set it to a URL you operate, and only after checking it resolves |
 | `name`, `description`, `version` | — | the card's own words. `description` is the line a person reads in a directory listing — and the right place to say what you record about visitors, since it is fetched **before** the knock |
 
@@ -534,8 +534,8 @@ and it is not one. It is the upgrade path:
   ledger back to gate, greet or rate-limit, so a fire-and-forget sink records visiting
   agents with no database anywhere. Use `observer` for it, never your responder: watching
   a visit should not be an edit to the code that decides what to say. See
-  [Counting visits](#counting-visits-without-handing-over-who-they-are) below for the
-  whole pattern, including the one rule that shapes it — **a DID is not a page view**,
+  [Counting visits](#counting-visits-without-handing-over-your-customer-list) below for the
+  whole pattern, including the one rule that shapes it — **a DID is not a cookie**,
   so what leaves your box is a salted digest, never the identifier itself. A sink cannot
   be read back during a request: it counts customers, it cannot recognise one. It
   replaces a log line, not the store above — none of the recommended features stand
@@ -565,7 +565,7 @@ What the entry now handles for you at the HTTP layer, so you do not have to:
   which says a server must accept the absolute form: this endpoint answers exactly the
   address its card names, and the refusal says so.
 
-## Counting visits without handing over who they are
+## Counting visits without handing over your customer list
 
 You will want to know how many agents knocked, how many came back, and what they asked. All
 three are answerable — and how you answer them decides whether you are counting your visitors
@@ -576,11 +576,18 @@ envelope, after the verdict, so watching a visit stops being an edit to the code
 what to say. It cannot matter: its return is discarded, a throw is swallowed, a promise is
 never awaited — a slow or broken watcher cannot delay or change one byte of the signed reply.
 
-**The rule that shapes everything else: a DID is not a page view.** A visitor hands you one in
-order to transact with **you**, and here first contact *is* the account — there is no signup
-form where they agreed to anything else. Forwarding the raw value to an analytics vendor shares
-a durable identifier its owner never offered them, silently, on a surface with no consent
-dialog and no visitor who could decline. So split it:
+**The rule that shapes everything else: a DID is not a cookie, and it is not a throwaway
+either.** Nobody imposed it — the visitor read your card *before* knocking, and an owner who
+wanted this conversation kept apart would have sent a different agent, because an owner runs
+several and each is a distinct agent with its own lasting identity. But the one that did knock
+means to keep the key it used: that is how it gets recognised, introduced and trusted anywhere on
+the network, so it is closer to a professional's name than to a tracking cookie.
+
+Which is exactly why the raw value should not travel onward. **The DID is genuinely durable, and
+you were given it so that YOU could reach them again.** Widen that purpose and nothing happens to
+you legally, which is the part worth understanding: the owner simply stops sending that agent to
+you. Silently, at no cost, and you never learn you lost them — not one data point, the whole
+relationship. So split it:
 
 - **What leaves** — a salted digest and a few shape facts. Never the DID, never the text.
 - **What stays** — the relationship (who, how many, first and last seen) in your own store,
