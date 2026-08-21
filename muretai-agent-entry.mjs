@@ -336,10 +336,12 @@ export const UA_FAMILIES = [
   ['mozilla', 'browser'],
 ];
 
-/** The families that read as an AI agent — the ones the notice route signposts with a
- *  `Link` header. `muretai-node` is deliberately absent: its Outbox already walks the
- *  well-known card paths, so a signpost buys it nothing. Must match the same set in
- *  examples/agent_entry_reference.py. */
+/** The families that read as an AI agent. Since v1.11 this set steers NO wire byte —
+ *  the notice route's `Link` signpost is emitted for every caller (see `steerHeaders`
+ *  and ISSUE(agent-entry-unconditional-link)) — so it remains only as a published
+ *  classification an operator's own observation code can lean on. `muretai-node` is
+ *  deliberately absent: its Outbox already walks the well-known card paths. Must match
+ *  the same set in examples/agent_entry_reference.py. */
 export const AI_AGENT_FAMILIES = new Set([
   'claude-user', 'claudebot', 'gptbot', 'openai', 'perplexity', 'google-extended',
 ]);
@@ -2394,6 +2396,18 @@ export function createAgentEntry({
     },
   };
   card.security = [{ [SIGNED_ENVELOPE_SCHEME]: [] }];
+  // WHERE A 1.0-NATIVE READER FINDS THE ENDPOINT. A2A 1.0 removed the top-level `url` /
+  // `preferredTransport` pair in favour of `supportedInterfaces`, so a client written
+  // against 1.0 greps for exactly this field and, without it, learns nothing from this
+  // card about where to POST. `url` is doorUrl — the address message/send is actually
+  // POSTed to, the same string the securitySchemes `exampleRequest`'s `endpoint` names —
+  // and deliberately NOT canonUrl, which at a bare origin differs from the door by the
+  // trailing slash (canonUrl's bytes are pinned and signed; this entry is what carries
+  // the canonical POST form). Appended last so every field an already-deployed entry
+  // publishes keeps its bytes AND its position.
+  card.supportedInterfaces = [
+    { url: doorUrl, protocolBinding: 'JSONRPC', protocolVersion: PROTOCOL_VERSION },
+  ];
 
   const cardBytes = Buffer.from(JSON.stringify(card), 'utf8');   // identical bytes on both paths
   // ACCOUNT DID -> {first_seen, last_seen, messages}. Keyed by the RESOLVED account (T102):
@@ -2517,25 +2531,32 @@ export function createAgentEntry({
     return out;
   }
 
-  /** The `Link` header the notice route carries. TWO relations with different audiences,
-   *  in ONE header field (RFC 8288 allows several link-values in one field, and one field
-   *  is what keeps the two twins' bytes identical through their single-header plumbing):
+  /** The `Link` header the notice route carries — the SAME one-field value for EVERY
+   *  caller. TWO relations in ONE header field (RFC 8288 allows several link-values in
+   *  one field, and one field is what keeps the two twins' bytes identical through their
+   *  single-header plumbing):
    *
-   *    - the DOOR pointer, `rel="https://muretai.net/rel/agent-entry"`, for EVERY caller.
-   *      This is the coexistence primitive (E4): an agent that fetched a page finds the
+   *    - `rel="service-desc"` (RFC 8631's registered relation for "service description …
+   *      primarily intended for consumption by machines"), FIRST. It was emitted only to
+   *      the UA families that read as an AI agent (the T119 signpost) until a
+   *      third-party scanner (agentcard.org, 2026-08-21) measured that conditioned
+   *      emission as invisible: its crawler is none of our families, so a working door
+   *      scored as publishing no service description at all — the revisit trigger
+   *      recorded in ISSUE(agent-entry-unconditional-link). A header conditioned on a
+   *      guess about the reader is invisible to exactly the readers the guess missed,
+   *      so it is now emitted for every caller.
+   *    - the DOOR pointer, `rel="https://muretai.net/rel/agent-entry"`. This is the
+   *      coexistence primitive (E4): an agent that fetched a page finds the
    *      machine-readable door in the RESPONSE, with no HTML to parse and no prose to
    *      read, and a browser ignores it — which is what lets a site keep its own front
    *      page and add ONE header instead of migrating. An absolute URI because RFC 8288
    *      §2.1.2 permits a bare token only for an IANA-registered relation.
-   *    - `rel="service-desc"` (RFC 8631's registered relation for "service description …
-   *      primarily intended for consumption by machines"), FIRST and only for the UA
-   *      families that read as an AI agent — the T119 signpost, unchanged in meaning.
    *
-   *  HEADER-ONLY on purpose: the notice BODY is byte-identical for every caller, so what
-   *  the UA changes is still only this one additive relation and never a verdict. */
-  function steerHeaders(family) {
+   *  HEADER-ONLY on purpose: the notice BODY is byte-identical for every caller, and now
+   *  so is this header — the UA family still steers observation (`tally`/`stats`), never
+   *  a byte on the wire. */
+  function steerHeaders(family) {   // `family` kept for observation symmetry, unread here
     const door = `<${mount}${AGENT_CARD_PATH}>; rel="${AGENT_ENTRY_REL}"`;
-    if (!AI_AGENT_FAMILIES.has(family)) return { Link: door };
     return { Link: `<${mount}${AGENT_CARD_PATH}>; rel="service-desc", ${door}` };
   }
 
@@ -3162,8 +3183,8 @@ export function createAgentEntry({
         return { status: 200,
           headers: { 'Content-Type': 'text/plain; charset=utf-8',
             'Content-Length': String(body.length),
-            // The ONE wire-visible thing observation adds: an AI-agent UA is pointed at
-            // the machine-readable door. The body above is byte-identical either way.
+            // Every caller is pointed at the machine-readable door — the same one-field
+            // Link value for all of them (v1.11). The body above is byte-identical too.
             ...steerHeaders(family) },
           body };
       }

@@ -138,10 +138,12 @@ Each request's `User-Agent` is classified into a fixed family (`claude-user`,
 `claudebot`, `gptbot`, `openai`, `perplexity`, `google-extended`, `muretai-node`,
 `curl`, `browser`, `none`/`other`) and counted by stage. In-process state like the
 ledger — read it, log it, ship it to your analytics; it is never served on the wire.
-An AI-agent family also gets one nudge: `GET /` answers it with
-`Link: </.well-known/agent-card.json>; rel="service-desc"` (RFC 8631), so a crawler
-that landed on prose is handed the machine-readable door. The body stays
-byte-identical for every caller.
+Every caller also gets one nudge: `GET /` answers with a single `Link:` field carrying
+two relations — `rel="service-desc"` (RFC 8631) first, then the door pointer
+`rel="https://muretai.net/rel/agent-entry"` — so a crawler that landed on prose is
+handed the machine-readable door, whatever its `User-Agent` claims. The body stays
+byte-identical for every caller, and so does the header: classification feeds the
+counters above and never a byte on the wire.
 
 One rule holds this together, enforced by the contract suite rather than promised:
 **a User-Agent never affects `verified`, an account row, a rate limit, or any
