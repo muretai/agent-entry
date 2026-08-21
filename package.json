@@ -1,6 +1,6 @@
 {
   "name": "@muretai/agent-entry",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Make your website answer AI agents: an A2A agent endpoint that verifies who is knocking, opens an account for them and replies signed, in one HTTP round trip. Zero dependencies. Pairs with llms.txt and WebMCP.",
   "type": "module",
   "main": "muretai-agent-entry.mjs",
