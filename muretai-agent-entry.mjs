@@ -1706,7 +1706,7 @@ function jsonResponse(status, obj, extraHeaders = {}) {
   };
 }
 
-function rpcError(id, error, data) {
+function baseRpcError(id, error, data) {
   const err = { ...error };
   if (data) err.data = data;
   return jsonResponse(200, { jsonrpc: '2.0', id: id ?? null, error: err });
@@ -2479,10 +2479,32 @@ export function createAgentEntry({
   // five stage names — an attacker choosing UA strings cannot grow it.
   const uaStats = new Map();
 
+  /** Count the stage, and tell the watcher about it.
+   *
+   *  Every stage a visitor can reach already passes through here — `card_get`, `notice_get`,
+   *  `anon_post`, `signed_post`, `refused_post` — so this is where the observer learns HOW FAR
+   *  somebody got. It could previously see only the conversations: a site shipping visits to
+   *  analytics got the answered messages and nothing else, no card fetch, no notice read, no
+   *  keyless walk-in. The interesting shape of agent traffic is exactly that drop-off — how
+   *  many looked, how many tried, how many got in.
+   *
+   *  Reported from HERE and not from a second place, so the watcher and `entry.stats()` can
+   *  never disagree about what happened, and a stage added later is reported without anyone
+   *  remembering to. `identified` rides along because "no DID at all" and "had a DID and was
+   *  refused" are different answers for a site deciding whether to open the anonymous lane.
+   *
+   *  A GET carries no envelope, so the watcher is told what is true and nothing invented: no
+   *  DIDs, no text, `verified: false`. The POST stages are handed to `respond()` /
+   *  `observeRefusal()` instead, which know the envelope — one visit, one row, never two. */
   function tally(family, stage) {
     let row = uaStats.get(family);
     if (!row) { row = new Map(); uaStats.set(family, row); }
     row.set(stage, (row.get(stage) || 0) + 1);
+    if (typeof observer !== 'function') return;
+    if (stage === 'card_get' || stage === 'notice_get') {
+      observe({ stage, identified: 0, verified: false, ua_family: family,
+                peer_did: null, owner_did: null, wba_did: null, text: null });
+    }
   }
 
   /** A plain JSON-able copy of the counters: { family: { stage: n } }. */
@@ -2718,7 +2740,80 @@ export function createAgentEntry({
    * size checks come BEFORE any parsing or crypto — a check placed after the signature is
    * a check the attacker simply skips.
    */
+  /** The code of the refusal this request produced, or null when it was answered. Set by the
+   *  entry-local `rpcError` below so the funnel can report it without re-parsing a Buffer. */
+  let lastRefusal = null;
+
+  /** The stage `tally()` computed for the POST currently in flight, handed to whichever
+   *  observation point reports it. `tally()` runs AFTER the ladder returns, so the answered
+   *  case is observed before this is set — which is why `respond()` reads it lazily rather
+   *  than being passed it. */
+  let pendingStage = null;
+
+  /** Shadows the module-level `rpcError` for the whole entry: same return value, and it
+   *  remembers the code on the way out. A local alias rather than seventeen edits, and rather
+   *  than a parameter every refusal site would have to remember to pass. */
+  const rpcError = (id, error, data) => {
+    lastRefusal = error && typeof error.code === 'number' ? error.code : null;
+    return baseRpcError(id, error, data);
+  };
+
+  /** Every POST outcome, observed once, at the single point they all funnel through.
+   *
+   *  `respond()` observes the answered case with the full envelope. Everything else — the
+   *  keyless walk-in, the bad signature, the flood that hit a ceiling — returned an rpcError
+   *  and was never seen at all, so a door could count who it TALKED to and never who it TURNED
+   *  AWAY. For a site asking whether agents are arriving, the refusals are the signal: an agent
+   *  that could not get in is the one nobody hears from again. It also made the documented
+   *  contract false, since the guide says the observer runs once per message, after the verdict,
+   *  and a refusal IS a verdict.
+   *
+   *  Structural rather than enumerated ON PURPOSE. Seventeen refusal sites would have been
+   *  seventeen chances to forget, and the eighteenth would be forgotten by construction.
+   *
+   *  The code is read from `lastRefusal`, set by `rpcError` on its way out, rather than by
+   *  re-parsing the response — the body is already a Buffer by then, and a watcher must never
+   *  cost a JSON round-trip on the reply path.
+   *
+   *  A refusal hands the watcher only what was actually established: `refused` carries the
+   *  JSON-RPC code and the DIDs are null, because a walk-in that named nobody named nobody. The
+   *  watcher still cannot matter — same swallowed throw, same discarded return. */
   function handlePost(rawBody, reqHeaders) {
+    lastRefusal = null;
+    // The stage a POST reaches is decided by whether it CARRIED a signature, which is knowable
+    // from the request alone — so it is settled here, before the ladder answers, and read by
+    // whichever observation point fires. `tally()` computes the same thing afterwards from the
+    // finished reply, for the counters; the two agree because they ask the same question.
+    pendingStage = postRequestStage(rawBody);
+    const out = handlePostLadder(rawBody, reqHeaders);
+    if (isThenable(out)) return out.then((o) => { observeRefusal(); return o; });
+    observeRefusal();
+    return out;
+  }
+
+  /** The answered case is already observed inside `respond()`; this adds refusals only, so no
+   *  message is ever observed twice. */
+  function observeRefusal() {
+    if (typeof observer !== 'function' || lastRefusal === null) return;
+    observe({ verified: false, refused: lastRefusal, stage: 'refused_post',
+              identified: pendingStage === 'signed_post' ? 1 : 0,
+              peer_did: null, owner_did: null, wba_did: null, text: null });
+  }
+
+  /** Did this POST body carry a signature? That is the whole difference between a keyless
+   *  walk-in and an identified visitor, and it is answerable from the request without waiting
+   *  for the verdict — a bad signature is still a visitor who HAD a key. Parsed defensively:
+   *  anything unreadable is a walk-in, because it certainly did not present an identity. */
+  function postRequestStage(rawBody) {
+    try {
+      const buf = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody || '');
+      const req = JSON.parse(buf.toString('utf8'));
+      const meta = req?.params?.message?.metadata;
+      return (meta && typeof meta.sig === 'string' && meta.sig) ? 'signed_post' : 'anon_post';
+    } catch { return 'anon_post'; }
+  }
+
+  function handlePostLadder(rawBody, reqHeaders) {
     // RAW BYTES, always. A host app that hands us a decoded string has already destroyed
     // the evidence the strict decode below exists to find, so normalise once and measure
     // the SIZE in bytes rather than in UTF-16 code units.
@@ -2871,17 +2966,25 @@ export function createAgentEntry({
     if (!Number.isSafeInteger(ts) || Math.abs(nowEpoch() - ts) > CLOCK_WINDOW_S) {
       return rpcError(reqId, ERRORS.REPLAY_REJECTED, 'timestamp out of range (clock skew or replay)');
     }
-    // 7. duplicate messageId inside the replay window. (Its type was settled by the shape
-    //    gate: a non-string messageId never reaches here on either implementation.)
+    // 7. the signature itself, under the key DERIVED FROM `from`. (`messageId`'s type was
+    //    settled by the shape gate: a non-string never reaches here on either implementation.)
     const messageId = msg.messageId;
-    if (!replay.checkAndRemember(messageId)) {
-      return rpcError(reqId, ERRORS.REPLAY_REJECTED, 'duplicate messageId (replay) detected');
-    }
-    // 8. the signature itself, under the key DERIVED FROM `from`.
     const fields = { from, to, messageId, contextId: msg.contextId ?? null,
       timestamp: ts, text, sig };
     if (!verifyEnvelope(fields, { recipientDid: did })) {
       return rpcError(reqId, ERRORS.UNAUTHENTICATED, 'signature does not match');
+    }
+    // 8. duplicate messageId inside the replay window — AFTER the verify, and the ORDER is the
+    //    property. The table is state an authenticated sender depends on, so a caller who has
+    //    proved nothing must not write into it. Ahead of the verify a stranger could BURN an id
+    //    its real sender was about to use, and because the table is capped and evicts
+    //    oldest-first, flood past the cap to discard genuine entries and re-open real messages
+    //    to replay — invalid signatures are not rate-limited, so that flood is free. This is the
+    //    rule the signed lane's ceiling already follows one step below, for the same reason; it
+    //    was simply never applied here. The cost of the swap is one Ed25519 verify spent on a
+    //    replayed VALID message, which an attacker must first have obtained.
+    if (!replay.checkAndRemember(messageId)) {
+      return rpcError(reqId, ERRORS.REPLAY_REJECTED, 'duplicate messageId (replay) detected');
     }
 
     // 9. T102 account layer. An OPTIONAL countersigned v2 binding collapses an owner's device
@@ -2936,18 +3039,22 @@ export function createAgentEntry({
   }
 
   function respond(env, reqId, msg, toDid) {
-    observe(env);
+    // The answered case: the envelope already says who this was, and the stage says how they
+    // arrived. `identified` is read off the envelope rather than the stage, because the
+    // anonymous lane answers a visitor who genuinely presented no DID.
+    observe({ ...env, stage: pendingStage,
+              identified: env && env.peer_did ? 1 : 0 });
     let answer;
     try {
       answer = responder(env);
     } catch (e) {
-      return rpcError(reqId, ERRORS.INTERNAL_ERROR, `responder failed: ${e && e.message}`);
+      return rpcError(reqId, ERRORS.INTERNAL_ERROR, 'the site backend failed to answer');
     }
     const inbound = { contextId: msg.contextId ?? null, messageId: msg.messageId ?? null };
     if (isThenable(answer)) {
       return answer.then(
         (v) => finishReply(reqId, v, { inbound, toDid }),
-        (e) => rpcError(reqId, ERRORS.INTERNAL_ERROR, `responder failed: ${e && e.message}`));
+        (e) => rpcError(reqId, ERRORS.INTERNAL_ERROR, 'the site backend failed to answer'));
     }
     return finishReply(reqId, answer, { inbound, toDid });
   }
@@ -3180,7 +3287,7 @@ export function createAgentEntry({
         const body = oversize ? oversizeSentinel() : Buffer.concat(chunks, total);
         Promise.resolve()
           .then(() => handleRequestAsync(req.method, req.url, req.headers, body))
-          .catch((e) => rpcError(null, ERRORS.INTERNAL_ERROR, String(e && e.message)))
+          .catch(() => rpcError(null, ERRORS.INTERNAL_ERROR, 'the entry failed to answer'))
           .then(({ status, headers, body: out }) => {
             res.writeHead(status, headers);
             res.end(req.method === 'HEAD' ? undefined : out);
