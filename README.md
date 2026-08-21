@@ -104,9 +104,12 @@ answers questions and hands off nothing, is a signed claim you cannot keep.
 | option | default | what it does |
 |---|---|---|
 | `skills` | `[]` | the menu above — what a visitor learns before knocking |
-| `openDoor` | `true` | publishes `muretai.open_door`: the field that tells a visiting agent it may message you with no introduction |
+| `openDoor` | `true` | publishes `agentEntry.open_door`: the field that tells a visiting agent it may message you with no introduction. The same fact is emitted under the older `muretai.open_door` spelling beside it — read either, write the neutral one |
 | `anonymousLane` | `false` | also answer **unsigned** inquiries. They create no account row, and the lane is capped entry-wide — an unauthenticated caller must never become an unmetered signing oracle |
-| `anonRatePerMin` | `30` | anonymous replies per minute, entry-wide. Signed senders are not bound by it: they are attributable and already in your ledger |
+| `anonRatePerMin` | `30` | anonymous replies per minute, entry-wide |
+| `signedRatePerMin` | `60` | signed replies per minute **per account**, ON by default. Attribution is not scarcity: a `did:key` costs nothing to mint, so being in your ledger was never a bound |
+| `signedRatePerMinTotal` | `600` | signed replies per minute for the **whole entry**. Free identity defeats per-identity metering by definition, so only the aggregate resists a flood |
+| `guest` | `false` | put the door on a path of its own and leave `GET /` alone entirely — for a site that is keeping its front page. A `GET` on a guest mount answers **405 with `Allow: POST, OPTIONS`**, never 404: the address is signed into a public card, and hiding a published address conceals nothing |
 | `maxAccounts` | `50000` | how many accounts the in-process ledger holds |
 | `domains` | none | the domains this entry speaks for (see below) |
 | `basePath` | from `baseUrl` | the path this entry answers at, derived rather than set beside it |
@@ -498,8 +501,10 @@ navigator.modelContext.registerTool({
 ```
 
 `MY_DID` is the DID your Agent Entry prints at startup — **the same one**, from the same seed.
-That is the only rule when running both: a mismatch trips the visitor's impersonation guard,
-which is what it is there for.
+That is the only rule when running both, and **nothing here enforces it** — this package never
+sees your in-page handoff. A mismatch is a site publishing two different identities for one
+origin, which a careful visitor may notice and a careless one will not, so treat it as your
+invariant to keep rather than a guard you are behind.
 
 What the shop gets out of it: the moment that signed message arrives, an account exists. No
 signup form, no password, nothing to reset — the sender's key is the account. Come back
@@ -642,7 +647,7 @@ in the same breath, in plain words.
 
 This module is not alone. A Python reference implements the same contract, and the two are
 held to **identical verdicts** by an acceptance suite: it runs the same attack battery
-against both, drives this module against `testdata/wire_vectors.json` byte for byte, posts
+against both, drives this module against the same wire vectors byte for byte, posts
 identical bytes to each over real sockets — down to the HTTP framing — and requires the same
 status, the same account outcome and the same signed reply from both. If you write a third
 implementation, that suite is the gate.
@@ -671,9 +676,16 @@ because a shared library would only ever have covered the parts they happen to s
 suite posts identical bytes to both, down to the HTTP framing, and requires the same status,
 the same account outcome and the same signed reply.
 
-`testdata/wire_vectors.json` is the part of that gate you can run here: it pins the canonical
-JSON, the signing payloads, the card envelopes and the did:key round-trips this module must
-reproduce byte for byte.
+**The part of that gate you can run here ships in this package.** `npm test` executes
+`conformance/run.mjs` against `conformance/vectors.json` — the canonical JSON, the signing
+payloads, the card envelopes and the `did:key` round-trips this module must reproduce byte
+for byte. No network, no checkout of ours, nothing to ask us for:
+
+```bash
+npm test
+```
+
+Write a third implementation and point it at the same vectors.
 
 ## What this is part of
 
