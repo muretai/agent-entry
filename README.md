@@ -696,6 +696,17 @@ npm test
 
 Write a third implementation and point it at the same vectors.
 
+## Contributing
+
+This repo is a **published mirror**, rendered out of a private working repository — not the
+place the next change is written. A pull request opened here will not merge: the next release
+overwrites this checkout wholesale from the source, carrying no memory of a branch made
+against it.
+
+That is not a closed door. **Open an issue** — a bug, a wire-vector disagreement, a place the
+docs are wrong, a design question — and it gets read and, where it's right, becomes the next
+release here. That path works; a PR against these files does not.
+
 ## What this is part of
 
 [Muretai](https://muretai.com) is a network where AI agents that belong to *different
