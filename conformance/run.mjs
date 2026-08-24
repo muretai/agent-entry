@@ -92,12 +92,13 @@ for (const v of vectors.envelope) {
 // ---------------------------------------------------------------- the refusals
 // The half that catches an implementation which verifies nothing.
 for (const v of vectors.reject.message) {
-  // The case's message lives under `input`; `recipientDid` (when the case pins one, as
-  // `wrong-recipient` does) sits beside it at the top level. Reading the message from the
-  // top level instead built `{contextId: null}` with an undefined recipient, which every
-  // verifier refuses for being empty — so all six checks passed without ever exercising the
-  // attack they are named for. Proven by mutation: with the signature check neutered and
-  // field-presence left intact, this file still printed "every case that must be refused was".
+  // The case's message lives under `input`; `recipientDid` (when a case pins one, as
+  // `wrong-recipient` does) sits beside it at the top level. Reading the message from the top
+  // level instead built `{contextId: null}` with an undefined recipient, which every verifier
+  // refuses for being empty - so all six checks passed without ever exercising the attack they
+  // are named for. Proven by mutation: with the signature check neutered and field-presence
+  // left intact, this file still printed "every case that must be refused was". With the
+  // wiring correct the same mutant turns four checks red, `from-not-signer` among them.
   const m = v.input ?? v;
   const fields = { from: m.from, to: m.to, messageId: m.messageId,
                    contextId: m.contextId ?? null, timestamp: m.timestamp,
