@@ -12,6 +12,7 @@
     "conformance/",
     "examples/server.mjs",
     "LICENSE",
+    "spec/",
     "README.md"
   ],
   "engines": {

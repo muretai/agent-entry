@@ -92,12 +92,19 @@ for (const v of vectors.envelope) {
 // ---------------------------------------------------------------- the refusals
 // The half that catches an implementation which verifies nothing.
 for (const v of vectors.reject.message) {
-  const fields = { from: v.from, to: v.to, messageId: v.messageId,
-                   contextId: v.contextId ?? null, timestamp: v.timestamp,
-                   text: v.text, sig: v.sig };
+  // The case's message lives under `input`; `recipientDid` (when the case pins one, as
+  // `wrong-recipient` does) sits beside it at the top level. Reading the message from the
+  // top level instead built `{contextId: null}` with an undefined recipient, which every
+  // verifier refuses for being empty — so all six checks passed without ever exercising the
+  // attack they are named for. Proven by mutation: with the signature check neutered and
+  // field-presence left intact, this file still printed "every case that must be refused was".
+  const m = v.input ?? v;
+  const fields = { from: m.from, to: m.to, messageId: m.messageId,
+                   contextId: m.contextId ?? null, timestamp: m.timestamp,
+                   text: m.text, sig: m.sig };
   let accepted;
   try {
-    accepted = verifyEnvelope(fields, { recipientDid: v.recipientDid ?? v.to });
+    accepted = verifyEnvelope(fields, { recipientDid: v.recipientDid ?? m.recipientDid ?? m.to });
   } catch {
     accepted = false;                            // refusing by throwing is still refusing
   }
