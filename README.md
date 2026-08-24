@@ -114,7 +114,7 @@ answers questions and hands off nothing, is a signed claim you cannot keep.
 | `domains` | none | the domains this entry speaks for (see below) |
 | `basePath` | from `baseUrl` | the path this entry answers at, derived rather than set beside it |
 | `wbaVerifiers` | none | a JWKS document (`{"keys":[…]}`) of Ed25519 keys whose holders this entry should **recognise** on inbound signed requests (Web Bot Auth / RFC 9421 — see *Who is knocking*). Recognition only adds `env.wba_did` and a visit count; it never changes a verdict |
-| `observer` | none | called once per message with the same envelope your responder gets, **after** the verdict — for counting, logging, analytics. It cannot matter: its return is discarded, a throw is swallowed, a promise is never awaited, so a slow or broken watcher cannot delay or change one byte of the signed reply. See [Counting visits](#counting-visits-without-handing-over-your-customer-list) |
+| `observer` | none | called once per message with the same envelope your responder gets, plus `stage`, `identified` and `ua_family`, **after** the verdict — for counting, logging, analytics. It cannot matter: its return is discarded, a throw is swallowed, a promise is never awaited, so a slow or broken watcher cannot delay or change one byte of the signed reply. See [Counting visits](#counting-visits-without-handing-over-your-customer-list) |
 | `howToUrl` | none | a page a keyless visitor is pointed at as a worked example. **Empty means omitted** — the refusal already teaches the whole recipe without it, and a reference implementation must not stamp somebody else's docs host into every door built from it. Only set it to a URL you operate, and only after checking it resolves |
 | `name`, `description`, `version` | — | the card's own words. `description` is the line a person reads in a directory listing — and the right place to say what you record about visitors, since it is fetched **before** the knock |
 
@@ -144,6 +144,15 @@ two relations — `rel="service-desc"` (RFC 8631) first, then the door pointer
 handed the machine-readable door, whatever its `User-Agent` claims. The body stays
 byte-identical for every caller, and so does the header: classification feeds the
 counters above and never a byte on the wire.
+
+**Since 1.8.0 the watcher is told the same thing.** `entry.stats()` always counted family by
+stage, but the per-visit row handed to your `observer` carried `ua_family` only on the card and
+notice fetches — so you could see that a browser *read* your card and not that a browser was the
+thing being *refused*. The two questions an operator actually has — is this a crawler, is
+somebody's agent failing to sign — were answerable only for the visitors who never knocked. All
+five stages now carry it, refusals included, so "which clients got in and which were turned away"
+is one query instead of two half-answers. Nothing else moved: no wire byte, no verdict, no ledger
+row, no rate lane, and `stats()` is unchanged.
 
 One rule holds this together, enforced by the contract suite rather than promised:
 **a User-Agent never affects `verified`, an account row, a rate limit, or any

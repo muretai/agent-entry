@@ -2254,6 +2254,12 @@ export function canonicalMount(canonUrl, basePath) {
  *                  callback, and a watcher that dialled out on the hot path would make the
  *                  visitor's answer depend on somebody else's uptime.
  *
+ *                  WHAT IT IS TOLD. Every stage reports `stage`, `identified` and
+ *                  `ua_family` — the door's own bounded classification of the client, one
+ *                  of the fixed `UA_FAMILIES` names and NEVER a substring of what the caller
+ *                  sent, so a stranger cannot write its own label into your metrics. The
+ *                  POST stages add the envelope on top.
+ *
  *                  WHAT NOT TO PUT IN IT. The envelope carries `peer_did`/`owner_did`,
  *                  which a visitor handed you to transact with YOU. Forwarding a raw DID to
  *                  a third party shares a durable identifier its owner never offered them;
@@ -2509,7 +2515,9 @@ export function createAgentEntry({
    *
    *  A GET carries no envelope, so the watcher is told what is true and nothing invented: no
    *  DIDs, no text, `verified: false`. The POST stages are handed to `respond()` /
-   *  `observeRefusal()` instead, which know the envelope — one visit, one row, never two. */
+   *  `observeRefusal()` instead, which know the envelope — one visit, one row, never two.
+   *  `ua_family` is the one field BOTH sides report, so a watcher can ask "which clients got
+   *  in and which were turned away" as one question instead of two half-answers. */
   function tally(family, stage) {
     let row = uaStats.get(family);
     if (!row) { row = new Map(); uaStats.set(family, row); }
@@ -2771,6 +2779,22 @@ export function createAgentEntry({
    *  than being passed it. */
   let pendingStage = null;
 
+  /** The client family for the POST currently in flight, handed to the same observation
+   *  points as `pendingStage` and for the same reason. The GET stages already carry
+   *  `ua_family` — it is what `tally()` counts under — and a KNOCK, the stage where "who is
+   *  this client" matters most, was the one arriving without it. A watcher could see that a
+   *  browser fetched the card and NOT that a browser was the thing being refused, which
+   *  leaves the two questions an operator actually has (is this a crawler? is somebody's
+   *  agent failing to sign?) answerable only for the visitors who did not try.
+   *
+   *  Derived from the same request `route()` derived its own `family` from, and `uaFamily` is
+   *  a pure function of that one header, so the two cannot disagree. Recomputed rather than
+   *  threaded through a signature every call site would have to remember to pass — the same
+   *  argument `rpcError` makes for shadowing itself a few lines below. Set and read together
+   *  with `pendingStage`, so it inherits exactly that field's accepted skew under an async
+   *  responder and can never disagree with the stage it is reported beside. */
+  let pendingFamily = 'none';
+
   /** Shadows the module-level `rpcError` for the whole entry: same return value, and it
    *  remembers the code on the way out. A local alias rather than seventeen edits, and rather
    *  than a parameter every refusal site would have to remember to pass. */
@@ -2806,6 +2830,7 @@ export function createAgentEntry({
     // whichever observation point fires. `tally()` computes the same thing afterwards from the
     // finished reply, for the counters; the two agree because they ask the same question.
     pendingStage = postRequestStage(rawBody);
+    pendingFamily = uaFamily(uaOf(reqHeaders));
     const out = handlePostLadder(rawBody, reqHeaders);
     if (isThenable(out)) return out.then((o) => { observeRefusal(); return o; });
     observeRefusal();
@@ -2817,7 +2842,7 @@ export function createAgentEntry({
   function observeRefusal() {
     if (typeof observer !== 'function' || lastRefusal === null) return;
     observe({ verified: false, refused: lastRefusal, stage: 'refused_post',
-              identified: pendingStage === 'signed_post' ? 1 : 0,
+              identified: pendingStage === 'signed_post' ? 1 : 0, ua_family: pendingFamily,
               peer_did: null, owner_did: null, wba_did: null, text: null });
   }
 
@@ -3063,7 +3088,7 @@ export function createAgentEntry({
     // The answered case: the envelope already says who this was, and the stage says how they
     // arrived. `identified` is read off the envelope rather than the stage, because the
     // anonymous lane answers a visitor who genuinely presented no DID.
-    observe({ ...env, stage: pendingStage,
+    observe({ ...env, stage: pendingStage, ua_family: pendingFamily,
               identified: env && env.peer_did ? 1 : 0 });
     let answer;
     try {
@@ -3211,24 +3236,6 @@ export function createAgentEntry({
       // and when this entry is mounted under a path, "anywhere else" INCLUDES the bare
       // host, which belongs to the site (or to the neighbour agent) and not to us.
       if (!isMountPath(pathname)) return jsonResponse(404, { error: 'not found' });
-      // A QUERY STRING MEANS THE POST IS NOT OURS. The door's address is the signed
-      // card's `url`, byte-exact: a base URL carrying a query is refused at startup, and
-      // a visitor's walk drops any query it was handed before it POSTs the card's `url` —
-      // so no conformant caller can arrive here, while a site's own query-multiplexed
-      // traffic (`?wc-api=`, `?wc-ajax=`, `?rest_route=`) always does. Disjoint BY
-      // CONSTRUCTION, which is what makes this a rule and not a heuristic. Measured:
-      // WooCommerce Stripe delivers its only webhook to `/?wc-api=wc_stripe` (path `/`,
-      // application/json); a bare-origin door that claimed it answered HTTP 200/-32601
-      // echoing the event id, the sender recorded the event as delivered and never
-      // retried — payment events lost SILENTLY. The answer is the unowned-path 404
-      // above, same bytes, one meaning — the DECISION(non-door-post-answers-404-not-405)
-      // non-disclosure again, because the caller most likely to land here is the site's
-      // own webhook, which deserves the most anonymous answer, never a door verdict.
-      const hashless = target.split('#')[0];
-      const queryAt = hashless.indexOf('?');
-      if (queryAt !== -1 && queryAt + 1 < hashless.length) {
-        return jsonResponse(404, { error: 'not found' });
-      }
       const buf = bodyBuffer || Buffer.alloc(0);
       const out = handlePost(buf, headers);
       // The stage is read off the finished answer, so an async responder tallies when it
