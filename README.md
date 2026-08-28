@@ -114,7 +114,7 @@ answers questions and hands off nothing, is a signed claim you cannot keep.
 | `domains` | none | the domains this entry speaks for (see below) |
 | `basePath` | from `baseUrl` | the path this entry answers at, derived rather than set beside it |
 | `wbaVerifiers` | none | a JWKS document (`{"keys":[…]}`) of Ed25519 keys whose holders this entry should **recognise** on inbound signed requests (Web Bot Auth / RFC 9421 — see *Who is knocking*). Recognition only adds `env.wba_did` and a visit count; it never changes a verdict |
-| `observer` | none | called once per message with the same envelope your responder gets, plus `stage`, `identified` and `ua_family`, **after** the verdict — for counting, logging, analytics. It cannot matter: its return is discarded, a throw is swallowed, a promise is never awaited, so a slow or broken watcher cannot delay or change one byte of the signed reply. See [Counting visits](#counting-visits-without-handing-over-your-customer-list) |
+| `observer` | none | called once per message with the same envelope your responder gets, plus `stage`, `identified`, `ua_family` and `client_class`, **after** the verdict — for counting, logging, analytics. It cannot matter: its return is discarded, a throw is swallowed, a promise is never awaited, so a slow or broken watcher cannot delay or change one byte of the signed reply. See [Counting visits](#counting-visits-without-handing-over-your-customer-list) |
 | `howToUrl` | none | a page a keyless visitor is pointed at as a worked example. **Empty means omitted** — the refusal already teaches the whole recipe without it, and a reference implementation must not stamp somebody else's docs host into every door built from it. Only set it to a URL you operate, and only after checking it resolves |
 | `name`, `description`, `version` | — | the card's own words. `description` is the line a person reads in a directory listing — and the right place to say what you record about visitors, since it is fetched **before** the knock |
 
@@ -131,12 +131,21 @@ door counts it:
 ```js
 entry.stats()
 // { gptbot:  { card_get: 12, signed_post: 3 },
-//   browser: { notice_get: 5 } }
+//   browser: { notice_get: 5, card_get: 2 } }
+
+entry.clientStats()
+// { 'declared-agent': { card_get: 12, signed_post: 3 },
+//   'human-like':     { notice_get: 5 },
+//   'stealth-agent':  { card_get: 2 } }
 ```
 
 Each request's `User-Agent` is classified into a fixed family (`claude-user`,
 `claudebot`, `gptbot`, `openai`, `perplexity`, `google-extended`, `muretai-node`,
-`curl`, `browser`, `none`/`other`) and counted by stage. In-process state like the
+`camoufox`, `playwright`, `puppeteer`, `selenium`, `headless-chrome`,
+`curl`, `browser`, `none`/`other`) and counted by stage. `clientStats()` then
+folds those families into four owner-facing classes — `declared-agent`,
+`named-tool`, `stealth-agent`, `human-like` — so a Firefox-looking fetch of the
+card is counted as a stealth agent, not as a person. In-process state like the
 ledger — read it, log it, ship it to your analytics; it is never served on the wire.
 Every caller also gets one nudge: `GET /` answers with a single `Link:` field carrying
 two relations — `rel="service-desc"` (RFC 8631) first, then the door pointer
@@ -153,6 +162,15 @@ somebody's agent failing to sign — were answerable only for the visitors who n
 five stages now carry it, refusals included, so "which clients got in and which were turned away"
 is one query instead of two half-answers. Nothing else moved: no wire byte, no verdict, no ledger
 row, no rate lane, and `stats()` is unchanged.
+
+**Since 1.9.0 a Firefox-looking card fetch is not a human.** `stats()` still files it under
+`browser` — Camoufox's published shape is a clean Firefox UA, and that is the point of
+stealth. `clientStats()` splits it: a browser that only opened the notice is `human-like`;
+the same UA on the card or the door is `stealth-agent`; a leaking automation token
+(`playwright`, `camoufox`, …) is `named-tool`. Export `bodySignpost()` and put that
+`<a>` in the page body, because a snapshot client never sees the header or the
+`<head>` tag. Still observation only — the same POST with or without that UA is the
+same refusal.
 
 One rule holds this together, enforced by the contract suite rather than promised:
 **a User-Agent never affects `verified`, an account row, a rate limit, or any
@@ -228,8 +246,8 @@ framework, an edge worker — that notice never renders**, and your home page is
 people with nothing machine-readable in it. The address ends up published in a card nobody was
 told to fetch.
 
-So put the pointer on every page a visitor might land on, in **both** spellings. Neither is a
-fallback for the other:
+So put the pointer on every page a visitor might land on, in **all three** spellings. None is a
+fallback for the others:
 
 ```
 Link: </.well-known/agent-card.json>; rel="https://muretai.net/rel/agent-entry"
@@ -237,13 +255,17 @@ Link: </.well-known/agent-card.json>; rel="https://muretai.net/rel/agent-entry"
 
 ```html
 <link rel="https://muretai.net/rel/agent-entry" href="/.well-known/agent-card.json">
+<a href="/.well-known/agent-card.json" rel="https://muretai.net/rel/agent-entry">This site answers agents at /.well-known/agent-card.json</a>
 ```
 
 The relation is an opaque **identifier**, matched as a string — nothing about resolving an agent
-endpoint requires a request to that host. The two spellings exist because the two kinds of client
+endpoint requires a request to that host. The three spellings exist because three kinds of client
 have opposite blind spots: an agent that fetches with a plain `curl` (no `-i`) never sees the
-header, and one that reads only headers never parses the HTML. Shipping one is a coin flip on
-which kind arrived.
+header; one that reads only headers never parses the HTML; and a snapshot / ARIA client
+(Camofox, Playwright accessibility dumps) sees only `<body>`, so the `<link>` in `<head>`
+vanishes too. Shipping one is a coin flip on which kind arrived. The module exports
+`bodySignpost()` so the body `<a>` is one function call, not a string you have to keep in
+sync with the relation URI.
 
 We know because we shipped one. An agent that had never been told about our door was handed only
 the domain, fetched the page, read the copy written for humans, and stopped — while the door had
@@ -253,13 +275,13 @@ Then check it from outside, because this is exactly the class of thing that look
 
 ```bash
 curl -sI https://studio.example/ | grep -i '^link:'         # the header half
-curl -s  https://studio.example/ | grep 'rel/agent-entry'   # the tag half
+curl -s  https://studio.example/ | grep 'rel/agent-entry'   # the tag half AND the body <a>
 ```
 
-Worth knowing before you call it done: **both halves disappear in a fetch that converts the page
-to markdown**, which is a common way an agent reads the web — headers are dropped and so is
-everything in `<head>`. No tag survives that. The only remedy is prose: say in the visible body
-that agents are answered here, and name the card path in text a reader can act on.
+Worth knowing before you call it done: **the header and the `<head>` tag disappear in a fetch
+that converts the page to markdown, and in an accessibility snapshot that only sees `<body>`**
+— a common way an agent browser reads the web. The body `<a>` is the spelling those clients
+can still see.
 
 ### Check that your own CDN is not refusing your door
 

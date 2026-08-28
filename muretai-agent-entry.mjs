@@ -107,6 +107,17 @@ export const SIGNED_ENVELOPE_SCHEME = 'did-key-ed25519';
  *  examples/agent_entry_reference.py. */
 export const AGENT_ENTRY_REL = 'https://muretai.net/rel/agent-entry';
 
+/** The body `<a>` a site puts on its own front page so a snapshot / ARIA / `a[href]`
+ *  client (Camofox, Playwright accessibility dumps, markdown converters) can still find
+ *  the door. `<link rel>` in `<head>` and the HTTP `Link` header both vanish in those
+ *  views; an in-body anchor with this relation does not. `href` is the card path this
+ *  entry actually answers (mount-prefixed when the entry sits under a path). Must match
+ *  `body_signpost` in examples/agent_entry_reference.py. */
+export function bodySignpost(href = AGENT_CARD_PATH) {
+  const path = typeof href === 'string' && href ? href : AGENT_CARD_PATH;
+  return `<a href="${path}" rel="${AGENT_ENTRY_REL}">This site answers agents at ${path}</a>`;
+}
+
 /** Where a keyless visitor is sent to learn how to mint an identity and sign. It rides in
  *  the card AND in the refusal, so an agent that has only one of the two still has the URL.
  *
@@ -332,6 +343,16 @@ export const UA_FAMILIES = [
   ['perplexity', 'perplexity'],
   ['google-extended', 'google-extended'],
   ['muretai-node', 'muretai-node'],
+  // Leaking automation UAs. Must sit BEFORE `mozilla`: Camoufox/Playwright Firefox UAs
+  // start with "Mozilla/5.0 …" and a needle after that would never fire. A patched
+  // Camoufox sends a clean Firefox UA and classifies as `browser` — that is the
+  // stealth-agent case `clientClass` exists for, not a miss in this table.
+  ['camoufox', 'camoufox'],
+  ['camofox', 'camoufox'],
+  ['playwright', 'playwright'],
+  ['puppeteer', 'puppeteer'],
+  ['selenium', 'selenium'],
+  ['headlesschrome', 'headless-chrome'],
   ['curl', 'curl'],
   ['mozilla', 'browser'],
 ];
@@ -344,6 +365,20 @@ export const UA_FAMILIES = [
  *  the same set in examples/agent_entry_reference.py. */
 export const AI_AGENT_FAMILIES = new Set([
   'claude-user', 'claudebot', 'gptbot', 'openai', 'perplexity', 'google-extended',
+]);
+
+/** Automation / HTTP-tool families that named themselves in the UA. OBSERVATION ONLY —
+ *  same rule as the rest of this table: never identity, never a verdict. Must match
+ *  `NAMED_TOOL_FAMILIES` in examples/agent_entry_reference.py. */
+export const NAMED_TOOL_FAMILIES = new Set([
+  'camoufox', 'playwright', 'puppeteer', 'selenium', 'headless-chrome', 'curl',
+]);
+
+/** The four owner-facing traffic classes `clientClass` may return. Bounded on purpose:
+ *  an attacker-chosen UA must never become a class name. Must match
+ *  `CLIENT_CLASSES` in examples/agent_entry_reference.py. */
+export const CLIENT_CLASSES = new Set([
+  'declared-agent', 'named-tool', 'stealth-agent', 'human-like',
 ]);
 
 /** ASCII-only lowercase fold. NOT `toLowerCase()`: Unicode casing is runtime- and
@@ -359,7 +394,7 @@ function asciiLower(s) {
 }
 
 /** UA string -> family. Absent/empty/non-string -> 'none'; no needle matched -> 'other'.
- *  Total on untrusted input, and the RETURN VALUE is always one of the twelve fixed
+ *  Total on untrusted input, and the RETURN VALUE is always one of the fixed
  *  family names — never a substring of the input (bounded stats keyspace). */
 export function uaFamily(ua) {
   if (typeof ua !== 'string' || !ua) return 'none';
@@ -368,6 +403,23 @@ export function uaFamily(ua) {
     if (folded.includes(needle)) return family;
   }
   return 'other';
+}
+
+/** Owner-facing traffic class. OBSERVATION ONLY — never `verified`, never a ledger row,
+ *  never a rate lane, never a refusal. The split an operator asked for: tell agent
+ *  traffic from human traffic WITHOUT treating a spoofable UA as a credential.
+ *
+ *  Camoufox / patched Playwright send a clean Firefox UA, so `uaFamily` says `browser`.
+ *  That is not a human reading the homepage. A human Firefox almost never GETs the
+ *  agent card or POSTs the door; a stealth agent that found the door does. The one
+ *  human-shaped case at the door is `browser` + `notice_get` (someone opened the
+ *  address as a document on a site-owning mount). Must match `client_class` in
+ *  examples/agent_entry_reference.py. */
+export function clientClass(family, stage) {
+  if (AI_AGENT_FAMILIES.has(family) || family === 'muretai-node') return 'declared-agent';
+  if (NAMED_TOOL_FAMILIES.has(family)) return 'named-tool';
+  if (family === 'browser' && stage === 'notice_get') return 'human-like';
+  return 'stealth-agent';
 }
 
 /** The FIRST User-Agent value out of a headers mapping, or null. Case-insensitive key
@@ -2254,11 +2306,14 @@ export function canonicalMount(canonUrl, basePath) {
  *                  callback, and a watcher that dialled out on the hot path would make the
  *                  visitor's answer depend on somebody else's uptime.
  *
- *                  WHAT IT IS TOLD. Every stage reports `stage`, `identified` and
+ *                  WHAT IT IS TOLD. Every stage reports `stage`, `identified`,
  *                  `ua_family` — the door's own bounded classification of the client, one
  *                  of the fixed `UA_FAMILIES` names and NEVER a substring of what the caller
- *                  sent, so a stranger cannot write its own label into your metrics. The
- *                  POST stages add the envelope on top.
+ *                  sent, so a stranger cannot write its own label into your metrics — and
+ *                  `client_class`, the four-way split (`declared-agent` / `named-tool` /
+ *                  `stealth-agent` / `human-like`) that tells an operator whether a
+ *                  Firefox-looking knock is a stealth agent at the door or a human who
+ *                  opened the notice. The POST stages add the envelope on top.
  *
  *                  WHAT NOT TO PUT IN IT. The envelope carries `peer_did`/`owner_did`,
  *                  which a visitor handed you to transact with YOU. Forwarding a raw DID to
@@ -2498,6 +2553,7 @@ export function createAgentEntry({
   // composition to any stranger). Keyspace bounded by the fixed UA_FAMILIES table times
   // five stage names — an attacker choosing UA strings cannot grow it.
   const uaStats = new Map();
+  const clientStatsMap = new Map();
 
   /** Count the stage, and tell the watcher about it.
    *
@@ -2522,9 +2578,14 @@ export function createAgentEntry({
     let row = uaStats.get(family);
     if (!row) { row = new Map(); uaStats.set(family, row); }
     row.set(stage, (row.get(stage) || 0) + 1);
+    const cls = clientClass(family, stage);
+    let crow = clientStatsMap.get(cls);
+    if (!crow) { crow = new Map(); clientStatsMap.set(cls, crow); }
+    crow.set(stage, (crow.get(stage) || 0) + 1);
     if (typeof observer !== 'function') return;
     if (stage === 'card_get' || stage === 'notice_get') {
       observe({ stage, identified: 0, verified: false, ua_family: family,
+                client_class: cls,
                 peer_did: null, owner_did: null, wba_did: null, text: null });
     }
   }
@@ -2535,6 +2596,17 @@ export function createAgentEntry({
     for (const [family, row] of uaStats) {
       out[family] = {};
       for (const [stage, n] of row) out[family][stage] = n;
+    }
+    return out;
+  }
+
+  /** A plain JSON-able copy of the traffic-class counters: { class: { stage: n } }.
+   *  Same contract as `stats()`: in-process only, never on the wire, bounded keyspace. */
+  function clientStats() {
+    const out = {};
+    for (const [cls, row] of clientStatsMap) {
+      out[cls] = {};
+      for (const [stage, n] of row) out[cls][stage] = n;
     }
     return out;
   }
@@ -2843,6 +2915,7 @@ export function createAgentEntry({
     if (typeof observer !== 'function' || lastRefusal === null) return;
     observe({ verified: false, refused: lastRefusal, stage: 'refused_post',
               identified: pendingStage === 'signed_post' ? 1 : 0, ua_family: pendingFamily,
+              client_class: clientClass(pendingFamily, 'refused_post'),
               peer_did: null, owner_did: null, wba_did: null, text: null });
   }
 
@@ -3089,6 +3162,7 @@ export function createAgentEntry({
     // arrived. `identified` is read off the envelope rather than the stage, because the
     // anonymous lane answers a visitor who genuinely presented no DID.
     observe({ ...env, stage: pendingStage, ua_family: pendingFamily,
+              client_class: clientClass(pendingFamily, pendingStage),
               identified: env && env.peer_did ? 1 : 0 });
     let answer;
     try {
@@ -3367,9 +3441,10 @@ export function createAgentEntry({
 
   // `mount` is exported so a host app can route exactly what this entry answers (and log
   // it): it is derived, so reading it here can never disagree with the signed card.
-  // `stats` is the owner-facing UA-family counters and `wbaVisits` the DID->count of
-  // WBA-verified fetches — both in-process only, like `ledger`.
-  return { did, card, ledger, mount, stats, wbaVisits,
+  // `stats` is the owner-facing UA-family counters, `clientStats` the four-way
+  // traffic-class split, and `wbaVisits` the DID->count of WBA-verified fetches —
+  // all in-process only, like `ledger`.
+  return { did, card, ledger, mount, stats, clientStats, wbaVisits,
     handleRequest, handleRequestAsync, listen,
     cardEnvelope: () => JSON.parse(cardEnvelopeBytes().toString('utf8')) };
 }

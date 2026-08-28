@@ -183,16 +183,23 @@ const server = entry.listen(port, host, () => {
 // printed only when they changed. `[ua]` is greppable; the shape is entry.stats()
 // verbatim ({family: {stage: n}}). `unref()` so the timer never holds the process open.
 let lastStats = '';
+let lastClient = '';
 setInterval(() => {
   // Sorted keys at every level so the line is stable run to run (and diffable against
   // the Python runner's `json.dumps(..., sort_keys=True)` spelling of the same shape).
-  const line = JSON.stringify(entry.stats(), (k, v) =>
+  const stable = (obj) => JSON.stringify(obj, (k, v) =>
     (v && typeof v === 'object' && !Array.isArray(v))
       ? Object.fromEntries(Object.keys(v).sort().map((key) => [key, v[key]]))
       : v);
+  const line = stable(entry.stats());
   if (line !== '{}' && line !== lastStats) {
     console.log(`[ua] ${line}`);
     lastStats = line;
+  }
+  const clientLine = stable(entry.clientStats());
+  if (clientLine !== '{}' && clientLine !== lastClient) {
+    console.log(`[client] ${clientLine}`);
+    lastClient = clientLine;
   }
 }, 60_000).unref();
 
