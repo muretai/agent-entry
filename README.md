@@ -105,6 +105,7 @@ answers questions and hands off nothing, is a signed claim you cannot keep.
 |---|---|---|
 | `skills` | `[]` | the menu above — what a visitor learns before knocking |
 | `openDoor` | `true` | publishes `agentEntry.open_door`: the field that tells a visiting agent it may message you with no introduction. The same fact is emitted under the older `muretai.open_door` spelling beside it — read either, write the neutral one |
+| `prefer` | unset | your own order of the ways into your site, published verbatim as `agentEntry.prefer` (spec AE-30): an array of `"page"`, `"card"`, `"mcp"` or `{kind, when}` with `when` one of `person`, `alone`, `key`, `no-key`, `token`, `browser` — e.g. `[{kind:'page', when:'no-key'}, 'card']` says "read on the page if you hold no key; otherwise the door". A visiting agent reads it against what it has on hand. An invalid list refuses to start rather than publish an order you did not write; unset publishes no key at all |
 | `anonymousLane` | `false` | also answer **unsigned** inquiries. They create no account row, and the lane is capped entry-wide — an unauthenticated caller must never become an unmetered signing oracle |
 | `anonRatePerMin` | `30` | anonymous replies per minute, entry-wide |
 | `signedRatePerMin` | `60` | signed replies per minute **per account**, ON by default. Attribution is not scarcity: a `did:key` costs nothing to mint, so being in your ledger was never a bound |
@@ -381,7 +382,8 @@ node examples/server.mjs        # prints its DID and card URL
 Environment: `AGENT_ENTRY_SEED_HEX` (generated and printed if absent — **persist it, it is
 your site's identity**), `AGENT_ENTRY_PORT` (8788), `AGENT_ENTRY_BASE_URL`,
 `AGENT_ENTRY_NAME`, `AGENT_ENTRY_ANON` (`1` also accepts unsigned inquiries, which create
-no account).
+no account), `AGENT_ENTRY_PREFER` (your order of the ways in, as one JSON array — see
+`prefer` above; an invalid list refuses to start).
 
 ## What `baseUrl` may be
 

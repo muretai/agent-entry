@@ -43,6 +43,10 @@
  *                       https://example.com/agent) and answers NOTHING at `/` — no notice,
  *                       no OPTIONS, no POST. Point your proxy at the door path and the
  *                       well-known paths; the site keeps everything else, unchanged.
+ *   AGENT_ENTRY_PREFER     OPTIONAL: the site's own order of its ways in, as one JSON array
+ *                       (AE-30), e.g. '[{"kind":"page","when":"no-key"},"card"]' — "read on
+ *                       the page if you hold no key; otherwise the door". Published verbatim
+ *                       as `agentEntry.prefer`; an invalid list REFUSES to start.
  *   AGENT_ENTRY_WBA_JWKS   OPTIONAL: a JWKS document {"keys":[…]} as one JSON string —
  *                       the Web Bot Auth key directory (verified out of band) whose
  *                       holders this entry should RECOGNISE on inbound requests. Off
@@ -156,6 +160,10 @@ try {
     ...(process.env.AGENT_ENTRY_SIGNED_RATE_TOTAL
       ? { signedRatePerMinTotal: Number(process.env.AGENT_ENTRY_SIGNED_RATE_TOTAL) } : {}),
     guest: process.env.AGENT_ENTRY_GUEST === '1',
+    // AE-30: the site's own order of its ways in, a JSON array. Malformed JSON or an
+    // unknown kind/condition throws inside this try and the entry never starts — the same
+    // posture as a bad domain list: never publish a statement the operator did not make.
+    ...(process.env.AGENT_ENTRY_PREFER ? { prefer: JSON.parse(process.env.AGENT_ENTRY_PREFER) } : {}),
     wbaVerifiers,
   });
 } catch (err) {
