@@ -18,6 +18,13 @@ a site may already have. MCP and WebMCP are often named together; they are not t
 | **WebMCP** | tools *in the page*, while a person is in the tab | complementary — [see below](#pairs-with-webmcp-the-tab-conversation-becomes-a-customer) |
 | **MCP** | a tool *server* over HTTP; identifies the client app | complementary — neither substitutes |
 | **Agent Entry** | a signed A2A door; the caller's key *is* the account | **this file** |
+| **Handoff** | a tool result that *points at* this door (names your DID) | destination — not implemented here |
+
+A **handoff** is how WebMCP or MCP send the visitor *here*: the tool result names this
+entry's DID, and the next act is a signed knock at this origin. This file does not follow
+a handoff and does not parse `_meta.handoff`. It is where one lands. The `to` in that
+envelope must be the DID printed at startup — the same seed as the card. A visitor (or
+any router they run) is who honours the pointer.
 
 A headless agent (no person in the tab) should knock **here**, or at your MCP server — not
 scrape the page that holds your WebMCP tools.
@@ -28,7 +35,7 @@ scrape the page that holds your WebMCP tools.
 | **Not for** | People writing the visiting agent. This package does not find doors, MCP servers, or WebMCP tools; it *is* a door. |
 | **The problem** | A brochure cannot recognise anyone. A signup form does not work for an agent. The first signed message has to *be* the account. |
 
-![llms.txt, WebMCP, and MCP sit beside this file. Agent Entry verifies a signed knock, opens an account from the key, and replies in the same request.](diagrams/desk.svg)
+![llms.txt, WebMCP, and MCP sit beside this file. A handoff from WebMCP or MCP names this DID. Agent Entry verifies the knock, opens an account from the key, and replies in the same request.](diagrams/desk.svg)
 
 One file. Zero dependencies. No database. Node 20+.
 
@@ -554,10 +561,11 @@ An Agent Entry is the second door, and it is the one that keeps something:
 | **WebMCP tools** | a person's agent, in a tab, right now | an answer in the moment |
 | **Agent Entry** | an agent alone, from anywhere, at any hour | a customer you still recognise next month |
 
-**They connect.** When a WebMCP tool call reaches the point of actually wanting something —
-a booking, a quote, a follow-up — the tool returns a small envelope naming your site's DID,
-and the visitor's agent then sends a **signed message to your own origin**, where your Agent
-Entry receives it:
+**They connect by a handoff.** When a WebMCP (or MCP) tool call reaches the point of
+actually wanting something — a booking, a quote, a follow-up — the tool returns a small
+envelope naming your site's DID. The visitor's agent then sends a **signed message to your
+own origin**, where your Agent Entry receives it. That envelope is a handoff: this package
+is the landing, not the follower.
 
 ```js
 navigator.modelContext.registerTool({

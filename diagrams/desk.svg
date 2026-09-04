@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 740 300" role="img" aria-labelledby="t d">
-  <title id="t">Agent Entry sits beside WebMCP and MCP</title>
-  <desc id="d">llms.txt describes. WebMCP is tools in the page while a person is in the tab. MCP is a tool server over HTTP. Agent Entry is the signed door: verify, the key is the account, reply in the same request. A headless agent knocks here or at MCP, and does not scrape the page.</desc>
-  <rect width="740" height="300" fill="#fafafa"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 740 360" role="img" aria-labelledby="t d">
+  <title id="t">Agent Entry sits beside WebMCP and MCP; a handoff lands here</title>
+  <desc id="d">llms.txt describes. WebMCP is tools in the page. MCP is a tool server. A handoff from either names this door's DID. Agent Entry verifies the knock, the key is the account, and replies in the same request. This file does not follow a handoff; it is where one lands.</desc>
+  <rect width="740" height="360" fill="#fafafa"/>
   <text x="24" y="26" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#666">Your site can run all four. This file is only the last one.</text>
   <rect x="20" y="40" width="170" height="72" rx="8" fill="#fff" stroke="#bbb"/>
   <text x="105" y="70" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700" fill="#444">llms.txt</text>
@@ -15,10 +15,12 @@
   <rect x="554" y="40" width="166" height="72" rx="8" fill="#111"/>
   <text x="637" y="70" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700" fill="#fff">Agent Entry</text>
   <text x="637" y="92" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" fill="#ddd">this file</text>
-  <rect x="20" y="136" width="700" height="140" rx="10" fill="#fff" stroke="#111"/>
-  <text x="370" y="164" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#666">Any A2A client - not a particular router</text>
-  <text x="370" y="196" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="700" fill="#111">1. verify the signature</text>
-  <text x="370" y="222" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="700" fill="#111">2. the key is the account</text>
-  <text x="370" y="248" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="700" fill="#111">3. signed reply, same request</text>
-  <text x="370" y="278" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#666">No person in the tab? Knock here (or at MCP). Do not scrape WebMCP.</text>
+  <rect x="20" y="128" width="700" height="212" rx="10" fill="#fff" stroke="#111"/>
+  <text x="370" y="156" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#666">Any A2A client - not a particular router</text>
+  <text x="370" y="186" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="700" fill="#111">1. verify the signature</text>
+  <text x="370" y="212" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="700" fill="#111">2. the key is the account</text>
+  <text x="370" y="238" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="700" fill="#111">3. signed reply, same request</text>
+  <text x="370" y="274" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#111">A handoff from WebMCP or MCP names this DID.</text>
+  <text x="370" y="296" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#555">This file does not follow it. It is where one lands.</text>
+  <text x="370" y="322" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#666">No person in the tab? Knock here or at MCP. Do not scrape WebMCP.</text>
 </svg>
