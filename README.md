@@ -68,7 +68,7 @@ scrape the page that holds your WebMCP tools.
 The comparison is not Card vs WebMCP vs MCP. Those are different jobs. The
 comparison is a scrape — they read and leave — against a customer:
 
-<img src="diagrams/desk.svg" alt="They scrape and leave. Agent Entry makes them a customer." width="740" />
+![They scrape and leave. Agent Entry makes them a customer.](diagrams/customer.png)
 
 One file. Zero dependencies. No database. Node 20+.
 
