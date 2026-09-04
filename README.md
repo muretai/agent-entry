@@ -11,6 +11,8 @@
 - [What you get](#what-you-get)
 - [Who is knocking](#who-is-knocking)
 - [Put it on a site](#put-it-on-a-site)
+- [On serverless](#on-serverless)
+- [On WordPress](#on-wordpress)
 - [Pairs with WebMCP](#pairs-with-webmcp-the-tab-conversation-becomes-a-customer)
 - [In production](#in-production)
 - [This package](#this-package)
@@ -438,8 +440,9 @@ has already changed the bytes the signature covers, and the only diagnostic anyo
 
 ### 3. A reverse proxy — for a site that is not Node at all
 
-WordPress, Rails, a static build. Run the entry as one small process and route three
-locations to it:
+Rails, a static build, anything that is not WordPress and not a function. Run the
+entry as one small process and route three locations to it. WordPress has its own
+plugin — [On WordPress](#on-wordpress).
 
 ```nginx
 location = /.well-known/agent-card.json     { proxy_pass http://127.0.0.1:8788; }
@@ -450,14 +453,33 @@ location = / {
 }
 ```
 
-### Serverless
+### On serverless
 
-The round-trip shape fits a single function well, and `handleRequestAsync` is exactly the
-handler signature those platforms want. Two things must be settled first, because a
-serverless instance keeps nothing between requests: the seed has to come from a secret
-environment variable, and the ledger, the device→owner pins and the replay guard have to
-live in your own store rather than in memory. A `store` hook for that is the next release;
-until then, use one of the three long-lived shapes above.
+The round-trip shape fits a single function: one signed POST in, one signed reply out.
+What does not fit is the state. A function instance keeps nothing between requests, so
+the replay set, the device→owner pins and the ledger have to live in a store the
+platform keeps, not in memory.
+
+This package still runs in process. For Cloudflare Workers, Vercel and Netlify, use
+the deploy templates — this door plus one store adapter per platform:
+
+[github.com/muretai/agent-entry-serverless](https://github.com/muretai/agent-entry-serverless)
+
+They vendor a library build that includes the `store` seam those adapters need. Do not
+replace that file with an older published copy of this package: versions without the
+seam accept the option and silently ignore it, which puts the three stateful rules
+back into per-instance memory — the failures those templates exist to prevent.
+
+Until you are on one of those templates, use one of the long-lived shapes above.
+
+### On WordPress
+
+If the site is WordPress, do not proxy this Node file in front of it. The plugin is a
+third implementation of the same contract — it publishes the card, answers the signed
+POST, and with WooCommerce lets an agent ask about the catalogue. `GET /` stays your
+site.
+
+[github.com/muretai/agent-entry-wordpress](https://github.com/muretai/agent-entry-wordpress)
 
 ### Run the example
 
@@ -823,7 +845,10 @@ for byte. No network, no checkout of ours, nothing to ask us for:
 npm test
 ```
 
-Write a third implementation and point it at the same vectors.
+Write another implementation and point it at the same vectors.
+[Agent Entry for WordPress](https://github.com/muretai/agent-entry-wordpress)
+is one that already does — a PHP door, not this file wrapped, held to the same
+golden bytes.
 
 ### Contributing
 
@@ -845,6 +870,14 @@ that has to stay awake.
 
 You do not need the rest of the network to use this file. It is useful on its own the
 moment an agent knocks.
+
+This package is the Node door. Two other install paths speak the same contract and do
+not require this file on the host:
+
+- [Agent Entry on serverless](https://github.com/muretai/agent-entry-serverless) —
+  Cloudflare Workers, Vercel, Netlify
+- [Agent Entry for WordPress](https://github.com/muretai/agent-entry-wordpress) —
+  the CMS, including WooCommerce
 
 Visitors do not need [Agent Web Router](https://github.com/muretai/agent-web-router).
 That package is one way an agent *finds* doors; this package *is* a door. Either works
