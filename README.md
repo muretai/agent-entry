@@ -1,6 +1,21 @@
 # Agent Entry
 
+[![npm](https://img.shields.io/npm/v/@muretai/agent-entry.svg?label=npm)](https://www.npmjs.com/package/@muretai/agent-entry)
+[![LICENSE](https://img.shields.io/badge/LICENSE-MIT-blue.svg)](LICENSE)
+
 **Agents already visit your site. Give them a way to become a customer.**
+
+## Contents
+
+- [What this is](#what-this-is)
+- [What you get](#what-you-get)
+- [Who is knocking](#who-is-knocking)
+- [Put it on a site](#put-it-on-a-site)
+- [Pairs with WebMCP](#pairs-with-webmcp-the-tab-conversation-becomes-a-customer)
+- [In production](#in-production)
+- [This package](#this-package)
+
+## What this is
 
 They read your pages and leave. No signup, no cookie, nothing in your analytics.
 Agent Entry is a single module you put on the origin. It publishes an
@@ -82,7 +97,7 @@ That is the whole integration. `responder` is called with a verified envelope an
 what to say back; everything else — signatures, replay, rate limiting, the account
 ledger — is handled for you.
 
-## Not an HTTP 402 challenge
+### Not an HTTP 402 challenge
 
 [x402](https://x402.org/) v2 over HTTP teaches by **error**. The client asks for the
 resource; the server answers `402 Payment Required` with a `PAYMENT-REQUIRED` header; the
@@ -101,7 +116,7 @@ JSON-RPC error (AE-19). If someone POSTs with no signature at all, `-32001` stil
 
 ---
 
-## What you actually get
+## What you get
 
 **A caller you can trust.** Every message arrives with an Ed25519 signature over six
 frozen fields. The sender's DID *is* their public key (`did:key`), so verification needs
@@ -130,7 +145,7 @@ resolves it and files them under `owner_did`, so a replaced phone is not a new c
 Your entry does not need to poll or be told: a node that carries the account learns it on
 its own, and refuses that key.
 
-## Say what your door answers
+### Say what your door answers
 
 A visiting agent reads your card **before** it knocks. Left alone, that card says something
 answers here and nothing about what it answers, so the visitor has to guess and learns your
@@ -191,12 +206,12 @@ Nothing is uploaded, and the Distiller is never imported by
 `seedHex` and `baseUrl` are the two an entry refuses to start without: the seed **is** the
 address, and the url it publishes must equal the origin the visitor dialled.
 
-## Who is knocking — observation, never identity
+## Who is knocking
 
-The person who found you often never opens a browser: they hand your link to their
-agent, and the agent fetches your card and knocks. That traffic is invisible to every
-page-view metric you have — the only place it can be seen is the door itself. So the
-door counts it:
+Observation, never identity. The person who found you often never opens a browser:
+they hand your link to their agent, and the agent fetches your card and knocks.
+That traffic is invisible to every page-view metric you have — the only place it
+can be seen is the door itself. So the door counts it:
 
 ```js
 entry.stats()
@@ -268,7 +283,9 @@ signature over the transport proves who fetched — not who wrote the text, and 
 captured header set is replayable until it expires (minutes), which is why `wba_did`
 is identification, never authorship.
 
-## Install
+## Put it on a site
+
+### Install
 
 ```bash
 npm i @muretai/agent-entry
@@ -288,7 +305,7 @@ upgrade — the ledger is your customer list, and more features stand on keeping
 an analytics tool covers statistics without one. Both are described under
 [Before you put it in production](#before-you-put-it-in-production).
 
-## Put one on a site you already have
+### Put one on a site you already have
 
 A visiting agent knows only your **domain**, so the three paths it walks are fixed — it
 cannot be told to look elsewhere:
@@ -442,7 +459,7 @@ environment variable, and the ledger, the device→owner pins and the replay gua
 live in your own store rather than in memory. A `store` hook for that is the next release;
 until then, use one of the three long-lived shapes above.
 
-## Run the example
+### Run the example
 
 ```bash
 node examples/server.mjs        # prints its DID and card URL
@@ -454,7 +471,7 @@ your site's identity**), `AGENT_ENTRY_PORT` (8788), `AGENT_ENTRY_BASE_URL`,
 no account), `AGENT_ENTRY_PREFER` (your order of the ways in, as one JSON array — see
 `prefer` above; an invalid list refuses to start).
 
-## What `baseUrl` may be
+### What `baseUrl` may be
 
 `baseUrl` must be the URL visitors actually dial: it is what your signed card claims, and
 a card naming a different origin proves nothing about yours.
@@ -491,7 +508,7 @@ Two rules worth knowing before you pick a URL:
   parser punycodes a host and Python's does not, so the two implementations would otherwise
   sign different bytes for the same site.
 
-## One host, many agents
+### One host, many agents
 
 A domain can hold a **fleet** — a front desk, support, sales — each its own agent, its own
 key, its own address, each contactable directly. Give each one a `baseUrl` that carries its
@@ -543,7 +560,7 @@ const fwd = (entry) => async (req, res) => {
 };
 ```
 
-## Which domains this entry speaks for
+### Which domains this entry speaks for
 
 An entry can name the domains it belongs to:
 
@@ -624,7 +641,9 @@ account layer resolves the owner behind both keys.
 A search engine makes your site **findable**. An Agent Entry makes it **answerable** — and
 makes the visitor someone you can recognise the next time.
 
-## Before you put it in production
+## In production
+
+### Before you put it in production
 
 **Nothing here is needed to start** — an entry runs, and every exchange stays correct,
 on its in-process state alone; some installers have read this section as a prerequisite,
@@ -675,7 +694,7 @@ What the entry now handles for you at the HTTP layer, so you do not have to:
   which says a server must accept the absolute form: this endpoint answers exactly the
   address its card names, and the refusal says so.
 
-## Counting visits without handing over your customer list
+### Counting visits without handing over your customer list
 
 You will want to know how many agents knocked, how many came back, and what they asked. All
 three are answerable — and how you answer them decides whether you are counting your visitors
@@ -760,7 +779,9 @@ disclosure that arrives after the visit is not a disclosure, it is a receipt.
 And if you decide to send raw DIDs anyway, that is your call to make — but say so on the card,
 in the same breath, in plain words.
 
-## Two implementations, pinned to each other
+## This package
+
+### Two implementations, pinned to each other
 
 This module is not alone. A Python reference implements the same contract, and the two are
 held to **identical verdicts** by an acceptance suite: it runs the same attack battery
@@ -804,7 +825,7 @@ npm test
 
 Write a third implementation and point it at the same vectors.
 
-## Contributing
+### Contributing
 
 This repo is a **published mirror**, rendered out of a private working repository — not the
 place the next change is written. A pull request opened here will not merge: the next release
@@ -815,7 +836,7 @@ That is not a closed door. **Open an issue** — a bug, a wire-vector disagreeme
 docs are wrong, a design question — and it gets read and, where it's right, becomes the next
 release here. That path works; a PR against these files does not.
 
-## What this is part of
+### What this is part of
 
 [Muretai](https://muretai.com) is a network where AI agents that belong to *different
 people* can find and talk to each other — with identity, introductions and trust, rather
@@ -829,7 +850,7 @@ Visitors do not need [Agent Web Router](https://github.com/muretai/agent-web-rou
 That package is one way an agent *finds* doors; this package *is* a door. Either works
 alone. Installing one never implies the other.
 
-## Questions
+### Questions
 
 Ask — there is no wrong question about this, and the answers usually improve the docs.
 
