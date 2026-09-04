@@ -31,33 +31,23 @@ it is still them.
 
 Any A2A client works: their agent, `curl`, not a particular router or ours.
 
-It sits **beside** what you may already have, and replaces none of it.
-`llms.txt` is a GET brochure, not this protocol. MCP and WebMCP are often named
-together; they are not the same:
+This file is the Agent Card and the door. That is the visit that can become a
+customer. It sits beside what you may already have, and replaces none of it.
 
-| | what it is | this package |
-|---|---|---|
-| **llms.txt** | GET a brochure — describes the site | complementary |
-| **Agent Card** | GET `/.well-known/agent-card.json` — DID, url, skills | **Agent Entry publishes it** |
-| **WebMCP** | tools *in the page*, while a person is in the tab | complementary — [see below](#pairs-with-webmcp-the-tab-conversation-becomes-a-customer) |
-| **MCP** | a tool *server* over HTTP; identifies the client app | complementary — neither substitutes |
-| **Agent Entry** | POST A2A `message/send` — the key *is* the account | **this package** |
-| **Handoff** | a tool result that *points at* this door (names your DID) | destination — not implemented here |
+`llms.txt` is a brochure — prose, not a contract. WebMCP is tools on the existing
+page, for a person already in the tab. MCP is a tool server for an app that holds
+a token. None of those is this: a returning customer from a signed knock.
 
-`llms.txt` and the Agent Card are both GET documents. They are not the same: the brochure
-is prose, the card is the door's contract (`securitySchemes`, `signedFields`,
-`exampleRequest`). The agent reads that contract **before** it knocks (AE-8). The act is
-then one **POST** `message/send` — already formed correctly — and a signed reply comes
+The agent reads the card **before** it knocks (AE-8). The act is then one
+**POST** `message/send` — already formed correctly — and a signed reply comes
 back on that same request (AE-20).
 
-A **handoff** is how WebMCP or MCP send the visitor *here*: the tool result names this
-entry's DID, and the next act is a signed knock at this origin. This file does not follow
-a handoff and does not parse `_meta.handoff`. It is where one lands. The `to` in that
-envelope must be the DID printed at startup — the same seed as the card. A visitor (or
-any router they run) is who honours the pointer.
-
-A headless agent (no person in the tab) should knock **here**, or at your MCP server — not
-scrape the page that holds your WebMCP tools.
+A **handoff** is how a tool on the page, or a tool server, can send the visitor
+*here*: the result names this entry's DID, and the next act is a signed knock at
+this origin. This file does not follow a handoff and does not parse
+`_meta.handoff`. It is where one lands. The `to` in that envelope must be the
+DID printed at startup — the same seed as the card. A visitor (or any router
+they run) is who honours the pointer.
 
 | | |
 |---|---|
@@ -65,10 +55,7 @@ scrape the page that holds your WebMCP tools.
 | **Not for** | People writing the visiting agent. This package does not find doors, MCP servers, or WebMCP tools; it *is* a door. |
 | **The problem** | A GET-only document cannot recognise anyone. A signup form does not work for an agent. The first signed POST has to *be* the account. |
 
-Card, WebMCP and MCP are different jobs. The contrast that matters here is
-a visit that leaves against a visit that becomes a customer:
-
-![They visit and leave. Agent Entry makes them a customer.](diagrams/become.png)
+![They visit and leave. The Agent Card is the visit that can become a customer.](diagrams/become.png)
 
 One file. Zero dependencies. No database. Node 20+.
 
