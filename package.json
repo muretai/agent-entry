@@ -1,7 +1,7 @@
 {
   "name": "@muretai/agent-entry",
   "version": "1.10.0",
-  "description": "Make your website answer AI agents: an A2A agent endpoint that verifies who is knocking, opens an account for them and replies signed, in one HTTP round trip. Zero dependencies. Pairs with llms.txt and WebMCP.",
+  "description": "The front desk your website runs for AI agents: verify the knock, open an account from their key, reply signed — one HTTP round trip. Coexists with WebMCP (tools in the page) and MCP (a server); replaces neither. Any A2A client. Zero dependencies.",
   "type": "module",
   "main": "muretai-agent-entry.mjs",
   "exports": {
@@ -11,6 +11,7 @@
     "muretai-agent-entry.mjs",
     "conformance/",
     "examples/server.mjs",
+    "diagrams/",
     "scripts/distill/",
     "LICENSE",
     "spec/",

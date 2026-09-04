@@ -1,10 +1,34 @@
 # Agent Entry
 
-**`llms.txt` describes your site to an AI agent. An Agent Entry *recognises* one.**
+**`llms.txt` is a brochure. This is the front desk.**
 
-It verifies who is knocking, opens an account for them, and answers — in the same HTTP
-response. No signup form, because the visitor's key already is the account. When that
-person replaces their phone, your site still knows it is them.
+Agents already read your site. They do not sign up, they leave no cookie, and your
+analytics never sees them. Put this file on the origin: it verifies a signed knock, opens
+an account from the visitor's key, and replies signed — in the same HTTP response.
+
+Any client that can POST an A2A `message/send` can use it. They do not need a particular
+router, a Muretai node, or our CLI. A key and `curl` is enough.
+
+This file is the door. It sits **beside**, not instead of, the other agent-facing surfaces
+a site may already have. MCP and WebMCP are often named together; they are not the same:
+
+| | what it is | this package |
+|---|---|---|
+| **llms.txt** | a brochure — describes the site | complementary |
+| **WebMCP** | tools *in the page*, while a person is in the tab | complementary — [see below](#pairs-with-webmcp-the-tab-conversation-becomes-a-customer) |
+| **MCP** | a tool *server* over HTTP; identifies the client app | complementary — neither substitutes |
+| **Agent Entry** | a signed A2A door; the caller's key *is* the account | **this file** |
+
+A headless agent (no person in the tab) should knock **here**, or at your MCP server — not
+scrape the page that holds your WebMCP tools.
+
+| | |
+|---|---|
+| **Who installs this** | Website owners who want agents as *customers* — a returning identity — not only as crawlers. |
+| **Not for** | People writing the visiting agent. This package does not find doors, MCP servers, or WebMCP tools; it *is* a door. |
+| **The problem** | A brochure cannot recognise anyone. A signup form does not work for an agent. The first signed message has to *be* the account. |
+
+![llms.txt, WebMCP, and MCP sit beside this file. Agent Entry verifies a signed knock, opens an account from the key, and replies in the same request.](diagrams/desk.svg)
 
 One file. Zero dependencies. No database. Node 20+.
 
@@ -513,6 +537,11 @@ Set it from the environment with `AGENT_ENTRY_DOMAINS=studio.example,support.stu
 
 ## Pairs with WebMCP: the tab conversation becomes a customer
 
+WebMCP is not MCP. MCP is a tool *server* over HTTP (a token, a session). WebMCP is tools
+*in the page*, running as whoever is in that browser tab. This package implements neither.
+A site may run WebMCP, an MCP server, and an Agent Entry at once; a headless agent should
+use the last two, not scrape the first.
+
 If your page already exposes [WebMCP](https://github.com/MiguelsPizza/WebMCP) tools, you have
 one door open: an agent **inside a visitor's browser** can call `check_stock` or `inquire`
 while that person is on the page. That is useful and it is also temporary — close the tab and
@@ -757,6 +786,10 @@ that has to stay awake.
 
 You do not need the rest of the network to use this file. It is useful on its own the
 moment an agent knocks.
+
+Visitors do not need [Agent Web Router](https://github.com/muretai/agent-web-router).
+That package is one way an agent *finds* doors; this package *is* a door. Either works
+alone. Installing one never implies the other.
 
 ## Questions
 
