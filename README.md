@@ -14,11 +14,27 @@ a site may already have. MCP and WebMCP are often named together; they are not t
 
 | | what it is | this package |
 |---|---|---|
-| **llms.txt** | a brochure — describes the site | complementary |
+| **llms.txt** | GET a brochure — describes the site | complementary |
+| **Agent Card** | GET `/.well-known/agent-card.json` — DID, url, skills | **this file serves it** |
 | **WebMCP** | tools *in the page*, while a person is in the tab | complementary — [see below](#pairs-with-webmcp-the-tab-conversation-becomes-a-customer) |
 | **MCP** | a tool *server* over HTTP; identifies the client app | complementary — neither substitutes |
-| **Agent Entry** | a signed A2A door; the caller's key *is* the account | **this file** |
+| **Agent Entry** | POST A2A `message/send` — the key *is* the account | **this file** |
 | **Handoff** | a tool result that *points at* this door (names your DID) | destination — not implemented here |
+
+`llms.txt` and the Agent Card are both GET documents. They are not the same: the brochure
+is prose, the card is the door's contract (`securitySchemes`, `signedFields`,
+`exampleRequest`). The agent reads that contract **before** it knocks (AE-8). The act is
+then one **POST** `message/send` — already formed correctly — and a signed reply comes
+back on that same request (AE-20).
+
+That is the opposite of [x402](https://x402.org/). x402 v2 over HTTP teaches by **error**:
+the client asks for the resource, the server answers `402 Payment Required` with a
+`PAYMENT-REQUIRED` header, and the client **retries** with `PAYMENT-SIGNATURE`. An
+HTTP-402-style challenge cannot state its terms before the failure; the Agent Card can,
+and must. This package does not speak x402 and does not return HTTP 402. A protocol
+refusal here is HTTP `200` plus a JSON-RPC error (AE-19). If someone POSTs with no
+signature at all, `-32001` still carries `data.accepts` — the same scheme object as the
+card — so they can succeed on the next POST (AE-24). That is a fallback, not the design.
 
 A **handoff** is how WebMCP or MCP send the visitor *here*: the tool result names this
 entry's DID, and the next act is a signed knock at this origin. This file does not follow
@@ -35,7 +51,7 @@ scrape the page that holds your WebMCP tools.
 | **Not for** | People writing the visiting agent. This package does not find doors, MCP servers, or WebMCP tools; it *is* a door. |
 | **The problem** | A brochure cannot recognise anyone. A signup form does not work for an agent. The first signed message has to *be* the account. |
 
-![llms.txt, WebMCP, and MCP sit beside this file. A handoff from WebMCP or MCP names this DID. Agent Entry verifies the knock, opens an account from the key, and replies in the same request.](diagrams/desk.svg)
+![GET the Agent Card as 200 before anyone knocks. POST message/send is already correct and is answered 200. x402 instead returns HTTP 402 and asks for a retry.](diagrams/desk.svg)
 
 One file. Zero dependencies. No database. Node 20+.
 
