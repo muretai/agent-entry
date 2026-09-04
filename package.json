@@ -1,7 +1,7 @@
 {
   "name": "@muretai/agent-entry",
   "version": "1.10.0",
-  "description": "Let AI agents become customers of your website. Publish an Agent Card, answer one signed POST, and the visitor's key is the account. Coexists with llms.txt, WebMCP, and MCP. Any A2A client. Zero dependencies.",
+  "description": "Agents already visit your site. Give them a way to become a customer: know who knocked, remember them next time, answer in the same request. Works beside llms.txt, WebMCP, and MCP. Zero dependencies.",
   "type": "module",
   "main": "muretai-agent-entry.mjs",
   "exports": {
