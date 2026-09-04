@@ -1,0 +1,10 @@
+{
+  "comment": "First dojo: a booking desk that cannot answer a book request without a day. Gold is the fixture responder (same policy as examples/server.mjs). Placeholders only.",
+  "cases": [
+    { "id": "book-no-day", "split": "train", "intent": "book", "naive_text": "I want to book a shoot" },
+    { "id": "book-saturday", "split": "train", "intent": "book", "naive_text": "Book Saturday 14:00" },
+    { "id": "price", "split": "train", "intent": "price", "naive_text": "What does a 60-minute shoot cost?" },
+    { "id": "book-holdout", "split": "holdout", "intent": "book", "naive_text": "Can I reserve a session" },
+    { "id": "price-holdout", "split": "holdout", "intent": "price", "naive_text": "How much is a half-day?" }
+  ]
+}

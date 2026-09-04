@@ -84,7 +84,7 @@ createAgentEntry({
     description: 'Ask what a shoot costs, what the studio does, and how to book. '
       + 'The answer comes back in the same HTTP response, signed by this domain.',
     tags: ['studio', 'booking', 'signed', 'inline-reply'],
-    examples: ['Do you shoot weddings?', 'What does a half-day cost?', 'How do I book?'],
+    examples: ['Do you shoot weddings?', 'How much is a half-day?', 'Book Saturday 14:00'],
   }],
 });
 ```
@@ -98,6 +98,14 @@ promise printed on your card, and the visitor who copies one verbatim is the bes
 visitor you will get, so drive your examples through your own responder in your tests.
 **Declare only what the responder does:** a skill that mentions booking, on an entry that
 answers questions and hands off nothing, is a signed claim you cannot keep.
+
+Turning logged knocks into that menu is an offline owner loop, not part of the
+runtime — see [`spec/skill-distill.md`](spec/skill-distill.md). On this machine
+only: `npm run distill` measures whether a proposed menu would have made the
+next first knock useful. `observer: fileSink()` (from
+`scripts/distill/record.mjs`) appends POST outcomes to `var/traces.jsonl`.
+Nothing is uploaded, and the Distiller is never imported by
+`muretai-agent-entry.mjs`.
 
 ### The rest of the settings
 

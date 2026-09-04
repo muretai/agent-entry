@@ -11,6 +11,7 @@
     "muretai-agent-entry.mjs",
     "conformance/",
     "examples/server.mjs",
+    "scripts/distill/",
     "LICENSE",
     "spec/",
     "README.md"
@@ -20,7 +21,10 @@
   },
   "scripts": {
     "test": "node conformance/run.mjs",
-    "example": "node examples/server.mjs"
+    "example": "node examples/server.mjs",
+    "distill": "node scripts/distill/loop.mjs",
+    "distill:record": "node scripts/distill/record.mjs",
+    "distill:measure": "node scripts/distill/measure.mjs"
   },
   "keywords": [
     "ai-agent",

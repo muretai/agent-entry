@@ -149,6 +149,15 @@ try {
     domains,
     description: 'Books photo shoots. Send a signed message; you get a signed answer.',
     responder,
+    // Menu a visitor reads before knocking. Every example is a promise this
+    // responder keeps — a book request that names no day is not yet useful.
+    skills: [{
+      id: 'ask',
+      name: 'signed-answers-about-the-studio',
+      description: 'Ask what a shoot costs, and book by naming a day. The answer comes back signed.',
+      tags: ['studio', 'booking', 'signed', 'inline-reply'],
+      examples: ['How much is a half-day?', 'Book Saturday 14:00'],
+    }],
     openDoor: true,                                     // "you may contact me, no introduction"
     anonymousLane: process.env.AGENT_ENTRY_ANON === '1',
     // The SIGNED lane's ceilings. Left unset they are the library defaults, which no

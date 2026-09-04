@@ -6,3 +6,7 @@ node_modules/
 # private key: it must never be committed, and regenerating it makes every returning
 # visitor a stranger.
 *.seed
+
+# Local distill loop — traces and proposed menus stay on this machine
+var/
+generated/
