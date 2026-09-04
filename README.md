@@ -1,27 +1,30 @@
 # Agent Entry
 
-**This file serves the Agent Card, and answers the door that card names.**
+**Agents already visit your site. Give them a way to become a customer.**
 
-`GET /.well-known/agent-card.json` is the contract: who you are (`did`), where to
-knock (`url`), what you answer (`skills`), and how to sign. A visiting agent reads
-that first. Then it `POST`s one signed A2A `message/send` to the URL the card
-published. This file verifies the knock, opens an account from the visitor's key,
-and replies signed — in the same HTTP response.
+They read your pages and leave. No signup, no cookie, nothing in your analytics.
+Agent Entry is a single module you put on the origin. It publishes an
+[Agent Card](https://a2a-protocol.org/latest/specification/)
+at `/.well-known/agent-card.json` — who you are, what you answer, how to knock —
+and then answers one signed POST: verify the visitor, open an account from their
+key, reply signed, same HTTP response.
 
-Any A2A client can do that. They do not need a particular router, a Muretai node,
-or our CLI. A key and `curl` is enough.
+No form. The key *is* the account. Come back next month from another device and
+it is still them.
 
-It sits **beside**, not instead of, the other agent-facing surfaces a site may
-already have. `llms.txt` is one of those — a GET brochure, not this protocol.
-MCP and WebMCP are often named together; they are not the same:
+Any A2A client works: their agent, `curl`, not a particular router or ours.
+
+It sits **beside** what you may already have, and replaces none of it.
+`llms.txt` is a GET brochure, not this protocol. MCP and WebMCP are often named
+together; they are not the same:
 
 | | what it is | this package |
 |---|---|---|
 | **llms.txt** | GET a brochure — describes the site | complementary |
-| **Agent Card** | GET `/.well-known/agent-card.json` — DID, url, skills | **this file serves it** |
+| **Agent Card** | GET `/.well-known/agent-card.json` — DID, url, skills | **Agent Entry publishes it** |
 | **WebMCP** | tools *in the page*, while a person is in the tab | complementary — [see below](#pairs-with-webmcp-the-tab-conversation-becomes-a-customer) |
 | **MCP** | a tool *server* over HTTP; identifies the client app | complementary — neither substitutes |
-| **Agent Entry** | POST A2A `message/send` — the key *is* the account | **this file** |
+| **Agent Entry** | POST A2A `message/send` — the key *is* the account | **this package** |
 | **Handoff** | a tool result that *points at* this door (names your DID) | destination — not implemented here |
 
 `llms.txt` and the Agent Card are both GET documents. They are not the same: the brochure
@@ -45,7 +48,7 @@ scrape the page that holds your WebMCP tools.
 | **Not for** | People writing the visiting agent. This package does not find doors, MCP servers, or WebMCP tools; it *is* a door. |
 | **The problem** | A GET-only document cannot recognise anyone. A signup form does not work for an agent. The first signed POST has to *be* the account. |
 
-![This file serves GET /.well-known/agent-card.json (200) and POST message/send (200). llms.txt, WebMCP, and MCP sit beside it.](diagrams/desk.svg)
+![Agent Entry publishes GET /.well-known/agent-card.json (200) and answers POST message/send (200). llms.txt, WebMCP, and MCP sit beside it.](diagrams/desk.svg)
 
 One file. Zero dependencies. No database. Node 20+.
 
