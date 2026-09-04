@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 740 280" role="img" aria-labelledby="t d">
+  <title id="t">x402 teaches with HTTP 402; Agent Entry teaches on GET 200</title>
+  <desc id="d">x402: request the resource, receive HTTP 402 and PAYMENT-REQUIRED, retry with PAYMENT-SIGNATURE. Agent Entry: GET the Agent Card as 200 before the knock, then POST already correct, answered 200. A refusal is JSON-RPC on HTTP 200, not HTTP 402.</desc>
+  <rect width="740" height="280" fill="#fafafa"/>
+  <rect x="20" y="20" width="340" height="240" rx="10" fill="#fff" stroke="#111"/>
+  <text x="190" y="48" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="700" fill="#111">x402 (HTTP)</text>
+  <text x="190" y="80" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#333">1. ask for the resource</text>
+  <text x="190" y="108" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#333">2. HTTP 402 + PAYMENT-REQUIRED</text>
+  <text x="190" y="136" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#333">3. retry with PAYMENT-SIGNATURE</text>
+  <text x="190" y="164" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#333">4. 200 if paid</text>
+  <text x="190" y="204" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#666">The error is how the client learns</text>
+  <text x="190" y="224" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#666">what to do next.</text>
+  <rect x="380" y="20" width="340" height="240" rx="10" fill="#111"/>
+  <text x="550" y="48" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="700" fill="#fff">Agent Entry</text>
+  <text x="550" y="80" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#fff">1. GET agent-card.json  (200)</text>
+  <text x="550" y="108" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#fff">2. read how to sign (AE-8)</text>
+  <text x="550" y="136" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#fff">3. POST message/send  (200)</text>
+  <text x="550" y="164" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#fff">4. signed reply, same request</text>
+  <text x="550" y="204" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#ddd">The POST is not a retry after an error.</text>
+  <text x="550" y="224" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#ddd">A refusal is JSON-RPC on HTTP 200.</text>
+</svg>

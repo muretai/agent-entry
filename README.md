@@ -27,15 +27,6 @@ is prose, the card is the door's contract (`securitySchemes`, `signedFields`,
 then one **POST** `message/send` — already formed correctly — and a signed reply comes
 back on that same request (AE-20).
 
-That is the opposite of [x402](https://x402.org/). x402 v2 over HTTP teaches by **error**:
-the client asks for the resource, the server answers `402 Payment Required` with a
-`PAYMENT-REQUIRED` header, and the client **retries** with `PAYMENT-SIGNATURE`. An
-HTTP-402-style challenge cannot state its terms before the failure; the Agent Card can,
-and must. This package does not speak x402 and does not return HTTP 402. A protocol
-refusal here is HTTP `200` plus a JSON-RPC error (AE-19). If someone POSTs with no
-signature at all, `-32001` still carries `data.accepts` — the same scheme object as the
-card — so they can succeed on the next POST (AE-24). That is a fallback, not the design.
-
 A **handoff** is how WebMCP or MCP send the visitor *here*: the tool result names this
 entry's DID, and the next act is a signed knock at this origin. This file does not follow
 a handoff and does not parse `_meta.handoff`. It is where one lands. The `to` in that
@@ -51,7 +42,7 @@ scrape the page that holds your WebMCP tools.
 | **Not for** | People writing the visiting agent. This package does not find doors, MCP servers, or WebMCP tools; it *is* a door. |
 | **The problem** | A brochure cannot recognise anyone. A signup form does not work for an agent. The first signed message has to *be* the account. |
 
-![GET the Agent Card as 200 before anyone knocks. POST message/send is already correct and is answered 200. x402 instead returns HTTP 402 and asks for a retry.](diagrams/desk.svg)
+![This file serves GET /.well-known/agent-card.json (200) and POST message/send (200). llms.txt, WebMCP, and MCP sit beside it.](diagrams/desk.svg)
 
 One file. Zero dependencies. No database. Node 20+.
 
@@ -84,6 +75,23 @@ createAgentEntry({
 That is the whole integration. `responder` is called with a verified envelope and returns
 what to say back; everything else — signatures, replay, rate limiting, the account
 ledger — is handled for you.
+
+## Not an HTTP 402 challenge
+
+[x402](https://x402.org/) v2 over HTTP teaches by **error**. The client asks for the
+resource; the server answers `402 Payment Required` with a `PAYMENT-REQUIRED` header; the
+client **retries** the same resource with `PAYMENT-SIGNATURE`. The error is how the
+client learns what to do next.
+
+Agent Entry does the reverse. The Agent Card states the terms **before** anyone knocks
+(AE-8). An HTTP-402-style challenge structurally cannot do that. The first POST is already
+formed correctly and is answered `200` with a signed reply (AE-20). This package does not
+speak x402 and does not return HTTP 402. A protocol refusal here is HTTP `200` plus a
+JSON-RPC error (AE-19). If someone POSTs with no signature at all, `-32001` still carries
+`data.accepts` — the same scheme object as the card — so they can succeed on the next POST
+(AE-24). That is a fallback, not the design.
+
+![x402: request, HTTP 402, retry with payment. Agent Entry: GET the card as 200, then POST already correct, answered 200.](diagrams/x402.svg)
 
 ---
 
