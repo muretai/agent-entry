@@ -1,7 +1,7 @@
 {
   "name": "@muretai/agent-entry",
   "version": "1.10.0",
-  "description": "The front desk your website runs for AI agents: verify the knock, open an account from their key, reply signed — one HTTP round trip. Coexists with WebMCP (tools in the page) and MCP (a server); replaces neither. Any A2A client. Zero dependencies.",
+  "description": "Serve /.well-known/agent-card.json, then answer a signed POST: verify who is knocking, open an account from their key, reply signed — one HTTP round trip. Coexists with llms.txt, WebMCP, and MCP; replaces none of them. Any A2A client. Zero dependencies.",
   "type": "module",
   "main": "muretai-agent-entry.mjs",
   "exports": {

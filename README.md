@@ -1,16 +1,19 @@
 # Agent Entry
 
-**`llms.txt` is a brochure. This is the front desk.**
+**This file serves the Agent Card, and answers the door that card names.**
 
-Agents already read your site. They do not sign up, they leave no cookie, and your
-analytics never sees them. Put this file on the origin: it verifies a signed knock, opens
-an account from the visitor's key, and replies signed — in the same HTTP response.
+`GET /.well-known/agent-card.json` is the contract: who you are (`did`), where to
+knock (`url`), what you answer (`skills`), and how to sign. A visiting agent reads
+that first. Then it `POST`s one signed A2A `message/send` to the URL the card
+published. This file verifies the knock, opens an account from the visitor's key,
+and replies signed — in the same HTTP response.
 
-Any client that can POST an A2A `message/send` can use it. They do not need a particular
-router, a Muretai node, or our CLI. A key and `curl` is enough.
+Any A2A client can do that. They do not need a particular router, a Muretai node,
+or our CLI. A key and `curl` is enough.
 
-This file is the door. It sits **beside**, not instead of, the other agent-facing surfaces
-a site may already have. MCP and WebMCP are often named together; they are not the same:
+It sits **beside**, not instead of, the other agent-facing surfaces a site may
+already have. `llms.txt` is one of those — a GET brochure, not this protocol.
+MCP and WebMCP are often named together; they are not the same:
 
 | | what it is | this package |
 |---|---|---|
@@ -40,7 +43,7 @@ scrape the page that holds your WebMCP tools.
 |---|---|
 | **Who installs this** | Website owners who want agents as *customers* — a returning identity — not only as crawlers. |
 | **Not for** | People writing the visiting agent. This package does not find doors, MCP servers, or WebMCP tools; it *is* a door. |
-| **The problem** | A brochure cannot recognise anyone. A signup form does not work for an agent. The first signed message has to *be* the account. |
+| **The problem** | A GET-only document cannot recognise anyone. A signup form does not work for an agent. The first signed POST has to *be* the account. |
 
 ![This file serves GET /.well-known/agent-card.json (200) and POST message/send (200). llms.txt, WebMCP, and MCP sit beside it.](diagrams/desk.svg)
 
