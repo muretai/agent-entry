@@ -31,12 +31,12 @@ it is still them.
 
 Any A2A client works: their agent, `curl`, not a particular router or ours.
 
-This file is the Agent Card and the door. That is the visit that can become a
-customer. It sits beside what you may already have, and replaces none of it.
+Keep WebMCP. A person already in the tab keeps the page. This file sits beside
+it and replaces none of it: an Agent Card and a door, so an agent who arrives
+alone can become a customer — one signed POST, a signed reply.
 
-`llms.txt` is a brochure — prose, not a contract. WebMCP is tools on the existing
-page, for a person already in the tab. MCP is a tool server for an app that holds
-a token. None of those is this: a returning customer from a signed knock.
+`llms.txt` is a brochure — prose, not a contract. MCP is a tool server for an
+app that holds a token. A different purpose.
 
 The agent reads the card **before** it knocks (AE-8). The act is then one
 **POST** `message/send` — already formed correctly — and a signed reply comes
@@ -55,7 +55,7 @@ they run) is who honours the pointer.
 | **Not for** | People writing the visiting agent. This package does not find doors, MCP servers, or WebMCP tools; it *is* a door. |
 | **The problem** | A GET-only document cannot recognise anyone. A signup form does not work for an agent. The first signed POST has to *be* the account. |
 
-![They visit and leave. The Agent Card is the visit that can become a customer.](diagrams/become.png)
+![A person in the tab keeps WebMCP. An agent alone can become a customer at the door beside it.](diagrams/become.png)
 
 One file. Zero dependencies. No database. Node 20+.
 

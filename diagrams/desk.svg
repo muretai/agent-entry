@@ -1,17 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 740 300" role="img">
-  <title>Agents already visit. Give them a way to become a customer.</title>
+  <title>Keep WebMCP. Add a door beside it if the agent is alone.</title>
   <rect width="740" height="300" fill="#fafafa"/>
-  <text x="24" y="26" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#666">The Agent Card is the visit that can become a customer.</text>
-  <rect x="20" y="40" width="340" height="140" rx="10" fill="#111"/>
-  <text x="190" y="78" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="700" fill="#fff">They visit and leave</text>
-  <text x="190" y="112" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#ddd">no one you can recognise</text>
-  <text x="190" y="144" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#bbb">gone next month</text>
-  <rect x="380" y="40" width="340" height="140" rx="10" fill="#fff" stroke="#111"/>
-  <text x="550" y="78" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="700" fill="#111">They become a customer</text>
-  <text x="550" y="112" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#555">the Agent Card, then one signed POST</text>
-  <text x="550" y="144" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#111">know who knocked; remember them</text>
-  <rect x="20" y="196" width="700" height="84" rx="10" fill="#fff" stroke="#111"/>
-  <text x="370" y="228" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700" fill="#111">GET /.well-known/agent-card.json  200</text>
-  <text x="370" y="254" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700" fill="#111">POST /  message/send  200  signed reply</text>
+  <text x="24" y="26" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#666">A person in the tab keeps WebMCP. An agent alone can become a customer at the door beside it.</text>
+  <rect x="20" y="44" width="340" height="140" rx="10" fill="#111"/>
+  <text x="190" y="80" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="700" fill="#fff">A person is in the tab</text>
+  <text x="190" y="114" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#ddd">Keep WebMCP</text>
+  <text x="190" y="144" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#bbb">the page is theirs</text>
+  <rect x="380" y="44" width="340" height="140" rx="10" fill="#fff" stroke="#111"/>
+  <text x="550" y="80" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="700" fill="#111">The agent is alone</text>
+  <text x="550" y="114" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#555">Add a door beside WebMCP</text>
+  <text x="550" y="144" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#111">they can become a customer</text>
+  <rect x="20" y="200" width="700" height="80" rx="10" fill="#fff" stroke="#111"/>
+  <text x="370" y="232" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700" fill="#111">GET /.well-known/agent-card.json  200</text>
+  <text x="370" y="260" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700" fill="#111">POST /  message/send  200  signed reply</text>
 </svg>
