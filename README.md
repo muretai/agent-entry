@@ -65,7 +65,10 @@ scrape the page that holds your WebMCP tools.
 | **Not for** | People writing the visiting agent. This package does not find doors, MCP servers, or WebMCP tools; it *is* a door. |
 | **The problem** | A GET-only document cannot recognise anyone. A signup form does not work for an agent. The first signed POST has to *be* the account. |
 
-![Agent Entry publishes GET /.well-known/agent-card.json (200) and answers POST message/send (200). llms.txt, WebMCP, and MCP sit beside it.](diagrams/desk.svg)
+The comparison is not Card vs WebMCP vs MCP. Those are different jobs. The
+comparison is a scrape — they read and leave — against a customer:
+
+<img src="diagrams/desk.svg" alt="They scrape and leave. Agent Entry makes them a customer." width="740" />
 
 One file. Zero dependencies. No database. Node 20+.
 
