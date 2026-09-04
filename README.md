@@ -65,10 +65,10 @@ scrape the page that holds your WebMCP tools.
 | **Not for** | People writing the visiting agent. This package does not find doors, MCP servers, or WebMCP tools; it *is* a door. |
 | **The problem** | A GET-only document cannot recognise anyone. A signup form does not work for an agent. The first signed POST has to *be* the account. |
 
-The comparison is not Card vs WebMCP vs MCP. Those are different jobs. The
-comparison is a scrape — they read and leave — against a customer:
+Card, WebMCP and MCP are different jobs. The contrast that matters here is
+a visit that leaves against a visit that becomes a customer:
 
-![They scrape and leave. Agent Entry makes them a customer.](diagrams/customer.png)
+![They visit and leave. Agent Entry makes them a customer.](diagrams/become.png)
 
 One file. Zero dependencies. No database. Node 20+.
 

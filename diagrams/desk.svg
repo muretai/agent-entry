@@ -1,22 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 740 340" role="img">
-  <title>They scrape and leave. Agent Entry makes them a customer.</title>
-  <rect width="740" height="340" fill="#fafafa"/>
-  <text x="24" y="26" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#666">The comparison is a scrape against a customer. Not Card vs WebMCP vs MCP.</text>
-  <rect x="20" y="40" width="340" height="168" rx="10" fill="#111"/>
-  <text x="190" y="72" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="700" fill="#fff">They scrape and leave</text>
-  <text x="190" y="108" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#ddd">a visit that is not a customer</text>
-  <text x="190" y="142" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#bbb">no account</text>
-  <text x="190" y="166" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#bbb">no cookie</text>
-  <text x="190" y="190" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#bbb">nothing in your analytics</text>
-  <rect x="380" y="40" width="340" height="168" rx="10" fill="#fff" stroke="#111"/>
-  <text x="550" y="72" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="700" fill="#111">Agent Entry</text>
-  <text x="550" y="108" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#555">they become a customer</text>
-  <text x="550" y="142" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#111">know who knocked</text>
-  <text x="550" y="166" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#111">remember them next time</text>
-  <text x="550" y="190" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#111">answer in the same request</text>
-  <rect x="20" y="224" width="700" height="92" rx="10" fill="#fff" stroke="#111"/>
-  <text x="370" y="254" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700" fill="#111">GET /.well-known/agent-card.json  200</text>
-  <text x="370" y="276" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#555">then</text>
-  <text x="370" y="300" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700" fill="#111">POST /  message/send  200  signed reply</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 740 320" role="img">
+  <title>Agents already visit. Give them a way to become a customer.</title>
+  <rect width="740" height="320" fill="#fafafa"/>
+  <text x="24" y="26" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#666">A visit that leaves, against a visit that becomes a customer. Not Card vs WebMCP vs MCP.</text>
+  <rect x="20" y="40" width="340" height="156" rx="10" fill="#111"/>
+  <text x="190" y="72" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="700" fill="#fff">They visit and leave</text>
+  <text x="190" y="104" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#ddd">no one you can recognise</text>
+  <text x="190" y="136" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#bbb">no account</text>
+  <text x="190" y="160" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#bbb">gone next month</text>
+  <rect x="380" y="40" width="340" height="156" rx="10" fill="#fff" stroke="#111"/>
+  <text x="550" y="72" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="700" fill="#111">They become a customer</text>
+  <text x="550" y="104" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#555">Agent Entry</text>
+  <text x="550" y="136" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#111">know who knocked</text>
+  <text x="550" y="160" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#111">remember them next time</text>
+  <rect x="20" y="212" width="700" height="88" rx="10" fill="#fff" stroke="#111"/>
+  <text x="370" y="244" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700" fill="#111">GET /.well-known/agent-card.json  200</text>
+  <text x="370" y="266" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#555">then</text>
+  <text x="370" y="288" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700" fill="#111">POST /  message/send  200  signed reply</text>
 </svg>
