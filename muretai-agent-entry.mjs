@@ -761,7 +761,7 @@ export function signEnvelope(seedHex, fields) {
 /** Question 1 ONLY: does `sig` verify under the key DERIVED FROM `from`, over the six
  *  fields? Total and fail-closed — a malformed DID, bad base64, unrenderable number or
  *  short signature all answer false rather than throwing. */
-export function verifyEnvelopeSignature(fields) {
+export function verifyEnvelopeSignature(fields, opts = {}) {
   try {
     if (!fields || typeof fields !== 'object') return false;
     // `from` (the key) and `sig` must be there; `to` may be the EMPTY STRING — that is how
@@ -772,7 +772,11 @@ export function verifyEnvelopeSignature(fields) {
     assertEncodable(payload);
     const sig = Buffer.from(String(fields.sig), 'base64');
     if (sig.length !== 64) return false;
-    return verifyBytes(publicKeyFromDid(fields.from), sig, Buffer.from(payload, 'utf8'));
+    // Payload `from` stays the root DID. `signerDid` is the verifying key when the
+    // sender enrolled a delegated op-key (T142 A2); omitted → `from` (the un-enrolled
+    // / this-door-reply case).
+    const signerDid = opts.signerDid || fields.from;
+    return verifyBytes(publicKeyFromDid(signerDid), sig, Buffer.from(payload, 'utf8'));
   } catch {
     return false;
   }
@@ -805,10 +809,80 @@ export function verifyEnvelope(fields, opts = {}) {
     const recipient = opts.recipientDid ?? opts.me ?? fields.recipientDid ?? null;
     if (typeof recipient !== 'string' || !recipient) return false;
     if (fields.to !== recipient) return false;
-    return verifyEnvelopeSignature(fields);
+    return verifyEnvelopeSignature(fields, opts);
   } catch {
     return false;
   }
+}
+
+// ================================================================ KeyState (inline op-key, T142 A2)
+//
+// A persisted muretai identity enrolls a genesis KeyState at birth and signs
+// messages with a delegated op-key while `from` stays the root DID. This door
+// used to verify under `from` only, which refused every default-enrolled
+// visitor. Resolve the op-key from a valid inline KeyState (root-signed, pin
+// to the claimed `from`); a missing or invalid record falls back to `from`.
+// No directory, no pin store — first-contact, same as the Python twin.
+
+const KEYSTATE_TYP = 'muretai/keystate/1';
+// Lockstep with shared/keystate._FIELDS_V1 / _signed_names: presence of
+// encPubPqHash (even "") selects the T142 list. A V1-only list made every
+// default-enrolled visitor fail verify and fall back to the root DID, so
+// the op-signed envelope was -32001 at this door only (Python twin accepted).
+const KEYSTATE_FIELDS_V1 = [
+  'typ', 'rootDid', 'epoch', 'rootKey', 'rootNextHash',
+  'opDid', 'opNextHash', 'encPub', 'encNextHash',
+  'guardiansHash', 'revokedOps', 'notBefore', 'notAfter', 'ts',
+];
+function keystateSignedNames(ks) {
+  if (ks && Object.prototype.hasOwnProperty.call(ks, 'encPubPqHash')) {
+    return KEYSTATE_FIELDS_V1.concat(['encPubPqHash']);
+  }
+  return KEYSTATE_FIELDS_V1;
+}
+const MAX_KEYSTATE_EPOCH = 2147483647; // 2**31 - 1, shared/keystate.MAX_EPOCH
+
+export function verifyKeystate(ks, expectedRootDid, now) {
+  try {
+    if (!ks || typeof ks !== 'object') return false;
+    if (ks.typ !== KEYSTATE_TYP) return false;
+    const rootDid = ks.rootDid;
+    const epoch = ks.epoch;
+    if (!Number.isInteger(epoch) || epoch < 0 || epoch > MAX_KEYSTATE_EPOCH) return false;
+    if (expectedRootDid != null && rootDid !== expectedRootDid) return false;
+    const didKey = publicKeyHexFromDid(rootDid);
+    if (ks.rootKey !== didKey) return false;
+    const sig = Buffer.from(String(ks.sig), 'base64');
+    if (sig.length !== 64) return false;
+    const payloadObj = {};
+    for (const k of keystateSignedNames(ks)) {
+      payloadObj[k] = ks[k] === undefined ? null : ks[k];
+    }
+    const payload = canonicalJSON(payloadObj);
+    const pub = Buffer.from(String(ks.rootKey), 'hex');
+    if (pub.length !== 32) return false;
+    if (!verifyBytes(pub, sig, Buffer.from(payload, 'utf8'))) return false;
+    if (now != null) {
+      const nb = ks.notBefore || 0;
+      const na = ks.notAfter;
+      if (now < nb) return false;
+      if (na != null && now > na) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function resolveOpDid(rootDid, inlineKeystate, now) {
+  if (inlineKeystate && verifyKeystate(inlineKeystate, rootDid, now)) {
+    const burned = Array.isArray(inlineKeystate.revokedOps)
+      ? inlineKeystate.revokedOps : [];
+    const op = inlineKeystate.opDid || rootDid;
+    if (burned.includes(op)) return rootDid;
+    return op;
+  }
+  return rootDid;
 }
 
 // ================================================================ Web Bot Auth (RFC 9421 subset, verify-only) — T107
@@ -1770,6 +1844,43 @@ function isThenable(v) {
   return v !== null && typeof v === 'object' && typeof v.then === 'function';
 }
 
+/**
+ * `then1(x, f)` — apply `f` to `x`, awaiting `x` only if it is a promise.
+ *
+ * This is what lets ONE verification ladder serve both the synchronous in-memory state and
+ * an asynchronous external `store` (T105), instead of the ladder being written twice and
+ * drifting. Writing it twice was the alternative considered and rejected: the ladder is the
+ * security-critical path, its steps are ORDER-DEPENDENT, and two copies of an ordered
+ * security argument is how one of them silently stops matching the other.
+ *
+ * The sync branch is not an optimisation — it is the contract. With no store, every step
+ * returns a plain value, the ladder returns a plain value, and `handleRequest` (the
+ * synchronous entry point) keeps working exactly as it always has.
+ */
+function then1(x, f) {
+  return isThenable(x) ? x.then(f) : f(x);
+}
+
+/**
+ * Validate a caller-supplied `store` and return it unchanged.
+ *
+ * Checked ONCE at construction rather than per call, and it throws rather than filling in a
+ * default: a store missing `seenMessage` would otherwise silently disable replay protection,
+ * and the failure would appear as "the door works" until somebody replayed a message.
+ */
+function asStore(store) {
+  const REQUIRED = ['seenMessage', 'getAccount', 'putAccount', 'getDeviceOwner',
+    'putDeviceOwner'];
+  const missing = REQUIRED.filter((m) => typeof store[m] !== 'function');
+  if (missing.length) {
+    throw new TypeError(
+      `createAgentEntry: store is missing ${missing.join(', ')}. A store must implement all `
+      + `of ${REQUIRED.join(', ')} — a partial store would disable a security rule silently `
+      + 'rather than loudly.');
+  }
+  return store;
+}
+
 // ---------------------------------------------------------------- baseUrl canonicalisation
 
 /** RFC 3986 `pchar` plus '/' — the only characters an accepted path may carry. Everything
@@ -2385,6 +2496,7 @@ export function createAgentEntry({
   howToUrl = FIRST_KNOCK_URL,
   observer = null,
   wbaVerifiers = null,
+  store = null,
 } = {}) {
   if (!seedHex) throw new TypeError('createAgentEntry: seedHex is required');
   if (!baseUrl) throw new TypeError('createAgentEntry: baseUrl is required (it is signed into the card)');
@@ -2531,6 +2643,53 @@ export function createAgentEntry({
   // Unlike the ledger it is READ on every message, so only a real store can carry it.
   const deviceOwner = new Map();
   const replay = new ReplayGuard();
+
+  // ---------------------------------------------------------------- the state seam (T105)
+  //
+  // WHY. The three structures above live in CLOSURE MEMORY, and a serverless instance keeps
+  // none of them between requests. The round-trip shape suits those platforms perfectly —
+  // one signed POST in, one signed reply out, nothing to keep awake — so what blocks them is
+  // not the shape but the STATE. Losing `replay` re-opens every message inside the freshness
+  // window to replay; losing `deviceOwner` resets the no-re-ownership rule to
+  // trust-on-first-use at every cold start.
+  //
+  // `store` is an OPTIONAL duck-typed object whose five methods may each return a value or a
+  // promise:
+  //
+  //   seenMessage(messageId, ttlSeconds) -> bool   TRUE when the id was NEW (and is now
+  //                                                remembered). The test and the remember
+  //                                                MUST be atomic in the backing store.
+  //   getAccount(did)          -> row | null
+  //   putAccount(did, row)     -> void             row === null DELETES the row.
+  //   getDeviceOwner(deviceDid)-> ownerDid | null
+  //   putDeviceOwner(dev, own) -> void
+  //
+  // Rate counters are deliberately NOT in this interface, and that is the approved design,
+  // not an omission: a bound that costs a store write per request is its own denial of
+  // service, and losing one fails open for a single minute — a bounded loss, unlike a lost
+  // replay set or a lost pin.
+  //
+  // WITH NO STORE the default below is SYNCHRONOUS and wraps exactly the Maps above, so the
+  // no-store path stays byte-identical and `handleRequest` (the sync entry point) keeps
+  // working. With a store the message path returns a promise, which `route()` already
+  // propagates and `handleRequestAsync` already awaits.
+  const memoryStore = {
+    seenMessage: (messageId) => replay.checkAndRemember(messageId),
+    getAccount: (did) => ledger.get(did) ?? null,
+    putAccount: (did, row) => {
+      if (row === null) { ledger.delete(did); return; }
+      ledger.set(did, row);
+      while (ledger.size > maxAccounts) {
+        const oldest = ledger.keys().next();
+        if (oldest.done) break;
+        ledger.delete(oldest.value);
+      }
+    },
+    getDeviceOwner: (deviceDid) => deviceOwner.get(deviceDid) ?? null,
+    putDeviceOwner: (deviceDid, ownerDid) => { deviceOwner.set(deviceDid, ownerDid); },
+  };
+  const state = store ? asStore(store) : memoryStore;
+  const storeIsExternal = Boolean(store);
   const anonRate = new RateBound(anonRatePerMin);
   // A tier is ON unless its ceiling is a non-positive or non-finite number. Constructed
   // rather than clamped, so "disabled" is one absent object and never a bound of 0 — which
@@ -2726,25 +2885,24 @@ export function createAgentEntry({
     return sigEnvelope;
   }
 
+  /** Record contact from an account. Returns the row (or a promise of it, with a store). */
   function noteContact(accountDid) {
     const now = nowEpoch();
-    const row = ledger.get(accountDid);
-    if (row) {
-      row.messages += 1;
-      row.last_seen = now;
-      return row;
-    }
-    // FIRST CONTACT IS ACCOUNT CREATION. There is no signup form: the sender proved control
-    // of a device key one line above, which is strictly more than an email link. The row is
-    // keyed by the ACCOUNT (the owner when bound), so sibling devices are one customer.
-    const fresh = { first_seen: now, last_seen: now, messages: 1 };
-    ledger.set(accountDid, fresh);
-    while (ledger.size > maxAccounts) {
-      const oldest = ledger.keys().next();
-      if (oldest.done) break;
-      ledger.delete(oldest.value);
-    }
-    return fresh;
+    return then1(state.getAccount(accountDid), (row) => {
+      if (row) {
+        // A store hands back a COPY, so the row must be written home again. The in-memory
+        // store hands back the live object and the write is a no-op re-set of the same
+        // reference — one code path, correct for both.
+        const updated = { ...row, messages: (row.messages || 0) + 1, last_seen: now };
+        return then1(state.putAccount(accountDid, updated), () => updated);
+      }
+      // FIRST CONTACT IS ACCOUNT CREATION. There is no signup form: the sender proved
+      // control of a device key one line above, which is strictly more than an email link.
+      // The row is keyed by the ACCOUNT (the owner when bound), so sibling devices are one
+      // customer.
+      const fresh = { first_seen: now, last_seen: now, messages: 1 };
+      return then1(state.putAccount(accountDid, fresh), () => fresh);
+    });
   }
 
   /** When a device that ALREADY has an unbound ledger row first proves its owner, move that
@@ -2752,13 +2910,19 @@ export function createAgentEntry({
    *  resolves to the device DID and must not merge, or stripping a binding would become a
    *  way to read the owner's history. */
   function foldDeviceIntoOwner(deviceDid, ownerDid) {
-    const devRow = ledger.get(deviceDid);
-    if (!devRow) return;
-    ledger.delete(deviceDid);
-    const ownerRow = ledger.get(ownerDid);
-    if (!ownerRow) { ledger.set(ownerDid, devRow); return; }
-    ownerRow.messages += devRow.messages || 0;
-    ownerRow.first_seen = Math.min(ownerRow.first_seen, devRow.first_seen);
+    return then1(state.getAccount(deviceDid), (devRow) => {
+      if (!devRow) return undefined;
+      return then1(state.putAccount(deviceDid, null), () =>
+        then1(state.getAccount(ownerDid), (ownerRow) => {
+          if (!ownerRow) return state.putAccount(ownerDid, devRow);
+          const merged = {
+            ...ownerRow,
+            messages: (ownerRow.messages || 0) + (devRow.messages || 0),
+            first_seen: Math.min(ownerRow.first_seen, devRow.first_seen),
+          };
+          return state.putAccount(ownerDid, merged);
+        }));
+    });
   }
 
   /**
@@ -2806,17 +2970,18 @@ export function createAgentEntry({
     if (!verifyDeviceBindingV2(binding, { now, expectedDeviceDid: from })) {
       return { ok: false, reason: 'device binding does not verify' };
     }
-    const pinned = deviceOwner.get(from);
-    if (pinned !== undefined && pinned !== rootDid) {
-      return { ok: false, reason:
-        'device is already bound to a different owner (a device DID is never re-owned '
-        + '— a new owner means a new device key)' };
-    }
-    if (pinned === undefined) {
-      deviceOwner.set(from, rootDid);
-      foldDeviceIntoOwner(from, rootDid);
-    }
-    return { ok: true, account: rootDid };
+    return then1(state.getDeviceOwner(from), (pinned) => {
+      if (pinned !== null && pinned !== undefined && pinned !== rootDid) {
+        return { ok: false, reason:
+          'device is already bound to a different owner (a device DID is never re-owned '
+          + '— a new owner means a new device key)' };
+      }
+      if (pinned === null || pinned === undefined) {
+        return then1(state.putDeviceOwner(from, rootDid), () =>
+          then1(foldDeviceIntoOwner(from, rootDid), () => ({ ok: true, account: rootDid })));
+      }
+      return { ok: true, account: rootDid };
+    });
   }
 
   /** The FROZEN backend-handoff shape (agent/webhookwake.py::_envelope). The site's own
@@ -3097,16 +3262,19 @@ export function createAgentEntry({
           `the anonymous lane is limited to ${anonRatePerMin} replies per minute — `
           + 'sign your message to lift the bound');
       }
-      if (!replay.checkAndRemember(msg.messageId)) {
-        return rpcError(reqId, ERRORS.REPLAY_REJECTED, 'duplicate messageId (replay) detected');
-      }
-      // T107: the interesting case — an anonymous inquiry whose TRANSPORT a known key
-      // signed. `verified` STAYS false (the WBA signature covers @authority +
-      // signature-agent, not the text), no ledger row is minted (the header set is a
-      // bearer credential and replayable while it lives), and the anon rate bound
-      // above already applied. Identify, don't enrol.
-      return respond(backendEnvelope(msg, { verified: false, peerDid: null,
-        wbaDid: wbaIdentify(reqHeaders) }), reqId, msg, '');
+      return then1(state.seenMessage(msg.messageId, REPLAY_TTL_S), (fresh) => {
+        if (!fresh) {
+          return rpcError(reqId, ERRORS.REPLAY_REJECTED,
+            'duplicate messageId (replay) detected');
+        }
+        // T107: the interesting case — an anonymous inquiry whose TRANSPORT a known key
+        // signed. `verified` STAYS false (the WBA signature covers @authority +
+        // signature-agent, not the text), no ledger row is minted (the header set is a
+        // bearer credential and replayable while it lives), and the anon rate bound
+        // above already applied. Identify, don't enrol.
+        return respond(backendEnvelope(msg, { verified: false, peerDid: null,
+          wbaDid: wbaIdentify(reqHeaders) }), reqId, msg, '');
+      });
     }
     // 5. addressed to someone else. Checked BEFORE decoding `from`, so a junk DID in a
     //    misaddressed message never reaches the base58 decoder.
@@ -3131,12 +3299,13 @@ export function createAgentEntry({
     if (!Number.isSafeInteger(ts) || Math.abs(nowEpoch() - ts) > CLOCK_WINDOW_S) {
       return rpcError(reqId, ERRORS.REPLAY_REJECTED, 'timestamp out of range (clock skew or replay)');
     }
-    // 7. the signature itself, under the key DERIVED FROM `from`. (`messageId`'s type was
-    //    settled by the shape gate: a non-string never reaches here on either implementation.)
+    // 7. the signature itself. Payload `from` is the root DID; the verifying key is
+    //    the delegated op-key when a valid inline KeyState is attached (T142 A2).
     const messageId = msg.messageId;
     const fields = { from, to, messageId, contextId: msg.contextId ?? null,
       timestamp: ts, text, sig };
-    if (!verifyEnvelope(fields, { recipientDid: did })) {
+    const signerDid = resolveOpDid(from, meta.keystate, ts);
+    if (!verifyEnvelope(fields, { recipientDid: did, signerDid })) {
       return rpcError(reqId, ERRORS.UNAUTHENTICATED, 'signature does not match');
     }
     // 8. duplicate messageId inside the replay window — AFTER the verify, and the ORDER is the
@@ -3148,40 +3317,54 @@ export function createAgentEntry({
     //    rule the signed lane's ceiling already follows one step below, for the same reason; it
     //    was simply never applied here. The cost of the swap is one Ed25519 verify spent on a
     //    replayed VALID message, which an attacker must first have obtained.
-    if (!replay.checkAndRemember(messageId)) {
-      return rpcError(reqId, ERRORS.REPLAY_REJECTED, 'duplicate messageId (replay) detected');
-    }
+    return then1(state.seenMessage(messageId, REPLAY_TTL_S), (fresh) => {
+      if (!fresh) {
+        return rpcError(reqId, ERRORS.REPLAY_REJECTED, 'duplicate messageId (replay) detected');
+      }
 
-    // 9. T102 account layer. An OPTIONAL countersigned v2 binding collapses an owner's device
-    //    DIDs to ONE account; a present-but-INVALID binding fails closed with the SAME
-    //    UNAUTHENTICATED code (never a silent downgrade to unbound). Absent → the device DID.
-    const acct = resolveAccount(meta.binding, from);
-    if (!acct.ok) return rpcError(reqId, ERRORS.UNAUTHENTICATED, acct.reason);
-    const account = acct.account;
-    const ownerDid = account !== from ? account : null;
+      // 9. T102 account layer. An OPTIONAL countersigned v2 binding collapses an owner's
+      //    device DIDs to ONE account; a present-but-INVALID binding fails closed with the
+      //    SAME UNAUTHENTICATED code (never a silent downgrade to unbound). Absent → the
+      //    device DID.
+      return then1(resolveAccount(meta.binding, from), (acct) => {
+        if (!acct.ok) return rpcError(reqId, ERRORS.UNAUTHENTICATED, acct.reason);
+        const account = acct.account;
+        const ownerDid = account !== from ? account : null;
 
-    // 10. THE SIGNED LANE'S CEILING. Here and not earlier: before the signature a stranger
-    //     could spend somebody else's budget by naming them, and before `resolveAccount` an
-    //     owner's devices would each get their own. Here and not later: a refused flood must
-    //     grow neither the ledger nor whatever the responder costs.
-    //     PER-ACCOUNT FIRST, deliberately — one loud peer is then stopped by ITS OWN window
-    //     without drawing down the shared one, so it cannot starve everybody else on its way
-    //     to being refused. Neither refusal names its ceiling: a published number is a
-    //     calibration table telling a flood exactly how many keys to mint.
-    if (signedAccountRate && !signedAccountRate.allow(account)) {
-      return rpcError(reqId, ERRORS.RATE_LIMITED,
-        'you are sending faster than this door answers — slow down and retry');
-    }
-    if (signedTotalRate && !signedTotalRate.allow()) {
-      return rpcError(reqId, ERRORS.RATE_LIMITED,
-        'this entry is at its ceiling right now — retry shortly');
-    }
+        // 10. THE SIGNED LANE'S CEILING. Here and not earlier: before the signature a
+        //     stranger could spend somebody else's budget by naming them, and before
+        //     `resolveAccount` an owner's devices would each get their own. Here and not
+        //     later: a refused flood must grow neither the ledger nor whatever the
+        //     responder costs.
+        //     PER-ACCOUNT FIRST, deliberately — one loud peer is then stopped by ITS OWN
+        //     window without drawing down the shared one, so it cannot starve everybody
+        //     else on its way to being refused. Neither refusal names its ceiling: a
+        //     published number is a calibration table telling a flood exactly how many keys
+        //     to mint.
+        //
+        //     These two bounds stay IN PROCESS even with an external store, and that is the
+        //     approved design rather than an omission: a ceiling that costs a store write
+        //     per request is its own denial of service, and losing a counter fails open for
+        //     one minute — bounded, unlike a lost replay set or a lost device pin. A
+        //     serverless deployment therefore gets its ceiling per instance; put a real one
+        //     at the edge if that matters.
+        if (signedAccountRate && !signedAccountRate.allow(account)) {
+          return rpcError(reqId, ERRORS.RATE_LIMITED,
+            'you are sending faster than this door answers — slow down and retry');
+        }
+        if (signedTotalRate && !signedTotalRate.allow()) {
+          return rpcError(reqId, ERRORS.RATE_LIMITED,
+            'this entry is at its ceiling right now — retry shortly');
+        }
 
-    noteContact(account);
-    // T107: `wba_did` may legitimately differ from `peer_did` (the transport signer vs
-    // the message signer) — both facts are honest, and the schema says which is which.
-    return respond(backendEnvelope(msg, { verified: true, peerDid: from, ownerDid,
-      wbaDid: wbaIdentify(reqHeaders) }), reqId, msg, from);
+        return then1(noteContact(account), () =>
+          // T107: `wba_did` may legitimately differ from `peer_did` (the transport signer
+          // vs the message signer) — both facts are honest, and the schema says which is
+          // which.
+          respond(backendEnvelope(msg, { verified: true, peerDid: from, ownerDid,
+            wbaDid: wbaIdentify(reqHeaders) }), reqId, msg, from));
+      });
+    });
   }
 
   /** Hand the envelope to the watcher, and make sure it can cost nothing.
@@ -3419,8 +3602,14 @@ export function createAgentEntry({
   function handleRequest(method, path, headers, bodyBuffer) {
     const out = route(method, path, bodyBuffer, headers);
     if (isThenable(out)) {
-      return rpcError(null, ERRORS.INTERNAL_ERROR,
-        'responder is async — serve this agent entry through listen()/handleRequestAsync()');
+      // Two different causes, and an operator can only fix the one they are told about.
+      // A `store` makes EVERY message path async by construction, so saying "responder is
+      // async" to somebody who passed a synchronous responder and a KV store would send
+      // them looking in the wrong place entirely.
+      return rpcError(null, ERRORS.INTERNAL_ERROR, storeIsExternal
+        ? 'this entry has an external store, so every message is answered asynchronously — '
+          + 'serve it through listen()/handleRequestAsync()'
+        : 'responder is async — serve this agent entry through listen()/handleRequestAsync()');
     }
     return out;
   }
