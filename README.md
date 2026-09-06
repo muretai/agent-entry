@@ -810,21 +810,32 @@ exactly, or a signature is unverifiable and the only diagnostic anyone gets is
 It is one file, it depends on nothing, and it carries everything it needs including its own
 Ed25519.
 
-The other implementation is a Python one, and it lives with Muretai core, where it is the
-executable specification the acceptance suite drives. It is not published here on purpose. A
-door needs a signer, a card, a binding verifier and a domain-name check; core's copy reaches
-for a URL guard, a JWS minter and a release module that a door never touches, and shipping
-those here would put the *visiting-agent* and *node* sides of the network into an artifact that
-is only ever the site side.
+The other implementation is a Python one. Its **door** half lives with Muretai core, where it
+is the executable specification the acceptance suite drives, and it is not published here on
+purpose: a door needs a signer, a card, a binding verifier and a domain-name check; core's copy
+reaches for a URL guard, a JWS minter and a release module that a door never touches, and
+shipping those here would put the *visiting-agent* and *node* sides of the network into an
+artifact that is only ever the site side.
 
 The visiting side needs nothing from this package either: an agent already has a runtime — a
 Muretai node, or whatever framework it runs on — and that is what knocks on your door.
 
-So the two implementations share no code at all, by design. **What holds them to identical
-verdicts is the acceptance suite, not a shared library** — which is the honest arrangement,
-because a shared library would only ever have covered the parts they happen to share. The
-suite posts identical bytes to both, down to the HTTP framing, and requires the same status,
-the same account outcome and the same signed reply.
+**The two doors share exactly one thing, and it is the part that must not differ: the wire
+layer.** Canonical JSON, `did:key`, the six signed fields, the card envelope, the device
+binding, the Web Bot Auth verify side, the sealed box — the bytes, and nothing that decides
+anything. In this file they are the block between the `CANONICAL JSON` banner and the
+`reach-back through a relay` banner, and those exact bytes are published on their own, MIT, as
+[**agent-wire**](https://github.com/muretai/agent-wire) — in JavaScript *and* Python, with the
+golden vectors and a specification of just those bytes. `npm test` proves this copy has not
+drifted from it (`conformance/wire-twin.mjs`) whenever that repository is checked out beside
+this one; without it the check says so and skips.
+
+Everything *around* the wire layer — the ladder, the store, the account rules, the HTTP — is
+still written twice, in two languages, sharing nothing. **What holds those to identical
+verdicts is the acceptance suite, not a shared library**, and that is still the honest
+arrangement: the suite posts identical bytes to both, down to the HTTP framing, and requires
+the same status, the same account outcome and the same signed reply. If you write a third
+implementation, that suite is the gate.
 
 **The part of that gate you can run here ships in this package.** `npm test` executes
 `conformance/run.mjs` against `conformance/vectors.json` — the canonical JSON, the signing
@@ -835,7 +846,12 @@ for byte. No network, no checkout of ours, nothing to ask us for:
 npm test
 ```
 
-Write another implementation and point it at the same vectors.
+That file is a subset, chosen so the suite ships in a tarball. The **superset** — the same
+groups plus the device bindings, the owner state, the domain-linkage credentials, the relay
+session tokens, the invites and the sealed boxes — lives in agent-wire's `vectors/`, with a
+runner in each language that re-derives it. A disagreement about the bytes belongs there.
+
+Write another implementation and point it at those vectors.
 [Agent Entry for WordPress](https://github.com/muretai/agent-entry-wordpress)
 is one that already does — a PHP door, not this file wrapped, held to the same
 golden bytes.
@@ -850,6 +866,10 @@ against it.
 That is not a closed door. **Open an issue** — a bug, a wire-vector disagreement, a place the
 docs are wrong, a design question — and it gets read and, where it's right, becomes the next
 release here. That path works; a PR against these files does not.
+
+The wire layer has its own home: a disagreement about the *bytes* — canonical JSON, `did:key`,
+the signed payloads, the vectors — belongs in [agent-wire](https://github.com/muretai/agent-wire),
+where they are specified and where every implementation reads them from.
 
 ### What this is part of
 

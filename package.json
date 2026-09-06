@@ -21,7 +21,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node conformance/run.mjs",
+    "test": "node conformance/run.mjs && node conformance/wire-twin.mjs",
+    "test:wire": "node conformance/wire-twin.mjs",
     "example": "node examples/server.mjs",
     "distill": "node scripts/distill/loop.mjs",
     "distill:record": "node scripts/distill/record.mjs",
