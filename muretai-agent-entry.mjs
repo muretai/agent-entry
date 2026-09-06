@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * web/agent-entry/muretai-agent-entry.mjs
  * THE AGENT ENTRY — one dependency-free Node file that makes a website agent-reachable.
@@ -15,9 +16,18 @@
  *
  * THE BYTES ARE THE CONTRACT. Every signed payload here must be byte-identical to what
  * Python's `shared/crypto.canonical` produces, or the signature is unverifiable and the only
- * diagnostic anyone gets is "signature verification failed". The pinned bytes live in
- * `testdata/wire_vectors.json`; `test_agent_entry_contract.py` Part 3 re-derives all of them
- * through this file. If you change anything under CANONICAL JSON, run that suite first.
+ * diagnostic anyone gets is "signature verification failed". The pinned bytes are the golden
+ * vectors — `testdata/wire_vectors.json` here, `vectors/wire_vectors.json` in agent-wire —
+ * and `test_agent_entry_contract.py` Part 3 re-derives all of them through this file. If you
+ * change anything under CANONICAL JSON, run that suite first.
+ *
+ * THE CRYPTO BLOCK IS PUBLISHED ON ITS OWN. Everything between the CANONICAL JSON banner and
+ * the `reach-back through a relay` banner is the WIRE CONTRACT: the bytes a Swift, Kotlin,
+ * PHP or Rust implementation must reproduce, with nothing in them that decides anything. Those
+ * exact bytes are `js/wire.mjs` in the `agent-wire` repository (MIT, beside the vectors, a
+ * Python twin of the same layer and a specification of just those bytes), and
+ * `part_wire` in the contract suite fails when the two drift. Edit it HERE; the release
+ * script's `wire` station carries it there.
  *
  *   import { createAgentEntry } from './muretai-agent-entry.mjs';
  *   createAgentEntry({ seedHex, name: 'Example Studio', baseUrl: 'https://studio.example',
@@ -461,7 +471,7 @@ export const ERRORS = {
 //   json.dumps(obj, sort_keys=True, separators=(",",":"), ensure_ascii=False,
 //              allow_nan=False).encode("utf-8")
 //
-// The four traps, each pinned by a case in testdata/wire_vectors.json:
+// The four traps, each pinned by a case in the golden vectors (`wire_vectors.json`):
 //   1. KEY ORDER is by UNICODE CODE POINT. JavaScript's default string sort compares
 //      UTF-16 code UNITS, which disagrees for astral characters (U+1F600 sorts BEFORE
 //      U+FFFD by unit, AFTER it by code point). `codePointCompare` below is deliberate.
@@ -891,7 +901,7 @@ export function resolveOpDid(rootDid, inlineKeystate, now) {
 // THIS request, for THIS authority, as a `web-bot-auth` request? It mirrors EXACTLY the
 // subset shared/webbotauth.py::verify_request implements — no more (content digests,
 // @query-param, per-item parameters and every other RFC 9421 feature are refused, not
-// ignored) and no less. The two are pinned to one fixture, testdata/wba_vectors.json:
+// ignored) and no less. The two are pinned to one fixture, `wba_vectors.json`:
 // a vector one twin accepts and the other refuses is a red suite. Verification is
 // BYTE-FAITHFUL, not canonical: the signature base is rebuilt from the RECEIVED
 // `@signature-params` text, so a peer who orders or spaces parameters differently still
@@ -1230,7 +1240,7 @@ function wbaEntryVerifies(entry, { keyid, publicRaw, authority, headers, now }) 
  *  directory document ({keys:[…]}) already established as trustworthy — who the keys
  *  belong to was decided before this was called (DECISION 2: keys are GIVEN, never
  *  fetched on the hot path). Mirrors shared/webbotauth.verify_request exactly;
- *  testdata/wba_vectors.json holds the two to one verdict per input. */
+ *  `wba_vectors.json` holds the two to one verdict per input. */
 export function wbaVerifyRequest(headers, { authority, jwks, now } = {}) {
   try {
     const entries = wbaParseSignatureHeaders(
@@ -1266,7 +1276,7 @@ export function wbaVerifyRequest(headers, { authority, jwks, now } = {}) {
 // The ACCOUNT layer: a message may carry a countersigned DeviceKeyBinding v2 in
 // metadata.binding proving its device DID belongs to an OWNER DID. This is the JS twin of
 // shared/keybinding.verify_device_binding_v2 + the agent entry's account resolution, byte-pinned
-// by testdata/wire_vectors.json `bindingV2`.
+// by the golden vectors' `bindingV2` group.
 //
 // Two signatures, over the SAME canonical bytes: the OWNER (root) signs, and the DEVICE
 // countersigns — the countersignature is what stops a foreign owner claiming someone else's

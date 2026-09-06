@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: MIT
 /*
  * conformance/run.mjs — check an Agent Entry implementation against the golden vectors.
  *
