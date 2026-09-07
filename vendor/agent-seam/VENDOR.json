@@ -2,9 +2,9 @@
   "_": "Written by scripts/vendor-seam.mjs; do not edit by hand. conformance/seam-twin.mjs holds these copies to these digests, and holds the door's block and pinned declarations to vendor/agent-seam/seam.mjs, without any agent-seam checkout present.",
   "from": "agent-seam",
   "repository": "https://github.com/muretai/agent-seam",
-  "ref": "v0.2.0",
-  "commit": "201ab05e93745864e02a8476d75bf41e87725f16",
-  "version": "0.2.0",
+  "ref": "v0.2.1",
+  "commit": "f2968b1656a73437cf9940fe1b936d2b24ac8512",
+  "version": "0.2.1",
   "date": "2026-09-07",
   "files": {
     "vendor/agent-seam/seam.mjs": {
