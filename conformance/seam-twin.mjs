@@ -35,6 +35,10 @@
  *   2. PINNED DECLARATIONS ARE MATCHED BY NAME, NOT BY SUBSTRING. They live OUTSIDE the block
  *      (`CLOCK_WINDOW_S`, `REPLAY_TTL_S`, the size caps, the `-32xxx` table), the softest target
  *      in the file; "does this line appear somewhere" passed a tenfold-shorter replay window.
+ *      And a line is judged by its CODE, comments and strings stripped: a declaration inside a
+ *      block comment counted once, and an indented `const REPLAY_TTL_S = 6;` inside a handler
+ *      shadowed the pinned one while "declared exactly once" stayed green (2026-09-07). So the
+ *      door is searched at any depth for a second declaration, and for any assignment.
  *   3. THE LINES OUTSIDE THE BLOCK ARE CODE TOO. Repointing the `node:crypto` import at a shim
  *      left every signature running through another file while a block-only check said OK.
  *
@@ -98,6 +102,10 @@ const END_DOOR = /^\/\/ =+ reach-back through a relay$/;
 const END_SEAM = /^\/\/ ---- end of the seam$/;
 const PINNED = /^\/\/ ---- pinned:/;
 const DECL = /^(?:export\s+)?(?:const|let|function|class)\s+([A-Za-z_$][\w$]*)/;
+/** The door-side net: any depth, any keyword. A pinned name declared a second time inside a
+ *  handler shadows the pinned constant for that handler and reads as "declared exactly once"
+ *  to a scan that only sees column 0. */
+const DOOR_DECL = /^(?:export\s+)?(?:const|let|var|function|class)\s+([A-Za-z_$][\w$]*)/;
 
 let pass = 0;
 const failures = [];
@@ -120,24 +128,53 @@ function sections(region) {
   lines.forEach((l, i) => { const m = /^\/\/ ={10,} (.+)$/.exec(l); if (m) marks.push([i, m[1].trim()]); });
   return marks.map(([start, title], k) => ({ title, text: lines.slice(start, k + 1 < marks.length ? marks[k + 1][0] : lines.length).join('\n') }));
 }
-function unitAt(lines, i) {
+
+/** The code on each line with `/* … *\/` spans and `// …` tails removed, trimmed — string-aware,
+ *  because the pinned zone holds 'https://…' and a naive `//` cut would eat every declaration
+ *  after it. A declaration inside a comment is not a declaration; this is what makes that true. */
+function codeLines(lines) {
+  let inComment = false;
+  return lines.map((l) => {
+    let out = '';
+    let quote = null;
+    for (let k = 0; k < l.length; k += 1) {
+      const ch = l[k];
+      if (quote) { out += ch; if (ch === '\\' && k + 1 < l.length) { out += l[k + 1]; k += 1; continue; } if (ch === quote) quote = null; continue; }
+      if (inComment) { if (l.startsWith('*/', k)) { inComment = false; k += 1; } continue; }
+      if (l.startsWith('/*', k)) { inComment = true; k += 1; continue; }
+      if (l.startsWith('//', k)) break;
+      if (ch === "'" || ch === '"' || ch === '`') quote = ch;
+      out += ch;
+    }
+    return out.trim();
+  });
+}
+/** The extent of the declaration that starts at `i`, by bracket balance over the CODE of each
+ *  line (comments and strings stripped), returned as the ORIGINAL lines. */
+function unitAt(lines, code, i) {
   let depth = 0;
   for (let end = i; end < lines.length && end < i + 400; end += 1) {
-    for (const ch of lines[end]) {
+    for (const ch of code[end]) {
       if (ch === '(' || ch === '[' || ch === '{') depth += 1;
       else if (ch === ')' || ch === ']' || ch === '}') depth -= 1;
     }
-    if (depth <= 0 && /[;}\]]\s*$/.test(lines[end])) return { start: i, end, text: lines.slice(i, end + 1).join('\n') };
+    if (depth <= 0 && /[;}\]]\s*$/.test(code[end])) return { start: i, end, text: lines.slice(i, end + 1).join('\n') };
   }
   return { start: i, end: i, text: lines[i] };
 }
-function declarations(text) {
+/** Every top-level declaration in `text`, as [{name, text, start, end}] — read off the code of
+ *  each line, so a declaration inside a comment is not one. `re` selects what counts: the seam's
+ *  pinned zone is held to top-level `const|let|function|class`; the door is searched with a
+ *  wider net (indented, `var`) because a SECOND declaration of a pinned name anywhere in it is
+ *  a shadow the first check must see. */
+function declarations(text, re = DECL) {
   const lines = text.split('\n');
+  const code = codeLines(lines);
   const out = [];
   for (let i = 0; i < lines.length; i += 1) {
-    const m = DECL.exec(lines[i]);
+    const m = re.exec(code[i]);
     if (!m) continue;
-    const u = unitAt(lines, i);
+    const u = unitAt(lines, code, i);
     out.push({ name: m[1], text: u.text, start: u.start, end: u.end });
     i = u.end;
   }
@@ -238,16 +275,27 @@ if (check(pinnedSlice !== null, 'pinned/marker-found', `${seamPath} has no "// -
   const extra = have.filter((n) => !EXPECTED_PINNED.includes(n));
   check(missing.length === 0 && extra.length === 0, 'pinned/exactly-the-expected-declarations',
         missing.length ? `the seam no longer pins ${missing.join(', ')}` : extra.length ? `the seam also pins ${extra.join(', ')} — if it grew, add it to EXPECTED_PINNED here` : '');
+  const doorCode = codeLines(doorLines);
   for (const d of pinnedUnits) {
+    // Every line of the door, none skipped: `declarations()` jumps past each unit it finds,
+    // which is right for the seam's flat pinned zone and wrong here — a re-declaration inside
+    // a handler body sits inside the createAgentEntry unit and would never be visited.
     const found = [];
     for (let i = 0; i < doorLines.length; i += 1) {
-      const m = DECL.exec(doorLines[i]);
-      if (m && m[1] === d.name) { found.push(unitAt(doorLines, i)); i = found[found.length - 1].end; }
+      const m = DOOR_DECL.exec(doorCode[i]);
+      if (m && m[1] === d.name) found.push(unitAt(doorLines, doorCode, i));
     }
     check(found.length === 1 && found[0].text === d.text, `pinned/${d.name}`,
           found.length === 0 ? `this door does not declare ${d.name}`
-            : found.length > 1 ? `this door declares ${d.name} ${found.length} times — one of them is not the pinned one`
+            : found.length > 1 ? `this door declares ${d.name} ${found.length} times (lines ${found.map((f) => f.start + 1).join(', ')}) — a second declaration shadows the pinned one wherever it sits`
             : `door ${JSON.stringify(found[0].text).slice(0, 110)}\n      seam ${JSON.stringify(d.text).slice(0, 110)}`);
+    // Never rebound, never mutated: `NAME = …`, `NAME.x = …`, `NAME[k] = …`, a destructuring or
+    // parameter default `{ NAME = 5 }` — anywhere in the door but the declaration's own first
+    // line. A constant the block reads is only the pinned value if nothing else assigns it.
+    const rebind = new RegExp(`(?<![\\w$.])${d.name.replace(/\$/g, '\\$')}\\s*(?:\\.[\\w$]+|\\[[^\\]]*\\])?\\s*=(?!=)`);
+    const declLine = found.length === 1 ? found[0].start : -1;
+    const hits = doorCode.map((l, i) => (i !== declLine && rebind.test(l) ? `${i + 1}: ${l.slice(0, 60)}` : null)).filter(Boolean);
+    check(hits.length === 0, `pinned/${d.name}-is-never-rebound`, hits.length ? `${hits.length} line(s) assign to it, first: ${hits[0]}` : '');
   }
   console.log(`  pinned: ${pinnedUnits.length} declarations matched by name (${pinnedUnits.map((d) => d.name).join(', ')})`);
 }
@@ -258,16 +306,19 @@ if (seamRegion !== null && pinnedSlice !== null) {
   for (let i = seamRegion.a; i < seamRegion.b; i += 1) inRegion.add(i);
   for (const d of pinnedUnits) for (let i = pinnedSlice.a + d.start; i <= pinnedSlice.a + d.end; i += 1) inRegion.add(i);
   const doorImports = new Set(doorLines.filter((l) => /^(import\s|\s+create|\s+diffieHellman|\s*\}\s+from\s+'node:)/.test(l)));
+  const seamCode = codeLines(seamLines);
   const stray = [];
   let footerExports = 0;
   seamLines.forEach((l, i) => {
     if (inRegion.has(i)) return;
-    const t = l.trim();
-    if (!t || t.startsWith('//') || t.startsWith('/*') || t.startsWith('*')) return;
+    const t = seamCode[i];                                                                      // comments stripped as spans: `/**/ x = 1` is code
+    if (!t) return;
     if (i > seamRegion.b && /^export \{ [\w$]+ \};$/.test(t)) { footerExports += 1; return; }   // the one line the seam's file adds
-    if (doorImports.has(l)) return;                                                             // the door's own import lines, verbatim
+    if (doorImports.has(l) && !/from\s+'(?!node:)/.test(t)) return;                             // the door's own import lines, verbatim, and only from node:
     stray.push(`${i + 1}: ${t.slice(0, 80)}`);
   });
+  const regionImports = seamCode.slice(seamRegion.a, seamRegion.b).map((t, k) => (/^(import\b|export\s+\*\s+from\b)/.test(t) ? seamRegion.a + k + 1 : 0)).filter(Boolean);
+  check(regionImports.length === 0, 'surface/the-block-imports-nothing', regionImports.length ? `an import inside the block would be hoisted past this check: line ${regionImports[0]}` : '');
   check(stray.length === 0, 'surface/nothing-outside-the-block-is-code',
         stray.length ? `${stray.length} line(s) of the vendored seam.mjs are code this door does not carry, first: ${stray[0]}` : '');
   check(footerExports === 1, 'surface/one-footer-export', `expected exactly one export after the end marker, found ${footerExports}`);
@@ -314,6 +365,17 @@ if (pin && existsSync(join(siblingRoot, '.git'))) {
       check(theirs !== null && theirs.equals(mine), `sibling/${p}-is-what-${pin.commit.slice(0, 7)}-produces`,
             theirs === null ? `${pin.commit.slice(0, 7)} has no ${v.source}` : `the pin lies: ${v.source} at ${pin.commit.slice(0, 7)} is ${sha(theirs).slice(0, 12)}, the copy here is ${sha(mine).slice(0, 12)}`);
     }
+    const theirVersion = JSON.parse(git('show', `${pin.commit}:package.json`).toString('utf8')).version;
+    check(theirVersion === pin.version, 'sibling/pinned-version-is-that-commits', theirVersion === pin.version ? '' : `VENDOR.json says ${pin.version}, agent-seam at ${pin.commit.slice(0, 7)} says ${theirVersion}`);
+    let isTag = false;
+    try { isTag = git('for-each-ref', `refs/tags/${pin.ref}`).toString().trim() !== ''; } catch { /* not a tag */ }
+    if (isTag) {
+      let tagCommit = null;
+      try { tagCommit = git('rev-parse', '--verify', `${pin.ref}^{commit}`).toString().trim(); } catch { /* unresolvable */ }
+      check(tagCommit === pin.commit, 'sibling/pinned-ref-still-names-the-commit', tagCommit === pin.commit ? '' : `tag ${pin.ref} is ${String(tagCommit).slice(0, 7)} there, the pin says ${pin.commit.slice(0, 7)}`);
+    } else {
+      console.log(`  note: ${pin.ref} is not a tag in ${siblingRoot} — a branch name moves; only the commit is pinned`);
+    }
     const behind = git('rev-list', '--count', `${pin.commit}..HEAD`).toString().trim();
     const head = git('rev-parse', '--short', 'HEAD').toString().trim();
     console.log(`  sibling: ${siblingRoot} — pin ${pin.ref} (${pin.commit.slice(0, 7)}) is ${behind} commit(s) behind its HEAD ${head}`);
@@ -333,7 +395,7 @@ function report() {
     process.exit(1);
   }
   // A count nobody asserts is a count that can quietly fall.
-  const FLOOR = 2 + 3 + 6 + 4 + 2 + 2 + EXPECTED_SECTIONS.length + 1 + 1 + 1 + EXPECTED_PINNED.length + 2;
+  const FLOOR = 2 + 3 + 6 + 4 + 2 + 2 + EXPECTED_SECTIONS.length + 1 + 1 + 1 + EXPECTED_PINNED.length * 2 + 3;
   if (pass < FLOOR) {
     console.log(`\nFAILED — only ${pass} checks ran, and at least ${FLOOR} were expected. Read the rows above.\n`);
     process.exit(1);

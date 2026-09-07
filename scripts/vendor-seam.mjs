@@ -93,19 +93,42 @@ const regionChanged = before !== region.join('\n');
 const out = [...doorLines.slice(0, dStart), ...region, ...doorLines.slice(dEnd)];
 
 const DECL = /^(?:export\s+)?(?:const|let|function|class)\s+([A-Za-z_$][\w$]*)/;
-function unitEnd(lines, i) {
+const DOOR_DECL = /^(?:export\s+)?(?:const|let|var|function|class)\s+([A-Za-z_$][\w$]*)/;
+
+/** The code on each line with `/* … *\/` spans and `// …` tails removed, trimmed — string-aware,
+ *  because the pinned zone holds 'https://…' and a naive `//` cut would eat every declaration
+ *  after it. A declaration inside a comment is not a declaration; this is what makes that true. */
+function codeLines(lines) {
+  let inComment = false;
+  return lines.map((l) => {
+    let out = '';
+    let quote = null;
+    for (let k = 0; k < l.length; k += 1) {
+      const ch = l[k];
+      if (quote) { out += ch; if (ch === '\\' && k + 1 < l.length) { out += l[k + 1]; k += 1; continue; } if (ch === quote) quote = null; continue; }
+      if (inComment) { if (l.startsWith('*/', k)) { inComment = false; k += 1; } continue; }
+      if (l.startsWith('/*', k)) { inComment = true; k += 1; continue; }
+      if (l.startsWith('//', k)) break;
+      if (ch === "'" || ch === '"' || ch === '`') quote = ch;
+      out += ch;
+    }
+    return out.trim();
+  });
+}
+function unitEnd(code, i) {
   let depth = 0;
-  for (let e = i; e < lines.length && e < i + 400; e += 1) {
-    for (const ch of lines[e]) { if ('([{'.includes(ch)) depth += 1; else if (')]}'.includes(ch)) depth -= 1; }
-    if (depth <= 0 && /[;}\]]\s*$/.test(lines[e])) return e;
+  for (let e = i; e < code.length && e < i + 400; e += 1) {
+    for (const ch of code[e]) { if ('([{'.includes(ch)) depth += 1; else if (')]}'.includes(ch)) depth -= 1; }
+    if (depth <= 0 && /[;}\]]\s*$/.test(code[e])) return e;
   }
   return i;
 }
+const seamCode = codeLines(seamLines);
 const pinned = [];
 for (let i = sMarker + 1; i < sStart; i += 1) {
-  const m = DECL.exec(seamLines[i]);
+  const m = DECL.exec(seamCode[i]);                       // the code of the line: a commented-out declaration is none
   if (!m) continue;
-  const e = unitEnd(seamLines, i);
+  const e = unitEnd(seamCode, i);
   pinned.push({ name: m[1], text: seamLines.slice(i, e + 1).join('\n') });
   i = e;
 }
@@ -114,12 +137,13 @@ if (pinned.map((p) => p.name).sort().join() !== [...jr.pinnedDeclarations].sort(
 }
 const rewritten = [];
 for (const p of pinned) {
+  const outCode = codeLines(out);
   const hits = [];
   for (let i = 0; i < out.length; i += 1) {
-    const m = DECL.exec(out[i]);
-    if (m && m[1] === p.name) { hits.push([i, unitEnd(out, i)]); i = hits[hits.length - 1][1]; }
+    const m = DOOR_DECL.exec(outCode[i]);                  // any depth, any keyword: a shadowing declaration is a second one
+    if (m && m[1] === p.name) { hits.push([i, unitEnd(outCode, i)]); i = hits[hits.length - 1][1]; }
   }
-  if (hits.length !== 1) die(`the door declares ${p.name} ${hits.length} times; exactly one is the pinned declaration`);
+  if (hits.length !== 1) die(`the door declares ${p.name} ${hits.length} times (lines ${hits.map(([a]) => a + 1).join(', ')}); exactly one is the pinned declaration`);
   const [a, b] = hits[0];
   if (out.slice(a, b + 1).join('\n') !== p.text) { out.splice(a, b - a + 1, ...p.text.split('\n')); rewritten.push(p.name); }
 }
