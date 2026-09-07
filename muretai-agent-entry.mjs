@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: MIT
 /**
- * web/agent-entry/muretai-agent-entry.mjs
+ * muretai-agent-entry.mjs
  * THE AGENT ENTRY — one dependency-free Node file that makes a website agent-reachable.
+ *
+ * THIS REPOSITORY IS WHERE THIS FILE LIVES. It used to be written in Muretai core
+ * (`web/agent-entry/`) and copied here for publishing, which made the package a mirror of a
+ * repository it claimed independence from. Since 2026-09-07 this is the home: the npm package
+ * is built from here, and Muretai core carries a pinned copy (`web/agent-entry/VENDOR.json`
+ * there) for its own front desk and its contract suite. Edit it here — except the crypto
+ * block, which is itself a pinned copy (below).
  *
  * Why this exists:
  *   Muretai's adoption bottleneck is that BOTH ends had to run a node. A site does not want
@@ -15,25 +22,28 @@
  * build step, no transpiler. Node 20+ (native ed25519 / x25519 / hkdfSync / chacha20-poly1305).
  *
  * THE BYTES ARE THE CONTRACT. Every signed payload here must be byte-identical to what
- * Python's `shared/crypto.canonical` produces, or the signature is unverifiable and the only
- * diagnostic anyone gets is "signature verification failed". The pinned bytes are the golden
- * vectors — `testdata/wire_vectors.json` here, `vectors/wire_vectors.json` in agent-wire —
- * and `test_agent_entry_contract.py` Part 3 re-derives all of them through this file. If you
- * change anything under CANONICAL JSON, run that suite first.
+ * every other implementation of the seam produces, or the signature is unverifiable and the
+ * only diagnostic anyone gets is "signature verification failed". The pinned bytes are
+ * agent-seam's golden vectors, vendored at `vendor/agent-seam/wire_vectors.json`; the door's
+ * subset, `conformance/vectors.json`, is DERIVED from them by `scripts/build-vectors.mjs`, and
+ * `conformance/run.mjs` re-derives it through this file. Muretai core re-derives the same
+ * bytes through its Python door. If you change anything under CANONICAL JSON, run `npm test`
+ * first — and then read the next paragraph, because you should not be changing it here.
  *
- * THE CRYPTO BLOCK IS PUBLISHED ON ITS OWN. Everything between the CANONICAL JSON banner and
- * the `reach-back through a relay` banner is the WIRE CONTRACT: the bytes a Swift, Kotlin,
- * PHP or Rust implementation must reproduce, with nothing in them that decides anything. Those
- * exact bytes are `js/wire.mjs` in the `agent-wire` repository (MIT, beside the vectors, a
- * Python twin of the same layer and a specification of just those bytes), and
- * `part_wire` in the contract suite fails when the two drift. Edit it HERE; the release
- * script's `wire` station carries it there.
+ * THE CRYPTO BLOCK IS A PINNED COPY. Everything between the CANONICAL JSON banner and the
+ * `reach-back through a relay` banner is the SEAM: the bytes a Swift, Kotlin, PHP or Rust
+ * implementation must reproduce, with nothing in them that decides anything. Their home is
+ * `js/seam.mjs` in the `agent-seam` repository (MIT, beside the vectors, a Python twin of the
+ * same layer and a specification of just those bytes). `scripts/vendor-seam.mjs` splices that
+ * block in here at one tagged commit and records it in `vendor/agent-seam/VENDOR.json`;
+ * `conformance/seam-twin.mjs` fails when this copy — or any of the constants it pins by name —
+ * drifts from it. The seam is edited THERE; this file carries it.
  *
  *   import { createAgentEntry } from './muretai-agent-entry.mjs';
  *   createAgentEntry({ seedHex, name: 'Example Studio', baseUrl: 'https://studio.example',
  *                    responder: (env) => `You said: ${env.text}` }).listen(8788);
  *
- * See examples/agent_entry_server.mjs for the ~50-line file a site actually copies.
+ * See examples/server.mjs for the ~50-line file a site actually copies.
  */
 
 import {
@@ -2165,7 +2175,7 @@ const LDH = new Set('abcdefghijklmnopqrstuvwxyz0123456789-');
  *  legal ":<port>" for the raw-input bound (shared/domainbind.MAX_DOMAIN_LEN). */
 const MAX_DOMAIN_LEN = 253;
 
-/** Exported because the RUNNER needs the same fold: `examples/agent_entry_server.mjs` decides
+/** Exported because the RUNNER needs the same fold: `examples/server.mjs` decides
  *  whether `AGENT_ENTRY_DOMAINS` is blank at all, and it used `trim()`. That is a different
  *  set from Python's `strip()` in BOTH directions, so one variable got two verdicts — a
  *  `\x1c` started the Python runner with no domains and made this one exit 2, and a BOM

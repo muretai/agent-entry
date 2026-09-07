@@ -1,15 +1,15 @@
 /**
- * examples/agent_entry_server.mjs
+ * examples/server.mjs
  * The file a site copies — a website that is agent-reachable in ~50 lines.
  *
- * **This is a usage SAMPLE, not part of core Muretai.** It adds nothing to the protocol:
+ * **This is a usage SAMPLE, not part of the module.** It adds nothing to the protocol:
  * it only wires the public primitive `createAgentEntry()` from
  * `muretai-agent-entry.mjs` to a demo booking desk. Copy it, gut the responder,
- * point it at your backend — core stays byte-unchanged.
+ * point it at your backend — the module stays byte-unchanged.
  *
  * Run it:
  *
- *     node examples/agent_entry_server.mjs
+ *     node examples/server.mjs
  *
  * Environment:
  *   AGENT_ENTRY_SEED_HEX   32-byte identity seed, hex. THE PRIVATE KEY — keep it in your
@@ -218,7 +218,7 @@ server.on('error', (err) => {
   if (err && err.code === 'EADDRINUSE') {
     console.error(`Port ${port} on ${host} is already in use — something else is listening `
       + '(often an earlier run of this file).');
-    console.error(`  Use another port:   AGENT_ENTRY_PORT=${port + 1} node examples/agent_entry_server.mjs`);
+    console.error(`  Use another port:   AGENT_ENTRY_PORT=${port + 1} node examples/server.mjs`);
     console.error(`  Or stop the holder:  lsof -nP -iTCP:${port} -sTCP:LISTEN   then  kill <PID>`);
     process.exit(1);
   }

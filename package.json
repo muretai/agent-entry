@@ -21,8 +21,11 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node conformance/run.mjs && node conformance/wire-twin.mjs",
-    "test:wire": "node conformance/wire-twin.mjs",
+    "test": "node conformance/run.mjs && node conformance/seam-twin.mjs",
+    "test:seam": "node conformance/seam-twin.mjs",
+    "vendor:seam": "node scripts/vendor-seam.mjs",
+    "build:vectors": "node scripts/build-vectors.mjs",
+    "check:vectors": "node scripts/build-vectors.mjs --check",
     "example": "node examples/server.mjs",
     "distill": "node scripts/distill/loop.mjs",
     "distill:record": "node scripts/distill/record.mjs",
@@ -41,8 +44,7 @@
     "agentic",
     "did",
     "ed25519",
-    "muretai",
-    "agent-network"
+    "muretai"
   ],
   "license": "MIT",
   "author": "Muretai",
@@ -53,5 +55,8 @@
   },
   "bugs": {
     "url": "https://github.com/muretai/agent-entry/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

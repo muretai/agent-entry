@@ -31,6 +31,19 @@ it is still them.
 
 Any A2A client works: their agent, `curl`, not a particular router or ours.
 
+### Where this lives
+
+This repository is the home of Agent Entry: the module, the specification (`spec/v1.md`),
+the conformance vectors and the two checkers are written here, and the npm package is built
+from here and nothing else. Two things are pinned copies rather than ours, and both say so
+in a `VENDOR.json` beside them: the crypto block inside the module and the golden vectors are
+the **seam** — the wire layer every implementation reproduces — vendored from
+[agent-seam](https://github.com/muretai/agent-seam) at one tagged commit
+(`vendor/agent-seam/`, `npm run vendor:seam`); and Muretai, the network this door was first
+written for, vendors a pinned version of *this* repository into its own and holds its Python
+door to the same vectors. Nobody's release overwrites anybody else's checkout, and `npm test`
+here reads nothing outside this repository.
+
 Keep WebMCP. A person already in the tab keeps the page. This file sits beside
 it and replaces none of it: an Agent Card and a door, so an agent who arrives
 alone can become a customer — one signed POST, a signed reply.
@@ -802,8 +815,8 @@ identical bytes to each over real sockets — down to the HTTP framing — and r
 status, the same account outcome and the same signed reply from both. If you write a third
 implementation, that suite is the gate.
 
-The bytes are the contract: every signed payload must match Python's canonical JSON
-exactly, or a signature is unverifiable and the only diagnostic anyone gets is
+The bytes are the contract: every signed payload must match every other implementation's
+canonical JSON exactly, or a signature is unverifiable and the only diagnostic anyone gets is
 "signature verification failed".
 
 **What ships here, and what does not.** This repo is the **site side**: the door a website runs.
@@ -820,15 +833,18 @@ artifact that is only ever the site side.
 The visiting side needs nothing from this package either: an agent already has a runtime — a
 Muretai node, or whatever framework it runs on — and that is what knocks on your door.
 
-**The two doors share exactly one thing, and it is the part that must not differ: the wire
-layer.** Canonical JSON, `did:key`, the six signed fields, the card envelope, the device
+**The two doors share exactly one thing, and it is the part that must not differ: the
+seam.** Canonical JSON, `did:key`, the six signed fields, the card envelope, the device
 binding, the Web Bot Auth verify side, the sealed box — the bytes, and nothing that decides
 anything. In this file they are the block between the `CANONICAL JSON` banner and the
-`reach-back through a relay` banner, and those exact bytes are published on their own, MIT, as
-[**agent-wire**](https://github.com/muretai/agent-wire) — in JavaScript *and* Python, with the
-golden vectors and a specification of just those bytes. `npm test` proves this copy has not
-drifted from it (`conformance/wire-twin.mjs`) whenever that repository is checked out beside
-this one; without it the check says so and skips.
+`reach-back through a relay` banner, and that block is a **copy**: its home is
+[**agent-seam**](https://github.com/muretai/agent-seam) (MIT) — the same layer in JavaScript
+*and* Python, the golden vectors, and a specification of just those bytes. The copy is taken
+at one tagged commit by `npm run vendor:seam`, recorded in `vendor/agent-seam/VENDOR.json`,
+and `npm test` (`conformance/seam-twin.mjs`) proves the block and the pinned constants still
+equal it — using only the digests in that file, so the check needs no other checkout. When
+agent-seam *is* checked out beside this one, the same run also proves the recorded commit
+really produces those bytes.
 
 Everything *around* the wire layer — the ladder, the store, the account rules, the HTTP — is
 still written twice, in two languages, sharing nothing. **What holds those to identical
@@ -848,8 +864,9 @@ npm test
 
 That file is a subset, chosen so the suite ships in a tarball. The **superset** — the same
 groups plus the device bindings, the owner state, the domain-linkage credentials, the relay
-session tokens, the invites and the sealed boxes — lives in agent-wire's `vectors/`, with a
-runner in each language that re-derives it. A disagreement about the bytes belongs there.
+session tokens, the invites and the sealed boxes — is agent-seam's `vectors/`, vendored here
+under `vendor/agent-seam/` and re-derived by a runner in each language there. A
+disagreement about the bytes belongs there.
 
 Write another implementation and point it at those vectors.
 [Agent Entry for WordPress](https://github.com/muretai/agent-entry-wordpress)
@@ -858,18 +875,19 @@ golden bytes.
 
 ### Contributing
 
-This repo is a **published mirror**, rendered out of a private working repository — not the
-place the next change is written. A pull request opened here will not merge: the next release
-overwrites this checkout wholesale from the source, carrying no memory of a branch made
-against it.
+This repository is where the next change is written. A pull request against the module, the
+spec, the examples or this README is a pull request against the source; `npm test` is the
+gate, and it runs without anything else checked out. Releases are cut from here
+([RELEASING.md](RELEASING.md)).
 
-That is not a closed door. **Open an issue** — a bug, a wire-vector disagreement, a place the
-docs are wrong, a design question — and it gets read and, where it's right, becomes the next
-release here. That path works; a PR against these files does not.
+Two things are not edited here, and a PR that touches them will be asked to move: the crypto
+block between the `CANONICAL JSON` and `reach-back through a relay` banners and the vendored
+vectors under `vendor/agent-seam/`. Those bytes are the seam, and a disagreement about them —
+canonical JSON, `did:key`, the signed payloads, the vectors — belongs in
+[agent-seam](https://github.com/muretai/agent-seam), where they are specified, where every
+implementation reads them from, and from where this repository re-vendors them.
 
-The wire layer has its own home: a disagreement about the *bytes* — canonical JSON, `did:key`,
-the signed payloads, the vectors — belongs in [agent-wire](https://github.com/muretai/agent-wire),
-where they are specified and where every implementation reads them from.
+**Open an issue** for anything else — a bug, a place the docs are wrong, a design question.
 
 ### What this is part of
 
