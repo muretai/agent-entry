@@ -49,10 +49,23 @@ const SECTIONS = [
   'cardpub',             // the signed card envelope the door serves
   'epochNote',
 ];
-/** `reject` also carries invite and claim cases, which belong to a node. Only the message
- *  half is the door's, and it is the half that matters: an implementation that accepts
- *  everything passes every positive vector. */
-const REJECT_KEYS = ['message'];
+/** `reject` also carries invite and claim cases, which belong to a NODE, not a door.
+ *  Everything else under `reject` is the door's, because the door implements the thing each
+ *  group refuses: `message` the six-field envelope, `cardpub` the signed card envelope,
+ *  `did` the did:key codec, `encoding` the canonical-JSON boundary. `keystate` is here too
+ *  — the door carries `verifyKeystate` and `resolveOpDid` in its spliced block.
+ *
+ *  THIS LIST WAS `['message']` UNTIL 0.3.1, AND THAT WAS THE BUG. A group left out here is
+ *  not merely unshipped, it is invisible: the derived file simply does not have it, so no
+ *  loop can be written against it and nothing says one is missing. Upstream added
+ *  `reject.encoding` and `reject.keystate` in 0.3.0 and `reject.cardpub` and `reject.did`
+ *  in 0.3.1, and all four were dropped here without a word. `checkComplement` below now
+ *  refuses to build a file that silently omits a group, so the next one has to be a
+ *  decision rather than an oversight. */
+const REJECT_KEYS = ['message', 'cardpub', 'did', 'encoding', 'keystate'];
+/** The groups that belong to a NODE and are deliberately not the door's. Named, so that
+ *  `REJECT_KEYS` plus this list must account for EVERY group upstream carries. */
+const REJECT_NOT_OURS = ['invite', 'claim'];
 const NOTE =
   'Golden wire vectors for an Agent Entry implementation. Reproduce every `canonical`, ' +
   '`did`, `signingPayload` and `bindingPayload` field BYTE-FOR-BYTE, and REFUSE every ' +
@@ -111,6 +124,23 @@ export function render(sourcePath = SOURCE) {
   const rejectLines = lines.slice(rejectSpan[0], rejectSpan[1] + 1);
   const absent = REJECT_KEYS.filter((k) => spanOf(rejectLines, k, 4) === null);
   if (absent.length) throw new Error(`wire_vectors.json \`reject\` no longer carries ${JSON.stringify(absent)}`);
+
+  // THE COMPLEMENT CHECK. An allowlist can only ever be wrong in one direction quietly: a
+  // group upstream adds and this file does not name is dropped without a word, and then no
+  // loop can be written against it because the derived file has not got it. That is how
+  // `reject.encoding`, `reject.keystate`, `reject.cardpub` and `reject.did` went missing.
+  // So every group upstream carries must be accounted for by one list or the other, and
+  // adding a group upstream now BREAKS THIS BUILD until somebody decides which it is.
+  const upstreamRejectKeys = Object.keys(JSON.parse(text).reject);
+  const unaccounted = upstreamRejectKeys.filter(
+    (k) => !REJECT_KEYS.includes(k) && !REJECT_NOT_OURS.includes(k));
+  if (unaccounted.length) {
+    throw new Error(
+      `wire_vectors.json \`reject\` carries ${JSON.stringify(unaccounted)}, which this script `
+      + 'neither ships nor names as a node\'s. Add each to REJECT_KEYS (the door can drive it) '
+      + 'or to REJECT_NOT_OURS (it belongs to a node) — silence is how four groups were '
+      + 'already lost.');
+  }
 
   const parts = [`  "note": ${JSON.stringify(NOTE)}`];
   for (const key of SECTIONS) parts.push(sliceValue(lines, spanOf(lines, key, 2)));

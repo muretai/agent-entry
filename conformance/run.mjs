@@ -25,8 +25,9 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import {
-  canonicalJSON, didFromPublicKeyHex, publicKeyFromSeedHex, signingPayload,
-  signEnvelope, verifyEnvelope,
+  canonicalJSON, canonicalFromJSON, didFromPublicKeyHex, publicKeyFromSeedHex,
+  publicKeyHexFromDid, resolveOpDid, signingPayload, signEnvelope, verifyCardEnvelope,
+  verifyEnvelope,
 } from '../muretai-agent-entry.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -120,6 +121,76 @@ for (const v of vectors.reject.message) {
   }
   check(accepted === false, `reject/${v.name}`,
         accepted === false ? '' : `ACCEPTED a message it must refuse — ${v.note || v.why || ''}`);
+}
+
+// ---------------------------------------------------------------- the OTHER refusals
+// Four groups that this file did not carry until 0.3.1, because `scripts/build-vectors.mjs`
+// shipped only `reject.message`. A group the derived file does not have cannot be looped
+// over, and nothing said one was missing — which is how the door came to be held to none of
+// them. Each loop below drives the door's OWN exported function, not a re-implementation.
+
+// The signed card envelope. Upstream measured that its verification could be deleted
+// outright and the contract suite stayed green; these are the cases that changed that.
+for (const c of vectors.reject.cardpub ?? []) {
+  let accepted;
+  try { accepted = verifyCardEnvelope(c.envelope, c.expectedDid ?? null) !== null; }
+  catch { accepted = false; }
+  check(accepted === false, `reject/cardpub/${c.name}`,
+        accepted === false ? '' : `ACCEPTED a card envelope it must refuse — ${c.note || c.why || ''}`);
+}
+// The did:key codec. A wrong multicodec or a wrong key length is not a DID.
+for (const c of vectors.reject.did ?? []) {
+  let accepted;
+  try { accepted = typeof publicKeyHexFromDid(c.did) === 'string'; }
+  catch { accepted = false; }
+  check(accepted === false, `reject/did/${c.name}`,
+        accepted === false ? '' : `DECODED a did:key it must refuse — ${c.note || c.why || ''}`);
+}
+// The canonical-JSON boundary, driven on RAW DOCUMENT BYTES — the cases carry hex because
+// JSON cannot hold an invalid byte, and the accept half exists so a door that refuses
+// everything cannot pass by refusing everything.
+const enc = vectors.reject.encoding;
+if (enc) {
+  for (const c of enc.accept ?? []) {
+    let got = null;
+    try { got = Buffer.from(canonicalFromJSON(Buffer.from(c.documentHex, 'hex'))).toString('utf8'); }
+    catch { got = null; }
+    check(got === c.canonical, `encoding/accept/${c.name}`,
+          got === null ? 'REFUSED a document it must render'
+                       : `rendered ${JSON.stringify(got)}, want ${JSON.stringify(c.canonical)}`);
+  }
+  for (const c of enc.refuse ?? []) {
+    let accepted = true;
+    try { canonicalFromJSON(Buffer.from(c.documentHex, 'hex')); } catch { accepted = false; }
+    check(accepted === false, `encoding/refuse/${c.name}`,
+          accepted === false ? '' : `ACCEPTED bytes it must refuse — ${c.note || c.why || ''}`);
+  }
+}
+// KeyState resolution. The refuse half needs the pin, which is what `opts.pinned` is for;
+// without one, revocation is unenforceable and these cases would all pass for the wrong
+// reason. The accept half is what stops a resolver passing by always answering the root.
+const ks = vectors.reject.keystate;
+if (ks) {
+  const run = (c) => {
+    try {
+      return resolveOpDid(ks.rootDid, c.inline ?? null, ks.checkNow,
+                          c.pinned ? { pinned: c.pinned } : {});
+    } catch (e) { return `THREW: ${e && e.constructor ? e.constructor.name : 'Error'}`; }
+  };
+  for (const c of ks.accept ?? []) {
+    const got = run(c);
+    check(got === c.expect, `keystate/accept/${c.name}`, `resolved ${got}, want ${c.expect}`);
+    if (c.mustNotResolveTo !== undefined) {
+      check(got !== c.mustNotResolveTo, `keystate/accept/${c.name}/not`,
+            `resolved to ${got}, the very DID this case must not reach`);
+    }
+  }
+  for (const c of ks.refuse ?? []) {
+    const got = run(c);
+    check(got === c.expect, `keystate/refuse/${c.name}`, `resolved ${got}, want ${c.expect}`);
+    check(got !== c.mustNotResolveTo, `keystate/refuse/${c.name}/not`,
+          `resolved to ${got}, the attacker's key`);
+  }
 }
 
 // ---------------------------------------------------------------- verdict
