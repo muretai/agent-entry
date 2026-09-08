@@ -630,8 +630,55 @@
         },
         "recipientDid": "did:key:z6MkknhhwAGsRrcTTthPSsBbQtrNX6CMqt4poro5jdP6uCue",
         "note": "validly signed, but `to` is not us. The signature verifies for the real recipient; a client must still refuse a message not addressed to it."
+      },
+      {
+        "name": "small-order-signer",
+        "category": "small-order-key",
+        "mustReject": true,
+        "input": {
+          "from": "did:key:z6MkeXATEjyXENzBXBxgC5EHk2JE5aqd7qMGGtDpLUH1e2Sj",
+          "to": "did:key:z6MkknhhwAGsRrcTTthPSsBbQtrNX6CMqt4poro5jdP6uCue",
+          "messageId": "m1",
+          "contextId": "c1",
+          "timestamp": 1784273681,
+          "text": "pay the invoice",
+          "sig": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+        },
+        "note": "`from` is the Ed25519 IDENTITY point as a did:key and `sig` is the constant blob R = identity, S = 0, which satisfies [S]B == R + [h]A over EVERY message. No private key exists or is needed. Derive the verifying key through the door that refuses the fourteen small-order encodings — as `from` AND as the signature's first 32 bytes — not through the codec."
+      },
+      {
+        "name": "sig-not-canonical-base64",
+        "category": "sig-not-canonical-base64",
+        "mustReject": true,
+        "input": {
+          "from": "did:key:z6MkneMkZqwqRiU5mJzSG3kDwzt9P8C59N4NGTfBLfSGE7c7",
+          "to": "did:key:z6MkknhhwAGsRrcTTthPSsBbQtrNX6CMqt4poro5jdP6uCue",
+          "messageId": "m1",
+          "contextId": "c1",
+          "timestamp": 1784273681,
+          "text": "pay the invoice",
+          "sig": "E/lo60PN4uJdh7nt2BYj3BZU1rFmsTv+/1WK8iuEJ/zmjn2W6X+ycD+Knvs8mGvJjaJ1b/fHNk+hfUHKtX/1CB=="
+        },
+        "note": "the same 64 signature bytes as the honest message, spelled with a different final DATA character. Standard alphabet, length 88, two trailing '=', decodes without error to the genuine signature — nothing about it is malformed. It is refused because the bytes do not RE-ENCODE to the string that arrived: the last data character carries four bits no decoder reads, so one signature has sixteen names, and a receiver that de-duplicates, logs or replay-caches on the `sig` STRING sees sixteen messages where there is one."
+      },
+      {
+        "name": "wire-names-its-own-recipient",
+        "category": "wrong-recipient",
+        "mustReject": true,
+        "verifierNamesNoRecipient": true,
+        "input": {
+          "from": "did:key:z6MkneMkZqwqRiU5mJzSG3kDwzt9P8C59N4NGTfBLfSGE7c7",
+          "to": "did:key:z6MkknhhwAGsRrcTTthPSsBbQtrNX6CMqt4poro5jdP6uCue",
+          "messageId": "m1",
+          "contextId": "c1",
+          "timestamp": 1784273681,
+          "text": "pay the invoice",
+          "sig": "E/lo60PN4uJdh7nt2BYj3BZU1rFmsTv+/1WK8iuEJ/zmjn2W6X+ycD+Knvs8mGvJjaJ1b/fHNk+hfUHKtX/1CA==",
+          "recipientDid": "did:key:z6MkknhhwAGsRrcTTthPSsBbQtrNX6CMqt4poro5jdP6uCue"
+        },
+        "note": "a valid envelope addressed to someone else, carrying an UNSIGNED `recipientDid` equal to `to`, presented to a verifier that names no recipient. An implementation that falls back to a recipient supplied by the message compares the wire against itself and accepts every replay. Who \"me\" is comes from the caller or from nowhere; `recipientDid` is not one of the six signed fields and must never be read as one."
       }
     ]
   },
-  "rejectNote": "Each case MUST be rejected by your receiver (`mustReject`). `category` is language-neutral guidance, NOT core's -32xxx — your own error taxonomy is yours. message: verified with the key DERIVED FROM `from` (crypto.verify_envelope); invite: shared/invite.verify_invite, judged at the case's `checkNow`; claim: signature MUST verify AND a one-time nonce THIS device issued must be consumed before any trust is written. ONE case cannot be a static vector: `claim-spent-nonce` (a replayed claim whose nonce was already consumed) needs receiver state, so it is a REQUIRED client unit test, not pinned here — the same boundary as cryptobox's random-nonce seal."
+  "rejectNote": "Each case MUST be rejected by your receiver (`mustReject`). `category` is language-neutral guidance, NOT core's -32xxx — your own error taxonomy is yours. message: verified with the key DERIVED FROM `from` (crypto.verify_envelope) — and note that `wire-names-its-own-recipient` carries `verifierNamesNoRecipient`, which means the verifier must be called with NO recipient of its own; naming one makes the case pass for the wrong reason. encoding: raw document BYTES as hex, refused at the parse boundary (see that group's own note) with an `accept` half that must still canonicalize; invite: shared/invite.verify_invite, judged at the case's `checkNow`; claim: signature MUST verify AND a one-time nonce THIS device issued must be consumed before any trust is written. ONE case cannot be a static vector: `claim-spent-nonce` (a replayed claim whose nonce was already consumed) needs receiver state, so it is a REQUIRED client unit test, not pinned here — the same boundary as cryptobox's random-nonce seal."
 }

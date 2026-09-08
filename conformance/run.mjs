@@ -104,14 +104,22 @@ for (const v of vectors.reject.message) {
   const fields = { from: m.from, to: m.to, messageId: m.messageId,
                    contextId: m.contextId ?? null, timestamp: m.timestamp,
                    text: m.text, sig: m.sig };
+  // `recipientDid` inside the message is UNSIGNED and it is BAIT. It is copied in so it sits
+  // exactly where a verifier that trusts the wire would look, and it is never read as the
+  // answer: `wire-names-its-own-recipient` carries a `recipientDid` equal to its own `to`, so
+  // a chain ending `?? m.recipientDid ?? m.to` compares the message against itself and always
+  // holds. That chain was here, and it made the case unfailable. A case that sets
+  // `verifierNamesNoRecipient` is the door with no "me" — unknown fails closed.
+  if (m.recipientDid !== undefined) fields.recipientDid = m.recipientDid;
+  const opts = v.verifierNamesNoRecipient ? {} : { recipientDid: v.recipientDid ?? m.to };
   let accepted;
   try {
-    accepted = verifyEnvelope(fields, { recipientDid: v.recipientDid ?? m.recipientDid ?? m.to });
+    accepted = verifyEnvelope(fields, opts);
   } catch {
     accepted = false;                            // refusing by throwing is still refusing
   }
   check(accepted === false, `reject/${v.name}`,
-        accepted === false ? '' : `ACCEPTED a message it must refuse — ${v.why || ''}`);
+        accepted === false ? '' : `ACCEPTED a message it must refuse — ${v.note || v.why || ''}`);
 }
 
 // ---------------------------------------------------------------- verdict
