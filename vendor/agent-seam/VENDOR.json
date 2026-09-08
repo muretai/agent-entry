@@ -3,9 +3,9 @@
   "from": "agent-seam",
   "repository": "https://github.com/muretai/agent-seam",
   "ref": "v0.2.1",
-  "commit": "f2968b1656a73437cf9940fe1b936d2b24ac8512",
+  "commit": "f93d595ec02d007ca5fff80b583cc1710d4d1734",
   "version": "0.2.1",
-  "date": "2026-09-07",
+  "date": "2026-09-08",
   "files": {
     "vendor/agent-seam/seam.mjs": {
       "source": "js/seam.mjs",
