@@ -25,9 +25,9 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import {
-  canonicalJSON, canonicalFromJSON, didFromPublicKeyHex, publicKeyFromSeedHex,
-  publicKeyHexFromDid, resolveOpDid, signingPayload, signEnvelope, verifyCardEnvelope,
-  verifyEnvelope,
+  canonicalJSON, canonicalFromJSON, createAgentEntry, didFromPublicKeyHex,
+  publicKeyFromSeedHex, publicKeyHexFromDid, resolveOpDid, signingPayload, signEnvelope,
+  verifyCardEnvelope, verifyEnvelope,
 } from '../muretai-agent-entry.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -191,6 +191,85 @@ if (ks) {
     check(got !== c.mustNotResolveTo, `keystate/refuse/${c.name}/not`,
           `resolved to ${got}, the attacker's key`);
   }
+}
+
+// ---------------------------------------------------------------- the door's body boundary
+// Everything above drives an EXPORTED FUNCTION. This block drives the DOOR — the real
+// `handleRequestAsync`, the real router, the real ladder — because the defect it exists for
+// lived at a boundary no exported function touches: the JSON-RPC body decoder had
+// `ignoreBOM` at its default of false, and false means STRIP, so `EF BB BF {…}` arrived at
+// `JSON.parse` with the mark already gone and was ACCEPTED. `canonicalFromJSON` (checked by
+// `encoding/refuse/*` above) had been fixed in agent-seam 0.3.1 and its sibling had not, so
+// the vectors were green while the door answered 200 for bytes Muretai core's Python door
+// answered 400 for. A vector suite that only reaches the library cannot see that.
+//
+// TWO THINGS MAKE THIS MEASURE SOMETHING, and neither is optional:
+//   * the mount. `handleRequestAsync(method, path, headers, bodyBuffer)` routes on the path,
+//     and the mount is `baseUrl`'s pathname — POST anywhere else is 404 or 405 and the body
+//     is never read at all, so a test that got this wrong would pass on a door with no guard.
+//   * the CONTROL. The same bytes without the mark must earn a SIGNED REPLY. A door that
+//     refused everything would satisfy every 400 below; the control is what says the three
+//     bytes are the whole difference.
+{
+  const doorSeed = '22'.repeat(32);
+  const visitorSeed = '33'.repeat(32);
+  const entry = createAgentEntry({
+    seedHex: doorSeed, name: 'conformance', baseUrl: 'https://x.example/agent',
+    responder: () => 'ok',
+  });
+  const from = didFromPublicKeyHex(publicKeyFromSeedHex(visitorSeed));
+  const fields = { from, to: entry.did, messageId: 'bom-boundary-1', contextId: null,
+                   timestamp: Math.floor(Date.now() / 1000), text: 'hello' };
+  const sig = signEnvelope(visitorSeed, fields);
+  const clean = Buffer.from(JSON.stringify({
+    jsonrpc: '2.0', id: 1, method: 'message/send',
+    params: { message: { kind: 'message', role: 'user',
+      parts: [{ kind: 'text', text: fields.text }], messageId: fields.messageId,
+      contextId: null,
+      metadata: { timestamp: fields.timestamp, from, to: entry.did, sig } } },
+  }), 'utf8');
+  const HEADERS = { 'content-type': 'application/json' };
+  const post = (body) => entry.handleRequestAsync('POST', '/agent', HEADERS, body);
+
+  // The refusal every other unparseable body already gets. The marked ones must be
+  // INDISTINGUISHABLE from it: which rung refused is not a fact a stranger is told, and the
+  // Python door tells them nothing either (one message for the whole 400 class).
+  const broken = await post(Buffer.from('{', 'utf8'));
+  check(broken.status === 400, 'door/malformed-body-is-400', `got ${broken.status}`);
+
+  // RFC 8259 §8.1: a JSON text sent between systems carries no byte order mark. All five,
+  // longest first — UTF-32-LE's begins with UTF-16-LE's.
+  const MARKS = [['utf-8', 'efbbbf'], ['utf-16-be', 'feff'], ['utf-16-le', 'fffe'],
+                 ['utf-32-be', '0000feff'], ['utf-32-le', 'fffe0000']];
+  for (const [name, hex] of MARKS) {
+    const out = await post(Buffer.concat([Buffer.from(hex, 'hex'), clean]));
+    check(out.status === 400, `door/refuses-${name}-byte-order-mark`,
+          out.status === 400 ? ''
+            : `answered HTTP ${out.status} for a body that begins ${hex} — core's Python `
+              + 'door answers 400, and a stripped mark makes two wire documents one');
+    check(out.body.equals(broken.body), `door/${name}-mark-is-the-ordinary-400`,
+          `answered ${JSON.stringify(out.body.toString('utf8'))}, and every other `
+          + `unparseable body is answered ${JSON.stringify(broken.body.toString('utf8'))}`);
+  }
+  // And it booked nobody. A marked body that reaches the ladder does not merely get the
+  // wrong status — it mints a customer under a signature the other door never accepted.
+  check(entry.ledger.size === 0, 'door/marked-body-books-no-account',
+        `${entry.ledger.size} ledger row(s) after five refused bodies`);
+
+  // THE CONTROL, last so the ledger assertion above is about the marked bodies alone. It
+  // carries the messageId the marked bodies carried, which makes it two assertions in one:
+  // the door answers a signed message at all (without which every 400 above is satisfied by
+  // a door that refuses everything), AND a marked document was never the same document —
+  // on a door that strips the mark this exact body is a REPLAY of the one it just answered,
+  // and gets refused for it. That collapse is the whole reason a mark may not be stripped.
+  const ok = await post(clean);
+  let replySig = null;
+  try { replySig = JSON.parse(ok.body.toString('utf8')).result.metadata.sig; } catch { /* null */ }
+  check(ok.status === 200 && typeof replySig === 'string' && replySig.length > 0,
+        'door/same-bytes-without-the-mark-earn-a-signed-reply',
+        `HTTP ${ok.status}, sig ${JSON.stringify(replySig)} — either this door refuses `
+        + 'everything (and the 400s above prove nothing), or it STRIPPED the mark, answered '
+        + 'the marked twin already, and is now refusing these bytes as a replay of it');
 }
 
 // ---------------------------------------------------------------- verdict
