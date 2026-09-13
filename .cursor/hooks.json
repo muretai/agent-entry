@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": ".cursor/skills/isolated-session/scripts/session-guard.sh",
+        "timeout": 10,
+        "failClosed": false
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": ".cursor/skills/isolated-session/scripts/session-guard.sh",
+        "timeout": 10,
+        "failClosed": false
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": ".cursor/skills/isolated-session/scripts/session-guard.sh",
+        "timeout": 10,
+        "failClosed": false
+      }
+    ]
+  }
+}

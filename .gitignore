@@ -10,3 +10,4 @@ node_modules/
 # Local distill loop — traces and proposed menus stay on this machine
 var/
 generated/
+/.cursor/cli.json
