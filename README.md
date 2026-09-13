@@ -10,6 +10,7 @@
 - [What this is](#what-this-is)
 - [What you get](#what-you-get)
 - [Who is knocking](#who-is-knocking)
+- [Knock from any runtime](#knock-from-any-runtime)
 - [Put it on a site](#put-it-on-a-site)
 - [On serverless](#on-serverless)
 - [On WordPress](#on-wordpress)
@@ -266,6 +267,37 @@ One rule holds this together, enforced by the contract suite rather than promise
 **a User-Agent never affects `verified`, an account row, a rate limit, or any
 refusal.** A UA string is written by the client; a door that trusted it would be a
 door anyone could talk their way through.
+
+## Knock from any runtime
+
+If your agent can run Node 20, the card URL is all it needs:
+
+```bash
+node muretai-agent-entry.mjs knock https://shop.example/.well-known/agent-card.json
+```
+
+The command verifies the signed card against the URL, keeps one Ed25519 identity at
+`~/.config/muretai-agent-entry/knock-seed`, sends a correctly signed `message/send`, verifies
+the signed reply, and prints its text. Set `AGENT_ENTRY_KNOCK_TEXT` to choose the message and
+`AGENT_ENTRY_KNOCK_KEY` to give a different private key path. The key file is created mode
+`0600`; keep it, because it is the account by which that store recognises this runtime.
+
+There is no invitation, Muretai node, token, registration, or network service between the
+runtime and the store:
+
+- **curl:** download the one file with the install `curl -O` command above, then run the
+  command shown here. `curl` transports the file; Node supplies Ed25519 without a package.
+- **Claude Code:** ask it to run the command with the store's card URL. To send a specific
+  inquiry, set `AGENT_ENTRY_KNOCK_TEXT` in the same shell command.
+- **OpenClaw:** put the command in a shell/exec tool action. Persist
+  `AGENT_ENTRY_KNOCK_KEY` on the runtime's durable volume.
+- **Hermes:** use the same shell command as a tool call and keep the key path in the Hermes
+  workspace so the next knock is the same customer.
+
+On a refusal the command prints the JSON-RPC code and translates `data.accepts` into plain
+instructions: which DID/signature to use, which fields are signed, who the recipient is, the
+clock rule, and where to POST. A third-party runtime can therefore repair a refusal without
+installing this package as a library.
 
 ### From hint to proof: recognising signed crawlers (Web Bot Auth)
 

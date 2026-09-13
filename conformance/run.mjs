@@ -26,9 +26,10 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import {
-  canonicalBytes, canonicalJSON, canonicalFromJSON, createAgentEntry, createFileStore,
-  didFromPublicKeyHex, publicKeyFromSeedHex, publicKeyHexFromDid, resolveOpDid,
-  signBytes, signingPayload, signEnvelope, verifyCardEnvelope, verifyEnvelope,
+  AGENT_CARD_PATH, SIGNED_ENVELOPE_SCHEME, canonicalBytes, canonicalJSON,
+  canonicalFromJSON, createAgentEntry, createFileStore,
+  didFromPublicKeyHex, knockAgentEntry, publicKeyFromSeedHex, publicKeyHexFromDid,
+  resolveOpDid, signBytes, signingPayload, signEnvelope, verifyCardEnvelope, verifyEnvelope,
 } from '../muretai-agent-entry.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -397,6 +398,68 @@ if (ks) {
         `HTTP ${ok.status}, sig ${JSON.stringify(replySig)} — either this door refuses `
         + 'everything (and the 400s above prove nothing), or it STRIPPED the mark, answered '
         + 'the marked twin already, and is now refusing these bytes as a replay of it');
+}
+
+// ---------------------------------------------------------------- one-command third-party knock
+{
+  const entry = createAgentEntry({
+    seedHex: '66'.repeat(32),
+    name: 'knock-conformance',
+    baseUrl: 'https://knock.example',
+    responder: (env) => `booked for ${env.peer_did}`,
+  });
+  const fetchEntry = async (url, init = {}) => {
+    const parsed = new URL(url);
+    const out = await entry.handleRequestAsync(
+      init.method || 'GET',
+      parsed.pathname + parsed.search,
+      init.headers || {},
+      Buffer.from(init.body || ''),
+    );
+    return new Response(out.body, { status: out.status, headers: out.headers });
+  };
+  const dir = mkdtempSync(join(tmpdir(), 'agent-entry-knock-'));
+  try {
+    const keyPath = join(dir, 'visitor.seed');
+    const cardUrl = `https://knock.example${AGENT_CARD_PATH}`;
+    const first = await knockAgentEntry(cardUrl, {
+      keyPath, text: 'Book Tuesday at 10', fetchImpl: fetchEntry,
+    });
+    const second = await knockAgentEntry(cardUrl, {
+      keyPath, text: 'Move it to 11', fetchImpl: fetchEntry,
+    });
+    check(first.ok && second.ok && first.did === second.did,
+      'knock/persists-one-did-key', 'two knocks with one key path did not keep one identity');
+    check(entry.ledger.get(first.did)?.messages === 2,
+      'knock/returns-as-the-same-customer',
+      `ledger row was ${JSON.stringify(entry.ledger.get(first.did))}`);
+    check(first.text.startsWith('booked for did:key:'),
+      'knock/prints-a-verifiable-reply', `got ${JSON.stringify(first.text)}`);
+
+    const refusalFetch = async (url, init = {}) => {
+      if ((init.method || 'GET') !== 'POST') return fetchEntry(url, init);
+      return new Response(JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        error: {
+          code: -32001,
+          message: 'Signature verification failed',
+          data: { accepts: [
+            entry.card.securitySchemes[SIGNED_ENVELOPE_SCHEME].agentEntry,
+          ] },
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    const refused = await knockAgentEntry(cardUrl, {
+      keyPath, text: 'hello', fetchImpl: refusalFetch,
+    });
+    check(!refused.ok && refused.requirements[0].includes('Use an Ed25519 did:key')
+      && refused.requirements[0].includes('POST it to https://knock.example/'),
+    'knock/refusal-explains-requirements-in-plain-words',
+    `got ${JSON.stringify(refused.requirements)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // ---------------------------------------------------------------- verdict

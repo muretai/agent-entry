@@ -52,8 +52,12 @@ import {
 } from 'node:crypto';
 import { createServer } from 'node:http';
 import { Buffer } from 'node:buffer';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync,
+} from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // ---------------------------------------------------------------- protocol constants
 
@@ -4383,4 +4387,208 @@ function messageText(msg) {
     .filter((p) => p && typeof p === 'object' && p.kind === 'text')
     .map((p) => (typeof p.text === 'string' ? p.text : ''))
     .join('\n');
+}
+
+// ---------------------------------------------------------------- visiting side: one-command knock
+
+function cardBaseFromUrl(cardUrl) {
+  const url = new URL(cardUrl);
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new TypeError('knock: card URL must use http or https');
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new TypeError('knock: card URL must not carry credentials, a query or a fragment');
+  }
+  const suffix = url.pathname.endsWith(AGENT_CARD_PATH) ? AGENT_CARD_PATH
+    : (url.pathname.endsWith(AGENT_CARD_PATH_LEGACY) ? AGENT_CARD_PATH_LEGACY : null);
+  if (!suffix) {
+    throw new TypeError(`knock: card URL must end in ${AGENT_CARD_PATH}`);
+  }
+  const basePath = url.pathname.slice(0, -suffix.length).replace(/\/+$/, '');
+  return {
+    url,
+    base: `${url.origin}${basePath}`,
+    signatureUrl: `${url.origin}${basePath}${AGENT_CARD_SIG_PATH}`,
+  };
+}
+
+function knockSeed(keyPath) {
+  const path = resolve(keyPath);
+  if (existsSync(path)) {
+    const seed = readFileSync(path, 'utf8').trim();
+    if (!/^[0-9a-f]{64}$/.test(seed)) {
+      throw new Error(`knock: ${path} must contain one lowercase 32-byte seed in hex`);
+    }
+    chmodSync(path, 0o600);
+    return seed;
+  }
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const seed = newSeedHex();
+  try {
+    writeFileSync(path, seed + '\n', { flag: 'wx', mode: 0o600 });
+    return seed;
+  } catch (e) {
+    // Another invocation may have won the exclusive create. Read that identity rather than
+    // replacing it: a key path is an account, so last-writer-wins would mint a stranger.
+    if (e && e.code === 'EEXIST') return knockSeed(path);
+    throw e;
+  }
+}
+
+/** Turn a refusal's machine-readable `accepts` array into lines a runtime operator can act on. */
+export function describeKnockRequirements(accepts) {
+  if (!Array.isArray(accepts) || accepts.length === 0) {
+    return ['The door did not include machine-readable requirements.'];
+  }
+  return accepts.map((way) => {
+    if (!way || typeof way !== 'object') return 'The door returned an unreadable requirement.';
+    const fields = Array.isArray(way.signedFields) ? way.signedFields.join(', ') : 'the declared fields';
+    const recipient = typeof way.recipient === 'string' ? way.recipient : 'the door DID';
+    const endpoint = typeof way.endpoint === 'string' && way.endpoint ? ` POST it to ${way.endpoint}.` : '';
+    return `Use an Ed25519 did:key, sign ${fields} as canonical UTF-8 JSON, address it to `
+      + `${recipient}, and use an integer timestamp within 300 seconds.${endpoint}`;
+  });
+}
+
+/**
+ * Read and verify an Agent Card, send one signed knock, and verify a successful reply.
+ * No invitation, account, token, Muretai node, or dependency is involved.
+ */
+export async function knockAgentEntry(cardUrl, {
+  keyPath = process.env.AGENT_ENTRY_KNOCK_KEY
+    || resolve(homedir(), '.config', 'muretai-agent-entry', 'knock-seed'),
+  text = process.env.AGENT_ENTRY_KNOCK_TEXT || 'Hello — what can I book here?',
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  if (typeof fetchImpl !== 'function') throw new TypeError('knock: fetch is unavailable');
+  const location = cardBaseFromUrl(cardUrl);
+  const get = async (url) => {
+    const response = await fetchImpl(url, {
+      headers: { Accept: 'application/json', 'User-Agent': 'agent-entry-knock/1' },
+      redirect: 'manual',
+    });
+    if (!response || response.status !== 200) {
+      throw new Error(`knock: GET ${url} returned HTTP ${response?.status ?? 'no response'}`);
+    }
+    return JSON.parse(await response.text());
+  };
+  const plainCard = await get(location.url.href);
+  const cardEnvelope = await get(location.signatureUrl);
+  const cardDid = typeof plainCard?.did === 'string' ? plainCard.did : null;
+  const card = cardDid ? verifyCardEnvelope(cardEnvelope, cardDid) : null;
+  if (!card || canonicalJSON(card) !== canonicalJSON(plainCard)) {
+    throw new Error('knock: the signed card envelope does not verify against the plain card');
+  }
+  if (!Number.isSafeInteger(cardEnvelope.ts)
+      || Math.abs(nowEpoch() - cardEnvelope.ts) > 6 * CARD_SIG_REFRESH_S) {
+    throw new Error('knock: the signed card envelope is stale');
+  }
+  if (canonicalBaseUrl(card.url, { warn: false }) !== canonicalBaseUrl(location.base, { warn: false })) {
+    throw new Error(`knock: the signed card names ${card.url}, not ${location.base}`);
+  }
+  const requirement = card.securitySchemes?.[SIGNED_ENVELOPE_SCHEME]?.agentEntry;
+  const endpoint = requirement?.endpoint
+    || card.supportedInterfaces?.find((v) => v?.protocolBinding === 'JSONRPC')?.url
+    || `${card.url}${new URL(card.url).pathname === '/' ? '/' : ''}`;
+  const seedHex = knockSeed(keyPath);
+  const from = didFromSeedHex(seedHex);
+  const timestamp = nowEpoch();
+  const fields = {
+    from,
+    to: card.did,
+    messageId: newId(),
+    contextId: null,
+    timestamp,
+    text: String(text),
+  };
+  const body = {
+    jsonrpc: '2.0',
+    id: fields.messageId,
+    method: 'message/send',
+    params: {
+      message: {
+        kind: 'message',
+        role: 'user',
+        messageId: fields.messageId,
+        contextId: null,
+        parts: [{ kind: 'text', text: fields.text }],
+        metadata: {
+          from,
+          to: card.did,
+          timestamp,
+          sig: signEnvelope(seedHex, fields),
+        },
+      },
+    },
+  };
+  const response = await fetchImpl(endpoint, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'User-Agent': 'agent-entry-knock/1',
+    },
+    body: JSON.stringify(body),
+    redirect: 'manual',
+  });
+  const reply = JSON.parse(await response.text());
+  if (reply?.error) {
+    const accepts = reply.error?.data?.accepts
+      || (requirement ? [requirement] : []);
+    return {
+      ok: false,
+      did: from,
+      status: response.status,
+      error: reply.error,
+      requirements: describeKnockRequirements(accepts),
+    };
+  }
+  const msg = reply?.result;
+  const meta = msg?.metadata || {};
+  const replyFields = {
+    from: meta.from,
+    to: meta.to,
+    messageId: msg?.messageId,
+    contextId: msg?.contextId ?? null,
+    timestamp: meta.timestamp,
+    text: messageText(msg),
+    sig: meta.sig,
+  };
+  if (response.status !== 200 || meta.from !== card.did || meta.to !== from
+      || !verifyEnvelope(replyFields, { recipientDid: from, signerDid: card.did })) {
+    throw new Error('knock: the door reply did not verify');
+  }
+  return {
+    ok: true,
+    did: from,
+    doorDid: card.did,
+    status: response.status,
+    text: replyFields.text,
+    reply,
+  };
+}
+
+async function knockMain(argv) {
+  if (argv.length !== 2 || argv[0] !== 'knock') {
+    console.error('usage: node muretai-agent-entry.mjs knock <card-url>');
+    return 2;
+  }
+  try {
+    const result = await knockAgentEntry(argv[1]);
+    if (result.ok) {
+      console.log(result.text);
+      return 0;
+    }
+    console.error(`Refused (${result.error?.code ?? 'unknown'}): `
+      + `${result.error?.message || 'the door refused the knock'}`);
+    for (const line of result.requirements) console.error(`- ${line}`);
+    return 1;
+  } catch (e) {
+    console.error(e && e.message ? e.message : String(e));
+    return 1;
+  }
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.exitCode = await knockMain(process.argv.slice(2));
 }
