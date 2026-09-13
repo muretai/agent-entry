@@ -20,18 +20,20 @@
  *       npm test
  */
 
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import {
-  canonicalJSON, canonicalFromJSON, createAgentEntry, didFromPublicKeyHex,
-  publicKeyFromSeedHex, publicKeyHexFromDid, resolveOpDid, signingPayload, signEnvelope,
-  verifyCardEnvelope, verifyEnvelope,
+  canonicalBytes, canonicalJSON, canonicalFromJSON, createAgentEntry, createFileStore,
+  didFromPublicKeyHex, publicKeyFromSeedHex, publicKeyHexFromDid, resolveOpDid,
+  signBytes, signingPayload, signEnvelope, verifyCardEnvelope, verifyEnvelope,
 } from '../muretai-agent-entry.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const vectors = JSON.parse(readFileSync(join(HERE, 'vectors.json'), 'utf8'));
+const pinVectors = JSON.parse(readFileSync(join(HERE, 'keystate-pin-vectors.json'), 'utf8'));
 
 let pass = 0;
 const failures = [];
@@ -191,6 +193,131 @@ if (ks) {
     check(got !== c.mustNotResolveTo, `keystate/refuse/${c.name}/not`,
           `resolved to ${got}, the attacker's key`);
   }
+}
+
+// ---------------------------------------------------------------- the door's KeyState pin store
+// `reject.keystate` above decides the pure resolver. These sequence vectors decide the
+// missing integration: the door reads that resolver's pin from its store, advances it only
+// after an accepted message, and carries it through a file-backed restart.
+{
+  const rootSeed = pinVectors.rootSeed;
+  const rootDid = didFromPublicKeyHex(publicKeyFromSeedHex(rootSeed));
+  const rootKey = publicKeyFromSeedHex(rootSeed).toString('hex');
+  const states = {};
+  for (const [name, v] of Object.entries(pinVectors.states)) {
+    const unsigned = {
+      typ: 'muretai/keystate/1',
+      rootDid,
+      epoch: v.epoch,
+      rootKey,
+      rootNextHash: '',
+      opDid: didFromPublicKeyHex(publicKeyFromSeedHex(v.opSeed)),
+      opNextHash: '',
+      encPub: '',
+      encNextHash: '',
+      guardiansHash: '',
+      revokedOps: v.revokedOps,
+      notBefore: 0,
+      notAfter: null,
+      ts: 1,
+    };
+    states[name] = {
+      ...unsigned,
+      sig: signBytes(rootSeed, canonicalBytes(unsigned)).toString('base64'),
+      opSeed: v.opSeed,
+    };
+  }
+
+  const makeEntry = (store = null) => createAgentEntry({
+    seedHex: pinVectors.doorSeed,
+    name: 'pin-store-conformance',
+    baseUrl: 'https://pin.example',
+    responder: () => 'ok',
+    ...(store ? { store } : {}),
+  });
+  let sequenceId = 0;
+  const send = async (entry, vector, label) => {
+    const state = states[vector.state];
+    const signer = states[vector.signer];
+    const timestamp = Math.floor(Date.now() / 1000);
+    const fields = {
+      from: rootDid,
+      to: entry.did,
+      messageId: `pin-${label}-${++sequenceId}`,
+      contextId: null,
+      timestamp,
+      text: 'book a table',
+    };
+    const body = Buffer.from(JSON.stringify({
+      jsonrpc: '2.0',
+      id: fields.messageId,
+      method: 'message/send',
+      params: {
+        message: {
+          kind: 'message',
+          role: 'user',
+          parts: [{ kind: 'text', text: fields.text }],
+          messageId: fields.messageId,
+          contextId: null,
+          metadata: {
+            timestamp,
+            from: rootDid,
+            to: entry.did,
+            sig: signEnvelope(signer.opSeed, fields),
+            keystate: Object.fromEntries(
+              Object.entries(state).filter(([key]) => key !== 'opSeed')),
+          },
+        },
+      },
+    }), 'utf8');
+    const out = await entry.handleRequestAsync(
+      'POST', '/', { 'content-type': 'application/json' }, body);
+    return JSON.parse(out.body.toString('utf8'));
+  };
+
+  const memoryEntry = makeEntry();
+  for (const vector of pinVectors.sequence) {
+    const out = await send(memoryEntry, vector, 'memory');
+    if (vector.expect === 'reply') {
+      check(typeof out.result?.metadata?.sig === 'string',
+        `keystate-pin/memory/${vector.name}`, `got ${JSON.stringify(out.error ?? out)}`);
+    } else {
+      check(out.error?.code === vector.expectError,
+        `keystate-pin/memory/${vector.name}`,
+        `got error ${JSON.stringify(out.error?.code)}, want ${vector.expectError}`);
+    }
+  }
+
+  const dir = mkdtempSync(join(tmpdir(), 'agent-entry-pin-'));
+  try {
+    const path = join(dir, 'state.json');
+    const store = createFileStore(path);
+    const epoch2 = pinVectors.sequence.find((v) => v.state === 'epoch2');
+    const accepted = await send(makeEntry(store), epoch2, 'file-first');
+    check(typeof accepted.result?.metadata?.sig === 'string',
+      'keystate-pin/file/persists-newest-state', `got ${JSON.stringify(accepted.error ?? accepted)}`);
+    check(createFileStore(path).getKeyState(rootDid)?.epoch === 2,
+      'keystate-pin/file/implements-get-put', 'the persisted root DID did not hold epoch 2');
+    const rollback = pinVectors.sequence.find((v) => v.expectError === -32001);
+    const refused = await send(makeEntry(createFileStore(path)), rollback, 'file-restart');
+    check(refused.error?.code === -32001,
+      'keystate-pin/file/restart-refuses-older-state',
+      `got error ${JSON.stringify(refused.error?.code)}, want -32001`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+
+  let partialAccepted = true;
+  try {
+    makeEntry({
+      seenMessage() {}, getAccount() {}, putAccount() {},
+      getDeviceOwner() {}, putDeviceOwner() {},
+    });
+  } catch {
+    partialAccepted = false;
+  }
+  check(!partialAccepted, 'keystate-pin/store-seam-requires-get-put',
+    'a five-method store silently disabled the KeyState ratchet');
 }
 
 // ---------------------------------------------------------------- the door's body boundary

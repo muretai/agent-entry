@@ -18,8 +18,8 @@
  *   (3) get YOUR signed reply back in the same HTTP response. First contact IS account
  *   creation — there is no signup form, because the sender's did:key already is the account.
  *
- * Zero dependencies, forever: `node:crypto`, `node:http`, `node:buffer` only. No npm, no
- * build step, no transpiler. Node 20+ (native ed25519 / x25519 / hkdfSync / chacha20-poly1305).
+ * Zero dependencies, forever: Node standard library only. No npm, no build step, no
+ * transpiler. Node 20+ (native ed25519 / x25519 / hkdfSync / chacha20-poly1305).
  *
  * THE BYTES ARE THE CONTRACT. Every signed payload here must be byte-identical to what
  * every other implementation of the seam produces, or the signature is unverifiable and the
@@ -52,6 +52,8 @@ import {
 } from 'node:crypto';
 import { createServer } from 'node:http';
 import { Buffer } from 'node:buffer';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 
 // ---------------------------------------------------------------- protocol constants
 
@@ -2380,7 +2382,7 @@ function then1(x, f) {
  */
 function asStore(store) {
   const REQUIRED = ['seenMessage', 'getAccount', 'putAccount', 'getDeviceOwner',
-    'putDeviceOwner'];
+    'putDeviceOwner', 'getKeyState', 'putKeyState'];
   const missing = REQUIRED.filter((m) => typeof store[m] !== 'function');
   if (missing.length) {
     throw new TypeError(
@@ -2389,6 +2391,108 @@ function asStore(store) {
       + 'rather than loudly.');
   }
   return store;
+}
+
+/**
+ * A synchronous JSON-file implementation of the state seam.
+ *
+ * It is for one long-lived Node process that needs state to survive restarts. The file is
+ * replaced atomically and written mode 0600; it is not a multi-process database, and two
+ * processes MUST NOT open the same path. Keys are arrays rather than object properties so a
+ * hostile DID or messageId can never become `__proto__`, and replay ids are hashed before
+ * storage so the body ceiling cannot become a disk-key ceiling.
+ */
+export function createFileStore(filePath, { maxAccounts = 50000, maxMessages = 20000 } = {}) {
+  if (typeof filePath !== 'string' || !filePath) {
+    throw new TypeError('createFileStore: filePath is required');
+  }
+  const path = resolve(filePath);
+  const accountCap = Math.max(1, Number(maxAccounts) || 1);
+  const messageCap = Math.max(1, Number(maxMessages) || 1);
+  const empty = () => ({
+    v: 1, messages: [], accounts: [], deviceOwners: [], keyStates: [],
+  });
+  const pairs = (value) => Array.isArray(value)
+    ? value.filter((row) => Array.isArray(row) && row.length === 2) : [];
+  const load = () => {
+    if (!existsSync(path)) return empty();
+    let doc;
+    try {
+      doc = JSON.parse(readFileSync(path, 'utf8'));
+    } catch {
+      throw new Error(`createFileStore: ${path} is not a readable JSON state file`);
+    }
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc) || doc.v !== 1) {
+      throw new Error(`createFileStore: ${path} has an unsupported state format`);
+    }
+    return {
+      v: 1,
+      messages: pairs(doc.messages),
+      accounts: pairs(doc.accounts),
+      deviceOwners: pairs(doc.deviceOwners),
+      keyStates: pairs(doc.keyStates),
+    };
+  };
+  const save = (doc) => {
+    mkdirSync(dirname(path), { recursive: true });
+    const temp = `${path}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
+    writeFileSync(temp, JSON.stringify(doc) + '\n', { mode: 0o600 });
+    renameSync(temp, path);
+  };
+  const get = (rows, key) => {
+    for (let i = rows.length - 1; i >= 0; i -= 1) {
+      if (rows[i][0] === key) return rows[i][1];
+    }
+    return null;
+  };
+  const put = (rows, key, value) => {
+    const kept = rows.filter((row) => row[0] !== key);
+    if (value !== null) kept.push([key, value]);
+    return kept;
+  };
+  const replayKey = (messageId) =>
+    createHash('sha256').update(String(messageId), 'utf8').digest('hex');
+
+  // Validate an existing file at construction, before the door binds a socket.
+  load();
+  return {
+    seenMessage(messageId, ttlSeconds = REPLAY_TTL_S) {
+      const doc = load();
+      const now = Date.now();
+      const key = replayKey(messageId);
+      const expiry = get(doc.messages, key);
+      if (typeof expiry === 'number' && expiry > now) return false;
+      doc.messages = doc.messages.filter((row) =>
+        typeof row[1] === 'number' && row[1] > now && row[0] !== key);
+      doc.messages.push([key, now + Math.max(0, Number(ttlSeconds) || 0) * 1000]);
+      if (doc.messages.length > messageCap) {
+        doc.messages = doc.messages.slice(doc.messages.length - messageCap);
+      }
+      save(doc);
+      return true;
+    },
+    getAccount(did) { return get(load().accounts, did); },
+    putAccount(did, row) {
+      const doc = load();
+      doc.accounts = put(doc.accounts, did, row);
+      if (doc.accounts.length > accountCap) {
+        doc.accounts = doc.accounts.slice(doc.accounts.length - accountCap);
+      }
+      save(doc);
+    },
+    getDeviceOwner(deviceDid) { return get(load().deviceOwners, deviceDid); },
+    putDeviceOwner(deviceDid, ownerDid) {
+      const doc = load();
+      doc.deviceOwners = put(doc.deviceOwners, deviceDid, ownerDid);
+      save(doc);
+    },
+    getKeyState(rootDid) { return get(load().keyStates, rootDid); },
+    putKeyState(rootDid, keyState) {
+      const doc = load();
+      doc.keyStates = put(doc.keyStates, rootDid, keyState);
+      save(doc);
+    },
+  };
 }
 
 // ---------------------------------------------------------------- baseUrl canonicalisation
@@ -3152,18 +3256,22 @@ export function createAgentEntry({
   // not required: without it the conflict rule resets to trust-on-first-use every restart.
   // Unlike the ledger it is READ on every message, so only a real store can carry it.
   const deviceOwner = new Map();
+  // root DID -> the newest root-signed KeyState this door accepted. Unlike an inline record,
+  // this half was not selected by the current sender, so it gives revokedOps and epoch their
+  // teeth on a returning visit.
+  const keyStates = new Map();
   const replay = new ReplayGuard();
 
   // ---------------------------------------------------------------- the state seam (T105)
   //
-  // WHY. The three structures above live in CLOSURE MEMORY, and a serverless instance keeps
+  // WHY. The four structures above live in CLOSURE MEMORY, and a serverless instance keeps
   // none of them between requests. The round-trip shape suits those platforms perfectly —
   // one signed POST in, one signed reply out, nothing to keep awake — so what blocks them is
   // not the shape but the STATE. Losing `replay` re-opens every message inside the freshness
   // window to replay; losing `deviceOwner` resets the no-re-ownership rule to
   // trust-on-first-use at every cold start.
   //
-  // `store` is an OPTIONAL duck-typed object whose five methods may each return a value or a
+  // `store` is an OPTIONAL duck-typed object whose seven methods may each return a value or a
   // promise:
   //
   //   seenMessage(messageId, ttlSeconds) -> bool   TRUE when the id was NEW (and is now
@@ -3173,6 +3281,8 @@ export function createAgentEntry({
   //   putAccount(did, row)     -> void             row === null DELETES the row.
   //   getDeviceOwner(deviceDid)-> ownerDid | null
   //   putDeviceOwner(dev, own) -> void
+  //   getKeyState(rootDid)      -> KeyState | null
+  //   putKeyState(rootDid, ks)  -> void
   //
   // Rate counters are deliberately NOT in this interface, and that is the approved design,
   // not an omission: a bound that costs a store write per request is its own denial of
@@ -3197,6 +3307,8 @@ export function createAgentEntry({
     },
     getDeviceOwner: (deviceDid) => deviceOwner.get(deviceDid) ?? null,
     putDeviceOwner: (deviceDid, ownerDid) => { deviceOwner.set(deviceDid, ownerDid); },
+    getKeyState: (rootDid) => keyStates.get(rootDid) ?? null,
+    putKeyState: (rootDid, keyState) => { keyStates.set(rootDid, keyState); },
   };
   const state = store ? asStore(store) : memoryStore;
   const storeIsExternal = Boolean(store);
@@ -3824,15 +3936,29 @@ export function createAgentEntry({
     const messageId = msg.messageId;
     const fields = { from, to, messageId, contextId: msg.contextId ?? null,
       timestamp: ts, text, sig };
-    const signerDid = resolveOpDid(from, meta.keystate, ts);
-    if (!verifyEnvelope(fields, { recipientDid: did, signerDid })) {
-      return rpcError(reqId, ERRORS.UNAUTHENTICATED, 'signature does not match');
-    }
-    // 8. T102 account layer. An OPTIONAL countersigned v2 binding collapses an owner's
-    //    device DIDs to ONE account; a present-but-INVALID binding fails closed with the
-    //    SAME UNAUTHENTICATED code (never a silent downgrade to unbound). Absent → the
-    //    device DID.
-    return then1(resolveAccount(meta.binding, from), (acct) => {
+    return then1(state.getKeyState(from), (pinned) => {
+      const inline = verifyKeystate(meta.keystate, from, ts) ? meta.keystate : null;
+      // A sender that explicitly presents history older than this door's verified history is
+      // refused even when it signs with the current key. Silently ignoring the stale record
+      // would let callers probe which retired histories remain usable and would make "last
+      // verified" a resolver hint rather than a ratchet.
+      if (pinned && inline && inline.epoch < pinned.epoch) {
+        return rpcError(reqId, ERRORS.UNAUTHENTICATED, 'signature does not match');
+      }
+      const signerDid = resolveOpDid(from, meta.keystate, ts, { pinned });
+      if (!verifyEnvelope(fields, { recipientDid: did, signerDid })) {
+        return rpcError(reqId, ERRORS.UNAUTHENTICATED, 'signature does not match');
+      }
+      const nextKeyState = inline
+        && (!pinned || (inline.rootKey === pinned.rootKey && inline.epoch > pinned.epoch))
+        && signerDid === (inline.opDid || from)
+        ? inline : null;
+
+      // 8. T102 account layer. An OPTIONAL countersigned v2 binding collapses an owner's
+      //    device DIDs to ONE account; a present-but-INVALID binding fails closed with the
+      //    SAME UNAUTHENTICATED code (never a silent downgrade to unbound). Absent → the
+      //    device DID.
+      return then1(resolveAccount(meta.binding, from), (acct) => {
       if (!acct.ok) return rpcError(reqId, ERRORS.UNAUTHENTICATED, acct.reason);
       const account = acct.account;
       const ownerDid = account !== from ? account : null;
@@ -3899,13 +4025,19 @@ export function createAgentEntry({
           return rpcError(reqId, ERRORS.REPLAY_REJECTED, 'duplicate messageId (replay) detected');
         }
 
-        return then1(noteContact(account), () =>
-          // T107: `wba_did` may legitimately differ from `peer_did` (the transport signer
-          // vs the message signer) — both facts are honest, and the schema says which is
-          // which.
-          respond(backendEnvelope(msg, { verified: true, peerDid: from, ownerDid,
-            wbaDid: wbaIdentify(reqHeaders) }), reqId, msg, from));
+        // Store only after every refusing rung, including rate and replay, has passed: a
+        // refusal must not mutate the ratchet. The record is root-signed, and the message
+        // itself has now proved possession of the op-key it names.
+        const pinnedWrite = nextKeyState
+          ? state.putKeyState(from, nextKeyState) : undefined;
+        return then1(pinnedWrite, () => then1(noteContact(account), () =>
+            // T107: `wba_did` may legitimately differ from `peer_did` (the transport signer
+            // vs the message signer) — both facts are honest, and the schema says which is
+            // which.
+            respond(backendEnvelope(msg, { verified: true, peerDid: from, ownerDid,
+              wbaDid: wbaIdentify(reqHeaders) }), reqId, msg, from)));
       });
+    });
     });
   }
 

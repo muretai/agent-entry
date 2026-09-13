@@ -1,0 +1,37 @@
+{
+  "note": "Door-level KeyState ratchet vectors. The seam vectors decide pure resolution; these sequences decide that an Agent Entry remembers the last accepted state per root DID.",
+  "doorSeed": "2222222222222222222222222222222222222222222222222222222222222222",
+  "rootSeed": "4444444444444444444444444444444444444444444444444444444444444444",
+  "states": {
+    "epoch1": {
+      "epoch": 1,
+      "opSeed": "4545454545454545454545454545454545454545454545454545454545454545",
+      "revokedOps": []
+    },
+    "epoch2": {
+      "epoch": 2,
+      "opSeed": "4646464646464646464646464646464646464646464646464646464646464646",
+      "revokedOps": []
+    }
+  },
+  "sequence": [
+    {
+      "name": "first-contact-pins-epoch-1",
+      "state": "epoch1",
+      "signer": "epoch1",
+      "expect": "reply"
+    },
+    {
+      "name": "higher-epoch-rotates-and-repins",
+      "state": "epoch2",
+      "signer": "epoch2",
+      "expect": "reply"
+    },
+    {
+      "name": "presented-history-older-than-pin-is-refused",
+      "state": "epoch1",
+      "signer": "epoch1",
+      "expectError": -32001
+    }
+  ]
+}

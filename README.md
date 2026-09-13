@@ -460,8 +460,8 @@ location = / {
 
 The round-trip shape fits a single function: one signed POST in, one signed reply out.
 What does not fit is the state. A function instance keeps nothing between requests, so
-the replay set, the device→owner pins and the ledger have to live in a store the
-platform keeps, not in memory.
+the replay set, the device→owner pins, the per-root KeyState pins and the ledger have to
+live in a store the platform keeps, not in memory.
 
 This package still runs in process. For Cloudflare Workers, Vercel and Netlify, use
 the deploy templates — this door plus one store adapter per platform:
@@ -680,10 +680,14 @@ and it is not one. It is the upgrade path:
   evaporates on restart. Kept in the database your site already has — keyed by exactly
   the account DID you are handed — it is what the features beyond answering stand on:
   greeting a returning account by its history, following up on yesterday's inquiry,
-  pricing by relationship. Keep the device→owner pins and the replay guard beside it and
-  the security rules — a device is never re-owned, a message is never accepted twice —
-  survive restarts as well; those two are read on every message, so only a real store
-  can carry them.
+  pricing by relationship. Keep the device→owner pins, KeyState pins and replay guard beside
+  it and the security rules — a device is never re-owned, a retired delegated key cannot
+  roll its owner backwards, a message is never accepted twice — survive restarts as well;
+  those are read on every message, so only a real store can carry them. An external store
+  implements `seenMessage`, `getAccount` / `putAccount`, `getDeviceOwner` /
+  `putDeviceOwner`, and `getKeyState` / `putKeyState`. For one Node process, the exported
+  `createFileStore(path)` is the zero-dependency restart-safe adapter; do not open one file
+  from several processes.
 - **Statistics without a store: an analytics sink.** Nothing in the entry reads the
   ledger back to gate, greet or rate-limit, so a fire-and-forget sink records visiting
   agents with no database anywhere. Use `observer` for it, never your responder: watching
