@@ -10,7 +10,7 @@
   "files": [
     "muretai-agent-entry.mjs",
     "conformance/",
-    "examples/server.mjs",
+    "examples/",
     "diagrams/",
     "scripts/distill/",
     "LICENSE",
@@ -21,7 +21,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node conformance/run.mjs && node conformance/seam-twin.mjs",
+    "test": "node conformance/run.mjs && node conformance/seam-twin.mjs && node conformance/recipes.mjs",
     "test:seam": "node conformance/seam-twin.mjs",
     "vendor:seam": "node scripts/vendor-seam.mjs",
     "build:vectors": "node scripts/build-vectors.mjs",

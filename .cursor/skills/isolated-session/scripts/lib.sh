@@ -200,8 +200,21 @@ iso_lock_get() {  # $1 lock file, $2 key
 
 # Rewrite one key of a lock (whole file, tmp + mv: sed -i differs between BSD and GNU).
 iso_lock_set() {  # $1 lock file, $2 key, $3 value
-  local tmp="$1.tmp"
-  { grep -v "^$2=" "$1" 2>/dev/null || true; echo "$2=$3"; } > "$tmp" && mv "$tmp" "$1"
+  # The temporary file is this process's own: two writers sharing one `$1.tmp` (a
+  # harness hook on every tool call, and a script in the same chat) truncated each
+  # other's copy, and one of them renamed an empty instant over the lock -- which the
+  # next writer then read as nothing, leaving a lock with `owner_seen` alone (2026-09-13,
+  # two Cursor workers). A lock that reads empty while it exists is being replaced by
+  # someone else: read it again rather than write that instant back.
+  local tmp="$1.tmp.$$" tries=0
+  while :; do
+    { grep -v "^$2=" "$1" 2>/dev/null || true; echo "$2=$3"; } > "$tmp"
+    if [[ -s "$1" ]] && [[ "$(grep -c . "$tmp")" -le 1 ]] && (( tries < 5 )); then
+      tries=$((tries + 1)); sleep 0.1; continue
+    fi
+    mv "$tmp" "$1"
+    return 0
+  done
 }
 
 # A lock is alive when its process is, and -- for a key-owned lock, whose chat may end

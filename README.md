@@ -14,6 +14,7 @@
 - [Put it on a site](#put-it-on-a-site)
 - [On serverless](#on-serverless)
 - [On WordPress](#on-wordpress)
+- [Your customers are yours](#your-customers-are-yours)
 - [Pairs with WebMCP](#pairs-with-webmcp-the-tab-conversation-becomes-a-customer)
 - [In production](#in-production)
 - [This package](#this-package)
@@ -527,6 +528,33 @@ your site's identity**), `AGENT_ENTRY_PORT` (8788), `AGENT_ENTRY_BASE_URL`,
 `AGENT_ENTRY_NAME`, `AGENT_ENTRY_ANON` (`1` also accepts unsigned inquiries, which create
 no account), `AGENT_ENTRY_PREFER` (your order of the ways in, as one JSON array — see
 `prefer` above; an invalid list refuses to start).
+
+## Your customers are yours
+
+A store puts a door on its own origin instead of answering agent email because a signed DID becomes the store's returning customer, while email leaves that relationship inside somebody else's list.
+
+Four one-file recipes turn that sentence into a minimal booking request. Each answers an
+exact `POST /` with the signed door and returns JSON text carrying `type`, `customer_did`,
+the original `request`, and a confirmation status:
+
+| Trade | One-file install | Booking shape |
+|---|---|---|
+| Restaurant | [`examples/restaurant-wordpress.php`](examples/restaurant-wordpress.php), a self-contained WordPress plugin using PHP sodium | `restaurant_reservation_request` |
+| Court / booking | [`examples/court-booking.mjs`](examples/court-booking.mjs), a long-lived Node door | `court_booking_request` |
+| Clinic | [`examples/clinic-booking.mjs`](examples/clinic-booking.mjs), a long-lived Node door with an explicit non-emergency boundary | `clinic_appointment_request` |
+| Repair shop | [`examples/repair-shop-serverless.mjs`](examples/repair-shop-serverless.mjs), a Fetch API serverless handler | `repair_booking_request` |
+
+The WordPress file stores its seed in a non-autoloaded WordPress option and implements the
+minimal Ed25519 verification and signed reply directly; it needs PHP sodium but no Muretai
+node or invitation. The two Node recipes run like `examples/server.mjs`: set one persistent
+`AGENT_ENTRY_SEED_HEX`, set the public `AGENT_ENTRY_BASE_URL`, and put the listener behind
+TLS. The serverless factory takes the same seed and a seven-method durable `store`; route its
+card GETs and root POST to the returned Fetch handler.
+
+These are deliberately small request desks, not scheduling systems: replace each responder's
+`pending_*_confirmation` result with the business's own availability and confirmation write.
+Instinct, Muse, Grok Bot, Claude Code, OpenClaw, Hermes, or any other runtime that can hold an
+Ed25519 key can read the card and use the same signed POST.
 
 ### What `baseUrl` may be
 
