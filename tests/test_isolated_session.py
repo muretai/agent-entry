@@ -20,7 +20,7 @@ was a rule, and a rule nobody enforces is a rule that is not in effect. So the
 lock and the hook are exercised as a second session and as an editor would hit
 them — a live owner that must be refused, a dead one that must be taken over.
 
-Run: `python3 test_isolated_session.py`
+Run: `python3 tests/test_isolated_session.py`
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ import tempfile
 import time
 from pathlib import Path
 
-SCRIPTS = Path(__file__).resolve().parent / ".cursor" / "skills" / "isolated-session" / "scripts"
+SCRIPTS = Path(__file__).resolve().parents[1] / ".cursor" / "skills" / "isolated-session" / "scripts"
 
 _passed = 0
 
@@ -420,7 +420,8 @@ def test_vendored_copies_are_pinned(tmp: Path) -> None:
     # This suite also runs inside the pinned copies (muretai-site, muretai-docs), where the
     # skill dir carries a VENDOR.json. A home has no pin, so the stand-in must not either.
     (home / ".cursor" / "skills" / "isolated-session" / "VENDOR.json").unlink(missing_ok=True)
-    shutil.copy(Path(__file__), home / "test_isolated_session.py")
+    (home / "tests").mkdir()
+    shutil.copy(Path(__file__), home / "tests" / "test_isolated_session.py")
     git("add", "-A", cwd=home)
     git("commit", "-q", "-m", "the home", cwd=home)
     pin_commit = git("rev-parse", "HEAD", cwd=home)
@@ -435,6 +436,7 @@ def test_vendored_copies_are_pinned(tmp: Path) -> None:
     (copy / ".cursor" / "skills" / "isolated-session" / "scripts").mkdir(parents=True)
     shutil.copy(SCRIPTS / "vendor.sh", copy / ".cursor" / "skills" / "isolated-session" / "scripts" / "vendor.sh")
     shutil.copy(SCRIPTS / "lib.sh", copy / ".cursor" / "skills" / "isolated-session" / "scripts" / "lib.sh")
+    (copy / "test_isolated_session.py").write_text("stale root copy\n")
     r = subprocess.run(["bash", str(copy / ".cursor/skills/isolated-session/scripts/vendor.sh"), "check"],
                        cwd=str(copy), env=_env(MURETAI_CORE=str(home)), capture_output=True, text=True)
     ok(r.returncode != 0 and "unpinned" in r.stderr, "an unpinned copy fails the check")
@@ -443,8 +445,9 @@ def test_vendored_copies_are_pinned(tmp: Path) -> None:
     ok(r.returncode == 0, "vendor.sh pull copies the skill from the home (" + r.stderr.strip()[:80] + ")")
     pin = json.loads((copy / ".cursor" / "skills" / "isolated-session" / "VENDOR.json").read_text())
     ok(pin["commit"] == pin_commit, "VENDOR.json records the home commit")
-    ok("test_isolated_session.py" in pin["files"] and (copy / "test_isolated_session.py").exists(),
-       "the contract test travels with the scripts")
+    ok("tests/test_isolated_session.py" in pin["files"] and (copy / "tests" / "test_isolated_session.py").exists()
+       and "test_isolated_session.py" not in pin["files"] and not (copy / "test_isolated_session.py").exists(),
+       "the contract is written at tests/ in the consumer; a stale root copy is removed")
     r = subprocess.run(["bash", str(copy / ".cursor/skills/isolated-session/scripts/vendor.sh"), "check"],
                        cwd=str(copy), env=_env(), capture_output=True, text=True)
     ok(r.returncode == 0, "the fresh copy passes the check with no home checkout named")
@@ -555,10 +558,11 @@ if os.environ.get("FAKE_RUNNER_ENV_OUT"):
     with open(os.environ["FAKE_RUNNER_ENV_OUT"], "w") as f:
         json.dump({k: os.environ.get(k) for k in keys}, f)
 status = "fail" if rc else "ok"
-print(json.dumps({"files": [{"file": "test_fake.py", "status": status, "secs": 0.3, "rc": rc,
+name = os.environ.get("FAKE_TEST_FILE", "test_fake.py")
+print(json.dumps({"files": [{"file": name, "status": status, "secs": 0.3, "rc": rc,
                              "reason": "", "tail": "fake tail line"}],
                   "wall_s": 0.3, "jobs": 1, "selection": "1 affected by the fake",
-                  "ledger": None, "failed": ["test_fake.py"] if rc else []}))
+                  "ledger": None, "failed": [name] if rc else []}))
 sys.exit(1 if rc else 0)
 '''
 
@@ -625,13 +629,13 @@ def test_landing_is_ordered(tmp: Path) -> None:
        "and the branch was already rebased onto the moved main")
     ok(not (primary / ".git" / "landing.lock").exists(), "the landing lock was released on the refusal")
 
-    r = script("finish-worktree.sh", branch, str(wt), cwd=primary)
+    r = script("finish-worktree.sh", branch, str(wt), cwd=primary, FAKE_TEST_FILE="tests/test_fake.py")
     ok(r.returncode == 0, "the same branch lands once the tests are green")
     receipt = parse(r.stdout)
     ok(receipt.get("REBASED") in ("yes", "no-op") and receipt.get("MERGE_KIND") == "fast-forward",
        "the receipt says it was rebased and fast-forwarded (" + receipt.get("REBASED", "?") + ")")
-    ok(receipt.get("TESTS", "").startswith("1 ok") and receipt.get("TESTS_FILES") == "test_fake.py",
-       "and which tests ran: " + receipt.get("TESTS", ""))
+    ok(receipt.get("TESTS", "").startswith("1 ok") and receipt.get("TESTS_FILES") == "tests/test_fake.py",
+       "and which tests ran (tests/ spelling): " + receipt.get("TESTS", ""))
     ok(receipt.get("LEDGER", "").startswith("current") or receipt.get("LEDGER", "").startswith("regenerated"),
        "and that the ledgers are current (" + receipt.get("LEDGER", "") + ")")
     ok(git("rev-list", "--merges", "--count", "main", cwd=primary) == "0",
@@ -703,7 +707,9 @@ if "--gate-files" in sys.argv:
     GATE_PREFIXES = ("tools/sec_lint.py", "tools/audit_scope.py", "tools/ledger.py", "tools/run_tests.py",
                      "tools/affected_tests.py", "tools/spec_build.py", "tools/units.json", "tools/security_weekly.sh",
                      "company/ops/backlog_to_core.py", "company/ops/launchd/",
-                     "test_isolated_session.py", "test_herd_spawn.py", "test_sec_lint.py",
+                     "tests/test_isolated_session.py",
+                     "tests/test_herd_spawn.py",
+                     "tests/test_sec_lint.py",
                      ".claude/settings.json", ".cursor/hooks.json", ".cursor/hooks/", ".claude/hooks/",
                      ".cursor/skills/", ".claude/skills/", ".claude/rules/", ".cursor/rules/", ".claude/agents/",
                      ".claude/commands/", ".github/copilot-instructions.md", ".cursor/mcp.json")
@@ -1492,6 +1498,22 @@ def test_the_no_push_wall(tmp: Path) -> None:
        "and the ledger's check and build ran in the same credential-free environment: " + json.dumps(rows)[:160])
 
 
+def test_lock_set_survives_concurrent_touchers(tmp: Path) -> None:
+    """lib.sh iso_lock_set: forty concurrent writers of the same lock leave every field in place
+    (the shared temp path of 2026-09-13 left a lock with owner_seen alone)."""
+    lock = tmp / "concurrent.lock"
+    lock.write_text("owner=cursor:x\nowner_pid=1\nkind=dev\nbranch=b\ntask=t\nstarted=1\n")
+    lib = SCRIPTS / "lib.sh"
+    procs = [subprocess.Popen(["bash", "-c", 'source "$1"; for i in 1 2 3 4 5; do iso_lock_set "$2" owner_seen "$3$i"; done', "_", str(lib), str(lock), str(n)],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for n in range(40)]
+    for p in procs:
+        p.wait()
+    text = lock.read_text()
+    ok(all(k in text for k in ("owner=cursor:x", "owner_pid=1", "kind=dev", "branch=b", "task=t", "started=1")) and text.count("owner_seen=") == 1,
+       "every field survives; one owner_seen line: " + text.replace("\n", " | ")[:120])
+    ok(not list(tmp.glob("concurrent.lock.tmp*")), "no temporary file is left behind")
+
+
 def main() -> int:
     ok(SCRIPTS.is_dir(), "isolated-session scripts found at " + str(SCRIPTS))
     # under the home, not TMPDIR: the runner's TMPDIR is under /tmp, and a herd directory
@@ -1520,6 +1542,7 @@ def main() -> int:
             ("review checkouts are named, placed and cleaned", test_review_checkouts_are_named_placed_and_cleaned),
             ("the no-push rule is a wall", test_the_no_push_wall),
             ("scripts are English-only", test_scripts_are_english_only),
+            ("a lock survives concurrent touchers", test_lock_set_survives_concurrent_touchers),
         ]:
             print("\n" + name)
             fn(tmp)

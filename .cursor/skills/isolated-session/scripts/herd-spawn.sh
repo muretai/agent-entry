@@ -415,7 +415,11 @@ allow=(
   "Bash(python3 -m agent.plugins:*)"
 )
 if [[ "$profile" == "worker" ]]; then
-  allow+=("Bash(python3 tools/run_tests.py:*)" "Bash(python3 test_:*)")
+  allow+=("Bash(python3 tools/run_tests.py:*)" "Bash(python3 tests/test_:*)")
+  # Dispatch finish: coord deliver, a Room post, /remember, and stance full on a
+  # provider limit. Reviewer profile does not send mail or take tickets.
+  allow+=("Bash(python3 operator_cli.py:*)")
+  allow+=("Bash(bash .cursor/skills/isolated-session/scripts/dispatch-capacity.sh:*)")
 fi
 allow+=(
   "Bash(bash .cursor/skills/isolated-session/scripts/stale.sh:*)"
@@ -427,8 +431,17 @@ allow+=(
   "Bash(git status:*)" "Bash(git add:*)" "Bash(git commit:*)"
   "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)"
   "Bash(git rev-parse:*)" "Bash(git worktree list:*)"
+  "Bash(git ls-files:*)"
   "Bash(ls:*)"
 )
+# `git ls-files` reads tracked content only (never keys/, which is not tracked).
+# `git grep -O` / `--open-files-in-pager` runs a program, and `git blame --contents`
+# reads any file the uid can read, so those two are not on the allowlist: a session
+# navigates with its own search and Read tools, and a `git grep` stops at a prompt
+# (the coordinator answers -- that is the intended cost). Measured 2026-09-13: a
+# Cursor session in allowlist mode stops at "Waiting for approval" on an unlisted
+# git subcommand, and "add to allowlist" writes the USER config, which the spawner
+# then refuses for every later spawn.
 # What the shell may NOT do even when a rule above would allow it: a deny rule is
 # evaluated before any allow rule and before the auto-mode classifier. A deny list is
 # NOT containment. `--add-dir` scopes the Read/Edit tools, not Bash; Bash reads whatever
@@ -459,6 +472,10 @@ deny=(
   "Bash(git diff --no-index:*)" "Bash(git diff /dev/null:*)" "Bash(git diff --output:*)" "Bash(git diff --output=*)"
   "Bash(git diff *--no-index*)" "Bash(git diff */dev/null*)" "Bash(git diff *--output*)"
   "Bash(git diff /*)" "Bash(git diff * /*)" "Bash(git diff *../*)" "Bash(git diff ~*)" "Bash(git diff * ~*)" "Bash(git diff *\$*)"
+  "Bash(git grep -O:*)" "Bash(git grep -O*)" "Bash(git grep --open-files-in-pager:*)" "Bash(git grep --open-files-in-pager=*)"
+  "Bash(git grep *-O*)" "Bash(git grep *--open-files-in-pager*)"
+  "Bash(git blame --contents:*)" "Bash(git blame --contents=*)"
+  "Bash(git blame *--contents*)"
   "Bash(python -c:*)" "Bash(python:*)" "Bash(python3 -:*)" "Bash(python3.*)"
   "Bash(/usr/bin/python3:*)" "Bash(/opt/homebrew/bin/python3:*)" "Bash(/usr/local/bin/python3:*)"
   "Bash(perl:*)" "Bash(ruby:*)" "Bash(node:*)" "Bash(php:*)"
@@ -554,6 +571,13 @@ def cursor_rule(rule):
             first, _, args = body[:-2].partition(" ")
             if not args:
                 return ["Shell(%s:*)" % first]
+            if args.endswith("_"):
+                # a NAME prefix (`python3 tests/test_:*` is every test file
+                # under tests/): the wildcard follows the prefix with no space,
+                # or `python3 tests/test_x.py` never matches and a Cursor
+                # session stops at "Waiting for approval" on each test run
+                # (measured 2026-09-13)
+                return ["Shell(%s:%s*)" % (first, args)]
             # the boundary Claude's rule carries (the prefix, then a space): the exact
             # arguments, or the arguments followed by more -- never `tools/x.py_evil.py`
             # (ISSUE(security-audit-2026-09-12-cursor-s-project-rul-e6f4-2))

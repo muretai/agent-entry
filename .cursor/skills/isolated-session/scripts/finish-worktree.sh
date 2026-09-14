@@ -616,6 +616,8 @@ echo "LANDING_LOCK=waited ${waited}s"
 echo "TESTS=${tests_line}"
 [[ -n "$tests_secs" ]] && echo "TESTS_SECS=${tests_secs}"
 [[ -n "$tests_files" ]] && echo "TESTS_FILES=${tests_files}"
+# names are tests/test_x.py: that is how the runner spells a file, and the
+# receipt prints them as-is
 echo "SEC=${sec_line}"
 echo "LEDGER=${ledger_line}"
 echo "BASE=${base}"

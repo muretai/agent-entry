@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Carry this skill into another repository, pinned -- or prove a copy is still its pin.
 #
-#   vendor.sh pull    copy SKILL.md, scripts/ and test_isolated_session.py from the
-#                     home (${MURETAI_CORE:-$HOME/muretai-trunk}) into THIS repository
-#                     and write VENDOR.json with the home commit and every digest
+#   vendor.sh pull    copy SKILL.md, scripts/ and tests/test_isolated_session.py
+#                     from the home (${MURETAI_CORE:-$HOME/muretai-trunk}) into
+#                     THIS repository and write VENDOR.json with the home commit
+#                     and every digest. The contract test is taken from
+#                     tests/test_isolated_session.py and written at the same
+#                     relative path (creating tests/ in the consumer). A stale
+#                     root copy in the consumer is removed.
 #   vendor.sh check   hold the copies to VENDOR.json's digests; needs no home checkout
 #
 # The home is the one repository without a VENDOR.json. It never pulls into itself.
@@ -45,9 +49,13 @@ FILES = [
     f"{skill}/scripts/session-guard.sh",
     f"{skill}/scripts/vendor.sh",
     f"{skill}/scripts/herd-spawn.sh",
+    f"{skill}/scripts/dispatch-take.sh",
+    f"{skill}/scripts/dispatch-capacity.sh",
     f"{skill}/briefs/worker.md",
-    "test_isolated_session.py",
+    f"{skill}/briefs/dispatch-ticket.md",
 ]
+
+CONTRACT = "tests/test_isolated_session.py"
 pin = repo / skill / "VENDOR.json"
 
 def sha(p: pathlib.Path) -> str:
@@ -98,18 +106,24 @@ if not (home / skill / "SKILL.md").exists():
 def git(*a):
     return subprocess.run(["git", "-C", str(home)] + list(a), capture_output=True, text=True, check=True).stdout.strip()
 commit = git("rev-parse", "HEAD")
-dirty = git("status", "--porcelain", "--", skill, "test_isolated_session.py")
+dirty = git("status", "--porcelain", "--", skill, CONTRACT)
 if dirty:
     print("vendor: refusing to pull uncommitted skill files from the home:", file=sys.stderr)
     print(dirty, file=sys.stderr)
     sys.exit(1)
+if not (home / CONTRACT).is_file():
+    print(f"vendor: no {CONTRACT} at {home} -- the contract test lives under tests/", file=sys.stderr)
+    sys.exit(1)
 files = {}
-for rel in FILES:
+for rel in FILES + [CONTRACT]:
     src, dst = home / rel, repo / rel
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_bytes(src.read_bytes())
     dst.chmod(src.stat().st_mode & 0o777)
     files[rel] = {"sha256": sha(dst)}
+stale = repo / "test_isolated_session.py"
+if stale.is_file():
+    stale.unlink()
 pin.write_text(json.dumps({
     "_": "Written by .cursor/skills/isolated-session/scripts/vendor.sh pull; never edit the copies by "
          "hand. `vendor.sh check` holds them to these digests with no home checkout present. The "
