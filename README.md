@@ -279,8 +279,11 @@ node muretai-agent-entry.mjs knock https://shop.example/.well-known/agent-card.j
 
 The command verifies the signed card against the URL, keeps one Ed25519 identity at
 `~/.config/muretai-agent-entry/knock-seed`, sends a correctly signed `message/send`, verifies
-the signed reply, and prints its text. Set `AGENT_ENTRY_KNOCK_TEXT` to choose the message and
-`AGENT_ENTRY_KNOCK_KEY` to give a different private key path. The key file is created mode
+the signed reply, and prints its text. If `AGENT_ENTRY_KNOCK_TEXT` is unset, it copies the
+first non-empty `skills[].examples` string from that verified card — so a runtime that only
+has the card URL still asks something the shop already promised to answer. Set
+`AGENT_ENTRY_KNOCK_TEXT` to choose a different message and `AGENT_ENTRY_KNOCK_KEY` to give a
+different private key path. The key file is created mode
 `0600`; keep it, because it is the account by which that store recognises this runtime.
 
 There is no invitation, Muretai node, token, registration, or network service between the

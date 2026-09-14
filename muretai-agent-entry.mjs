@@ -4435,6 +4435,32 @@ function knockSeed(keyPath) {
   }
 }
 
+/** First non-empty skill example on a verified card — the message the shop already promised. */
+export function firstCardExample(card) {
+  if (!Array.isArray(card?.skills)) return null;
+  for (const skill of card.skills) {
+    if (!Array.isArray(skill?.examples)) continue;
+    for (const example of skill.examples) {
+      if (typeof example !== 'string') continue;
+      const trimmed = example.trim();
+      if (trimmed) return trimmed;
+    }
+  }
+  return null;
+}
+
+function resolveKnockText(text, card) {
+  for (const candidate of [
+    text,
+    process.env.AGENT_ENTRY_KNOCK_TEXT,
+    firstCardExample(card),
+    'Hello — what can I book here?',
+  ]) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+  }
+  return 'Hello — what can I book here?';
+}
+
 /** Turn a refusal's machine-readable `accepts` array into lines a runtime operator can act on. */
 export function describeKnockRequirements(accepts) {
   if (!Array.isArray(accepts) || accepts.length === 0) {
@@ -4457,7 +4483,7 @@ export function describeKnockRequirements(accepts) {
 export async function knockAgentEntry(cardUrl, {
   keyPath = process.env.AGENT_ENTRY_KNOCK_KEY
     || resolve(homedir(), '.config', 'muretai-agent-entry', 'knock-seed'),
-  text = process.env.AGENT_ENTRY_KNOCK_TEXT || 'Hello — what can I book here?',
+  text,
   fetchImpl = globalThis.fetch,
 } = {}) {
   if (typeof fetchImpl !== 'function') throw new TypeError('knock: fetch is unavailable');
@@ -4490,6 +4516,7 @@ export async function knockAgentEntry(cardUrl, {
   const endpoint = requirement?.endpoint
     || card.supportedInterfaces?.find((v) => v?.protocolBinding === 'JSONRPC')?.url
     || `${card.url}${new URL(card.url).pathname === '/' ? '/' : ''}`;
+  const asked = resolveKnockText(text, card);
   const seedHex = knockSeed(keyPath);
   const from = didFromSeedHex(seedHex);
   const timestamp = nowEpoch();
@@ -4499,7 +4526,7 @@ export async function knockAgentEntry(cardUrl, {
     messageId: newId(),
     contextId: null,
     timestamp,
-    text: String(text),
+    text: asked,
   };
   const body = {
     jsonrpc: '2.0',
@@ -4538,6 +4565,7 @@ export async function knockAgentEntry(cardUrl, {
     return {
       ok: false,
       did: from,
+      asked,
       status: response.status,
       error: reply.error,
       requirements: describeKnockRequirements(accepts),
@@ -4562,6 +4590,7 @@ export async function knockAgentEntry(cardUrl, {
     ok: true,
     did: from,
     doorDid: card.did,
+    asked,
     status: response.status,
     text: replyFields.text,
     reply,

@@ -457,6 +457,56 @@ if (ks) {
       && refused.requirements[0].includes('POST it to https://knock.example/'),
     'knock/refusal-explains-requirements-in-plain-words',
     `got ${JSON.stringify(refused.requirements)}`);
+
+    const previousKnockText = process.env.AGENT_ENTRY_KNOCK_TEXT;
+    delete process.env.AGENT_ENTRY_KNOCK_TEXT;
+    try {
+      const untitled = await knockAgentEntry(cardUrl, { keyPath, fetchImpl: fetchEntry });
+      check(untitled.ok && untitled.asked === 'Hello — what can I book here?',
+        'knock/falls-back-to-hello-when-the-card-has-no-examples',
+        `got ${JSON.stringify(untitled.asked)}`);
+
+      const menu = createAgentEntry({
+        seedHex: '67'.repeat(32),
+        name: 'menu-knock',
+        baseUrl: 'https://menu.example',
+        skills: [{
+          id: 'book',
+          name: 'book-the-room',
+          description: 'Request the red room by date and time.',
+          examples: ['Book the red room on 2026-09-15 at 18:00'],
+        }],
+        responder: (env) => env.text,
+      });
+      const fetchMenu = async (url, init = {}) => {
+        const parsed = new URL(url);
+        const out = await menu.handleRequestAsync(
+          init.method || 'GET',
+          parsed.pathname + parsed.search,
+          init.headers || {},
+          Buffer.from(init.body || ''),
+        );
+        return new Response(out.body, { status: out.status, headers: out.headers });
+      };
+      const copied = await knockAgentEntry(`https://menu.example${AGENT_CARD_PATH}`, {
+        keyPath, fetchImpl: fetchMenu,
+      });
+      check(copied.ok && copied.asked === 'Book the red room on 2026-09-15 at 18:00'
+        && copied.text === copied.asked,
+        'knock/copies-first-skill-example-when-text-omitted',
+        `got asked=${JSON.stringify(copied.asked)} text=${JSON.stringify(copied.text)}`);
+
+      process.env.AGENT_ENTRY_KNOCK_TEXT = 'Hold Friday instead';
+      const overridden = await knockAgentEntry(`https://menu.example${AGENT_CARD_PATH}`, {
+        keyPath, fetchImpl: fetchMenu,
+      });
+      check(overridden.ok && overridden.asked === 'Hold Friday instead',
+        'knock/env-text-still-overrides-the-card-example',
+        `got ${JSON.stringify(overridden.asked)}`);
+    } finally {
+      if (previousKnockText === undefined) delete process.env.AGENT_ENTRY_KNOCK_TEXT;
+      else process.env.AGENT_ENTRY_KNOCK_TEXT = previousKnockText;
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
