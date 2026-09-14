@@ -4503,6 +4503,9 @@ function checkedBookingReceipt(replyText, visitorDid) {
 /**
  * Read and verify an Agent Card, send one signed knock, and verify a successful reply.
  * No invitation, account, token, Muretai node, or dependency is involved.
+ * When the verified reply carries a booking, `text` is the checked
+ * `{type, customer_did, request, status}` JSON — not the shop's raw signed body.
+ * `reply` remains the verified signed wire (`reply.result.parts[0].text`).
  */
 export async function knockAgentEntry(cardUrl, {
   keyPath = process.env.AGENT_ENTRY_KNOCK_KEY
@@ -4617,7 +4620,7 @@ export async function knockAgentEntry(cardUrl, {
     doorDid: card.did,
     asked,
     status: response.status,
-    text: replyFields.text,
+    text: booking ? JSON.stringify(booking) : replyFields.text,
     reply,
     ...(booking ? { booking } : {}),
   };
