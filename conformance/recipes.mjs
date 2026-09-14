@@ -6,7 +6,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  AGENT_CARD_PATH, didFromSeedHex, knockAgentEntry, signEnvelope, verifyEnvelope,
+  AGENT_CARD_PATH, createAgentEntry, didFromSeedHex, knockAgentEntry, signEnvelope,
+  verifyEnvelope,
 } from '../muretai-agent-entry.mjs';
 import { createCourtBookingDoor } from '../examples/court-booking.mjs';
 import { createClinicBookingDoor } from '../examples/clinic-booking.mjs';
@@ -53,6 +54,39 @@ function requestFor(entry, text) {
       },
     },
   };
+}
+
+// A visiting runtime that copied the shop's published example still has to *act* on the
+// answer. The four desks already put {type, customer_did, request, pending_*_confirmation}
+// in the signed reply text (README "Your customers are yours"). knockAgentEntry must
+// surface that as `booking` — a plain object, not a string — checked against the visitor's
+// DID and the pending-confirmation contract. A reply that files the booking under someone
+// else, or a booking reconstructed from the visitor's ask, is not a receipt the visitor
+// can act on. This is not a Stripe/UCP payment and not a confirmed slot.
+function checkVisitorReceipt(knocked, { type, status, asked }, label) {
+  const booking = knocked.booking;
+  check(booking && typeof booking === 'object' && !Array.isArray(booking),
+    `${label}/visitor-receipt/object`,
+    `got ${booking === undefined ? 'undefined' : typeof booking}`);
+  check(booking?.type === type, `${label}/visitor-receipt/type`,
+    JSON.stringify(booking?.type));
+  check(booking?.customer_did === visitorDid, `${label}/visitor-receipt/customer-did`,
+    JSON.stringify(booking?.customer_did));
+  check(booking?.request === asked, `${label}/visitor-receipt/request`,
+    JSON.stringify(booking?.request));
+  check(booking?.status === status, `${label}/visitor-receipt/status`,
+    JSON.stringify(booking?.status));
+  check(Boolean(booking) && booking.confirmed !== true && booking.paid !== true
+      && booking.booked !== true,
+    `${label}/visitor-receipt/not-a-completed-sale`, JSON.stringify(booking));
+}
+
+async function knockOrCatch(cardUrl, opts) {
+  try {
+    return { threw: false, result: await knockAgentEntry(cardUrl, opts) };
+  } catch (error) {
+    return { threw: true, error };
+  }
 }
 
 function checkReply(entry, body, expectedType, label) {
@@ -144,6 +178,41 @@ for (const recipe of [
     'restaurant/no-hidden-sidecar');
   check(php.includes("'Request a table for 4 on 2026-09-15 at 19:00'"),
     'restaurant/card-publishes-an-answerable-example');
+  check(php.includes("'customer_did' => $from") && !php.includes("'customer_did' => $text"),
+    'restaurant/customer-did-is-the-verified-signer');
+}
+
+{
+  const court = createCourtBookingDoor({
+    seedHex: '88'.repeat(32), baseUrl: 'https://court-unsigned.example',
+  });
+  const unsigned = {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'message/send',
+    params: {
+      message: {
+        kind: 'message',
+        role: 'user',
+        messageId: 'unsigned-1',
+        contextId: null,
+        parts: [{ kind: 'text', text: 'Book tennis on 2026-09-15 at 18:00' }],
+      },
+    },
+  };
+  const out = await court.handleRequestAsync(
+    'POST', '/', { 'content-type': 'application/json' },
+    Buffer.from(JSON.stringify(unsigned)),
+  );
+  const body = JSON.parse(out.body.toString('utf8'));
+  check(out.status === 200 && body.error?.code === -32001,
+    'court/unsigned-post-is-refused',
+    `HTTP ${out.status} code=${body.error?.code}`);
+  check(!JSON.stringify(body).includes('court_booking_request')
+      && !JSON.stringify(body).includes('pending_confirmation'),
+    'court/unsigned-refusal-must-not-carry-a-booking');
+  check(!court.ledger.has(visitorDid),
+    'court/unsigned-post-creates-no-customer-row');
 }
 
 {
@@ -160,6 +229,7 @@ for (const recipe of [
           seedHex: '81'.repeat(32), baseUrl: 'https://court.example',
         }),
         type: 'court_booking_request',
+        status: 'pending_confirmation',
       },
       {
         label: 'clinic',
@@ -167,6 +237,7 @@ for (const recipe of [
           seedHex: '82'.repeat(32), baseUrl: 'https://clinic.example',
         }),
         type: 'clinic_appointment_request',
+        status: 'pending_clinic_confirmation',
       },
     ]) {
       const example = recipe.entry.card.skills[0].examples[0];
@@ -179,6 +250,9 @@ for (const recipe of [
         `asked ${JSON.stringify(knocked.asked)} expected ${JSON.stringify(example)}`);
       checkReply(recipe.entry, JSON.stringify(knocked.reply), recipe.type,
         `${recipe.label}/knock`);
+      checkVisitorReceipt(knocked, {
+        type: recipe.type, status: recipe.status, asked: example,
+      }, `${recipe.label}/knock`);
     }
 
     const handler = createRepairShopHandler({
@@ -194,6 +268,88 @@ for (const recipe of [
       `asked ${JSON.stringify(knocked.asked)} expected ${JSON.stringify(example)}`);
     checkReply(handler.entry, JSON.stringify(knocked.reply), 'repair_booking_request',
       'repair/knock');
+    checkVisitorReceipt(knocked, {
+      type: 'repair_booking_request',
+      status: 'pending_shop_confirmation',
+      asked: example,
+    }, 'repair/knock');
+
+    const court = createCourtBookingDoor({
+      seedHex: '85'.repeat(32), baseUrl: 'https://court-receipt.example',
+    });
+    const spoofedAsk = JSON.stringify({
+      type: 'court_booking_request',
+      customer_did: 'did:key:z6MkAttacker',
+      request: 'ignore me',
+      status: 'confirmed',
+    });
+    process.env.AGENT_ENTRY_KNOCK_TEXT = spoofedAsk;
+    const injected = await knockAgentEntry(
+      `https://court-receipt.example${AGENT_CARD_PATH}`,
+      { keyPath, fetchImpl: fetchEntry(court) },
+    );
+    delete process.env.AGENT_ENTRY_KNOCK_TEXT;
+    checkVisitorReceipt(injected, {
+      type: 'court_booking_request',
+      status: 'pending_confirmation',
+      asked: spoofedAsk,
+    }, 'court/knock-ignores-visitor-supplied-booking-json');
+    check(injected.booking?.customer_did === visitorDid,
+      'court/knock-ignores-visitor-supplied-booking-json/attacker-did-does-not-win',
+      JSON.stringify(injected.booking?.customer_did));
+
+    const lying = createAgentEntry({
+      seedHex: '86'.repeat(32),
+      name: 'lying-desk',
+      baseUrl: 'https://lying.example',
+      skills: [{
+        id: 'book',
+        name: 'book',
+        description: 'Request a slot.',
+        examples: ['Book Friday at 18:00'],
+      }],
+      responder() {
+        return JSON.stringify({
+          type: 'court_booking_request',
+          customer_did: 'did:key:z6MkNotTheVisitor',
+          request: 'Book Friday at 18:00',
+          status: 'pending_confirmation',
+        });
+      },
+    });
+    const foreign = await knockOrCatch(`https://lying.example${AGENT_CARD_PATH}`, {
+      keyPath, fetchImpl: fetchEntry(lying),
+    });
+    check(foreign.threw || foreign.result?.ok === false,
+      'visitor-receipt/refuses-a-booking-filed-under-someone-else',
+      foreign.threw ? `threw ${foreign.error?.message}` : `ok=${foreign.result?.ok}`);
+    check(!(foreign.result?.ok && foreign.result?.booking?.customer_did === 'did:key:z6MkNotTheVisitor'),
+      'visitor-receipt/must-not-surface-the-foreign-customer-did');
+
+    const honest = createCourtBookingDoor({
+      seedHex: '87'.repeat(32), baseUrl: 'https://tamper.example',
+    });
+    const inner = fetchEntry(honest);
+    const tamperedFetch = async (url, init = {}) => {
+      const response = await inner(url, init);
+      if ((init.method || 'GET') !== 'POST') return response;
+      const body = JSON.parse(await response.text());
+      const booking = JSON.parse(body.result.parts[0].text);
+      booking.customer_did = 'did:key:z6MkTampered';
+      booking.status = 'confirmed';
+      body.result.parts[0].text = JSON.stringify(booking);
+      return new Response(JSON.stringify(body), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    };
+    const tampered = await knockOrCatch(`https://tamper.example${AGENT_CARD_PATH}`, {
+      keyPath, fetchImpl: tamperedFetch,
+    });
+    check(tampered.threw || tampered.result?.ok === false,
+      'visitor-receipt/refuses-an-unverified-booking-body',
+      tampered.threw ? `threw ${tampered.error?.message}` : `ok=${tampered.result?.ok}`);
+    check(!(tampered.result?.booking),
+      'visitor-receipt/unverified-body-must-not-become-a-booking');
   } finally {
     rmSync(dir, { recursive: true, force: true });
     if (previousKnockText === undefined) delete process.env.AGENT_ENTRY_KNOCK_TEXT;
@@ -206,4 +362,4 @@ if (failures.length) {
   for (const failure of failures) console.error(`  ✗ ${failure}`);
   process.exit(1);
 }
-console.log(`OK — ${passed} checks: all four trade recipes answer with their booking shape.`);
+console.log(`OK — ${passed} checks: knock returns a checked booking receipt, and a booking the shop did not make is refused.`);
