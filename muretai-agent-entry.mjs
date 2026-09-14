@@ -4477,6 +4477,30 @@ export function describeKnockRequirements(accepts) {
 }
 
 /**
+ * Surface a shop-signed booking receipt from verified reply text.
+ * Every field is taken from those bytes — never from the visitor's ask.
+ * A receipt filed under someone else's customer_did is not this visitor's booking.
+ */
+function checkedBookingReceipt(replyText, visitorDid) {
+  let parsed;
+  try {
+    parsed = JSON.parse(replyText);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const { type, customer_did, request, status } = parsed;
+  if (typeof type !== 'string' || typeof customer_did !== 'string'
+      || typeof request !== 'string' || typeof status !== 'string') {
+    return null;
+  }
+  if (customer_did !== visitorDid) {
+    throw new Error('knock: the signed reply files a booking under a different customer');
+  }
+  return { type, customer_did, request, status };
+}
+
+/**
  * Read and verify an Agent Card, send one signed knock, and verify a successful reply.
  * No invitation, account, token, Muretai node, or dependency is involved.
  */
@@ -4586,6 +4610,7 @@ export async function knockAgentEntry(cardUrl, {
       || !verifyEnvelope(replyFields, { recipientDid: from, signerDid: card.did })) {
     throw new Error('knock: the door reply did not verify');
   }
+  const booking = checkedBookingReceipt(replyFields.text, from);
   return {
     ok: true,
     did: from,
@@ -4594,6 +4619,7 @@ export async function knockAgentEntry(cardUrl, {
     status: response.status,
     text: replyFields.text,
     reply,
+    ...(booking ? { booking } : {}),
   };
 }
 
