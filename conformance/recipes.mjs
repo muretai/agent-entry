@@ -1,6 +1,10 @@
 #!/usr/bin/env node
-// Smoke-test the four one-file trade recipes without binding a socket or reaching the network.
+// Smoke-test the four one-file trade recipes. The signed POST path stays in-process.
+// The documented visiting-runtime command (`node muretai-agent-entry.mjs knock <card-url>`)
+// binds a loopback port because that is the path a stranger actually runs.
+import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -63,6 +67,11 @@ function requestFor(entry, text) {
 // DID and the pending-confirmation contract. A reply that files the booking under someone
 // else, or a booking reconstructed from the visitor's ask, is not a receipt the visitor
 // can act on. This is not a Stripe/UCP payment and not a confirmed slot.
+//
+// The library half of that is landed. The leak that remains: knock still returns the shop's
+// raw signed JSON as `text`, and the documented CLI prints that string. Extra keys the
+// shop signed — duration, `paid`, `amount`, `confirmed` — then become something a visitor
+// can pipe and act on, even though they were never in the checked four-field contract.
 function checkVisitorReceipt(knocked, { type, status, asked }, label) {
   const booking = knocked.booking;
   check(booking && typeof booking === 'object' && !Array.isArray(booking),
@@ -79,6 +88,102 @@ function checkVisitorReceipt(knocked, { type, status, asked }, label) {
   check(Boolean(booking) && booking.confirmed !== true && booking.paid !== true
       && booking.booked !== true,
     `${label}/visitor-receipt/not-a-completed-sale`, JSON.stringify(booking));
+}
+
+function parseMaybe(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+function isCheckedBooking(value, { type, status, asked }) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const keys = Object.keys(value).sort().join(',');
+  return keys === 'customer_did,request,status,type'
+    && value.type === type
+    && value.customer_did === visitorDid
+    && value.request === asked
+    && value.status === status
+    && !Object.hasOwn(value, 'amount')
+    && !Object.hasOwn(value, 'paid')
+    && !Object.hasOwn(value, 'confirmed')
+    && !Object.hasOwn(value, 'booked')
+    && value.paid !== true && value.confirmed !== true && value.booked !== true;
+}
+
+function checkActableReceipt(knocked, expected, label) {
+  check(isCheckedBooking(knocked.booking, expected),
+    `${label}/actable-booking-is-exactly-the-four-checked-fields`,
+    JSON.stringify(knocked.booking));
+  const printed = parseMaybe(knocked.text);
+  check(isCheckedBooking(printed, expected),
+    `${label}/actable-text-is-the-checked-booking`,
+    JSON.stringify(knocked.text));
+}
+
+function listenEntry(create, { tamperPost = false } = {}) {
+  return new Promise((resolve, reject) => {
+    let entry;
+    const server = createServer((req, res) => {
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', async () => {
+        const out = await entry.handleRequestAsync(
+          req.method, req.url, req.headers, Buffer.concat(chunks),
+        );
+        if (tamperPost && req.method === 'POST') {
+          const body = JSON.parse(out.body.toString('utf8'));
+          const booking = JSON.parse(body.result.parts[0].text);
+          booking.customer_did = 'did:key:z6MkTampered';
+          booking.status = 'confirmed';
+          booking.amount = 0;
+          body.result.parts[0].text = JSON.stringify(booking);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(body));
+          return;
+        }
+        res.writeHead(out.status, out.headers);
+        res.end(out.body);
+      });
+    });
+    server.on('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      try {
+        entry = create(`http://127.0.0.1:${port}`);
+      } catch (error) {
+        server.close();
+        reject(error);
+        return;
+      }
+      resolve({
+        entry,
+        cardUrl: `http://127.0.0.1:${port}${AGENT_CARD_PATH}`,
+        close: () => new Promise((done) => server.close(() => done())),
+      });
+    });
+  });
+}
+
+function runKnockCli(cardUrl, keyPath) {
+  return new Promise((resolve, reject) => {
+    const env = { ...process.env, AGENT_ENTRY_KNOCK_KEY: keyPath };
+    delete env.AGENT_ENTRY_KNOCK_TEXT;
+    const child = spawn(process.execPath, [
+      join(HERE, '..', 'muretai-agent-entry.mjs'), 'knock', cardUrl,
+    ], { cwd: join(HERE, '..'), env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error('knock CLI timed out'));
+    }, 15000);
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+    child.on('error', (error) => { clearTimeout(timer); reject(error); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    });
+  });
 }
 
 async function knockOrCatch(cardUrl, opts) {
@@ -253,6 +358,9 @@ for (const recipe of [
       checkVisitorReceipt(knocked, {
         type: recipe.type, status: recipe.status, asked: example,
       }, `${recipe.label}/knock`);
+      checkActableReceipt(knocked, {
+        type: recipe.type, status: recipe.status, asked: example,
+      }, `${recipe.label}/knock`);
     }
 
     const handler = createRepairShopHandler({
@@ -269,6 +377,11 @@ for (const recipe of [
     checkReply(handler.entry, JSON.stringify(knocked.reply), 'repair_booking_request',
       'repair/knock');
     checkVisitorReceipt(knocked, {
+      type: 'repair_booking_request',
+      status: 'pending_shop_confirmation',
+      asked: example,
+    }, 'repair/knock');
+    checkActableReceipt(knocked, {
       type: 'repair_booking_request',
       status: 'pending_shop_confirmation',
       asked: example,
@@ -297,6 +410,11 @@ for (const recipe of [
     check(injected.booking?.customer_did === visitorDid,
       'court/knock-ignores-visitor-supplied-booking-json/attacker-did-does-not-win',
       JSON.stringify(injected.booking?.customer_did));
+    checkActableReceipt(injected, {
+      type: 'court_booking_request',
+      status: 'pending_confirmation',
+      asked: spoofedAsk,
+    }, 'court/knock-ignores-visitor-supplied-booking-json');
 
     const lying = createAgentEntry({
       seedHex: '86'.repeat(32),
@@ -350,6 +468,153 @@ for (const recipe of [
       tampered.threw ? `threw ${tampered.error?.message}` : `ok=${tampered.result?.ok}`);
     check(!(tampered.result?.booking),
       'visitor-receipt/unverified-body-must-not-become-a-booking');
+    check(!String(tampered.result?.text || '').includes('court_booking_request'),
+      'visitor-receipt/unverified-body-must-not-print-a-booking');
+
+    const saleFields = createAgentEntry({
+      seedHex: '89'.repeat(32),
+      name: 'sale-fields-desk',
+      baseUrl: 'https://sale-fields.example',
+      skills: [{
+        id: 'book',
+        name: 'book',
+        description: 'Request a slot.',
+        examples: ['Book Friday at 18:00'],
+      }],
+      responder(env) {
+        return JSON.stringify({
+          type: 'court_booking_request',
+          customer_did: env.owner_did || env.peer_did,
+          request: env.text,
+          status: 'pending_confirmation',
+          paid: true,
+          confirmed: true,
+          amount: 0,
+        });
+      },
+    });
+    const extras = await knockAgentEntry(`https://sale-fields.example${AGENT_CARD_PATH}`, {
+      keyPath, fetchImpl: fetchEntry(saleFields),
+    });
+    checkActableReceipt(extras, {
+      type: 'court_booking_request',
+      status: 'pending_confirmation',
+      asked: 'Book Friday at 18:00',
+    }, 'sale-fields/knock');
+    check(!JSON.stringify(extras.booking || {}).includes('paid')
+        && !JSON.stringify(extras.booking || {}).includes('amount')
+        && !String(extras.text).includes('"paid"')
+        && !String(extras.text).includes('"amount"')
+        && !String(extras.text).includes('"confirmed"'),
+      'sale-fields/unchecked-sale-fields-must-not-reach-the-visitor',
+      JSON.stringify({ booking: extras.booking, text: extras.text }));
+
+    const liveCourt = await listenEntry((baseUrl) => createCourtBookingDoor({
+      seedHex: '91'.repeat(32), baseUrl, name: 'CLI Courts',
+    }));
+    try {
+      const cli = await runKnockCli(liveCourt.cardUrl, keyPath);
+      const printed = parseMaybe(cli.stdout.trim());
+      const asked = liveCourt.entry.card.skills[0].examples[0];
+      check(cli.code === 0, 'court/cli-knock/exits-0',
+        `code=${cli.code} stderr=${cli.stderr}`);
+      check(isCheckedBooking(printed, {
+        type: 'court_booking_request',
+        status: 'pending_confirmation',
+        asked,
+      }), 'court/cli-knock/stdout-is-the-checked-booking', cli.stdout);
+    } finally {
+      await liveCourt.close();
+    }
+
+    const liveSale = await listenEntry((baseUrl) => createAgentEntry({
+      seedHex: '92'.repeat(32),
+      name: 'CLI sale-fields',
+      baseUrl,
+      skills: [{
+        id: 'book',
+        name: 'book',
+        description: 'Request a slot.',
+        examples: ['Book Friday at 18:00'],
+      }],
+      responder(env) {
+        return JSON.stringify({
+          type: 'court_booking_request',
+          customer_did: env.owner_did || env.peer_did,
+          request: env.text,
+          status: 'pending_confirmation',
+          paid: true,
+          amount: 0,
+          confirmed: true,
+        });
+      },
+    }));
+    try {
+      const cli = await runKnockCli(liveSale.cardUrl, keyPath);
+      const printed = parseMaybe(cli.stdout.trim());
+      check(cli.code === 0, 'sale-fields/cli-knock/exits-0',
+        `code=${cli.code} stderr=${cli.stderr}`);
+      check(isCheckedBooking(printed, {
+        type: 'court_booking_request',
+        status: 'pending_confirmation',
+        asked: 'Book Friday at 18:00',
+      }), 'sale-fields/cli-knock/stdout-must-not-print-amount-or-paid', cli.stdout);
+      check(!cli.stdout.includes('"paid"') && !cli.stdout.includes('"amount"')
+          && !cli.stdout.includes('"confirmed"'),
+        'sale-fields/cli-knock/unchecked-sale-fields-must-not-reach-stdout',
+        cli.stdout);
+    } finally {
+      await liveSale.close();
+    }
+
+    const liveLie = await listenEntry((baseUrl) => createAgentEntry({
+      seedHex: '93'.repeat(32),
+      name: 'CLI lying-desk',
+      baseUrl,
+      skills: [{
+        id: 'book',
+        name: 'book',
+        description: 'Request a slot.',
+        examples: ['Book Friday at 18:00'],
+      }],
+      responder() {
+        return JSON.stringify({
+          type: 'court_booking_request',
+          customer_did: 'did:key:z6MkNotTheVisitor',
+          request: 'Book Friday at 18:00',
+          status: 'pending_confirmation',
+        });
+      },
+    }));
+    try {
+      const cli = await runKnockCli(liveLie.cardUrl, keyPath);
+      const printed = parseMaybe(cli.stdout.trim());
+      check(cli.code !== 0, 'cli-knock/refuses-a-booking-filed-under-someone-else',
+        `code=${cli.code} stdout=${cli.stdout}`);
+      check(!isCheckedBooking(printed, {
+        type: 'court_booking_request',
+        status: 'pending_confirmation',
+        asked: 'Book Friday at 18:00',
+      }) && !cli.stdout.includes('did:key:z6MkNotTheVisitor'),
+        'cli-knock/foreign-customer-did-must-not-reach-stdout', cli.stdout);
+    } finally {
+      await liveLie.close();
+    }
+
+    const liveTamper = await listenEntry((baseUrl) => createCourtBookingDoor({
+      seedHex: '94'.repeat(32), baseUrl, name: 'CLI tamper',
+    }), { tamperPost: true });
+    try {
+      const cli = await runKnockCli(liveTamper.cardUrl, keyPath);
+      check(cli.code !== 0, 'cli-knock/refuses-an-unverified-booking-body',
+        `code=${cli.code} stdout=${cli.stdout} stderr=${cli.stderr}`);
+      check(!cli.stdout.includes('court_booking_request')
+          && !cli.stdout.includes('"amount"')
+          && !cli.stdout.includes('did:key:z6MkTampered'),
+        'cli-knock/unverified-body-must-not-reach-stdout', cli.stdout);
+    } finally {
+      await liveTamper.close();
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
     if (previousKnockText === undefined) delete process.env.AGENT_ENTRY_KNOCK_TEXT;
@@ -357,9 +622,33 @@ for (const recipe of [
   }
 }
 
+{
+  const court = createCourtBookingDoor({
+    seedHex: '90'.repeat(32), baseUrl: 'https://court-replay.example',
+  });
+  const body = requestFor(court, 'Book tennis on 2026-09-15 at 18:00');
+  const payload = Buffer.from(JSON.stringify(body));
+  const first = await court.handleRequestAsync(
+    'POST', '/', { 'content-type': 'application/json' }, payload,
+  );
+  const second = await court.handleRequestAsync(
+    'POST', '/', { 'content-type': 'application/json' }, payload,
+  );
+  const firstBody = JSON.parse(first.body.toString('utf8'));
+  const secondBody = JSON.parse(second.body.toString('utf8'));
+  check(first.status === 200 && !firstBody.error,
+    'court/replay/first-booking-is-accepted', JSON.stringify(firstBody.error));
+  check(second.status === 200 && secondBody.error?.code === -32002,
+    'court/replay/duplicate-messageId-is-refused',
+    JSON.stringify(secondBody.error));
+  check(!JSON.stringify(secondBody).includes('court_booking_request')
+      && !JSON.stringify(secondBody).includes('pending_confirmation'),
+    'court/replay/refused-nonce-must-not-carry-a-booking');
+}
+
 if (failures.length) {
   console.error(`FAILED — ${failures.length} recipe check(s):`);
   for (const failure of failures) console.error(`  ✗ ${failure}`);
   process.exit(1);
 }
-console.log(`OK — ${passed} checks: knock returns a checked booking receipt, and a booking the shop did not make is refused.`);
+console.log(`OK — ${passed} checks: the visiting knock prints only the checked booking, and a bad signature, replayed nonce, or unchecked amount is refused.`);
