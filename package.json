@@ -27,6 +27,7 @@
     "build:vectors": "node scripts/build-vectors.mjs",
     "check:vectors": "node scripts/build-vectors.mjs --check",
     "example": "node examples/server.mjs",
+    "demo": "node examples/live-demo.mjs",
     "distill": "node scripts/distill/loop.mjs",
     "distill:record": "node scripts/distill/record.mjs",
     "distill:measure": "node scripts/distill/measure.mjs"

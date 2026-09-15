@@ -10,12 +10,15 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  AGENT_CARD_PATH, createAgentEntry, didFromSeedHex, knockAgentEntry, signEnvelope,
-  verifyEnvelope,
+  AGENT_CARD_PATH, AGENT_ENTRY_REL, createAgentEntry, didFromSeedHex, knockAgentEntry,
+  signEnvelope, verifyEnvelope,
 } from '../muretai-agent-entry.mjs';
 import { createCourtBookingDoor } from '../examples/court-booking.mjs';
 import { createClinicBookingDoor } from '../examples/clinic-booking.mjs';
 import { createRepairShopHandler } from '../examples/repair-shop-serverless.mjs';
+import {
+  createHarborLampEntry, handleDemoRequest, newDemoSession, runDemoStep,
+} from '../examples/live-demo.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const visitorSeed = '77'.repeat(32);
@@ -644,6 +647,65 @@ for (const recipe of [
   check(!JSON.stringify(secondBody).includes('court_booking_request')
       && !JSON.stringify(secondBody).includes('pending_confirmation'),
     'court/replay/refused-nonce-must-not-carry-a-booking');
+}
+
+{
+  const entry = createHarborLampEntry({
+    seedHex: 'a1'.repeat(32),
+    baseUrl: 'https://harbor.example',
+  });
+  const session = newDemoSession();
+  try {
+    const unsigned = await runDemoStep(entry, session, 'unsigned');
+    check(unsigned.error?.code === -32001,
+      'harbor/unsigned-is-refused-not-a-customer',
+      JSON.stringify(unsigned.error));
+    check(unsigned.accountCount === 0,
+      'harbor/unsigned-mints-no-ledger-row',
+      String(unsigned.accountCount));
+    check(Boolean(unsigned.error?.data?.accepts?.[0]),
+      'harbor/unsigned-refusal-teaches-how-to-knock');
+
+    let early = null;
+    try {
+      await runDemoStep(entry, session, 'again');
+    } catch (error) {
+      early = error;
+    }
+    check(early?.code === 'DEMO_ORDER',
+      'harbor/return-before-first-is-refused',
+      early ? String(early.message) : 'no throw');
+
+    const first = await runDemoStep(entry, session, 'first');
+    check(first.ok && first.booking?.type === 'restaurant_reservation_request',
+      'harbor/first-signed-knock-is-a-pending-reservation',
+      JSON.stringify(first.booking));
+    check(first.booking?.customer_did === first.did && first.messages === 1,
+      'harbor/first-knock-opens-the-account',
+      JSON.stringify({ did: first.did, messages: first.messages, booking: first.booking }));
+    check(first.booking?.status === 'pending_shop_confirmation'
+        && first.booking?.confirmed !== true,
+      'harbor/first-knock-is-not-a-completed-sale',
+      JSON.stringify(first.booking));
+
+    const again = await runDemoStep(entry, session, 'again');
+    check(again.ok && again.did === first.did && again.messages === 2,
+      'harbor/second-knock-is-the-same-customer',
+      JSON.stringify({ first: first.did, again: again.did, messages: again.messages }));
+
+    const page = await handleDemoRequest(
+      entry, session, 'GET', '/', {}, Buffer.alloc(0),
+    );
+    const html = page.body.toString('utf8');
+    check(page.status === 200 && html.includes('Harbor Lamp'),
+      'harbor/get-slash-is-the-shop-page');
+    check(html.includes(AGENT_ENTRY_REL) && html.includes('id="how"'),
+      'harbor/shop-page-points-at-the-door-and-the-howto');
+    check(String(page.headers.Link || '').includes(AGENT_ENTRY_REL),
+      'harbor/shop-page-sends-the-door-link-header');
+  } finally {
+    rmSync(session.dir, { recursive: true, force: true });
+  }
 }
 
 if (failures.length) {

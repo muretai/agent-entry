@@ -528,6 +528,14 @@ site.
 node examples/server.mjs        # prints its DID and card URL
 ```
 
+### Show an investor or a site owner
+
+```bash
+node examples/live-demo.mjs
+```
+
+Then open `http://127.0.0.1:8788`. It is a restaurant that is also a real Agent Entry: GET `/` is the shop, POST `/` is the door. Three buttons run the protocol, not a mock — an unsigned ask is refused and mints no customer; the first signed knock is the account; the second knock is recognised as the same customer.
+
 Environment: `AGENT_ENTRY_SEED_HEX` (generated and printed if absent — **persist it, it is
 your site's identity**), `AGENT_ENTRY_PORT` (8788), `AGENT_ENTRY_BASE_URL`,
 `AGENT_ENTRY_NAME`, `AGENT_ENTRY_ANON` (`1` also accepts unsigned inquiries, which create

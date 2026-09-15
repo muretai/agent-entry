@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Harbor Lamp — Agent Entry</title>
+  <style>
+    :root {
+      --paper: #f3eee4;
+      --ink: #1c1814;
+      --mute: #6f675c;
+      --line: #d8cfc0;
+      --lamp: #9a3412;
+      --ok: #0f5c52;
+      --card: #fffaf2;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--paper); color: var(--ink); }
+    body {
+      font: 16px/1.5 "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP",
+        ui-sans-serif, system-ui, sans-serif;
+    }
+    .wrap { max-width: 1120px; margin: 0 auto; padding: 28px 20px 64px; }
+    header { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; }
+    .brand {
+      font-family: "Iowan Old Style", "Palatino Linotype", "Hiragino Mincho ProN",
+        "YuMincho", serif;
+      font-size: 28px; letter-spacing: 0.02em; margin: 0;
+    }
+    .brand span { color: var(--lamp); }
+    .lang { display: flex; gap: 8px; }
+    .lang button, .play button {
+      font: inherit; background: transparent; color: var(--ink);
+      border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; cursor: pointer;
+    }
+    .lang button[aria-pressed="true"], .play button.primary {
+      background: var(--ink); color: var(--paper); border-color: var(--ink);
+    }
+    .lede { max-width: 40rem; margin: 18px 0 8px; font-size: 18px; }
+    .who { color: var(--mute); margin: 0 0 22px; max-width: 42rem; }
+    .play { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 28px; }
+    .play button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .grid { display: grid; grid-template-columns: 1.1fr 1fr 0.9fr; gap: 16px; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+    section {
+      background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px 18px 16px;
+    }
+    section h2 {
+      margin: 0 0 4px; font-size: 11px; font-weight: 600; letter-spacing: 0.14em;
+      text-transform: uppercase; color: var(--mute);
+    }
+    .shop h3 {
+      font-family: "Iowan Old Style", "Palatino Linotype", "Hiragino Mincho ProN", serif;
+      font-size: 22px; font-weight: 500; margin: 8px 0 6px;
+    }
+    .hours { color: var(--mute); margin: 0 0 12px; font-size: 14px; }
+    .menu { margin: 0; padding: 0; list-style: none; }
+    .menu li { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-top: 1px solid var(--line); }
+    .signpost { margin: 16px 0 0; font-size: 13px; color: var(--mute); }
+    .signpost a { color: var(--lamp); }
+    .log { margin: 12px 0 0; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-all; }
+    .empty { color: var(--mute); margin: 12px 0 0; }
+    .row { border-top: 1px solid var(--line); padding: 10px 0 2px; margin-top: 8px; }
+    .did { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+    .tag { display: inline-block; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ok); margin-top: 4px; }
+    .err { color: var(--lamp); }
+    footer { margin-top: 28px; color: var(--mute); font-size: 13px; }
+    footer code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    [lang-en] { display: none; }
+    html[lang="en"] [lang-ja] { display: none; }
+    html[lang="en"] [lang-en] { display: inline; }
+    html[lang="en"] p[lang-en], html[lang="en"] li[lang-en], html[lang="en"] h3[lang-en] { display: block; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <p class="brand">Harbor <span>Lamp</span></p>
+      <div class="lang">
+        <button type="button" id="lang-ja" aria-pressed="true">日本語</button>
+        <button type="button" id="lang-en" aria-pressed="false">EN</button>
+      </div>
+    </header>
+
+    <p class="lede">
+      <span lang-ja>フォームはない。鍵が口座。返事は同じ HTTP 応答で返る。</span>
+      <span lang-en>There is no form. The key is the account. The answer comes back on the same HTTP response.</span>
+    </p>
+    <p class="who">
+      <span lang-ja>投資家向け：最初の署名つきメッセージが顧客になる。サイト保有者向け：GET は今の店。POST がドア。</span>
+      <span lang-en>For investors: the first signed message is the customer. For site owners: GET is the shop you already have. POST is the door.</span>
+    </p>
+
+    <div class="play" id="how">
+      <button type="button" data-step="unsigned">
+        <span lang-ja>1. 鍵なしで聞く</span>
+        <span lang-en>1. Ask with no key</span>
+      </button>
+      <button type="button" data-step="first">
+        <span lang-ja>2. 署名して予約する</span>
+        <span lang-en>2. Sign and book</span>
+      </button>
+      <button type="button" data-step="again">
+        <span lang-ja>3. 同じ客が戻る</span>
+        <span lang-en>3. Same customer returns</span>
+      </button>
+      <button type="button" class="primary" id="play-all">
+        <span lang-ja>3つ続けて見る</span>
+        <span lang-en>Play all three</span>
+      </button>
+    </div>
+
+    <div class="grid">
+      <section class="shop">
+        <h2>
+          <span lang-ja>人が見る店</span>
+          <span lang-en>The shop people see</span>
+        </h2>
+        <h3>
+          <span lang-ja>ハーバーランプ</span>
+          <span lang-en>Harbor Lamp</span>
+        </h3>
+        <p class="hours">
+          <span lang-ja>火–日 17:00–22:00 · 港の灯台の下</span>
+          <span lang-en>Tue–Sun 17:00–22:00 · under the harbour light</span>
+        </p>
+        <ul class="menu">
+          <li><span lang-ja>本日の魚</span><span lang-en>Fish of the day</span><span>2,800</span></li>
+          <li><span lang-ja>灯台サラダ</span><span lang-en>Lamp salad</span><span>1,400</span></li>
+          <li><span lang-ja>二人席 · 土曜 19:00</span><span lang-en>Table for two · Sat 19:00</span><span lang-ja>空きあり</span><span lang-en>open</span></li>
+        </ul>
+        <p class="signpost">{{SIGNPOST}}</p>
+      </section>
+
+      <section>
+        <h2>
+          <span lang-ja>エージェントが見るもの</span>
+          <span lang-en>What the agent sees</span>
+        </h2>
+        <p class="empty" id="agent-empty">
+          <span lang-ja>上のボタンを押すと、この店のドアに実際のノックが届きます。モックではありません。</span>
+          <span lang-en>The buttons send a real knock to this shop’s door. Not a mock.</span>
+        </p>
+        <pre class="log" id="agent-log" hidden></pre>
+      </section>
+
+      <section>
+        <h2>
+          <span lang-ja>店が持つ台帳</span>
+          <span lang-en>The shop’s ledger</span>
+        </h2>
+        <p class="empty" id="book-empty">
+          <span lang-ja>顧客はまだいません。鍵なしの問い合わせでは行は増えない。</span>
+          <span lang-en>No customers yet. An unsigned ask does not mint a row.</span>
+        </p>
+        <div id="book"></div>
+      </section>
+    </div>
+
+    <footer>
+      <span lang-ja>店の DID</span>
+      <span lang-en>Shop DID</span>
+      <code>{{SHOP_DID}}</code>
+      · <code>node examples/live-demo.mjs</code>
+    </footer>
+  </div>
+  <script>
+    const agentEmpty = document.getElementById("agent-empty");
+    const agentLog = document.getElementById("agent-log");
+    const book = document.getElementById("book");
+    const bookEmpty = document.getElementById("book-empty");
+    const ja = document.getElementById("lang-ja");
+    const en = document.getElementById("lang-en");
+
+    function setLang(lang) {
+      document.documentElement.lang = lang;
+      ja.setAttribute("aria-pressed", String(lang === "ja"));
+      en.setAttribute("aria-pressed", String(lang === "en"));
+    }
+    ja.onclick = () => setLang("ja");
+    en.onclick = () => setLang("en");
+
+    function shortDid(did) {
+      if (!did) return "";
+      return did.slice(0, 26) + "…" + did.slice(-6);
+    }
+
+    function renderBook(accounts) {
+      if (!accounts || !accounts.length) {
+        book.replaceChildren();
+        bookEmpty.hidden = false;
+        return;
+      }
+      bookEmpty.hidden = true;
+      book.replaceChildren();
+      for (const row of accounts) {
+        const wrap = document.createElement("div");
+        wrap.className = "row";
+        const did = document.createElement("div");
+        did.className = "did";
+        did.textContent = shortDid(row.did);
+        const tag = document.createElement("div");
+        tag.className = "tag";
+        tag.textContent = row.messages <= 1 ? "NEW ACCOUNT" : "RETURNING · " + row.messages;
+        wrap.append(did, tag);
+        book.append(wrap);
+      }
+    }
+
+    function showAgent(text, isErr) {
+      agentEmpty.hidden = true;
+      agentLog.hidden = false;
+      agentLog.classList.toggle("err", Boolean(isErr));
+      agentLog.textContent = text;
+    }
+
+    function formatStep(result) {
+      if (result.action === "unsigned") {
+        const ja = document.documentElement.lang !== "en";
+        return (ja
+          ? [
+              "鍵なし",
+              "質問: " + result.asked,
+              "結果: 拒否（署名がない）",
+              "台帳の行: " + result.accountCount + " — 顧客は増えていない",
+              "",
+              "ドアは作り方を返した。鍵を自分で作り、同じ POST をもう一度送る。口座開設のフォームはない。",
+            ]
+          : [
+              "UNSIGNED",
+              "ask: " + result.asked,
+              "result: refused (no signature)",
+              "ledger rows: " + result.accountCount + " — no customer minted",
+              "",
+              "The door answered the recipe. Mint a key locally and POST again. There is no signup form.",
+            ]
+        ).join("\n");
+      }
+      if (result.action === "reset") {
+        return "New visitor key\n" + result.visitorDid;
+      }
+      const ja = document.documentElement.lang !== "en";
+      const lines = [
+        result.action === "first"
+          ? (ja ? "署名あり · 初回来店" : "SIGNED · first visit")
+          : (ja ? "署名あり · 再来店" : "SIGNED · return visit"),
+        (ja ? "質問: " : "ask: ") + result.asked,
+        (ja ? "客: " : "from: ") + result.did,
+        (ja ? "この行のメッセージ数: " : "messages on this row: ") + result.messages,
+      ];
+      if (result.booking) {
+        lines.push("", JSON.stringify(result.booking, null, 2));
+      } else if (result.text) {
+        lines.push("", result.text);
+      }
+      return lines.join("\n");
+    }
+
+    async function step(action) {
+      const res = await fetch("/demo/step", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      const result = await res.json();
+      if (!res.ok) {
+        showAgent(result.error || res.statusText, true);
+        return result;
+      }
+      showAgent(formatStep(result), false);
+      renderBook(result.accounts);
+      return result;
+    }
+
+    for (const button of document.querySelectorAll("[data-step]")) {
+      button.addEventListener("click", () => step(button.getAttribute("data-step")));
+    }
+
+    document.getElementById("play-all").addEventListener("click", async () => {
+      const buttons = document.querySelectorAll(".play button");
+      for (const button of buttons) button.disabled = true;
+      try {
+        await step("reset");
+        await step("unsigned");
+        await new Promise((r) => setTimeout(r, 700));
+        await step("first");
+        await new Promise((r) => setTimeout(r, 700));
+        await step("again");
+      } finally {
+        for (const button of buttons) button.disabled = false;
+      }
+    });
+
+    fetch("/demo/state").then((r) => r.json()).then((state) => renderBook(state.accounts)).catch(() => {});
+  </script>
+</body>
+</html>
