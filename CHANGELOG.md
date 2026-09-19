@@ -20,6 +20,14 @@ unedited by the implementation.
 - Invariant: `verified`, account rows, rate lanes, refusals and wire bytes are identical under
   every configuration; no client address reaches a counter, the ledger, an envelope, a log line
   or the wire.
+- connectors: Muse recipe. `connectors/muse.md` is the page a Muse custom connector reads: run
+  `npx @muretai/agent-entry knock <card-url>` on the user's VM, and the knock seed there is that
+  user's did:key. A README bullet and an informative spec §5 paragraph ("Agent connectors") point
+  at it. Documented for Muse, not tested in Muse. Tests first: `conformance/muse-connector.mjs`
+  (commit `726bfd3`), unedited by the implementation.
+- `npx @muretai/agent-entry knock <card-url>` now works: `package.json` declares the `agent-entry`
+  bin, the module starts with a `#!/usr/bin/env node` line, and its main-module check compares
+  real paths, so it runs through the npm `.bin` symlink instead of exiting 0 silently.
 
 ### Decisions left open by the tests (F11), made here
 

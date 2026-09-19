@@ -4,6 +4,9 @@
   "description": "Agents already visit your site. Give them a way to become a customer: know who knocked, remember them next time, answer in the same request. Zero dependencies.",
   "type": "module",
   "main": "muretai-agent-entry.mjs",
+  "bin": {
+    "agent-entry": "muretai-agent-entry.mjs"
+  },
   "exports": {
     ".": "./muretai-agent-entry.mjs"
   },

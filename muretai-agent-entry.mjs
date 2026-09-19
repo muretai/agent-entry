@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // SPDX-License-Identifier: MIT
 /**
  * muretai-agent-entry.mjs
@@ -53,7 +54,7 @@ import {
 import { createServer } from 'node:http';
 import { Buffer } from 'node:buffer';
 import {
-  chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
@@ -4973,6 +4974,18 @@ async function knockMain(argv) {
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+/** Is this file the program being run? Compared as REAL paths: `npx @muretai/agent-entry
+ *  knock` starts it through the `node_modules/.bin/agent-entry` symlink, so argv[1] is the
+ *  link while import.meta.url is the file it points at. */
+function isMainModule() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
   process.exitCode = await knockMain(process.argv.slice(2));
 }
