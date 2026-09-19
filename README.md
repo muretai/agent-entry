@@ -205,8 +205,10 @@ Nothing is uploaded, and the Distiller is never imported by
 | `maxAccounts` | `50000` | how many accounts the in-process ledger holds |
 | `domains` | none | the domains this entry speaks for (see below) |
 | `basePath` | from `baseUrl` | the path this entry answers at, derived rather than set beside it |
-| `wbaVerifiers` | none | a JWKS document (`{"keys":[…]}`) of Ed25519 keys whose holders this entry should **recognise** on inbound signed requests (Web Bot Auth / RFC 9421 — see *Who is knocking*). Recognition only adds `env.wba_did` and a visit count; it never changes a verdict |
-| `observer` | none | called once per message with the same envelope your responder gets, plus `stage`, `identified`, `ua_family` and `client_class`, **after** the verdict — for counting, logging, analytics. It cannot matter: its return is discarded, a throw is swallowed, a promise is never awaited, so a slow or broken watcher cannot delay or change one byte of the signed reply. See [Counting visits](#counting-visits-without-handing-over-your-customer-list) |
+| `wbaVerifiers` | none | a JWKS document (`{"keys":[…]}`) of Ed25519 keys whose holders this entry should **recognise** on inbound signed requests (Web Bot Auth / RFC 9421 — see *Who is knocking*), or an array `[{vendor, jwks}]` that also says whose keys they are (the observer's `signature_agent`). Recognition only adds `env.wba_did` and a visit count; it never changes a verdict |
+| `trustProxy` | `false` | read the client address from `CF-Connecting-IP`, `Fly-Client-IP`, then the first `X-Forwarded-For` hop, and the country from `CF-IPCountry`. Turn it on **only** behind a proxy that overwrites those headers; off, they are not read at all |
+| `vendorRanges` | none | `{<vendor>: [CIDR, …]}` — whose network the client address belongs to, for the observer's `ip_vendor` and `entry.vendorStats()`. `scripts/vendor-ranges.mjs` writes one. An unknown vendor or a malformed CIDR refuses to start |
+| `observer` | none | called once per message with the same envelope your responder gets, plus `stage`, `identified`, `ua_family`, `client_class`, `ip_vendor`, `country` and `signature_agent`, **after** the verdict — for counting, logging, analytics. It cannot matter: its return is discarded, a throw is swallowed, a promise is never awaited, so a slow or broken watcher cannot delay or change one byte of the signed reply. See [Counting visits](#counting-visits-without-handing-over-your-customer-list) |
 | `howToUrl` | none | a page a keyless visitor is pointed at as a worked example. **Empty means omitted** — the refusal already teaches the whole recipe without it, and a reference implementation must not stamp somebody else's docs host into every door built from it. Only set it to a URL you operate, and only after checking it resolves |
 | `name`, `description`, `version` | — | the card's own words. `description` is the line a person reads in a directory listing — and the right place to say what you record about visitors, since it is fetched **before** the knock |
 
@@ -264,9 +266,67 @@ the same UA on the card or the door is `stealth-agent`; a leaking automation tok
 `<head>` tag. Still observation only — the same POST with or without that UA is the
 same refusal.
 
+**Since 1.12.0 the door can say whose network a visitor came from.** Three options, all off
+by default:
+
+```js
+import { readFileSync } from 'node:fs';
+const cache = JSON.parse(readFileSync('var/vendor-ranges.json', 'utf8'));
+
+const entry = createAgentEntry({
+  seedHex, name, baseUrl, responder, observer,
+  trustProxy: true,                     // only behind Cloudflare / Fly / a proxy you run
+  vendorRanges: cache.ranges,           // { openai: ['…/24'], google: […], … }
+  wbaVerifiers: JSON.parse(readFileSync('var/wba-verifiers.json', 'utf8')),
+});
+
+entry.vendorStats()
+// { openai: { card_get: 9, signed_post: 2 },
+//   none:   { card_get: 4, notice_get: 5 } }
+```
+
+- `trustProxy` — behind a proxy, the client address is read from `CF-Connecting-IP`, then
+  `Fly-Client-IP`, then the first hop of `X-Forwarded-For`; without it, the socket address is
+  the only address, and those headers are never read. A door on a public port with
+  `trustProxy` on would believe any header a visitor wrote, so leave it off there.
+- `vendorRanges` — `{<vendor>: [CIDR, …]}`, IPv4 and IPv6, matched in plain JavaScript. The
+  vendors are a fixed table (`VENDORS`: `openai`, `anthropic`, `google`, `microsoft`,
+  `perplexity`, `apple`, `meta`, `xai`, `cloudflare`, `aws`, `gcp`, `azure`, `fly`, `hetzner`,
+  `other`). The most specific range wins; two vendors listing the same range go to the one
+  earlier in that list. An unknown vendor or a malformed CIDR refuses to start.
+- `wbaVerifiers` — also accepts `[{vendor, jwks: {keys: […]}}]`, so a recognised signature
+  says whose key it was. The plain JWKS reads as `other`.
+
+The observer gets three fields on all five stages, next to `ua_family` and `client_class`:
+`ip_vendor` (a `VENDORS` name or null), `country` (two capital letters from `CF-IPCountry`
+under `trustProxy`, else null), and `signature_agent` (the vendor label of the Web Bot Auth key
+that signed the request, else null). `entry.vendorStats()` counts by `ip_vendor` (`none` for no
+match), in the same shape as `clientStats()`. The address itself lives for one request: it is
+in no counter, no ledger row, no observer envelope, no log line, and never on the wire.
+
+`scripts/vendor-ranges.mjs` fetches the ranges and key directories the vendors publish and
+writes `var/vendor-ranges.json` (`{fetched_at, ranges}`) and `var/wba-verifiers.json`. Run it at
+boot or from cron: `node node_modules/@muretai/agent-entry/scripts/vendor-ranges.mjs`. It
+refreshes at most once a day (`--force` to refresh now), fetches the large AWS and GCP lists only
+with `--large`, and on any failure keeps the previous files byte for byte and exits non-zero
+with one line saying why. The door never imports it and never fetches anything itself.
+
+Cloudflare knows more than the door can: its verified-bot category. The door does not read it,
+but one Transform Rule puts it where your own code can — Rules → Transform Rules → Modify
+Request Header → set dynamic `X-Verified-Bot-Category` to `cf.verified_bot_category`. Read it in
+the code that calls `handleRequest`, or in your logs.
+
+Honest limits. A range says whose **network** a request came from, not who sent it: a VPS on
+AWS is `aws`, and a crawler that moved is `null` until the lists catch up. Anthropic, Fly, Azure
+and Hetzner publish no list the helper can fetch, so they are named only if you add their ranges
+yourself. `country` exists only where Cloudflare adds `CF-IPCountry`. An agent that drives a
+stealth browser on a person's own login — the Instinct class — shows as `stealth-agent`, with
+at most a hosting vendor; it becomes a name only when it knocks with a DID.
+
 One rule holds this together, enforced by the contract suite rather than promised:
 **a User-Agent never affects `verified`, an account row, a rate limit, or any
-refusal.** A UA string is written by the client; a door that trusted it would be a
+refusal** — and neither does an address, a vendor range, a country, or a recognised
+signature. A UA string is written by the client; a door that trusted it would be a
 door anyone could talk their way through.
 
 ## Knock from any runtime
