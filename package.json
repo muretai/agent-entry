@@ -22,7 +22,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node conformance/run.mjs && node conformance/seam-twin.mjs && node conformance/recipes.mjs && node conformance/who-is-knocking.mjs && node conformance/vendor-ranges-helper.mjs",
+    "test": "node conformance/run.mjs && node conformance/seam-twin.mjs && node conformance/recipes.mjs && node conformance/who-is-knocking.mjs && node conformance/vendor-ranges-helper.mjs && node conformance/muse-connector.mjs",
+    "test:muse": "node conformance/muse-connector.mjs",
     "test:seam": "node conformance/seam-twin.mjs",
     "test:knocking": "node conformance/who-is-knocking.mjs",
     "test:vendor-ranges": "node conformance/vendor-ranges-helper.mjs",
