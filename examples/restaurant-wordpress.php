@@ -160,7 +160,7 @@ function mae_restaurant_card() {
             'tags' => array('restaurant', 'reservation', 'booking'),
             'examples' => array('Request a table for 4 on 2026-09-15 at 19:00'),
         )),
-        'agentEntry' => array('open_door' => true),
+        'agentEntry' => array('open_door' => true, 'catalog' => true),
         'muretai' => array('open_door' => true),
         'securitySchemes' => array('did-key-ed25519' => array(
             'type' => 'did-key-ed25519',

@@ -564,6 +564,8 @@ node or invitation. The two Node recipes run like `examples/server.mjs`: set one
 TLS. The serverless factory takes the same seed and a seven-method durable `store`; route its
 card GETs and root POST to the returned Fetch handler.
 
+Register with the Woo Catalog: `POST <catalog origin>/catalog/register` with your card URL; the flag `agentEntry.catalog: true` lets the catalog index your public Store API products (read-only).
+
 These are deliberately small request desks, not scheduling systems: replace each responder's
 `pending_*_confirmation` result with the business's own availability and confirmation write.
 Instinct, Muse, Grok Bot, Claude Code, OpenClaw, Hermes, or any other runtime that can hold an
