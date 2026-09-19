@@ -440,6 +440,21 @@ export const CLIENT_CLASSES = new Set([
   'declared-agent', 'named-tool', 'stealth-agent', 'human-like',
 ]);
 
+/** The vendors a door may NAME when it observes who is knocking (AE-31): the keys
+ *  `vendorRanges` accepts, the `vendor` labels an array-shaped `wbaVerifiers` accepts, and
+ *  the only non-null values `ip_vendor` / `signature_agent` can take. Bounded for the same
+ *  reason as the families above: an operator's typo must refuse to start (AE-32), and
+ *  nothing a client sends can become a label. ORDERED, and the order is load-bearing once:
+ *  when two configured ranges of the same prefix length hold an address, the vendor
+ *  earlier here wins. `none` is deliberately absent — it is the `vendorStats()` bucket for
+ *  "matched nothing", never a vendor. Must match `VENDORS` in the Python twin (a follow-up
+ *  there: examples/agent_entry_reference.py is not in this repository). */
+export const VENDORS = Object.freeze([
+  'openai', 'anthropic', 'google', 'microsoft', 'perplexity', 'apple', 'meta', 'xai',
+  'cloudflare', 'aws', 'gcp', 'azure', 'fly', 'hetzner', 'other',
+]);
+const VENDOR_INDEX = new Map(VENDORS.map((v, i) => [v, i]));
+
 /** ASCII-only lowercase fold. NOT `toLowerCase()`: Unicode casing is runtime- and
  *  locale-shaped (the Turkish-I class of surprise), and no needle in the table needs it —
  *  folding only A-Z is what makes the same UA string classify identically in both twins. */
@@ -493,6 +508,151 @@ function uaOf(headers) {
       const v = headers[key];
       return typeof v === 'string' ? v : null;
     }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------- who is knocking: addresses
+//
+// OBSERVATION ONLY (AE-31). Everything below turns an address into one of the fixed VENDORS
+// names or null, and nothing in the verdict path ever calls it. Pure JS, no dependency, and
+// strict: an address is dotted-quad IPv4 (no leading zeros — `010` is octal to some parsers
+// and decimal to others) or RFC 4291 text IPv6, and anything else is null, never a guess.
+
+/** Dotted-quad IPv4 -> BigInt, or null. */
+function parseIPv4(s) {
+  const parts = s.split('.');
+  if (parts.length !== 4) return null;
+  let n = 0n;
+  for (const p of parts) {
+    if (!/^(0|[1-9][0-9]{0,2})$/.test(p)) return null;
+    const v = Number(p);
+    if (v > 255) return null;
+    n = (n << 8n) | BigInt(v);
+  }
+  return n;
+}
+
+/** RFC 4291 text IPv6 (one `::` at most, an embedded dotted quad only as the last 32 bits)
+ *  -> BigInt, or null. No zone id: a scoped link-local address is nobody's crawler. */
+function parseIPv6(s) {
+  if (!/^[0-9A-Fa-f:.]+$/.test(s)) return null;
+  const gap = s.indexOf('::');
+  if (gap !== -1 && s.indexOf('::', gap + 1) !== -1) return null;
+  const pieces = (t) => (t === '' ? [] : t.split(':'));
+  const words = (list, quadLast) => {
+    const out = [];
+    for (let i = 0; i < list.length; i += 1) {
+      const p = list[i];
+      if (quadLast && i === list.length - 1 && p.includes('.')) {
+        const q = parseIPv4(p);
+        if (q === null) return null;
+        out.push(Number(q >> 16n), Number(q & 0xffffn));
+      } else if (/^[0-9A-Fa-f]{1,4}$/.test(p)) {
+        out.push(parseInt(p, 16));
+      } else {
+        return null;
+      }
+    }
+    return out;
+  };
+  const head = words(pieces(gap === -1 ? s : s.slice(0, gap)), gap === -1);
+  const tail = gap === -1 ? [] : words(pieces(s.slice(gap + 2)), true);
+  if (head === null || tail === null) return null;
+  if (gap === -1 ? head.length !== 8 : head.length + tail.length > 7) return null;
+  const all = gap === -1 ? head
+    : [...head, ...new Array(8 - head.length - tail.length).fill(0), ...tail];
+  let n = 0n;
+  for (const w of all) n = (n << 16n) | BigInt(w);
+  return n;
+}
+
+/** An address string -> {v: 4|6, n}, or null. An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`,
+ *  in either spelling — what a dual-stack Node socket reports for an IPv4 client) IS its
+ *  IPv4 address, so it matches IPv4 ranges. */
+function parseAddress(s) {
+  if (typeof s !== 'string' || s.length === 0 || s.length > 45) return null;
+  if (!s.includes(':')) {
+    const n = parseIPv4(s);
+    return n === null ? null : { v: 4, n };
+  }
+  const n = parseIPv6(s);
+  if (n === null) return null;
+  if ((n >> 32n) === 0xffffn) return { v: 4, n: n & 0xffffffffn };
+  return { v: 6, n };
+}
+
+/** A CIDR string -> {v, bits, prefix}, or null. Prefix lengths shorter than /8 (IPv4) or
+ *  /32 (IPv6) are refused: a vendor that owns a sixteenth of the internet is a typo. Host
+ *  bits past the prefix are dropped (`10.1.2.3/8` is `10.0.0.0/8`), as the vendors' own
+ *  lists never carry them. An IPv6 base inside ::ffff:0:0/96 is refused — an address there
+ *  is matched as IPv4, so that range could never match anything; write it as IPv4. */
+function parseCidr(s) {
+  if (typeof s !== 'string') return null;
+  const m = /^([^/]+)\/(0|[1-9][0-9]{0,2})$/.exec(s);
+  if (!m) return null;
+  const bits = Number(m[2]);
+  if (m[1].includes(':')) {
+    const n = parseIPv6(m[1]);
+    if (n === null || bits < 32 || bits > 128 || (n >> 32n) === 0xffffn) return null;
+    return { v: 6, bits, prefix: n >> BigInt(128 - bits) };
+  }
+  const n = parseIPv4(m[1]);
+  if (n === null || bits < 8 || bits > 32) return null;
+  return { v: 4, bits, prefix: n >> BigInt(32 - bits) };
+}
+
+/** Validate and compile `vendorRanges` ({<vendor>: [CIDR, …]}) into per-family lists of
+ *  [prefixLength, Map(prefix -> vendor index)], longest prefix first — so a lookup is at
+ *  most one Map probe per distinct prefix length, and THE MOST SPECIFIC RANGE WINS; two
+ *  vendors listing the same prefix go to the one earlier in VENDORS. Throws a TypeError
+ *  naming the offending key or CIDR (AE-32). Null when nothing is configured. */
+function compileVendorRanges(vendorRanges) {
+  if (vendorRanges === null || vendorRanges === undefined) return null;
+  if (typeof vendorRanges !== 'object' || Array.isArray(vendorRanges)) {
+    throw new TypeError('createAgentEntry: vendorRanges must be an object '
+      + '{<vendor>: [CIDR, …]} keyed by VENDORS names');
+  }
+  const byFamily = { 4: new Map(), 6: new Map() };
+  let count = 0;
+  for (const vendor of Object.keys(vendorRanges)) {
+    if (!VENDOR_INDEX.has(vendor)) {
+      throw new TypeError(`createAgentEntry: vendorRanges key ${JSON.stringify(vendor)} is not `
+        + `a vendor — one of ${VENDORS.join(', ')} (case-exact)`
+        + (vendor === 'none' ? '; "none" is the vendorStats() bucket for no match' : ''));
+    }
+    const list = vendorRanges[vendor];
+    if (!Array.isArray(list)) {
+      throw new TypeError(`createAgentEntry: vendorRanges.${vendor} must be an array of CIDR strings`);
+    }
+    list.forEach((cidr, i) => {
+      const c = parseCidr(cidr);
+      if (c === null) {
+        throw new TypeError(`createAgentEntry: vendorRanges.${vendor}[${i}] is not a CIDR this door `
+          + `accepts: ${String(JSON.stringify(cidr)).slice(0, 80)} — IPv4 a.b.c.d/8…/32 or IPv6 x::/32…/128`);
+      }
+      let byPrefix = byFamily[c.v].get(c.bits);
+      if (!byPrefix) { byPrefix = new Map(); byFamily[c.v].set(c.bits, byPrefix); }
+      const held = byPrefix.get(c.prefix);
+      const mine = VENDOR_INDEX.get(vendor);
+      if (held === undefined || mine < held) byPrefix.set(c.prefix, mine);
+      count += 1;
+    });
+  }
+  if (count === 0) return null;
+  const ordered = (m) => [...m].sort((a, b) => b[0] - a[0]);
+  return { 4: ordered(byFamily[4]), 6: ordered(byFamily[6]) };
+}
+
+/** The VENDORS name whose range holds `address`, or null. Total on hostile input. */
+function vendorOfAddress(table, address) {
+  if (!table) return null;
+  const a = parseAddress(address);
+  if (a === null) return null;
+  const width = a.v === 4 ? 32n : 128n;
+  for (const [bits, byPrefix] of table[a.v]) {
+    const at = byPrefix.get(a.n >> (width - BigInt(bits)));
+    if (at !== undefined) return VENDORS[at];
   }
   return null;
 }
@@ -3063,8 +3223,30 @@ export function canonicalMount(canonUrl, basePath) {
  *                  feature is entirely off: no header is read, bytes are unchanged.
  *                  Recognition only ever ADDS identity (env.wba_did, the wbaVisits
  *                  count); it never changes verified, a ledger row, a rate lane or any
- *                  refusal verdict.
- *   observer       OPTIONAL `(env) => void` — a WATCHER, called once per message with the
+ *                  refusal verdict. Also accepted: an ARRAY [{vendor, jwks:{keys:[…]}}, …]
+ *                  labelling each directory with a VENDORS name, so the observer can say
+ *                  WHOSE key signed (`signature_agent`); the plain JWKS reads as 'other'.
+ *                  At most 64 keys in total, whichever shape.
+ *   trustProxy     OPTIONAL, default false. When true the client address is read from,
+ *                  in order, `CF-Connecting-IP`, `Fly-Client-IP`, the FIRST hop of
+ *                  `X-Forwarded-For` — the first of those present decides, even when its
+ *                  value is not an address — else the socket; and `CF-IPCountry` becomes
+ *                  `country`. When false none of those headers is read at all: a door not
+ *                  behind a proxy must not be told its visitor's address by the visitor.
+ *                  Only a boolean is accepted.
+ *   vendorRanges   OPTIONAL {<vendor>: [CIDR, …]}, keys from VENDORS, IPv4 /8…/32 and
+ *                  IPv6 /32…/128 (the `ranges` object scripts/vendor-ranges.mjs writes).
+ *                  The client address is matched against it for `ip_vendor`, most
+ *                  specific range first. An unknown key or a malformed CIDR refuses to
+ *                  start (AE-32).
+ *
+ *                  WHO IS KNOCKING IS OBSERVATION (AE-31). `trustProxy`, `vendorRanges`
+ *                  and the vendor labels feed three observer fields and
+ *                  `entry.vendorStats()`, and nothing else: not `verified`, not an account
+ *                  row, not a rate lane, not a refusal, not a wire byte, and not the
+ *                  responder's envelope. The address itself lives for one request and is
+ *                  never stored, counted, logged or sent.
+ *   observer      OPTIONAL `(env) => void` — a WATCHER, called once per message with the
  *                  same frozen envelope the responder gets. It exists so that OBSERVING a
  *                  visit is not the same edit as ANSWERING one: wanting a counter should
  *                  not mean reaching into the code that decides what to say.
@@ -3084,7 +3266,12 @@ export function canonicalMount(canonUrl, basePath) {
  *                  `client_class`, the four-way split (`declared-agent` / `named-tool` /
  *                  `stealth-agent` / `human-like`) that tells an operator whether a
  *                  Firefox-looking knock is a stealth agent at the door or a human who
- *                  opened the notice. The POST stages add the envelope on top.
+ *                  opened the notice. The POST stages add the envelope on top. Every stage
+ *                  also carries `ip_vendor` (a VENDORS name or null), `country` (two ASCII
+ *                  capitals from `CF-IPCountry` under `trustProxy`, or null) and
+ *                  `signature_agent` (the VENDORS label of the Web Bot Auth key that
+ *                  signed the request, or null) — the observer's only; the responder's
+ *                  envelope never gains them.
  *
  *                  WHAT NOT TO PUT IN IT. The envelope carries `peer_did`/`owner_did`,
  *                  which a visitor handed you to transact with YOU. Forwarding a raw DID to
@@ -3114,6 +3301,8 @@ export function createAgentEntry({
   howToUrl = FIRST_KNOCK_URL,
   observer = null,
   wbaVerifiers = null,
+  trustProxy = false,
+  vendorRanges = null,
   store = null,
 } = {}) {
   if (!seedHex) throw new TypeError('createAgentEntry: seedHex is required');
@@ -3339,25 +3528,68 @@ export function createAgentEntry({
   // count is bounded by the configured key list, never by attacker choice. Exposed on
   // the returned object like `ledger` (in-process sample state, never on the wire).
   const wbaVisits = new Map();
+  // DID -> the VENDORS label of the directory its key came from. OBSERVATION ONLY: read by
+  // nothing but the observer's `signature_agent`, so the array shape and the legacy shape
+  // recognise exactly the same signers with exactly the same verdicts.
+  const wbaVendorOf = new Map();
   if (wbaVerifiers !== null && wbaVerifiers !== undefined) {
-    const keys = (wbaVerifiers && typeof wbaVerifiers === 'object'
-      && !Array.isArray(wbaVerifiers)) ? wbaVerifiers.keys : null;
-    if (!Array.isArray(keys) || keys.length === 0) {
-      throw new TypeError('createAgentEntry: wbaVerifiers must be a JWKS document '
-        + '{keys:[…]} — the key-directory body you verified out of band');
+    // One list of {vendor, keys, where}, whichever shape was given; the legacy JWKS is one
+    // directory labelled 'other'.
+    let groups;
+    if (Array.isArray(wbaVerifiers)) {
+      if (wbaVerifiers.length === 0) {
+        throw new TypeError('createAgentEntry: wbaVerifiers is an empty array — give '
+          + '[{vendor, jwks:{keys:[…]}}, …] or leave it unset');
+      }
+      groups = wbaVerifiers.map((entry, i) => {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+          throw new TypeError(`createAgentEntry: wbaVerifiers[${i}] must be {vendor, jwks:{keys:[…]}}`);
+        }
+        if (!VENDOR_INDEX.has(entry.vendor)) {
+          throw new TypeError(`createAgentEntry: wbaVerifiers[${i}].vendor `
+            + `${String(JSON.stringify(entry.vendor)).slice(0, 80)} is not a vendor — one of `
+            + `${VENDORS.join(', ')} (case-exact)`);
+        }
+        const jwks = entry.jwks;
+        const keys = (jwks && typeof jwks === 'object' && !Array.isArray(jwks)) ? jwks.keys : null;
+        if (!Array.isArray(keys) || keys.length === 0) {
+          throw new TypeError(`createAgentEntry: wbaVerifiers[${i}].jwks must be a JWKS document `
+            + '{keys:[…]} — the key-directory body you verified out of band');
+        }
+        return { vendor: entry.vendor, keys, where: `wbaVerifiers[${i}].jwks.keys` };
+      });
+    } else {
+      const keys = (wbaVerifiers && typeof wbaVerifiers === 'object') ? wbaVerifiers.keys : null;
+      if (!Array.isArray(keys) || keys.length === 0) {
+        throw new TypeError('createAgentEntry: wbaVerifiers must be a JWKS document '
+          + '{keys:[…]} — the key-directory body you verified out of band — or an array '
+          + '[{vendor, jwks:{keys:[…]}}, …]');
+      }
+      groups = [{ vendor: 'other', keys, where: 'wbaVerifiers.keys' }];
     }
-    if (keys.length > 64) {
-      throw new TypeError(`createAgentEntry: wbaVerifiers holds ${keys.length} keys — `
+    const total = groups.reduce((n, g) => n + g.keys.length, 0);
+    if (total > 64) {
+      throw new TypeError(`createAgentEntry: wbaVerifiers holds ${total} keys — `
         + 'more than 64 is not a verifier list, it is a directory dump');
     }
-    keys.forEach((jwk, i) => {
-      if (wbaPublicFromJwk(jwk) === null) {
-        throw new TypeError(`createAgentEntry: wbaVerifiers.keys[${i}] is not an `
-          + 'Ed25519 OKP JWK (kty "OKP", crv "Ed25519", x = unpadded base64url of '
-          + '32 bytes)');
+    for (const { keys, where } of groups) {
+      keys.forEach((jwk, i) => {
+        if (wbaPublicFromJwk(jwk) === null) {
+          throw new TypeError(`createAgentEntry: ${where}[${i}] is not an `
+            + 'Ed25519 OKP JWK (kty "OKP", crv "Ed25519", x = unpadded base64url of '
+            + '32 bytes)');
+        }
+      });
+    }
+    wbaKeys = { keys: groups.flatMap((g) => g.keys.map((k) => ({ kty: k.kty, crv: k.crv, x: k.x }))) };
+    // A key listed under two vendors keeps the first label, the same first-wins rule
+    // `wbaVerifyRequest` applies when it walks the keys.
+    for (const { vendor, keys } of groups) {
+      for (const k of keys) {
+        const signer = didFromPublicKeyHex(wbaPublicFromJwk(k));
+        if (!wbaVendorOf.has(signer)) wbaVendorOf.set(signer, vendor);
       }
-    });
-    wbaKeys = { keys: keys.map((k) => ({ kty: k.kty, crv: k.crv, x: k.x })) };
+    }
     // @authority derives from the CANONICAL baseUrl, NEVER a Host header — a header a
     // client can set is not a fact about where we were reached. canonUrl already
     // lowercased the host and stripped the scheme's default port, so URL.host IS the
@@ -3373,9 +3605,52 @@ export function createAgentEntry({
     return wbaVerifyRequest(headers, { authority: wbaAuthority, jwks: wbaKeys });
   }
 
+  /** Count a WBA-verified GET/HEAD, and return the signer's VENDORS label (or null) for the
+   *  observer — one verification serves both. */
   function wbaObserve(headers) {
     const did = wbaIdentify(headers);
     if (did) wbaVisits.set(did, (wbaVisits.get(did) || 0) + 1);
+    return did ? (wbaVendorOf.get(did) ?? null) : null;
+  }
+
+  // ---------------------------------------------------------------- who is knocking (AE-31)
+  //
+  // A SIDE CHANNEL. `look()` below is computed once per request by `route()` and handed ONLY
+  // to the observation points (`tally`, `respond`'s observer copy, `observeRefusal`). The
+  // ladder never receives it, so no configuration of these options can reach `verified`, an
+  // account row, a rate lane, a refusal or a wire byte — the contract suite replays one
+  // script under every configuration and compares all of those byte for byte.
+  if (trustProxy !== true && trustProxy !== false && trustProxy !== null) {
+    throw new TypeError('createAgentEntry: trustProxy must be true or false — only a door '
+      + 'behind a proxy that overwrites CF-Connecting-IP / Fly-Client-IP / X-Forwarded-For '
+      + 'may believe them');
+  }
+  const trustsProxy = trustProxy === true;
+  const vendorTable = compileVendorRanges(vendorRanges);
+
+  /** The client address this request came from, per `trustProxy`. Returned to `look()` and
+   *  dropped there: the one place an address exists, for one call. */
+  function clientAddress(headers, conn) {
+    if (trustsProxy) {
+      for (const name of ['cf-connecting-ip', 'fly-client-ip']) {
+        const v = wbaHeaderGet(headers, name);
+        if (v !== null && v.trim() !== '') return v.trim();
+      }
+      const xff = wbaHeaderGet(headers, 'x-forwarded-for');
+      if (xff !== null && xff.trim() !== '') return xff.split(',')[0].trim();
+    }
+    return conn && typeof conn.remoteAddress === 'string' ? conn.remoteAddress : null;
+  }
+
+  /** The two request-level observation fields. Bounded by construction: `ip_vendor` is a
+   *  VENDORS name or null, `country` is exactly two ASCII capitals or null — never a
+   *  substring of anything the client sent beyond those two letters. */
+  function look(headers, conn) {
+    const cc = trustsProxy ? wbaHeaderGet(headers, 'cf-ipcountry') : null;
+    return {
+      ip_vendor: vendorTable ? vendorOfAddress(vendorTable, clientAddress(headers, conn)) : null,
+      country: cc !== null && /^[A-Z]{2}$/.test(cc) ? cc : null,
+    };
   }
 
   // family -> stage -> count. OBSERVATION ONLY, and out-of-contract sample state like the
@@ -3385,6 +3660,9 @@ export function createAgentEntry({
   // five stage names — an attacker choosing UA strings cannot grow it.
   const uaStats = new Map();
   const clientStatsMap = new Map();
+  // ip_vendor (or 'none') -> stage -> count. Same contract as the two above; keyspace
+  // bounded by VENDORS plus 'none'.
+  const vendorStatsMap = new Map();
 
   /** Count the stage, and tell the watcher about it.
    *
@@ -3404,8 +3682,12 @@ export function createAgentEntry({
    *  DIDs, no text, `verified: false`. The POST stages are handed to `respond()` /
    *  `observeRefusal()` instead, which know the envelope — one visit, one row, never two.
    *  `ua_family` is the one field BOTH sides report, so a watcher can ask "which clients got
-   *  in and which were turned away" as one question instead of two half-answers. */
-  function tally(family, stage) {
+   *  in and which were turned away" as one question instead of two half-answers.
+   *
+   *  `seen` is the request's observation (`look()` plus `signature_agent`): counted under
+   *  `vendorStats()` here, at the same point as the other two splits, so all three always
+   *  count the same visits. */
+  function tally(family, stage, seen) {
     let row = uaStats.get(family);
     if (!row) { row = new Map(); uaStats.set(family, row); }
     row.set(stage, (row.get(stage) || 0) + 1);
@@ -3413,11 +3695,17 @@ export function createAgentEntry({
     let crow = clientStatsMap.get(cls);
     if (!crow) { crow = new Map(); clientStatsMap.set(cls, crow); }
     crow.set(stage, (crow.get(stage) || 0) + 1);
+    const vendor = seen.ip_vendor ?? 'none';
+    let vrow = vendorStatsMap.get(vendor);
+    if (!vrow) { vrow = new Map(); vendorStatsMap.set(vendor, vrow); }
+    vrow.set(stage, (vrow.get(stage) || 0) + 1);
     if (typeof observer !== 'function') return;
     if (stage === 'card_get' || stage === 'notice_get') {
       observe({ stage, identified: 0, verified: false, ua_family: family,
                 client_class: cls,
-                peer_did: null, owner_did: null, wba_did: null, text: null });
+                peer_did: null, owner_did: null, wba_did: null, text: null,
+                ip_vendor: seen.ip_vendor, country: seen.country,
+                signature_agent: seen.signature_agent });
     }
   }
 
@@ -3438,6 +3726,18 @@ export function createAgentEntry({
     for (const [cls, row] of clientStatsMap) {
       out[cls] = {};
       for (const [stage, n] of row) out[cls][stage] = n;
+    }
+    return out;
+  }
+
+  /** A plain JSON-able copy of the vendor counters: { <ip_vendor|'none'>: { stage: n } }.
+   *  Same contract again: in-process only, never on the wire, and no address in it — the
+   *  key is the VENDORS name the address matched, never the address. */
+  function vendorStats() {
+    const out = {};
+    for (const [vendor, row] of vendorStatsMap) {
+      out[vendor] = {};
+      for (const [stage, n] of row) out[vendor][stage] = n;
     }
     return out;
   }
@@ -3704,6 +4004,11 @@ export function createAgentEntry({
    *  responder and can never disagree with the stage it is reported beside. */
   let pendingFamily = 'none';
 
+  /** The request's `look()` for the POST in flight — `ip_vendor` and `country` — handed to
+   *  the same two observation points as `pendingFamily`, set and read together with it, and
+   *  never read by the ladder. Bounded values only: the address it came from is gone. */
+  let pendingLook = { ip_vendor: null, country: null };
+
   /** Shadows the module-level `rpcError` for the whole entry: same return value, and it
    *  remembers the code on the way out. A local alias rather than seventeen edits, and rather
    *  than a parameter every refusal site would have to remember to pass. */
@@ -3732,7 +4037,7 @@ export function createAgentEntry({
    *  A refusal hands the watcher only what was actually established: `refused` carries the
    *  JSON-RPC code and the DIDs are null, because a walk-in that named nobody named nobody. The
    *  watcher still cannot matter — same swallowed throw, same discarded return. */
-  function handlePost(rawBody, reqHeaders) {
+  function handlePost(rawBody, reqHeaders, seen) {
     lastRefusal = null;
     // The stage a POST reaches is decided by whether it CARRIED a signature, which is knowable
     // from the request alone — so it is settled here, before the ladder answers, and read by
@@ -3740,6 +4045,8 @@ export function createAgentEntry({
     // finished reply, for the counters; the two agree because they ask the same question.
     pendingStage = postRequestStage(rawBody);
     pendingFamily = uaFamily(uaOf(reqHeaders));
+    pendingLook = seen;
+    // `seen` stops here: the ladder is called exactly as before, without it.
     const out = handlePostLadder(rawBody, reqHeaders);
     if (isThenable(out)) return out.then((o) => { observeRefusal(); return o; });
     observeRefusal();
@@ -3753,7 +4060,11 @@ export function createAgentEntry({
     observe({ verified: false, refused: lastRefusal, stage: 'refused_post',
               identified: pendingStage === 'signed_post' ? 1 : 0, ua_family: pendingFamily,
               client_class: clientClass(pendingFamily, 'refused_post'),
-              peer_did: null, owner_did: null, wba_did: null, text: null });
+              peer_did: null, owner_did: null, wba_did: null, text: null,
+              // A refusal establishes no transport signer, so it names none: `wba_did` is
+              // null here and so is its label, and a refused flood never costs a verify.
+              ip_vendor: pendingLook.ip_vendor, country: pendingLook.country,
+              signature_agent: null });
   }
 
   /** Did this POST body carry a signature? That is the whole difference between a keyless
@@ -4068,9 +4379,13 @@ export function createAgentEntry({
     // The answered case: the envelope already says who this was, and the stage says how they
     // arrived. `identified` is read off the envelope rather than the stage, because the
     // anonymous lane answers a visitor who genuinely presented no DID.
+    // The three who-is-knocking fields go on the OBSERVER's copy only; `env` itself — the
+    // frozen backend-handoff shape the responder gets below — is not touched.
     observe({ ...env, stage: pendingStage, ua_family: pendingFamily,
               client_class: clientClass(pendingFamily, pendingStage),
-              identified: env && env.peer_did ? 1 : 0 });
+              identified: env && env.peer_did ? 1 : 0,
+              ip_vendor: pendingLook.ip_vendor, country: pendingLook.country,
+              signature_agent: env && env.wba_did ? (wbaVendorOf.get(env.wba_did) ?? null) : null });
     let answer;
     try {
       answer = responder(env);
@@ -4134,10 +4449,13 @@ export function createAgentEntry({
     return { Allow: allow, 'Access-Control-Allow-Methods': allow };
   }
 
-  function route(method, path, bodyBuffer, headers) {
+  function route(method, path, bodyBuffer, headers, conn) {
     // Classified ONCE per request, used only to count and to signpost. Everything the
     // ladder decides is decided exactly as if this line did not exist.
     const family = uaFamily(uaOf(headers));
+    // The same holds for `seen` (AE-31): observation only, and the connection it was read
+    // from is not passed anywhere past this line.
+    const seen = look(headers, conn);
     const target = String(path || '/');
     // ORIGIN FORM ONLY, and SAY SO. HTTP/1.1 lets a client write the request-target in
     // absolute form (`POST http://elsewhere.example/support HTTP/1.1`) and RFC 9112 §3.2.2
@@ -4159,16 +4477,17 @@ export function createAgentEntry({
         // Byte-identical on every path: the current A2A path, the legacy alias, and (on a
         // guest mount) the origin's well-known copy of both. Which address a client
         // happened to fetch must never change what it believes about this DID.
-        tally(family, 'card_get');
         // T107: identify (count), never enrol, never change a byte. Runs only after a
-        // route MATCHED, so refused/404 paths never pay for crypto.
-        wbaObserve(headers);
+        // route MATCHED, so refused/404 paths never pay for crypto. The signer's label is
+        // told to the watcher: a crawler's Web Bot Auth arrives on the card fetch.
+        const signatureAgent = wbaObserve(headers);
+        tally(family, 'card_get', { ...seen, signature_agent: signatureAgent });
         return { status: 200, headers: cardHeaders(cardBytes.length), body: cardBytes };
       }
       if (SIG_ROUTES.has(pathname)) {
         const env = cardEnvelopeBytes();
-        tally(family, 'card_get');
-        wbaObserve(headers);
+        const signatureAgent = wbaObserve(headers);
+        tally(family, 'card_get', { ...seen, signature_agent: signatureAgent });
         return { status: 200, headers: cardHeaders(env.length), body: env };
       }
       // The human notice — NOT served on a guest mount, where GET belongs to the site (E3).
@@ -4176,8 +4495,8 @@ export function createAgentEntry({
       // already makes: an entry beside other agents does not confirm what lives at an
       // address it was not given.
       if (!guestMount && isMountPath(pathname)) {
-        tally(family, 'notice_get');
-        wbaObserve(headers);
+        const signatureAgent = wbaObserve(headers);
+        tally(family, 'notice_get', { ...seen, signature_agent: signatureAgent });
         const body = Buffer.from(
           // "This ADDRESS", not "this origin": once an entry can be mounted under a
           // path, the origin may hold several agents and this notice speaks for exactly
@@ -4236,13 +4555,15 @@ export function createAgentEntry({
         return jsonResponse(404, { error: 'not found' });
       }
       const buf = bodyBuffer || Buffer.alloc(0);
-      const out = handlePost(buf, headers);
+      const out = handlePost(buf, headers, seen);
       // The stage is read off the finished answer, so an async responder tallies when it
       // resolves. Known micro-skew, accepted: in the misconfigured sync-caller-with-async-
       // responder case `handleRequest` replaces the thenable with -32603 AFTER this wrap,
       // so a stage is tallied for a reply that was then replaced. Sample state only.
-      if (isThenable(out)) return out.then((o) => { tally(family, postStage(buf, o)); return o; });
-      tally(family, postStage(buf, out));
+      // `vendorStats()` needs only `ip_vendor`, so the POST tally carries no signer label.
+      const counted = { ...seen, signature_agent: null };
+      if (isThenable(out)) return out.then((o) => { tally(family, postStage(buf, o), counted); return o; });
+      tally(family, postStage(buf, out), counted);
       return out;
     }
     // Everything below answers for a RESOURCE, so an address this entry does not own is a
@@ -4276,9 +4597,13 @@ export function createAgentEntry({
 
   /** SYNCHRONOUS request handling: (method, path, headers, bodyBuffer) -> {status, headers, body}.
    *  If `responder` returned a Promise, this answers -32603 rather than serializing
-   *  "[object Promise]" into a signed reply — use `handleRequestAsync` for an async responder. */
-  function handleRequest(method, path, headers, bodyBuffer) {
-    const out = route(method, path, bodyBuffer, headers);
+   *  "[object Promise]" into a signed reply — use `handleRequestAsync` for an async responder.
+   *
+   *  The optional fifth argument is the connection, `{ remoteAddress }`, spelled as Node's
+   *  `req.socket.remoteAddress`: the address `vendorRanges` matches when `trustProxy` is off
+   *  (or no proxy header came). Observation only; absent, `ip_vendor` is null. */
+  function handleRequest(method, path, headers, bodyBuffer, conn) {
+    const out = route(method, path, bodyBuffer, headers, conn);
     if (isThenable(out)) {
       // Two different causes, and an operator can only fix the one they are told about.
       // A `store` makes EVERY message path async by construction, so saying "responder is
@@ -4293,8 +4618,8 @@ export function createAgentEntry({
   }
 
   /** Same contract, awaiting an async responder. This is what `listen()` uses. */
-  async function handleRequestAsync(method, path, headers, bodyBuffer) {
-    return route(method, path, bodyBuffer, headers);
+  async function handleRequestAsync(method, path, headers, bodyBuffer, conn) {
+    return route(method, path, bodyBuffer, headers, conn);
   }
 
   /**
@@ -4337,7 +4662,8 @@ export function createAgentEntry({
         // attacker the very allocation the 413 exists to refuse.
         const body = oversize ? oversizeSentinel() : Buffer.concat(chunks, total);
         Promise.resolve()
-          .then(() => handleRequestAsync(req.method, req.url, req.headers, body))
+          .then(() => handleRequestAsync(req.method, req.url, req.headers, body,
+            { remoteAddress: req.socket ? req.socket.remoteAddress : undefined }))
           .catch(() => rpcError(null, ERRORS.INTERNAL_ERROR, 'the entry failed to answer'))
           .then(({ status, headers, body: out }) => {
             res.writeHead(status, headers);
@@ -4373,9 +4699,9 @@ export function createAgentEntry({
   // `mount` is exported so a host app can route exactly what this entry answers (and log
   // it): it is derived, so reading it here can never disagree with the signed card.
   // `stats` is the owner-facing UA-family counters, `clientStats` the four-way
-  // traffic-class split, and `wbaVisits` the DID->count of WBA-verified fetches —
-  // all in-process only, like `ledger`.
-  return { did, card, ledger, mount, stats, clientStats, wbaVisits,
+  // traffic-class split, `vendorStats` the split by `ip_vendor`, and `wbaVisits` the
+  // DID->count of WBA-verified fetches — all in-process only, like `ledger`.
+  return { did, card, ledger, mount, stats, clientStats, vendorStats, wbaVisits,
     handleRequest, handleRequestAsync, listen,
     cardEnvelope: () => JSON.parse(cardEnvelopeBytes().toString('utf8')) };
 }
