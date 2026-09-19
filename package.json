@@ -21,8 +21,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node conformance/run.mjs && node conformance/seam-twin.mjs && node conformance/recipes.mjs",
+    "test": "node conformance/run.mjs && node conformance/seam-twin.mjs && node conformance/recipes.mjs && node conformance/who-is-knocking.mjs && node conformance/vendor-ranges-helper.mjs",
     "test:seam": "node conformance/seam-twin.mjs",
+    "test:knocking": "node conformance/who-is-knocking.mjs",
+    "test:vendor-ranges": "node conformance/vendor-ranges-helper.mjs",
     "vendor:seam": "node scripts/vendor-seam.mjs",
     "build:vectors": "node scripts/build-vectors.mjs",
     "check:vectors": "node scripts/build-vectors.mjs --check",
