@@ -1,0 +1,2985 @@
+{
+  "about": "Agent Entry Suite S1 (agent-entry.json, verbs first). Byte-pinned compile vectors: compileDeclaration(declaration, { version }) must produce a contract whose canonicalJSON equals canonicalJSON(contract) below, byte for byte, every time. skillsFromOffers(declaration) must produce skills[] deep-equal to skills below, in order.",
+  "rules": {
+    "registry": [
+      "find",
+      "ask",
+      "quote",
+      "book",
+      "hold",
+      "order",
+      "buy",
+      "track",
+      "change",
+      "cancel",
+      "join"
+    ],
+    "defaultEffect": {
+      "find": "none",
+      "ask": "none",
+      "quote": "none",
+      "book": "changes",
+      "hold": "changes",
+      "order": "changes",
+      "buy": "pays",
+      "track": "none",
+      "change": "changes",
+      "cancel": "reversible",
+      "join": "changes"
+    },
+    "effectOrder": [
+      "none",
+      "reversible",
+      "changes",
+      "pays"
+    ],
+    "askOrder": [
+      "never",
+      "advised",
+      "always"
+    ],
+    "askFloor": {
+      "none": "never",
+      "reversible": "advised",
+      "changes": "advised",
+      "pays": "always"
+    },
+    "thenDoorByDefault": [
+      "changes",
+      "pays"
+    ],
+    "receiptByDefault": [
+      "hold",
+      "book",
+      "order",
+      "quote"
+    ],
+    "replyKinds": [
+      "catalog",
+      "facts",
+      "pending",
+      "checkout",
+      "brain",
+      "human"
+    ],
+    "pageActions": [
+      "open",
+      "read",
+      "fill",
+      "fetch",
+      "call"
+    ],
+    "inputTypes": [
+      "string",
+      "integer",
+      "number",
+      "boolean"
+    ],
+    "offerId": "verb + \"_\" + of",
+    "verbAndOfSpelling": "^[a-z][a-z0-9_]*$",
+    "unknownVerb": "accepted as a pass-through with NO defaults: no effect, ask or then unless the offer declares them; door.receipt defaults to false",
+    "effect": "offer.effect may raise the verb default (effectOrder); lowering it is refused",
+    "ask": "offer.ask may raise the floor of the resolved effect (askOrder); below the floor is refused",
+    "then": "\"door\" when offer.then is \"door\", or page.then is \"door\", or the resolved effect is in thenDoorByDefault; absent when offer.then is \"none\"; absent otherwise",
+    "contract": "{ v: 1, name: entry.name, origins, version, offers, facts (only when declared), hash }",
+    "origins": "origin of entry.baseUrl first, then \"https://\" + lowercased entry.domains[i], in order, without duplicates",
+    "compiledOffer": "{ id, verb, of, about, input, effect?, ask?, then?, page?: { on, do }, door?: { reply, receipt, url? } } - page.then is folded into then",
+    "hash": "lowercase hex sha256 of the UTF-8 bytes of canonicalJSON(contract without hash)",
+    "served": "every contract is served as the UTF-8 bytes of canonicalJSON(contract)",
+    "skill": "{ id, name: id, description: about, tags: [verb, of], examples } - examples[0] is about; when input is non-empty, examples[1] is verb + \" \" + of + \" \" + canonicalJSON of { <field>: \"<\" + type + \">\" } over the input keys sorted",
+    "checkoutUrl": "a same-origin path: starts with \"/\" and not \"//\""
+  },
+  "vectors": [
+    {
+      "name": "harbor-lamp-every-reply-kind-and-facts",
+      "version": 1,
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Harbor Lamp",
+          "baseUrl": "https://shop.example",
+          "domains": [],
+          "prefer": [
+            {
+              "kind": "page",
+              "when": "person"
+            },
+            "card"
+          ],
+          "catalog": true
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "products",
+            "about": "Find lamps by words or category.",
+            "input": {
+              "q": "string"
+            },
+            "page": {
+              "on": [
+                "/shop/**"
+              ],
+              "do": {
+                "fetch": {
+                  "method": "GET",
+                  "path": "/wp-json/wc/store/v1/products",
+                  "query": {
+                    "search": "q"
+                  }
+                }
+              }
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          },
+          {
+            "verb": "hold",
+            "of": "item",
+            "about": "Hold one lamp for pickup within 48 hours.",
+            "input": {
+              "sku": "string",
+              "name": "string"
+            },
+            "page": {
+              "on": [
+                "/product/*"
+              ],
+              "do": {
+                "fill": {
+                  "form": "#hold"
+                }
+              },
+              "then": "door"
+            },
+            "door": {
+              "reply": "pending",
+              "receipt": true
+            }
+          },
+          {
+            "verb": "book",
+            "of": "table",
+            "about": "Reserve a table.",
+            "input": {
+              "party": "integer",
+              "when": "string"
+            },
+            "door": {
+              "reply": "pending",
+              "receipt": true
+            }
+          },
+          {
+            "verb": "buy",
+            "of": "order",
+            "about": "Pay for a held or chosen item.",
+            "input": {
+              "hold_id": "string"
+            },
+            "page": {
+              "on": [
+                "/checkout/**"
+              ],
+              "do": {
+                "open": "/checkout?hold={hold_id}"
+              }
+            },
+            "door": {
+              "reply": "checkout",
+              "url": "/checkout?hold={hold_id}"
+            }
+          },
+          {
+            "verb": "ask",
+            "of": "anything",
+            "about": "Ask the shop a question.",
+            "input": {
+              "text": "string"
+            },
+            "door": {
+              "reply": "human"
+            }
+          }
+        ],
+        "facts": {
+          "hours": "Tue-Sun 10:00-18:00",
+          "pickup": "48h",
+          "returns": "14 days"
+        }
+      },
+      "contract": {
+        "v": 1,
+        "name": "Harbor Lamp",
+        "origins": [
+          "https://shop.example"
+        ],
+        "version": 1,
+        "offers": [
+          {
+            "id": "find_products",
+            "verb": "find",
+            "of": "products",
+            "about": "Find lamps by words or category.",
+            "input": {
+              "q": "string"
+            },
+            "effect": "none",
+            "ask": "never",
+            "page": {
+              "on": [
+                "/shop/**"
+              ],
+              "do": {
+                "fetch": {
+                  "method": "GET",
+                  "path": "/wp-json/wc/store/v1/products",
+                  "query": {
+                    "search": "q"
+                  }
+                }
+              }
+            },
+            "door": {
+              "reply": "catalog",
+              "receipt": false
+            }
+          },
+          {
+            "id": "hold_item",
+            "verb": "hold",
+            "of": "item",
+            "about": "Hold one lamp for pickup within 48 hours.",
+            "input": {
+              "sku": "string",
+              "name": "string"
+            },
+            "effect": "changes",
+            "ask": "advised",
+            "then": "door",
+            "page": {
+              "on": [
+                "/product/*"
+              ],
+              "do": {
+                "fill": {
+                  "form": "#hold"
+                }
+              }
+            },
+            "door": {
+              "reply": "pending",
+              "receipt": true
+            }
+          },
+          {
+            "id": "book_table",
+            "verb": "book",
+            "of": "table",
+            "about": "Reserve a table.",
+            "input": {
+              "party": "integer",
+              "when": "string"
+            },
+            "effect": "changes",
+            "ask": "advised",
+            "then": "door",
+            "door": {
+              "reply": "pending",
+              "receipt": true
+            }
+          },
+          {
+            "id": "buy_order",
+            "verb": "buy",
+            "of": "order",
+            "about": "Pay for a held or chosen item.",
+            "input": {
+              "hold_id": "string"
+            },
+            "effect": "pays",
+            "ask": "always",
+            "then": "door",
+            "page": {
+              "on": [
+                "/checkout/**"
+              ],
+              "do": {
+                "open": "/checkout?hold={hold_id}"
+              }
+            },
+            "door": {
+              "reply": "checkout",
+              "receipt": false,
+              "url": "/checkout?hold={hold_id}"
+            }
+          },
+          {
+            "id": "ask_anything",
+            "verb": "ask",
+            "of": "anything",
+            "about": "Ask the shop a question.",
+            "input": {
+              "text": "string"
+            },
+            "effect": "none",
+            "ask": "never",
+            "door": {
+              "reply": "human",
+              "receipt": false
+            }
+          }
+        ],
+        "facts": {
+          "hours": "Tue-Sun 10:00-18:00",
+          "pickup": "48h",
+          "returns": "14 days"
+        },
+        "hash": "6e289306bb1cafb84cbc31aeffa2c8b501d5a03bc5cfce2aa570d06860a82890"
+      },
+      "skills": [
+        {
+          "id": "find_products",
+          "name": "find_products",
+          "description": "Find lamps by words or category.",
+          "tags": [
+            "find",
+            "products"
+          ],
+          "examples": [
+            "Find lamps by words or category.",
+            "find products {\"q\":\"<string>\"}"
+          ]
+        },
+        {
+          "id": "hold_item",
+          "name": "hold_item",
+          "description": "Hold one lamp for pickup within 48 hours.",
+          "tags": [
+            "hold",
+            "item"
+          ],
+          "examples": [
+            "Hold one lamp for pickup within 48 hours.",
+            "hold item {\"name\":\"<string>\",\"sku\":\"<string>\"}"
+          ]
+        },
+        {
+          "id": "book_table",
+          "name": "book_table",
+          "description": "Reserve a table.",
+          "tags": [
+            "book",
+            "table"
+          ],
+          "examples": [
+            "Reserve a table.",
+            "book table {\"party\":\"<integer>\",\"when\":\"<string>\"}"
+          ]
+        },
+        {
+          "id": "buy_order",
+          "name": "buy_order",
+          "description": "Pay for a held or chosen item.",
+          "tags": [
+            "buy",
+            "order"
+          ],
+          "examples": [
+            "Pay for a held or chosen item.",
+            "buy order {\"hold_id\":\"<string>\"}"
+          ]
+        },
+        {
+          "id": "ask_anything",
+          "name": "ask_anything",
+          "description": "Ask the shop a question.",
+          "tags": [
+            "ask",
+            "anything"
+          ],
+          "examples": [
+            "Ask the shop a question.",
+            "ask anything {\"text\":\"<string>\"}"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "repair-desk-reversible-and-receipt-defaults",
+      "version": 1,
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Spoke & Chain",
+          "baseUrl": "https://repair.example"
+        },
+        "offers": [
+          {
+            "verb": "quote",
+            "of": "repair",
+            "about": "Get a price for a repair before you commit.",
+            "input": {
+              "bike": "string",
+              "fault": "string"
+            },
+            "door": {
+              "reply": "pending"
+            }
+          },
+          {
+            "verb": "order",
+            "of": "parts",
+            "about": "Order a part to be fitted.",
+            "input": {
+              "part": "string",
+              "qty": "integer"
+            },
+            "door": {
+              "reply": "pending"
+            }
+          },
+          {
+            "verb": "track",
+            "of": "repair",
+            "about": "See where your repair is.",
+            "input": {
+              "ticket": "string"
+            },
+            "door": {
+              "reply": "facts"
+            }
+          },
+          {
+            "verb": "change",
+            "of": "booking",
+            "about": "Move a booked repair to another day.",
+            "input": {
+              "ticket": "string",
+              "when": "string"
+            },
+            "door": {
+              "reply": "pending"
+            }
+          },
+          {
+            "verb": "cancel",
+            "of": "booking",
+            "about": "Cancel a booked repair.",
+            "input": {
+              "ticket": "string"
+            },
+            "door": {
+              "reply": "pending"
+            }
+          },
+          {
+            "verb": "join",
+            "of": "waitlist",
+            "about": "Join the waitlist for a Saturday slot.",
+            "input": {},
+            "door": {
+              "reply": "pending"
+            }
+          }
+        ],
+        "facts": {
+          "hours": "Mon-Sat 09:00-17:00"
+        }
+      },
+      "contract": {
+        "v": 1,
+        "name": "Spoke & Chain",
+        "origins": [
+          "https://repair.example"
+        ],
+        "version": 1,
+        "offers": [
+          {
+            "id": "quote_repair",
+            "verb": "quote",
+            "of": "repair",
+            "about": "Get a price for a repair before you commit.",
+            "input": {
+              "bike": "string",
+              "fault": "string"
+            },
+            "effect": "none",
+            "ask": "never",
+            "door": {
+              "reply": "pending",
+              "receipt": true
+            }
+          },
+          {
+            "id": "order_parts",
+            "verb": "order",
+            "of": "parts",
+            "about": "Order a part to be fitted.",
+            "input": {
+              "part": "string",
+              "qty": "integer"
+            },
+            "effect": "changes",
+            "ask": "advised",
+            "then": "door",
+            "door": {
+              "reply": "pending",
+              "receipt": true
+            }
+          },
+          {
+            "id": "track_repair",
+            "verb": "track",
+            "of": "repair",
+            "about": "See where your repair is.",
+            "input": {
+              "ticket": "string"
+            },
+            "effect": "none",
+            "ask": "never",
+            "door": {
+              "reply": "facts",
+              "receipt": false
+            }
+          },
+          {
+            "id": "change_booking",
+            "verb": "change",
+            "of": "booking",
+            "about": "Move a booked repair to another day.",
+            "input": {
+              "ticket": "string",
+              "when": "string"
+            },
+            "effect": "changes",
+            "ask": "advised",
+            "then": "door",
+            "door": {
+              "reply": "pending",
+              "receipt": false
+            }
+          },
+          {
+            "id": "cancel_booking",
+            "verb": "cancel",
+            "of": "booking",
+            "about": "Cancel a booked repair.",
+            "input": {
+              "ticket": "string"
+            },
+            "effect": "reversible",
+            "ask": "advised",
+            "door": {
+              "reply": "pending",
+              "receipt": false
+            }
+          },
+          {
+            "id": "join_waitlist",
+            "verb": "join",
+            "of": "waitlist",
+            "about": "Join the waitlist for a Saturday slot.",
+            "input": {},
+            "effect": "changes",
+            "ask": "advised",
+            "then": "door",
+            "door": {
+              "reply": "pending",
+              "receipt": false
+            }
+          }
+        ],
+        "facts": {
+          "hours": "Mon-Sat 09:00-17:00"
+        },
+        "hash": "6ea0cbfa0868e7428ed6c2151cef12872a6da708c12c8c702cf704a89152537e"
+      },
+      "skills": [
+        {
+          "id": "quote_repair",
+          "name": "quote_repair",
+          "description": "Get a price for a repair before you commit.",
+          "tags": [
+            "quote",
+            "repair"
+          ],
+          "examples": [
+            "Get a price for a repair before you commit.",
+            "quote repair {\"bike\":\"<string>\",\"fault\":\"<string>\"}"
+          ]
+        },
+        {
+          "id": "order_parts",
+          "name": "order_parts",
+          "description": "Order a part to be fitted.",
+          "tags": [
+            "order",
+            "parts"
+          ],
+          "examples": [
+            "Order a part to be fitted.",
+            "order parts {\"part\":\"<string>\",\"qty\":\"<integer>\"}"
+          ]
+        },
+        {
+          "id": "track_repair",
+          "name": "track_repair",
+          "description": "See where your repair is.",
+          "tags": [
+            "track",
+            "repair"
+          ],
+          "examples": [
+            "See where your repair is.",
+            "track repair {\"ticket\":\"<string>\"}"
+          ]
+        },
+        {
+          "id": "change_booking",
+          "name": "change_booking",
+          "description": "Move a booked repair to another day.",
+          "tags": [
+            "change",
+            "booking"
+          ],
+          "examples": [
+            "Move a booked repair to another day.",
+            "change booking {\"ticket\":\"<string>\",\"when\":\"<string>\"}"
+          ]
+        },
+        {
+          "id": "cancel_booking",
+          "name": "cancel_booking",
+          "description": "Cancel a booked repair.",
+          "tags": [
+            "cancel",
+            "booking"
+          ],
+          "examples": [
+            "Cancel a booked repair.",
+            "cancel booking {\"ticket\":\"<string>\"}"
+          ]
+        },
+        {
+          "id": "join_waitlist",
+          "name": "join_waitlist",
+          "description": "Join the waitlist for a Saturday slot.",
+          "tags": [
+            "join",
+            "waitlist"
+          ],
+          "examples": [
+            "Join the waitlist for a Saturday slot."
+          ]
+        }
+      ]
+    },
+    {
+      "name": "overrides-raise-effect-and-ask-opt-out-of-then",
+      "version": 3,
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Override Studio",
+          "baseUrl": "https://studio.example:8443"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "slots",
+            "about": "Find an open slot.",
+            "input": {
+              "day": "string"
+            },
+            "page": {
+              "on": [
+                "/book/**"
+              ],
+              "do": {
+                "read": "#slots"
+              },
+              "then": "door"
+            }
+          },
+          {
+            "verb": "ask",
+            "of": "studio",
+            "about": "Ask the studio anything.",
+            "input": {
+              "text": "string"
+            },
+            "effect": "changes",
+            "ask": "always",
+            "door": {
+              "reply": "brain",
+              "receipt": true
+            }
+          },
+          {
+            "verb": "hold",
+            "of": "slot",
+            "about": "Hold a slot for ten minutes.",
+            "input": {
+              "slot": "string"
+            },
+            "then": "none",
+            "page": {
+              "on": [
+                "/book/*"
+              ],
+              "do": {
+                "call": "holdSlot"
+              }
+            }
+          },
+          {
+            "verb": "book",
+            "of": "session",
+            "about": "Book a session.",
+            "input": {
+              "slot": "string",
+              "people": "integer"
+            },
+            "door": {
+              "reply": "pending",
+              "receipt": false
+            }
+          },
+          {
+            "verb": "cancel",
+            "of": "session",
+            "about": "Cancel a session.",
+            "input": {
+              "booking": "string"
+            },
+            "ask": "always",
+            "door": {
+              "reply": "pending"
+            }
+          }
+        ]
+      },
+      "contract": {
+        "v": 1,
+        "name": "Override Studio",
+        "origins": [
+          "https://studio.example:8443"
+        ],
+        "version": 3,
+        "offers": [
+          {
+            "id": "find_slots",
+            "verb": "find",
+            "of": "slots",
+            "about": "Find an open slot.",
+            "input": {
+              "day": "string"
+            },
+            "effect": "none",
+            "ask": "never",
+            "then": "door",
+            "page": {
+              "on": [
+                "/book/**"
+              ],
+              "do": {
+                "read": "#slots"
+              }
+            }
+          },
+          {
+            "id": "ask_studio",
+            "verb": "ask",
+            "of": "studio",
+            "about": "Ask the studio anything.",
+            "input": {
+              "text": "string"
+            },
+            "effect": "changes",
+            "ask": "always",
+            "then": "door",
+            "door": {
+              "reply": "brain",
+              "receipt": true
+            }
+          },
+          {
+            "id": "hold_slot",
+            "verb": "hold",
+            "of": "slot",
+            "about": "Hold a slot for ten minutes.",
+            "input": {
+              "slot": "string"
+            },
+            "effect": "changes",
+            "ask": "advised",
+            "page": {
+              "on": [
+                "/book/*"
+              ],
+              "do": {
+                "call": "holdSlot"
+              }
+            }
+          },
+          {
+            "id": "book_session",
+            "verb": "book",
+            "of": "session",
+            "about": "Book a session.",
+            "input": {
+              "slot": "string",
+              "people": "integer"
+            },
+            "effect": "changes",
+            "ask": "advised",
+            "then": "door",
+            "door": {
+              "reply": "pending",
+              "receipt": false
+            }
+          },
+          {
+            "id": "cancel_session",
+            "verb": "cancel",
+            "of": "session",
+            "about": "Cancel a session.",
+            "input": {
+              "booking": "string"
+            },
+            "effect": "reversible",
+            "ask": "always",
+            "door": {
+              "reply": "pending",
+              "receipt": false
+            }
+          }
+        ],
+        "hash": "412d2842e0ef04c499b9f09a9c1a5e2434c8778a4873ff5c809f067d061c584a"
+      },
+      "skills": [
+        {
+          "id": "find_slots",
+          "name": "find_slots",
+          "description": "Find an open slot.",
+          "tags": [
+            "find",
+            "slots"
+          ],
+          "examples": [
+            "Find an open slot.",
+            "find slots {\"day\":\"<string>\"}"
+          ]
+        },
+        {
+          "id": "ask_studio",
+          "name": "ask_studio",
+          "description": "Ask the studio anything.",
+          "tags": [
+            "ask",
+            "studio"
+          ],
+          "examples": [
+            "Ask the studio anything.",
+            "ask studio {\"text\":\"<string>\"}"
+          ]
+        },
+        {
+          "id": "hold_slot",
+          "name": "hold_slot",
+          "description": "Hold a slot for ten minutes.",
+          "tags": [
+            "hold",
+            "slot"
+          ],
+          "examples": [
+            "Hold a slot for ten minutes.",
+            "hold slot {\"slot\":\"<string>\"}"
+          ]
+        },
+        {
+          "id": "book_session",
+          "name": "book_session",
+          "description": "Book a session.",
+          "tags": [
+            "book",
+            "session"
+          ],
+          "examples": [
+            "Book a session.",
+            "book session {\"people\":\"<integer>\",\"slot\":\"<string>\"}"
+          ]
+        },
+        {
+          "id": "cancel_session",
+          "name": "cancel_session",
+          "description": "Cancel a session.",
+          "tags": [
+            "cancel",
+            "session"
+          ],
+          "examples": [
+            "Cancel a session.",
+            "cancel session {\"booking\":\"<string>\"}"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "unknown-verb-passes-through-with-no-defaults",
+      "version": 1,
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Pedal Hire",
+          "baseUrl": "https://hire.example",
+          "domains": [
+            "Pedal-Hire.example",
+            "hire.example"
+          ]
+        },
+        "offers": [
+          {
+            "verb": "rent",
+            "of": "bike",
+            "about": "Rent a bike by the hour.",
+            "input": {
+              "hours": "integer",
+              "size": "string"
+            },
+            "door": {
+              "reply": "pending"
+            }
+          },
+          {
+            "verb": "find",
+            "of": "bikes",
+            "about": "Find a bike by size.",
+            "input": {
+              "size": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      },
+      "contract": {
+        "v": 1,
+        "name": "Pedal Hire",
+        "origins": [
+          "https://hire.example",
+          "https://pedal-hire.example"
+        ],
+        "version": 1,
+        "offers": [
+          {
+            "id": "rent_bike",
+            "verb": "rent",
+            "of": "bike",
+            "about": "Rent a bike by the hour.",
+            "input": {
+              "hours": "integer",
+              "size": "string"
+            },
+            "door": {
+              "reply": "pending",
+              "receipt": false
+            }
+          },
+          {
+            "id": "find_bikes",
+            "verb": "find",
+            "of": "bikes",
+            "about": "Find a bike by size.",
+            "input": {
+              "size": "string"
+            },
+            "effect": "none",
+            "ask": "never",
+            "door": {
+              "reply": "catalog",
+              "receipt": false
+            }
+          }
+        ],
+        "hash": "8558625e9fd4d0fd92e9b5284686cfe9e6b3edf523691076bf822270df8b0a0e"
+      },
+      "skills": [
+        {
+          "id": "rent_bike",
+          "name": "rent_bike",
+          "description": "Rent a bike by the hour.",
+          "tags": [
+            "rent",
+            "bike"
+          ],
+          "examples": [
+            "Rent a bike by the hour.",
+            "rent bike {\"hours\":\"<integer>\",\"size\":\"<string>\"}"
+          ]
+        },
+        {
+          "id": "find_bikes",
+          "name": "find_bikes",
+          "description": "Find a bike by size.",
+          "tags": [
+            "find",
+            "bikes"
+          ],
+          "examples": [
+            "Find a bike by size.",
+            "find bikes {\"size\":\"<string>\"}"
+          ]
+        }
+      ]
+    }
+  ],
+  "accepted": [
+    {
+      "name": "minimal-door-only-offer",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "page-only-offer-no-door",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "page": {
+              "on": [
+                "/shop/**"
+              ],
+              "do": {
+                "read": "#list"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "empty-input-map",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {},
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-input-type",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "a": "string",
+              "b": "integer",
+              "c": "number",
+              "d": "boolean"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-page-action/open",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "page": {
+              "on": [
+                "/"
+              ],
+              "do": {
+                "open": "/shop"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-page-action/read",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "page": {
+              "on": [
+                "/"
+              ],
+              "do": {
+                "read": "#list"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-page-action/fill",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "page": {
+              "on": [
+                "/"
+              ],
+              "do": {
+                "fill": {
+                  "form": "#f"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-page-action/fetch",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "page": {
+              "on": [
+                "/"
+              ],
+              "do": {
+                "fetch": {
+                  "method": "GET",
+                  "path": "/api/things"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-page-action/call",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "page": {
+              "on": [
+                "/"
+              ],
+              "do": {
+                "call": "findThings"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-reply-kind/catalog",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-reply-kind/facts",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "facts"
+            }
+          }
+        ],
+        "facts": {
+          "hours": "9-5"
+        }
+      }
+    },
+    {
+      "name": "every-reply-kind/pending",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "pending"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-reply-kind/checkout",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "buy",
+            "of": "order",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "checkout",
+              "url": "/checkout"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-reply-kind/brain",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "brain"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-reply-kind/human",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "human"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-registry-verb/find",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-registry-verb/ask",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "ask",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-registry-verb/quote",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "quote",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-registry-verb/book",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "book",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-registry-verb/hold",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "hold",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-registry-verb/order",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "order",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-registry-verb/buy",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "buy",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "checkout",
+              "url": "/checkout"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-registry-verb/track",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "track",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-registry-verb/change",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "change",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-registry-verb/cancel",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "cancel",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "every-registry-verb/join",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "join",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "unknown-verb-is-accepted",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "rent",
+            "of": "bike",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "raised-effect-and-ask",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "effect": "changes",
+            "ask": "always"
+          }
+        ]
+      }
+    },
+    {
+      "name": "then-opt-out",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "hold",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "then": "none"
+          }
+        ]
+      }
+    }
+  ],
+  "refusals": [
+    {
+      "name": "declaration-not-an-object",
+      "field": "declaration",
+      "declaration": null
+    },
+    {
+      "name": "v-missing",
+      "field": "v",
+      "declaration": {
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "v-is-not-1",
+      "field": "v",
+      "declaration": {
+        "v": 2,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "entry-missing",
+      "field": "entry",
+      "declaration": {
+        "v": 1,
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "entry-name-missing",
+      "field": "entry.name",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "entry-name-empty",
+      "field": "entry.name",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "entry-baseUrl-missing",
+      "field": "entry.baseUrl",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "entry-baseUrl-not-a-url",
+      "field": "entry.baseUrl",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "shop dot example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "entry-domains-not-an-array",
+      "field": "entry.domains",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example",
+          "domains": "shop.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "entry-prefer-unknown-kind",
+      "field": "entry.prefer",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example",
+          "prefer": [
+            "teleport"
+          ]
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "entry-catalog-not-a-boolean",
+      "field": "entry.catalog",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example",
+          "catalog": "yes"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "offers-missing",
+      "field": "offers",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        }
+      }
+    },
+    {
+      "name": "offers-not-an-array",
+      "field": "offers",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": {}
+      }
+    },
+    {
+      "name": "offer-not-an-object",
+      "field": "offers",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          "find things"
+        ]
+      }
+    },
+    {
+      "name": "offer-verb-missing",
+      "field": "verb",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-of-missing",
+      "field": "of",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-verb-not-a-string",
+      "field": "verb",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": 42,
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-of-not-a-string",
+      "field": "of",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": [
+              "things"
+            ],
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-verb-uppercase-is-not-a-registry-spelling",
+      "field": "verb",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "Buy",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-verb-with-a-space",
+      "field": "verb",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "buy now",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-of-with-a-slash",
+      "field": "of",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things/1",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-about-missing",
+      "field": "about",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-input-missing",
+      "field": "input",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-input-not-an-object",
+      "field": "input",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": "q",
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-input-unknown-type",
+      "field": "input",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "date"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-duplicate-id",
+      "field": "find_things",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          },
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-effect-unknown",
+      "field": "effect",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "effect": "dangerous"
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-effect-lowered-below-the-verb-default",
+      "field": "effect",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "buy",
+            "of": "order",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "checkout",
+              "url": "/checkout"
+            },
+            "effect": "none"
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-ask-unknown",
+      "field": "ask",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "ask": "sometimes"
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-ask-below-the-floor",
+      "field": "ask",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "buy",
+            "of": "order",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "checkout",
+              "url": "/checkout"
+            },
+            "ask": "never"
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-ask-below-the-floor-of-a-raised-effect",
+      "field": "ask",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "effect": "pays",
+            "ask": "advised"
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer-then-unknown",
+      "field": "then",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "then": "later"
+          }
+        ]
+      }
+    },
+    {
+      "name": "door-not-an-object",
+      "field": "door",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": "catalog"
+          }
+        ]
+      }
+    },
+    {
+      "name": "door-reply-missing",
+      "field": "door.reply",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {}
+          }
+        ]
+      }
+    },
+    {
+      "name": "door-reply-unknown-kind",
+      "field": "door.reply",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "email"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "door-receipt-not-a-boolean",
+      "field": "door.receipt",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog",
+              "receipt": "yes"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "door-checkout-without-url",
+      "field": "door.url",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "buy",
+            "of": "order",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "checkout"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "door-checkout-url-on-another-origin",
+      "field": "door.url",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "buy",
+            "of": "order",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "checkout",
+              "url": "https://pay.elsewhere.example/checkout"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "door-checkout-url-protocol-relative",
+      "field": "door.url",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "buy",
+            "of": "order",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "checkout",
+              "url": "//pay.elsewhere.example/checkout"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "door-checkout-url-javascript",
+      "field": "door.url",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "buy",
+            "of": "order",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "checkout",
+              "url": "javascript:alert(1)"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "page-not-an-object",
+      "field": "page",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "page": "/shop"
+          }
+        ]
+      }
+    },
+    {
+      "name": "page-on-missing",
+      "field": "page.on",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "page": {
+              "do": {
+                "read": "#list"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "page-on-empty",
+      "field": "page.on",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "page": {
+              "on": [],
+              "do": {
+                "read": "#list"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "page-on-not-a-path",
+      "field": "page.on",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "page": {
+              "on": [
+                "shop/**"
+              ],
+              "do": {
+                "read": "#list"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "page-do-missing",
+      "field": "page.do",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "page": {
+              "on": [
+                "/shop/**"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "page-do-unknown-action",
+      "field": "page.do",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "page": {
+              "on": [
+                "/shop/**"
+              ],
+              "do": {
+                "click": "#buy"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "page-do-two-actions",
+      "field": "page.do",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "page": {
+              "on": [
+                "/shop/**"
+              ],
+              "do": {
+                "open": "/a",
+                "read": "#b"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "page-then-unknown",
+      "field": "page.then",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            },
+            "page": {
+              "on": [
+                "/shop/**"
+              ],
+              "do": {
+                "read": "#b"
+              },
+              "then": "email"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "facts-not-an-object",
+      "field": "facts",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ],
+        "facts": [
+          "open daily"
+        ]
+      }
+    },
+    {
+      "name": "facts-value-not-a-string",
+      "field": "facts",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ],
+        "facts": {
+          "hours": 9
+        }
+      }
+    }
+  ]
+}
