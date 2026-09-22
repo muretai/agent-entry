@@ -12,6 +12,7 @@
   },
   "files": [
     "muretai-agent-entry.mjs",
+    "agent-entry-page.mjs",
     "conformance/",
     "examples/",
     "diagrams/",
@@ -39,6 +40,7 @@
     "check:vectors": "node scripts/build-vectors.mjs --check",
     "example": "node examples/server.mjs",
     "demo": "node examples/live-demo.mjs",
+    "demo:chrome": "node examples/live-demo-chrome.mjs",
     "distill": "node scripts/distill/loop.mjs",
     "distill:record": "node scripts/distill/record.mjs",
     "distill:measure": "node scripts/distill/measure.mjs"

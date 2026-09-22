@@ -3,7 +3,7 @@
 Releases before 1.12.0 are recorded in the commit history and in the README's "Since 1.x"
 paragraphs.
 
-## 1.13.0 — Agent Entry Suite S1: one declaration, verbs first (unreleased)
+## 1.13.0 — Agent Entry Suite S1 and S2: one declaration, verbs first, on the door and the page (unreleased)
 
 A site can now describe what a customer can do there in one declaration, `agent-entry.json`,
 keyed by verbs (`find`, `book`, `hold`, `buy`, `ask`, …). The door turns it into a signed tool
@@ -114,6 +114,126 @@ Choices made in the implementation, where the tests left room:
     `see_catalog`);
   - `knock` still recognises only the old `{type, …}` booking shape, not
     `{verb, of, …, deal?}`.
+
+### Suite S2: the page runtime `agent-entry-page.mjs`
+
+The page face of the same declaration. A new file at the package root, `agent-entry-page.mjs`,
+is listed in `files`. It is browser code with no dependencies, served from the site's own
+origin: `<script type="module" src="/agent-entry-page.mjs">`. It fetches the card, the contract
+and its envelope from that origin, and verifies the envelope with WebCrypto Ed25519 against the
+card's `did`. It checks `origins` and the hash. Only then does it register the route's page
+offers as WebMCP tools on `document.modelContext`. The spec grew AT-15 to AT-21 (the refusal set,
+registration and annotation projection, the ask dialog protocol, handoff emission, the
+same-origin rule, resync and abort, count emission). The tests came first:
+`conformance/page.mjs` (commit `808ec31`, wired in `d734060`). The implementation did not edit
+them. Design record: Agent Entry Suite section 3 and 7-S2 (intake `20260921T215427Z`).
+`muretai-agent-entry.mjs` and `vendor/agent-seam` are untouched; S1's surface is unchanged.
+
+What landed:
+
+- **`install({window, signal, handlers})`** resolves `{ok: true, version, hash, tools, webmcp}`
+  or `{ok: false, reason}`. It never throws on a refusal, and a refusal registers nothing and
+  counts nothing. `REFUSALS` (frozen) lists `contract_missing`, `sig_missing`, `sig_invalid`,
+  `origin_mismatch`, `hash_mismatch` and `card_mismatch`.
+- **The page tag installs itself.** Load the module as `/agent-entry-page.mjs?manual` to call
+  `install` yourself, for example with `handlers` for `call` actions. `ready` is the page tag's
+  own install promise.
+- **Tools:**
+  - the name is `verb_of` and the description is `about`;
+  - every input field is required and typed, and bad input is refused before any side effect;
+  - annotations come from `effect`;
+  - the page actions are `fetch` (GET, POST), `read`, `fill`, `call` and `open`;
+  - `*` matches one segment and `**` any depth;
+  - there is one `AbortSignal` per tool, and never a duplicate registration.
+- **Ask:**
+  - `advised` or `always` shows one `<dialog>` per call, built with `textContent` only and
+    queued so that two are never open at once;
+  - the call goes ahead only on `returnValue === "confirm"`;
+  - the dialog runs inside the agent's `requestUserInteraction` when one is given.
+- **Handoff:** when `then: "door"`, results carry `_meta.handoff` and the legacy `muretai`
+  key. `muretai` also carries `connect`, the card URL.
+- **SPA resync:** the Navigation API when there is one, else wrapped `pushState` /
+  `replaceState` plus `popstate`. Aborting `install`'s signal removes every tool, stops
+  resync, restores `history`, and flushes the counts.
+- **Counts:**
+  - by `sendBeacon` to the same-origin collector, with one random session per page;
+  - each beacon is at most 2048 bytes, with at most 100 events per session;
+  - flushed on `pagehide` or hidden `visibilitychange`, and on abort;
+  - referral engines are recognised from the referrer or `utm_source`.
+- **Headless-Chrome leg (local only, not in `npm test`):** `npm run demo:chrome`, or
+  `CHROME_PATH=/path/to/chrome npm run demo:chrome`. It is `examples/live-demo-chrome.mjs`,
+  which needs Node 22 or later. It serves Harbor Lamp on 127.0.0.1, with a throwaway Chrome
+  profile and a host-resolver rule that resolves only 127.0.0.1. It covers four verbs:
+  - `find products` from the shop's API;
+  - `hold item`: one dialog, the form filled, the handoff, and a signed knock that gets a
+    pending hold with a `deal`;
+  - `buy order`: one dialog, then the checkout URL;
+  - `ask anything`, answered at the door.
+
+  It also checks that the counts reach the collector. It downloads nothing. With no Chrome it
+  prints the paths it looked at and exits 2. WebMCP may be off in the local Chrome, so a
+  recording `document.modelContext` shim stands in for `registerTool`; everything past that is
+  the real runtime in Chrome. Run on 2026-09-22 with Chrome 153: 29/29.
+
+#### Decisions (coordinator rulings of 2026-09-22 on the test author's calls, all accepted as pinned)
+
+- The API is `install({window, signal, handlers})` plus the frozen `REFUSALS`. Every browser API
+  is read from the injected `window`.
+- A card that names another key than the envelope's signer is `sig_invalid`, not
+  `card_mismatch`.
+- A served contract that differs from the signed one is `hash_mismatch`.
+- `destructiveHint` is set only for `pays`: S1 has no `destroys` effect.
+- The dialog confirms only on `returnValue === "confirm"`, and it shows `about`.
+- In the handoff, `card` is the card URL string. The legacy key pins `v`, `action: "dm"` and
+  `to`.
+- The result is text in `content[].text`, and a failure is `isError: true`.
+- Site verbs without `effect` get no dialog, following the compiled `ask` (S1 AT-4). The
+  `doctor` warning is S3's follow-up.
+
+Choices made in the implementation, where the tests left room:
+
+- **Where the documents come from.**
+  - The contract URL is the card's `agentEntry.tools` when it is on this origin. Otherwise it
+    is this origin's `/.well-known/agent-tools.json`, and the `origins` check then decides.
+    The envelope is the same path with `.sig.json`.
+  - A foreign `agentEntry.events` falls back to this origin's collector.
+- **Input and preconditions.**
+  - Input with unknown fields is refused.
+  - A missing element, form or function is found before the person is asked, and checked
+    again after they confirm.
+- **Counts.**
+  - Every call counts `offer_started`, then one of `offer_succeeded`, `offer_failed` or
+    `ask_denied`. Bad input is `offer_failed`.
+  - Only answer engines count as referrals. Any other referrer counts nothing, never
+    `other`.
+- **Other browsers and other runtimes.**
+  - In a browser without `document.modelContext`, the runtime also tries
+    `navigator.modelContext`. With neither, `install` resolves `ok: true` with no tools and
+    still counts `page_ready`.
+  - If `registerTool` returns a handle with `unregister()`, that handle is used alongside the
+    signal.
+  - A second `install` on the same window stops the first.
+- **Results.**
+  - Result text is capped at 50,000 characters.
+  - `fill` sets values through the native setter and fires `input` and `change`, so framework
+    forms see them.
+- **Test count.** `npm run test:page` counts 318 checks, not the 322 the test author saw with a
+  prototype. The count depends on how many beacons a runtime sends, because each beacon is
+  checked, and this runtime batches more events per beacon. No check fails or is skipped.
+
+#### Follow-ups (named, not built here)
+
+- `steps` page action (`sodium.json` `interaction{steps}`), with the page runtime executing it.
+- A `destroys` effect, if one is ever added to S1. `destructiveHint` must then cover it as well
+  as `pays`.
+- A CSP note for sites that vendor the runtime. The page needs `script-src 'self'` for the
+  module and `connect-src 'self'` for the well-known fetches and the beacon. The runtime uses no
+  inline script, no `eval`, and no third-party origin.
+- The Chrome leg drives a shim, not native WebMCP. Once Chrome ships `document.modelContext`
+  (or a testing hook such as `modelContextTesting`) unflagged, it should run against the native
+  one.
+- The runtime does not check the envelope's `ts` age: the door serves it fresh (AT-10). Whether
+  a page runtime should also refuse a stale envelope is left to the spec's next revision.
 
 ## 1.12.0 — who is knocking, v2 (landed 2026-09-19, not yet published)
 

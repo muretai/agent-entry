@@ -316,6 +316,125 @@ The collector **MUST NOT** carry or accept a DID, free text, or input values, an
 write to the ledger. The reference hands each counted event to its observer as `stage: "page"`,
 with the door's usual `ua_family`, `client_class`, `ip_vendor` and `country` (v1 AE-31).
 
+### 2.7 The page runtime
+
+A **page runtime** is the browser code a site serves from its own origin to register its offers
+as WebMCP tools. The reference is `agent-entry-page.mjs`: one file, no dependencies, exporting
+`install({window, signal, handlers})` and the frozen list `REFUSALS`. The observations below are
+checked by `conformance/page.mjs`, which runs the reference under Node against a fake `window`
+and a real door.
+
+**AT-15. The refusal set.** A page runtime fetches three documents, all from the page's own
+origin (`location.origin`): the card at the v1 card path, the contract at
+`/.well-known/agent-tools.json`, and its envelope at `/.well-known/agent-tools.sig.json`. It
+**MUST** refuse to register anything unless all of these checks pass. Each refusal has one name,
+and the names are exactly these six, in this order:
+
+| reason | when |
+|---|---|
+| `contract_missing` | the contract is not served, or is not a JSON object |
+| `sig_missing` | the envelope is not served, or is not a JSON object |
+| `sig_invalid` | the envelope's `v` is not `1` or its `typ` is not `agenttools`; the signature does not verify under Ed25519 against the card's `did` over canonical JSON of `{contract, ts, typ, v}` (AT-8); or the browser cannot verify Ed25519 at all |
+| `origin_mismatch` | the signed contract's `origins` does not contain `location.origin` exactly (AT-9) |
+| `hash_mismatch` | the signed contract's `hash` is not the SHA-256 of its own canonical bytes, or the served contract is not the signed one |
+| `card_mismatch` | the card is not served or not JSON, its `did` is not a `did:key` for Ed25519, or it has no `agentEntry.tools` |
+
+- A card that names a different key than the one that signed the envelope is `sig_invalid`.
+  The runtime cannot tell that apart from a forged signature.
+- A refusal **MUST** resolve as `{ok: false, reason}`, **MUST NOT** throw, **MUST NOT** register
+  any tool, and **MUST NOT** send any count.
+- Verification **MUST** use the browser's own WebCrypto (`crypto.subtle`), never a script from
+  another origin.
+- A browser without `document.modelContext` is not a refusal: the runtime registers nothing and
+  does not throw.
+
+**AT-16. Registration and annotation projection.** After verification, the runtime registers each
+offer with a `page` binding whose `on` patterns match `location.pathname`. In a pattern, `*`
+matches within one path segment and `**` matches any depth, including none. The query and
+fragment are not part of the match. Offers without a `page` binding are never registered.
+
+- Registration is `document.modelContext.registerTool(tool, {signal})`, with one
+  `AbortSignal` per tool. A tool name **MUST NOT** be registered twice.
+- The tool is `{name: id, description: about, inputSchema, annotations, execute}`.
+  `inputSchema` is `{type: "object", properties: {<field>: {type}}, required: [<every field>]}`.
+- Annotations are projected from the compiled offer. A hint that does not apply is `false`:
+
+  | hint | true when |
+  |---|---|
+  | `readOnlyHint` | `effect` is `none` |
+  | `destructiveHint` | `effect` is `pays` |
+  | `idempotentHint` | `effect` is `none` or `reversible` |
+  | `untrustedContentHint` | the page action is `read` |
+
+  An offer without `effect` (a site verb, AT-4) is never read-only and never idempotent.
+- `execute` **MUST** refuse input that is not an object of exactly the declared fields and
+  types, before any side effect.
+- The page actions are:
+  - `fetch`: a same-origin request, where `query` maps input fields to parameters, and `POST`
+    sends the input as JSON;
+  - `read`: the text of the selected element;
+  - `fill`: set the form's named fields, then submit once;
+  - `call`: the site's function, called once with the input;
+  - `open`: a same-origin navigation, with `{field}` placeholders percent-encoded.
+
+  A missing element, form or function is an error result.
+- A result is a WebMCP result: `{content: [{type: "text", text}]}`, with `isError: true` on
+  failure.
+
+**AT-17. The ask dialog.** An offer whose compiled `ask` is `advised` or `always` **MUST** show
+exactly one `<dialog>` per call before any side effect. The dialog is connected to the document,
+opened with `showModal()` (or `show()`), and shows the offer's `about`.
+
+- The call proceeds only when the dialog's `returnValue` is `"confirm"` at its `close` event:
+  the `<form method="dialog"><button value="confirm">` idiom.
+- Anything else **MUST** be a denial: Esc, `cancel`, or closing another way. A denial is an
+  error result, has no side effect, and is counted as `ask_denied`.
+- Two dialogs **MUST NOT** be open at once.
+- `ask: never`, and an offer with no `ask`, shows none.
+- `window.confirm` **MUST NOT** be used, and input values **MUST NOT** be written into the page
+  as HTML.
+
+**AT-18. Handoff emission.** A successful result of an offer whose compiled `then` is `"door"`
+**MUST** carry:
+
+- `_meta.handoff = {v: 1, next: [{kind: "a2a", card: <origin + card path>}]}` (Agent Web
+  Router spec v0 §6);
+- the legacy top-level `muretai = {v: 1, action: "dm", to: <card did>, ...}`, for readers of
+  trunk `docs/WEBMCP_HANDOFF.md`. The reference adds `connect`, the card URL.
+
+An offer without `then` gets neither key, and a denied or failed call gets neither.
+
+**AT-19. Same origin only.** A signed contract is still data. A runtime **MUST NOT** make a
+request or a navigation to any origin but `location.origin`, whatever the contract says: an
+absolute URL, `//host`, `/\host` and `javascript:` are refused before anything is sent. A card
+whose `agentEntry.tools` or `agentEntry.events` names another origin is read as this origin's
+own well-known path.
+
+**AT-20. Resync and abort.** Tools follow the route of a single-page app:
+
+- With the Navigation API, the runtime follows `currententrychange` and `navigatesuccess` and
+  **MUST** leave `history.pushState` and `replaceState` alone.
+- Without it, it wraps `pushState` and `replaceState` (the wrapped calls still move the URL)
+  and follows `popstate`.
+- On each change, tools whose patterns no longer match are removed by aborting their own
+  signal. Tools that still match stay registered, and newly matching ones are added.
+- Aborting the `signal` given to `install` removes every tool and stops all resync. An
+  already-aborted signal registers nothing.
+
+**AT-21. Count emission.** A runtime that verified its contract counts with the AT-14 body and
+names:
+
+- by `navigator.sendBeacon` to `<origin>/.well-known/agent-tools/events`, never by `fetch`;
+- one random session per page;
+- each body at most 2048 bytes and 100 events, and at most 100 events per session in all;
+- flushed at the latest on `pagehide` or `visibilitychange` to hidden.
+
+`page_ready` is sent once. `referral{engine}` is sent at most once, and only when an answer
+engine is recognised from `document.referrer` or `utm_source`; never for an empty referrer or
+one from the page's own origin. Every call counts `offer_started`, and then `offer_succeeded`
+with an integer `ms`, `offer_failed`, or `ask_denied`. A handoff also counts `handoff`. Each
+registration counts `offer_registered`. No beacon carries an input value or a DID.
+
 ## 3. Informative
 
 ### 3.1 Mapping from `sodium.json`
@@ -383,7 +502,10 @@ countersigned deal attach later.
 | AT-12 | default reply shapes per kind |
 | AT-13 | the `deal` block |
 | AT-14 | the collector and its event names |
-
-Page-runtime requirements (registration, annotation projection, the refusal set of a runtime
-that cannot verify the contract) are reserved for the page-runtime slice and will extend this
-index.
+| AT-15 | page runtime: the six refusals; verify before registering |
+| AT-16 | page runtime: registration, route patterns, annotation projection, page actions |
+| AT-17 | page runtime: one `<dialog>` per ask, confirm only on `returnValue === "confirm"` |
+| AT-18 | page runtime: handoff emission (`_meta.handoff`, legacy `muretai`) |
+| AT-19 | page runtime: same origin only |
+| AT-20 | page runtime: SPA resync and abort |
+| AT-21 | page runtime: count emission |
