@@ -9,6 +9,7 @@
 
 - [What this is](#what-this-is)
 - [What you get](#what-you-get)
+- [What a customer can do here](#what-a-customer-can-do-here)
 - [Who is knocking](#who-is-knocking)
 - [Knock from any runtime](#knock-from-any-runtime)
 - [Put it on a site](#put-it-on-a-site)
@@ -215,6 +216,69 @@ Nothing is uploaded, and the Distiller is never imported by
 `seedHex` and `baseUrl` are the two an entry refuses to start without: the seed **is** the
 address, and the url it publishes must equal the origin the visitor dialled.
 
+## What a customer can do here
+
+An agent handed your URL asks one question on its person's behalf: *what can I do here?* A
+menu of skills written in your own words answers it only for an agent that reads prose well.
+Since 1.13.0 you can answer it in a shared vocabulary instead: one declaration,
+`agent-entry.json`, lists your **offers**, and each offer starts with a **verb** from a small
+registry that every door spells the same way. So an agent that wants to `book` something can
+match that intent at your shop and at the next one without learning either.
+
+From that one declaration the door generates both faces:
+
+- **at the door** — the card's `skills[]` (one per offer, `id` = `verb_of`) and a default signed
+  reply for every offer with a `door` binding;
+- **on the page** — a signed tool contract that `agent-entry-page.mjs` registers as WebMCP tools
+  (one per offer with a `page` binding, named `verb_of`). See
+  [Pairs with WebMCP](#pairs-with-webmcp-the-tab-conversation-becomes-a-customer).
+
+The verbs, and what each one does by default:
+
+| verb | default effect | on the page, by default | example (what a customer's agent asks) |
+|---|---|---|---|
+| `find` | none — it only reads; nothing on your side changes | runs without asking the person | "Do you have brass desk lamps under 80 euros?" (`find_products` on `https://shop.example.com/shop/`) |
+| `ask` | none — a question; nothing changes | runs without asking | "Are you open on Sunday?" |
+| `quote` | none — a price is stated; nothing is agreed or kept | runs without asking | "What would a half-day shoot cost?" |
+| `book` | changes — a table, slot or appointment is requested on your side | asks the person first, then hands over to the door | "A table for four on Friday at 20:00." |
+| `hold` | changes — an item is set aside for this customer | asks first, then the door | "Hold the brass lamp for pickup on Saturday." |
+| `order` | changes — an order is placed for you to fulfil | asks first, then the door | "Order two more of what I bought last month." |
+| `buy` | pays — money moves, on your own checkout page; the door only hands over the checkout URL | always asks the person first | "Buy the lamp I am holding." (continues at `https://shop.example.com/checkout`) |
+| `track` | none — reads the state of something already asked | runs without asking | "Where is my order?" |
+| `change` | changes — something already booked or ordered is altered | asks first, then the door | "Move my booking to 21:00." |
+| `cancel` | reversible — something is withdrawn and can be made again | asks first | "Cancel Friday's table." |
+| `join` | changes — the customer is added to a list, a waitlist or a membership | asks first, then the door | "Put me on the waitlist for the spring class." |
+
+An offer may raise its effect or its ask, never lower it. A verb that is not in the registry is
+allowed, but it gets no defaults: declare its `effect` yourself (`agent-entry doctor` warns
+when you have not). **Payment is never touched:** `buy` hands the visitor to your own checkout.
+The full grammar and the normative defaults are in [`spec/tools-v1.md`](spec/tools-v1.md).
+
+A declaration for a lamp shop, cut down to three offers:
+
+```json
+{
+  "v": 1,
+  "entry": { "name": "Harbor Lamp", "baseUrl": "https://shop.example.com" },
+  "offers": [
+    { "verb": "find", "of": "products", "about": "Find lamps by words.",
+      "input": { "q": "string" },
+      "page": { "on": ["/shop/**"], "do": { "fetch": { "method": "GET",
+                "path": "/wp-json/wc/store/v1/products", "query": { "search": "q" } } } } },
+    { "verb": "hold", "of": "item", "about": "Hold one lamp for pickup within 48 hours.",
+      "input": { "sku": "string" },
+      "door": { "reply": "pending", "receipt": true } },
+    { "verb": "ask", "of": "anything", "about": "Ask the shop a question.",
+      "input": { "text": "string" },
+      "door": { "reply": "human" } }
+  ]
+}
+```
+
+You do not have to write it by hand: `agent-entry init` writes a starter for your trade (see
+[Put it on a site](#put-it-on-a-site)), and the declaration is passed to the door as
+`createAgentEntry({ declaration, … })`.
+
 ## Who is knocking
 
 Observation, never identity. The person who found you often never opens a browser:
@@ -392,7 +456,40 @@ is identification, never authorship.
 
 ## Put it on a site
 
-### Install
+### Install with one command
+
+From the root of your site's project, inside its git repository:
+
+```bash
+npx @muretai/agent-entry init --trade retail --base-url https://shop.example.com
+```
+
+`agent-entry init` detects the framework (Next.js app or pages router, Nuxt, SvelteKit, Astro,
+Vite, Express), mints your site's seed into `.env.local` or `.env` (mode `0600`, checked to be
+git-ignored, never printed), writes a starter `agent-entry.json` for your trade (`restaurant`,
+`retail`, `clinic` or `repair`; or `--from sodium.json` to convert a Sodium config), and wires the
+door's routes, the three signposts and the page tag. It never replaces a file you already have:
+a step it cannot do safely is listed under `manual`. A static host is sent to
+[agent-entry-serverless](https://github.com/muretai/agent-entry-serverless) and WordPress to
+[the plugin](https://github.com/muretai/agent-entry-wordpress). It also writes
+`.agents/skills/agent-entry/SKILL.md`, so your own coding agent can fill in the page bindings
+from the UI and API you already have.
+
+Then, and every time you edit `agent-entry.json`:
+
+```bash
+npx @muretai/agent-entry publish   # validate, compile, sign; write /.well-known/agent-tools*.json
+npx @muretai/agent-entry doctor    # seed kept out of git, contract verifies, routes and tag wired,
+                                   # and one signed knock per door-bound offer
+npx @muretai/agent-entry doctor --url https://shop.example.com   # the same, against the live site
+```
+
+`agent-entry deploy` is the same command as `agent-entry publish`. A published version is never
+rewritten: the next publish is the next version. `agent-entry <command> --help` explains each
+one, and on `init`, `publish`, `doctor` and `counts`, `--json` prints one machine-readable
+document instead of text.
+
+### Install by hand
 
 ```bash
 npm i @muretai/agent-entry
@@ -405,7 +502,9 @@ which is the point — you can read all of it before you trust it.
 curl -O https://raw.githubusercontent.com/muretai/agent-entry/main/muretai-agent-entry.mjs
 ```
 
-That is the whole footprint. **There is no database to install** and no schema to create —
+That is the whole footprint of the door. The page face is a second file,
+`agent-entry-page.mjs`, which `init` copies into your static directory; you need it only if you
+want the offers as WebMCP tools on the page. **There is no database to install** and no schema to create —
 an entry runs, in production, on its bounded in-process state, which is how muretai.com's
 own door runs. Once your door is answering, a store of your own is the **recommended**
 upgrade — the ledger is your customer list, and more features stand on keeping it — while
@@ -772,6 +871,59 @@ An Agent Entry is the second door, and it is the one that keeps something:
 | **WebMCP tools** | a person's agent, in a tab, right now | an answer in the moment |
 | **Agent Entry** | an agent alone, from anywhere, at any hour | a customer you still recognise next month |
 
+Since 1.13.0 both doors can come from the same declaration. The door you already have is one
+face; `agent-entry-page.mjs` is the other.
+
+![One declaration, agent-entry.json, keyed by verbs. Publish signs it into /.well-known/agent-tools.json. On the page, agent-entry-page.mjs verifies it and registers the offers as WebMCP tools for a person's agent in the tab. At the door, the same offers are the card's skills and the signed replies for an agent alone. Both hand off to one account: the visitor's key.](diagrams/two-faces.svg)
+
+### The signed contract
+
+`agent-entry publish` compiles `agent-entry.json` into one contract and signs it with your site's
+seed, the same key as your card:
+
+| path | what it is |
+|---|---|
+| `/.well-known/agent-tools.json` | the contract: the offers, their page bindings, `version`, `origins` and a sha256 `hash` |
+| `/.well-known/agent-tools.sig.json` | the signed envelope `{v: 1, typ: "agenttools", contract, ts, sig}` |
+| `/.well-known/agent-tools/v<n>.json` | every earlier version, unchanged forever |
+
+The `agenttools` envelope is a type of its own: it can never be replayed as a card, and a card
+can never pass as a contract. It is bound to the contract's `origins`, so a copy served from
+another site does not verify. The card points at it as `agentEntry.tools`. There is no project
+id, no publishable key and no third-party endpoint: the contract is signed by you and served by
+you.
+
+### The page runtime: `agent-entry-page.mjs`
+
+One browser module, no dependencies, served from your own origin (`init` copies it there and puts
+the tag in your layout):
+
+```html
+<script type="module" src="/agent-entry-page.mjs"></script>
+```
+
+On load it fetches the card, the contract and its envelope from the same origin, and verifies the
+envelope with WebCrypto Ed25519 against the card's `did`. It then checks `origins` and the hash.
+It registers nothing unless every check passes: a refusal is one of `contract_missing`,
+`sig_missing`, `sig_invalid`, `origin_mismatch`, `hash_mismatch`, `card_mismatch`. After that, every
+offer whose `page.on` matches the current route becomes a tool on `document.modelContext`:
+
+- the tool name is `verb_of` (`find_products`, `hold_item`), and the description is `about`;
+- the annotations come from the verb's effect;
+- an offer that changes or pays opens one `<dialog>` and goes ahead only when the person
+  confirms;
+- the tools follow SPA navigation, and they are removed when the page aborts them.
+
+When an offer hands over to the door (`then: "door"`, the default for `changes` and `pays`), the
+tool's result carries the handoff for you: `_meta.handoff` with the card URL, and the legacy
+`muretai` key naming your DID. The page only talks to its own origin. To call it yourself, load
+`/agent-entry-page.mjs?manual` and call `install({ handlers })`.
+
+The page also counts, and only counts: see
+[Counting visits](#counting-visits-without-handing-over-your-customer-list).
+
+### Writing the handoff yourself
+
 **They connect by a handoff.** When a WebMCP (or MCP) tool call reaches the point of
 actually wanting something — a booking, a quote, a follow-up — the tool returns a small
 envelope naming your site's DID. The visitor's agent then sends a **signed message to your
@@ -872,6 +1024,68 @@ or contributing to a profile of them.
 envelope, after the verdict, so watching a visit stops being an edit to the code that decides
 what to say. It cannot matter: its return is discarded, a throw is swallowed, a promise is
 never awaited — a slow or broken watcher cannot delay or change one byte of the signed reply.
+
+**Since 1.13.0 the page counts too, through the door.** A door built from a declaration also
+runs a small **collector** at `POST /.well-known/agent-tools/events` (the card names it as
+`agentEntry.events`). The page runtime sends it beacons from the same origin: at most 2 KB each
+and 100 events per session. It sends only these allowlisted events:
+
+| event | when |
+|---|---|
+| `page_ready` | the page runtime verified the contract and installed |
+| `referral` | the visit came from an answer engine (by referrer or `utm_source`) |
+| `offer_registered` | an offer was registered as a WebMCP tool on this route |
+| `offer_started` | an agent called that tool |
+| `offer_succeeded` | the call finished |
+| `offer_failed` | the call failed, bad input included |
+| `ask_denied` | the person said no in the dialog |
+| `handoff` | the result handed the visitor over to the door |
+
+The collector answers `204` and never writes to the ledger. It hands each event to your
+`observer` as `stage: "page"`, with the door's usual `ua_family`, `client_class`, `ip_vendor`
+and `country`. An event never carries a DID, the visitor's text or an input value. So one
+observer sees both faces: what was asked on the page and what was asked at the door.
+
+Two observers ship with the package, so you do not have to write one:
+
+```js
+import { createAgentEntry, fileSink, gaSink } from '@muretai/agent-entry';
+
+const toFile = fileSink('var/visits.jsonl');   // one JSON line per event, for `agent-entry counts`
+const toGa = gaSink({ measurementId: process.env.GA_ID, apiSecret: process.env.GA_SECRET });
+
+createAgentEntry({
+  seedHex, name, baseUrl, declaration, responder,
+  observer: (env) => { toFile(env); toGa(env); },
+});
+```
+
+- `fileSink(path)` appends the allowlisted fields of each event to a local file, never a DID or
+  text.
+- `gaSink({measurementId, apiSecret})` posts each event to Google Analytics 4 over the
+  Measurement Protocol. A page event keeps its name, and a door stage is sent as `door_<stage>`.
+  It sends `engagement_time_msec` and `session_id`, and its `client_id` is random for each sink,
+  never derived from a visitor's key. A failing endpoint is swallowed. It is the ready-made form
+  of the hand-written example further down.
+
+Then read the log with the dashboard on your own machine:
+
+```bash
+npx @muretai/agent-entry counts --log var/visits.jsonl --store var/ledger.json
+npx @muretai/agent-entry counts --log var/visits.jsonl --serve   # one page, loopback only
+```
+
+`agent-entry counts` shows, **per offer**: how often it was asked on the page, asked at the
+door, completed, and how many receipts were issued. It also shows referrals by answer engine,
+returning customers (a count, never who), and door knocks by stage and client class. `--serve`
+binds only to `127.0.0.1` or `::1` and refuses any other `Host`.
+
+**A hosted dashboard is planned, not shipped.** The planned field is `entry.counts` in
+`agent-entry.json`: a URL for a Muretai-hosted counts endpoint. The page runtime and the door
+would send the same events there, and you would see the same numbers on your hosted door's
+ledger page with nothing to run. **`entry.counts` is NOT YET ACCEPTED in 1.13.0:** the
+declaration validator refuses unknown keys, so a declaration that sets it today is refused at
+startup. Until it ships, use `fileSink` with `agent-entry counts`, or `gaSink`.
 
 **The rule that shapes everything else: a DID is not a cookie, and it is not a throwaway
 either.** Nobody imposed it — the visitor read your card *before* knocking, and an owner who

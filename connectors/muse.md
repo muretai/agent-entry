@@ -48,6 +48,37 @@ AGENT_ENTRY_KNOCK_TEXT='Table for four on Friday at 20:00?' \
   npx @muretai/agent-entry knock https://shop.example/.well-known/agent-card.json
 ```
 
+## Ask the card which verbs the shop offers
+
+Before knocking on the user's behalf, ask the shop's card what a customer can do there. A shop
+that publishes an `agent-entry.json` declaration lists its offers in the card's `skills[]`, one
+skill per offer. Each skill's `id` is the verb and the thing it acts on, `verb_of` (`find_products`,
+`hold_item`, `book_table`, `ask_anything`). Its `tags` start with the verb, and its `examples` are
+messages the shop has promised to answer. Match the user's intent against the verb, not the
+wording. The verbs are the same at every shop: `find`, `ask`, `quote`, `book`, `hold`, `order`,
+`buy`, `track`, `change`, `cancel` and `join`.
+
+For example, for the card at `https://shop.example.com/.well-known/agent-card.json`:
+
+```json
+{"id": "hold_item", "name": "hold_item", "description": "Hold one lamp for pickup within 48 hours.",
+ "tags": ["hold", "item"],
+ "examples": ["Hold one lamp for pickup within 48 hours.", "hold item {\"sku\":\"<string>\"}"]}
+```
+
+- Tell the user which verbs the shop offers before you act, and knock only for the one they
+  chose.
+- Put that skill's example, filled in with the user's details, in `AGENT_ENTRY_KNOCK_TEXT`.
+- A verb that changes something (`book`, `hold`, `order`, `change`, `join`) or pays (`buy`) needs
+  the user's yes first. `buy` never takes payment at the door: the reply carries the shop's own
+  checkout URL, which you show the user.
+- A card with no skills, or skills without a registry verb, is a shop that has not declared its
+  offers. Knock with the user's words.
+
+`knock` sends the text only. It does not yet set `metadata.offer`, the field a door uses to pick
+one offer by its id. So the shop's own responder reads the message and decides which offer it
+is.
+
 ## Reading the answer
 
 On success the command exits 0 and prints one JSON object on stdout. When the shop's verified

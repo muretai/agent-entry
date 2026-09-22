@@ -3,7 +3,7 @@
 Releases before 1.12.0 are recorded in the commit history and in the README's "Since 1.x"
 paragraphs.
 
-## 1.13.0 — Agent Entry Suite S1 and S2: one declaration, verbs first, on the door and the page (unreleased)
+## 1.13.0 — Agent Entry Suite S1 to S4: one declaration, verbs first, on the door and the page (unreleased)
 
 A site can now describe what a customer can do there in one declaration, `agent-entry.json`,
 keyed by verbs (`find`, `book`, `hold`, `buy`, `ask`, …). The door turns it into a signed tool
@@ -345,6 +345,73 @@ Choices made in the implementation, where the tests left room:
   only on the dev/preview server or with on-demand rendering.
 - A human security review of the seed handling. This landing mints seeds and writes them to
   disk, and no SEC scan ran on it.
+
+### Suite S4: the README, this record and the Muse page say what S1 to S3 do
+
+Documentation only. No code changed: `muretai-agent-entry.mjs`, `agent-entry-page.mjs`,
+`vendor/` and the `package.json` version (still 1.12.0) are untouched. The tests came first:
+`conformance/docs.mjs` and its fixture `conformance/fixtures/docs/pre-s4-example-urls.json`
+(commit `e8d5304`, wired in `67c81cd` as `npm run test:docs`). The implementation did not edit
+them. They read the verbs, the events, the CLI commands and the contract paths from the code at
+run time, so a verb, event or command added later fails the run until the README names it.
+Design record: Agent Entry Suite, section 7-S4 (intake `20260921T215441Z-S4`).
+
+What landed:
+
+- **README "What a customer can do here"** (new section, in Contents). It explains the
+  declaration and its two faces, and has one table row per registry verb: the verb, its default
+  effect in plain words, whether the page asks the person first, and an example. It also shows a
+  three-offer declaration.
+- **README "Put it on a site".** `npx @muretai/agent-entry init` is now the first way in,
+  followed by `publish` (and its alias `deploy`) and `doctor` (local and `--url`). `npm i` and
+  the `curl -O` copy of the one file remain as "Install by hand". It says the page face is a
+  second file, `agent-entry-page.mjs`.
+- **README "Pairs with WebMCP"** names the signed contract: `/.well-known/agent-tools.json`,
+  `agent-tools.sig.json`, `agent-tools/v<n>.json`, the `agenttools` envelope and
+  `agentEntry.tools`. It also describes the page runtime `agent-entry-page.mjs`: the tag, the
+  checks it makes before registering anything, the refusal names, `verb_of` tools, the ask dialog,
+  and the handoff it emits. The hand-written handoff example stays, under its own heading.
+- **README "Counting visits"** names the collector and its eight events (`page_ready`,
+  `referral`, `offer_registered`, `offer_started`, `offer_succeeded`, `offer_failed`,
+  `ask_denied`, `handoff`), `fileSink`, `gaSink`, and `agent-entry counts` (with `--serve`). It
+  names `entry.counts` as the hosted-dashboard opt-in and says it is **not yet accepted** in
+  1.13.0.
+- **`diagrams/two-faces.svg`** (new, shown in "Pairs with WebMCP"): one declaration, the
+  signed contract, the page face and the door face, the handoff between them, and one account.
+- **`connectors/muse.md`** gains "Ask the card which verbs the shop offers": read `skills[]`
+  (one skill per offer, `id` = `verb_of`), match the user's intent on the verb, get a yes before
+  a verb that changes something or pays, and fill `AGENT_ENTRY_KNOCK_TEXT` from the skill's
+  example. It says plainly that `knock` does not set `metadata.offer` yet.
+- `spec/tools-v1.md` is unchanged: it already names every registry verb.
+
+#### Decisions (coordinator rulings of 2026-09-22)
+
+- **Placeholder hosts stay strict, as pinned.** Every new example URL uses `example.com` or
+  `*.example.com`, `*.test`, `*.invalid` or `192.0.2.x`. The `.example` TLD form, used by the
+  older examples, is not used for new ones. URLs that were already there are grandfathered
+  exactly, per section.
+- **`entry.counts` is named, not documented as working.** The S1 validator refuses unknown keys,
+  so a declaration that sets it today is refused. The README says so in "Counting visits".
+- **Diagrams.** A diagram that shows only the door is updated to show both faces when it is SVG
+  or text. `diagrams/become.png` (and its unreferenced source `diagrams/desk.svg`) shows WebMCP
+  as the site's own page and Agent Entry as the door only. It is a PNG, so it is left as is for a
+  human to check. The new `two-faces.svg` shows both faces. No machine check covers diagrams.
+- **The verb table's examples** use only placeholder hosts, and describe the default effect in
+  plain words.
+
+#### Follow-ups (named, not built here)
+
+- Align `conformance/docs.mjs`'s placeholder list with trunk's
+  `docs/curation/allowed_domains.json` (principle 8), which also allows `*.example`.
+- agent-entry: the `entry.counts` field, and posting to the hosted counts endpoint (this pairs
+  with trunk S5).
+- A human check of `diagrams/become.png`: regenerate it to show both faces (from `two-faces.svg`
+  or an updated `desk.svg`), or confirm the "WebMCP beside the door" framing it shows is still
+  wanted at the top of the README.
+- `knock` sets `metadata.offer` (for example `AGENT_ENTRY_KNOCK_OFFER`) and prints the
+  `{verb, of, customer_did, request, status, deal?}` reply shape. Today it sends text only and
+  recognises only the older `{type, …}` booking (S1 follow-up), so `connectors/muse.md` has to
+  route through the shop's responder.
 
 ## 1.12.0 — who is knocking, v2 (landed 2026-09-19, not yet published)
 
