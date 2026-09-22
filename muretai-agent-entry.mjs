@@ -3166,6 +3166,473 @@ export function canonicalMount(canonUrl, basePath) {
   return given;
 }
 
+// ================================================================ the declaration, verbs first (spec/tools-v1.md)
+//
+// ONE declaration, `agent-entry.json`, keyed by what a customer can DO here (`offers[]`, each a
+// verb + an object), and two faces generated from it: the page's tools (the signed
+// `agenttools` contract, served at TOOLS_PATH) and the door's card skills and default replies.
+// Nothing here is repeated by hand, so the card, the contract and the replies cannot disagree.
+// The byte-pinned vectors are `conformance/vectors-tools.json`; the rules there are data, so a
+// second implementation reads the same table this block implements.
+
+/** The verb registry v1 (AT-3): shared spellings a visiting agent can match an intent against
+ *  across shops. Order is part of the table. A site MAY use another verb; it then gets NO
+ *  defaults (AT-4). */
+export const VERBS = Object.freeze(['find', 'ask', 'quote', 'book', 'hold', 'order', 'buy', 'track',
+  'change', 'cancel', 'join']);
+/** Each registry verb's default `effect`. Frozen: a caller must not lower a default at runtime. */
+export const VERB_EFFECTS = Object.freeze({
+  find: 'none', ask: 'none', quote: 'none', book: 'changes', hold: 'changes', order: 'changes',
+  buy: 'pays', track: 'none', change: 'changes', cancel: 'reversible', join: 'changes',
+});
+/** The page's confirmation floor per effect (AT-5). An offer may raise it, never lower it. */
+export const ASK_FLOOR = Object.freeze({
+  none: 'never', reversible: 'advised', changes: 'advised', pays: 'always',
+});
+const EFFECT_ORDER = Object.freeze(['none', 'reversible', 'changes', 'pays']);
+const ASK_ORDER = Object.freeze(['never', 'advised', 'always']);
+const THEN_DOOR_EFFECTS = new Set(['changes', 'pays']);
+const RECEIPT_VERBS = new Set(['hold', 'book', 'order', 'quote']);
+/** How the door answers an offer (`door.reply`). */
+export const REPLY_KINDS = Object.freeze(['catalog', 'facts', 'pending', 'checkout', 'brain', 'human']);
+/** How the page does an offer (`page.do`, exactly one of these keys). */
+export const PAGE_ACTIONS = Object.freeze(['open', 'read', 'fill', 'fetch', 'call']);
+/** The field-map types an offer's `input` may name. */
+export const INPUT_TYPES = Object.freeze(['string', 'integer', 'number', 'boolean']);
+const OFFER_SPELLING = /^[a-z][a-z0-9_]*$/;
+const INPUT_FIELD = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const CALL_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+const DECLARATION_KEYS = ['v', 'entry', 'offers', 'facts'];
+const ENTRY_KEYS = ['name', 'baseUrl', 'domains', 'prefer', 'catalog'];
+const OFFER_KEYS = ['verb', 'of', 'about', 'input', 'effect', 'ask', 'then', 'page', 'door'];
+
+/** Where the contract, its signature and the collector live, under the entry's mount. */
+export const TOOLS_PATH = '/.well-known/agent-tools.json';
+export const TOOLS_SIG_PATH = '/.well-known/agent-tools.sig.json';
+export const TOOLS_EVENTS_PATH = '/.well-known/agent-tools/events';
+const TOOLS_VERSION_ROUTE = /^\/\.well-known\/agent-tools\/v([1-9][0-9]{0,8})\.json$/;
+const TOOLS_ENVELOPE_VERSION = 1;
+/** A NEW envelope type: an `agenttools` signature can never be replayed as an `agentcard` one,
+ *  because `typ` is inside the signed bytes of both. */
+const TOOLS_ENVELOPE_TYPE = 'agenttools';
+
+/** The collector's event names (AT-14), our own vocabulary, and the answer engines a
+ *  `referral` may name. */
+export const COLLECTOR_EVENTS = Object.freeze(['page_ready', 'referral', 'offer_registered',
+  'offer_started', 'offer_succeeded', 'offer_failed', 'ask_denied', 'handoff']);
+export const REFERRAL_ENGINES = Object.freeze(['chatgpt', 'claude', 'perplexity', 'gemini', 'copilot',
+  'grok', 'deepseek', 'mistral', 'you', 'other']);
+export const COLLECTOR_MAX_BODY_BYTES = 2048;
+export const COLLECTOR_MAX_EVENTS_PER_SESSION = 100;
+const COLLECTOR_MAX_MS = 600000;
+const COLLECTOR_SESSION = /^[A-Za-z0-9_-]{8,64}$/;
+const COLLECTOR_EVENT_KEYS = ['name', 'offer', 'engine', 'ms'];
+/** Sessions remembered for the per-session cap. Bounded so a stranger minting session names
+ *  cannot grow the door's memory; the oldest is forgotten first. */
+const COLLECTOR_MAX_SESSIONS = 10000;
+
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+/** Every refusal names the field it is about, so an operator reads the fix off the message. */
+function refuseDeclaration(field, why) {
+  throw new TypeError(`agent-entry.json: ${field} ${why}`);
+}
+
+function declaredString(value, field) {
+  if (typeof value !== 'string' || value.length === 0) refuseDeclaration(field, 'must be a non-empty string');
+  if (LONE_SURROGATE.test(value)) refuseDeclaration(field, 'is not encodable UTF-8 (a lone surrogate)');
+  return value;
+}
+
+function onlyKeys(obj, allowed, field) {
+  const stray = Object.keys(obj).filter((k) => !allowed.includes(k));
+  if (stray.length) {
+    refuseDeclaration(field, `has unexpected key(s) ${stray.map((k) => JSON.stringify(k).slice(0, 40)).join(', ')}`);
+  }
+}
+
+/** A same-origin path: starts with one "/", printable ASCII, no backslash. A checkout or an
+ *  `open` that could leave the origin is how a declaration would send a customer elsewhere. */
+function sameOriginPath(value, field) {
+  if (typeof value !== 'string' || !/^\/(?![/\\])[\x21-\x7e]*$/.test(value) || value.includes('\\')) {
+    refuseDeclaration(field, 'must be a same-origin path: it starts with "/", not "//", and is printable ASCII');
+  }
+  return value;
+}
+
+/** `{field}` placeholders in a URL template must name the offer's input. */
+function placeholdersNameInput(template, input, field) {
+  for (const [, key] of template.matchAll(/\{([^{}]*)\}/g)) {
+    if (!Object.hasOwn(input, key)) refuseDeclaration(field, `names {${key.slice(0, 40)}}, which is not in the offer's input`);
+  }
+}
+
+function readPageAction(action, value, input, field) {
+  switch (action) {
+    case 'open':
+      sameOriginPath(value, `${field}.open`);
+      placeholdersNameInput(value, input, `${field}.open`);
+      return value;
+    case 'read':
+      return declaredString(value, `${field}.read`);
+    case 'call':
+      if (typeof value !== 'string' || !CALL_NAME.test(value)) {
+        refuseDeclaration(`${field}.call`, 'must be the name of a function the page registers');
+      }
+      return value;
+    case 'fill':
+      if (!isPlainObject(value)) refuseDeclaration(`${field}.fill`, 'must be {form: "<selector>"}');
+      onlyKeys(value, ['form'], `${field}.fill`);
+      return { form: declaredString(value.form, `${field}.fill.form`) };
+    case 'fetch': {
+      if (!isPlainObject(value)) refuseDeclaration(`${field}.fetch`, 'must be {method, path, query?}');
+      onlyKeys(value, ['method', 'path', 'query'], `${field}.fetch`);
+      if (value.method !== 'GET' && value.method !== 'POST') refuseDeclaration(`${field}.fetch.method`, 'must be "GET" or "POST"');
+      const out = { method: value.method, path: sameOriginPath(value.path, `${field}.fetch.path`) };
+      if (value.query !== undefined) {
+        if (!isPlainObject(value.query)) refuseDeclaration(`${field}.fetch.query`, 'must map a query parameter to an input field');
+        out.query = {};
+        for (const [param, from] of Object.entries(value.query)) {
+          declaredString(param, `${field}.fetch.query`);
+          if (typeof from !== 'string' || !Object.hasOwn(input, from)) {
+            refuseDeclaration(`${field}.fetch.query`, 'must map each parameter to a field of the offer\'s input');
+          }
+          out.query[param] = from;
+        }
+      }
+      return out;
+    }
+    default:
+      return refuseDeclaration(field, `must be one of ${PAGE_ACTIONS.join(', ')}`);
+  }
+}
+
+/** One offer, validated and compiled (AT-2..AT-6). `facts` says whether the declaration has
+ *  any, because a `facts` reply with nothing to draw on would answer an empty object. */
+function readOffer(offer, i, hasFacts) {
+  const at = `offers[${i}]`;
+  if (!isPlainObject(offer)) refuseDeclaration(at, 'must be an object: {verb, of, about, input, page?, door?}');
+  onlyKeys(offer, OFFER_KEYS, at);
+  for (const key of ['verb', 'of']) {
+    if (typeof offer[key] !== 'string' || !OFFER_SPELLING.test(offer[key])) {
+      refuseDeclaration(`${at}.${key}`, 'must be lowercase ASCII letters, digits and "_", starting with a letter');
+    }
+  }
+  const { verb, of } = offer;
+  const about = declaredString(offer.about, `${at}.about`);
+  if (!isPlainObject(offer.input)) refuseDeclaration(`${at}.input`, 'must be a field map, e.g. {"q": "string"}');
+  const input = {};
+  for (const [key, type] of Object.entries(offer.input)) {
+    if (!INPUT_FIELD.test(key)) refuseDeclaration(`${at}.input`, 'field names must be ASCII identifiers');
+    if (!INPUT_TYPES.includes(type)) refuseDeclaration(`${at}.input`, `types must be one of ${INPUT_TYPES.join(', ')}`);
+    input[key] = type;
+  }
+
+  // Effect and ask: a registry verb brings its default and its floor, and an offer may only
+  // RAISE either. A verb outside the registry brings nothing (AT-4).
+  const defaultEffect = Object.hasOwn(VERB_EFFECTS, verb) ? VERB_EFFECTS[verb] : undefined;
+  if (offer.effect !== undefined && !EFFECT_ORDER.includes(offer.effect)) {
+    refuseDeclaration(`${at}.effect`, `must be one of ${EFFECT_ORDER.join(', ')}`);
+  }
+  if (offer.effect !== undefined && defaultEffect !== undefined
+      && EFFECT_ORDER.indexOf(offer.effect) < EFFECT_ORDER.indexOf(defaultEffect)) {
+    refuseDeclaration(`${at}.effect`, `may raise "${verb}"'s default "${defaultEffect}", never lower it`);
+  }
+  const effect = offer.effect ?? defaultEffect;
+  if (offer.ask !== undefined && !ASK_ORDER.includes(offer.ask)) {
+    refuseDeclaration(`${at}.ask`, `must be one of ${ASK_ORDER.join(', ')}`);
+  }
+  const floor = effect === undefined ? undefined : ASK_FLOOR[effect];
+  if (offer.ask !== undefined && floor !== undefined
+      && ASK_ORDER.indexOf(offer.ask) < ASK_ORDER.indexOf(floor)) {
+    refuseDeclaration(`${at}.ask`, `may raise the "${effect}" floor "${floor}", never lower it`);
+  }
+  const ask = offer.ask ?? floor;
+  if (offer.then !== undefined && offer.then !== 'door' && offer.then !== 'none') {
+    refuseDeclaration(`${at}.then`, 'must be "door" or "none"');
+  }
+
+  const out = { id: `${verb}_${of}`, verb, of, about, input };
+  if (effect !== undefined) out.effect = effect;
+  if (ask !== undefined) out.ask = ask;
+
+  let pageThen = false;
+  if (offer.page !== undefined) {
+    const page = offer.page;
+    if (!isPlainObject(page)) refuseDeclaration(`${at}.page`, 'must be {on, do, then?}');
+    onlyKeys(page, ['on', 'do', 'then'], `${at}.page`);
+    if (!Array.isArray(page.on) || page.on.length === 0) {
+      refuseDeclaration(`${at}.page.on`, 'must be a non-empty list of route patterns like "/shop/**"');
+    }
+    const on = page.on.map((p) => sameOriginPath(p, `${at}.page.on`));
+    if (!isPlainObject(page.do) || Object.keys(page.do).length !== 1
+        || !PAGE_ACTIONS.includes(Object.keys(page.do)[0])) {
+      refuseDeclaration(`${at}.page.do`, `must hold exactly one of ${PAGE_ACTIONS.join(', ')}`);
+    }
+    const [action] = Object.keys(page.do);
+    if (page.then !== undefined && page.then !== 'door') refuseDeclaration(`${at}.page.then`, 'may only be "door"');
+    pageThen = page.then === 'door';
+    if (pageThen && offer.then === 'none') refuseDeclaration(`${at}.then`, 'is "none" while page.then is "door"');
+    out.page = { on, do: { [action]: readPageAction(action, page.do[action], input, `${at}.page.do`) } };
+  }
+  const then = offer.then === 'door' || pageThen
+    || (offer.then !== 'none' && effect !== undefined && THEN_DOOR_EFFECTS.has(effect));
+  if (then) out.then = 'door';
+
+  if (offer.door !== undefined) {
+    const door = offer.door;
+    if (!isPlainObject(door)) refuseDeclaration(`${at}.door`, 'must be {reply, receipt?, url?}');
+    onlyKeys(door, ['reply', 'receipt', 'url'], `${at}.door`);
+    if (!REPLY_KINDS.includes(door.reply)) refuseDeclaration(`${at}.door.reply`, `must be one of ${REPLY_KINDS.join(', ')}`);
+    if (door.receipt !== undefined && typeof door.receipt !== 'boolean') refuseDeclaration(`${at}.door.receipt`, 'must be true or false');
+    if (door.reply === 'facts' && !hasFacts) refuseDeclaration(`${at}.door.reply`, 'is "facts" but the declaration has no facts');
+    const compiled = { reply: door.reply, receipt: door.receipt ?? RECEIPT_VERBS.has(verb) };
+    if (door.reply === 'checkout') {
+      if (door.url === undefined) refuseDeclaration(`${at}.door.url`, 'is required for a checkout reply: the path of the site\'s own checkout');
+      compiled.url = sameOriginPath(door.url, `${at}.door.url`);
+      placeholdersNameInput(door.url, input, `${at}.door.url`);
+    } else if (door.url !== undefined) {
+      refuseDeclaration(`${at}.door.url`, 'belongs to a checkout reply only');
+    }
+    out.door = compiled;
+  }
+  if (!out.page && !out.door) refuseDeclaration(at, 'binds neither a page nor a door, so nothing can do it');
+  return out;
+}
+
+/** The whole declaration, validated and compiled to everything but `version` and `hash`. */
+function readDeclaration(declaration) {
+  if (!isPlainObject(declaration)) refuseDeclaration('declaration', 'must be an object: {v, entry, offers, facts?}');
+  onlyKeys(declaration, DECLARATION_KEYS, 'declaration');
+  if (declaration.v !== 1) refuseDeclaration('v', 'must be 1');
+
+  const entry = declaration.entry;
+  if (!isPlainObject(entry)) refuseDeclaration('entry', 'must be an object: {name, baseUrl, domains?, prefer?, catalog?}');
+  onlyKeys(entry, ENTRY_KEYS, 'entry');
+  const name = declaredString(entry.name, 'entry.name');
+  if (typeof entry.baseUrl !== 'string') refuseDeclaration('entry.baseUrl', 'must be the URL visitors dial');
+  let origin;
+  try {
+    origin = new URL(canonicalBaseUrl(entry.baseUrl, { warn: false })).origin;
+  } catch (e) {
+    refuseDeclaration('entry.baseUrl', `is not usable: ${String(e.message).split('\n')[0]}`);
+  }
+  if (entry.domains !== undefined && !Array.isArray(entry.domains)) {
+    refuseDeclaration('entry.domains', 'must be a list of bare domain names');
+  }
+  let domains = [];
+  try {
+    domains = canonicalDomains(entry.domains, { warn: false });
+  } catch (e) {
+    refuseDeclaration('entry.domains', `is not usable: ${String(e.message).split('\n')[0]}`);
+  }
+  const origins = [origin];
+  for (const d of domains) if (!origins.includes(`https://${d}`)) origins.push(`https://${d}`);
+  let prefer = null;
+  try {
+    prefer = validatePrefer(entry.prefer);
+  } catch (e) {
+    // validatePrefer speaks for the card's `agentEntry.prefer`; here the operator wrote
+    // `entry.prefer`, so the refusal names the field in their file and keeps the reason.
+    refuseDeclaration('entry.prefer', `is not a valid order of ways in (${e.message})`);
+  }
+  if (entry.catalog !== undefined && typeof entry.catalog !== 'boolean') refuseDeclaration('entry.catalog', 'must be true or false');
+
+  let facts;
+  if (declaration.facts !== undefined) {
+    if (!isPlainObject(declaration.facts)) refuseDeclaration('facts', 'must map a name to a string');
+    facts = {};
+    for (const [key, value] of Object.entries(declaration.facts)) {
+      declaredString(key, 'facts');
+      facts[key] = declaredString(value, `facts.${key.slice(0, 40)}`);
+    }
+  }
+
+  if (!Array.isArray(declaration.offers) || declaration.offers.length === 0) {
+    refuseDeclaration('offers', 'must be a non-empty list of what a customer can do here');
+  }
+  const offers = [];
+  const ids = new Set();
+  declaration.offers.forEach((offer, i) => {
+    const compiled = readOffer(offer, i, facts !== undefined);
+    if (ids.has(compiled.id)) refuseDeclaration(`offers[${i}]`, `repeats the offer id "${compiled.id}"`);
+    ids.add(compiled.id);
+    offers.push(compiled);
+  });
+  return { name, origin, origins, prefer, offers, facts };
+}
+
+/** Returns the declaration unchanged, or throws a TypeError naming the field (AT-2). */
+export function validateDeclaration(declaration) {
+  readDeclaration(declaration);
+  return declaration;
+}
+
+function contractHash(contract) {
+  const { hash: _omit, ...rest } = contract;
+  return createHash('sha256').update(canonicalJSON(rest), 'utf8').digest('hex');
+}
+
+/** True when `contract` is an object whose `hash` is the sha256 of its own other bytes. */
+function contractHashOk(contract) {
+  try {
+    return isPlainObject(contract) && typeof contract.hash === 'string'
+      && /^[0-9a-f]{64}$/.test(contract.hash) && contractHash(contract) === contract.hash;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The contract (AT-6): `{v: 1, name, origins, version, offers, facts?, hash}`, byte-identical
+ * for identical input whatever the key order. `hash` is the hex sha256 of canonicalJSON of the
+ * contract without `hash`, and the version is inside what is hashed. Never mutates its input.
+ */
+export function compileDeclaration(declaration, { version = 1 } = {}) {
+  if (!Number.isSafeInteger(version) || version < 1) {
+    throw new TypeError('compileDeclaration: version must be a positive integer');
+  }
+  const { name, origins, offers, facts } = readDeclaration(declaration);
+  const contract = { v: 1, name, origins, version, offers };
+  if (facts !== undefined) contract.facts = facts;
+  contract.hash = contractHash(contract);
+  return contract;
+}
+
+/** The card's `skills[]`, one per offer in order (AT-7). */
+export function skillsFromOffers(declaration) {
+  return readDeclaration(declaration).offers.map((o) => {
+    const examples = [o.about];
+    const fields = Object.keys(o.input);
+    if (fields.length) {
+      const shape = Object.fromEntries(fields.map((k) => [k, `<${o.input[k]}>`]));
+      examples.push(`${o.verb} ${o.of} ${canonicalJSON(shape)}`);
+    }
+    return { id: o.id, name: o.id, description: o.about, tags: [o.verb, o.of], examples };
+  });
+}
+
+/** The canonical bytes an `agenttools` envelope signs: {contract, ts, typ, v} — the card
+ *  envelope's construction with its own `typ` (AT-8). */
+export function toolsEnvelopePayload(contract, ts) {
+  return canonicalJSON({ contract, ts, typ: TOOLS_ENVELOPE_TYPE, v: TOOLS_ENVELOPE_VERSION });
+}
+
+/** Sign a compiled contract. Refuses a contract whose hash does not match its bytes: a page
+ *  runtime rechecks the hash, so the door must never sign one that fails it. */
+export function makeToolsEnvelope(seedHex, contract, ts) {
+  if (!Number.isSafeInteger(ts)) throw new TypeError('tools envelope ts must be an INTEGER epoch');
+  if (!contractHashOk(contract)) {
+    throw new TypeError('makeToolsEnvelope: the contract hash does not match its bytes — compile it, never edit it');
+  }
+  const payload = toolsEnvelopePayload(contract, ts);
+  assertEncodable(payload);
+  return {
+    v: TOOLS_ENVELOPE_VERSION,
+    typ: TOOLS_ENVELOPE_TYPE,
+    contract,
+    ts,
+    sig: signBytes(seedHex, Buffer.from(payload, 'utf8')).toString('base64'),
+  };
+}
+
+/**
+ * Verify an `agenttools` envelope; returns the contract or null (AT-8, AT-9). `expectedDid` is
+ * REQUIRED — the contract names no key, the card does — and `origin`, when given, must be one
+ * of the contract's `origins`, spelled as URL.origin spells it.
+ */
+export function verifyToolsEnvelope(envelope, expectedDid = null, { origin = null } = {}) {
+  try {
+    if (typeof expectedDid !== 'string' || !expectedDid) return null;
+    if (!isPlainObject(envelope) || envelope.v !== TOOLS_ENVELOPE_VERSION
+        || envelope.typ !== TOOLS_ENVELOPE_TYPE) return null;
+    const { contract, ts, sig } = envelope;
+    if (!Number.isSafeInteger(ts) || typeof sig !== 'string') return null;
+    if (!contractHashOk(contract) || contract.v !== 1 || !Array.isArray(contract.origins)) return null;
+    if (origin !== null && !contract.origins.includes(origin)) return null;
+    const raw = strictB64(sig);
+    if (raw === null || raw.length !== 64) return null;
+    const payload = toolsEnvelopePayload(contract, ts);
+    assertEncodable(payload);
+    return verifyBytes(publicKeyFromDid(expectedDid), raw, Buffer.from(payload, 'utf8')) ? contract : null;
+  } catch {
+    return null;
+  }
+}
+
+function deepFreeze(value) {
+  if (value && typeof value === 'object') {
+    for (const v of Object.values(value)) deepFreeze(v);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+/** The four trade recipes as `offers[]` starters, for `init` to write into a new
+ *  `agent-entry.json`. Door-bound only: the page bindings are the site's to fill, grounded in
+ *  its own UI. */
+export const OFFER_STARTERS = deepFreeze({
+  restaurant: [
+    { verb: 'book', of: 'table', about: 'Request a table by party size, date and time.',
+      input: { party: 'integer', when: 'string' }, door: { reply: 'pending' } },
+    { verb: 'ask', of: 'anything', about: 'Ask the restaurant a question.',
+      input: { text: 'string' }, door: { reply: 'human' } },
+  ],
+  retail: [
+    { verb: 'find', of: 'products', about: 'Find products by words or category.',
+      input: { q: 'string' }, door: { reply: 'catalog' } },
+    { verb: 'hold', of: 'item', about: 'Hold one item for pickup.',
+      input: { sku: 'string' }, door: { reply: 'pending' } },
+    { verb: 'buy', of: 'order', about: 'Pay for a held item at the shop\'s own checkout.',
+      input: { hold_id: 'string' }, door: { reply: 'checkout', url: '/checkout?hold={hold_id}' } },
+  ],
+  clinic: [
+    { verb: 'book', of: 'appointment', about: 'Request a non-emergency appointment by service, date and preferred time.',
+      input: { service: 'string', when: 'string' }, door: { reply: 'pending' } },
+    { verb: 'cancel', of: 'appointment', about: 'Cancel a requested appointment.',
+      input: { booking: 'string' }, door: { reply: 'pending' } },
+    { verb: 'ask', of: 'anything', about: 'Ask the clinic a non-urgent question.',
+      input: { text: 'string' }, door: { reply: 'human' } },
+  ],
+  repair: [
+    { verb: 'book', of: 'repair', about: 'Request a repair by item, problem and preferred drop-off date.',
+      input: { item: 'string', problem: 'string', when: 'string' }, door: { reply: 'pending' } },
+    { verb: 'quote', of: 'repair', about: 'Get a price for a repair before you commit.',
+      input: { item: 'string', problem: 'string' }, door: { reply: 'pending' } },
+    { verb: 'ask', of: 'anything', about: 'Ask the shop a question.',
+      input: { text: 'string' }, door: { reply: 'human' } },
+  ],
+});
+
+/** The deal block a receipt-bearing reply carries (AT-12): the JS twin of trunk
+ *  `shared/deal.py`'s half-signed offer, with `salt` published so the visitor can check the
+ *  commitment before it countersigns the same seven-field payload. */
+function dealBlock(seedHex, partyA, terms, { partyB, contextId, ref }) {
+  const salt = randomBytes(16);
+  const termsHash = createHash('sha256')
+    .update(Buffer.concat([canonicalBytes({ terms }), salt])).digest('hex');
+  const ts = nowEpoch();
+  const payload = canonicalBytes({ type: 'DealReceipt', partyA, partyB, termsHash, contextId, ref, ts });
+  return { type: 'DealReceipt', partyA, partyB, termsHash, contextId, ref, ts,
+    salt: salt.toString('base64'), sigA: signBytes(seedHex, payload).toString('base64') };
+}
+
+/** The input values a visitor wrote as a JSON object after the words (the skill example's
+ *  shape, `buy order {"hold_id":"H-1"}`), limited to the offer's own fields. */
+function inputValues(text, input) {
+  const at = text.indexOf('{');
+  if (at === -1) return {};
+  let parsed;
+  try { parsed = JSON.parse(text.slice(at)); } catch { return {}; }
+  if (!isPlainObject(parsed)) return {};
+  const out = {};
+  for (const key of Object.keys(input)) {
+    const v = parsed[key];
+    if (typeof v === 'string' || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v))) out[key] = String(v);
+  }
+  return out;
+}
+
 /**
  * createAgentEntry(opts) -> { did, card, ledger, handleRequest, handleRequestAsync, listen }
  *
@@ -3305,6 +3772,8 @@ export function createAgentEntry({
   trustProxy = false,
   vendorRanges = null,
   store = null,
+  declaration = undefined,
+  toolsHistory = null,
 } = {}) {
   if (!seedHex) throw new TypeError('createAgentEntry: seedHex is required');
   if (!baseUrl) throw new TypeError('createAgentEntry: baseUrl is required (it is signed into the card)');
@@ -3346,6 +3815,69 @@ export function createAgentEntry({
   // The terms of this door, built ONCE: the card publishes it (E1, before the knock) and
   // the no-envelope refusal returns the same object (E2, after it).
   const requirement = signedEnvelopeRequirement(did, doorUrl, howToUrl);
+  const doorOrigin = new URL(canonUrl).origin;
+
+  // Suite S1: a DECLARATION makes this door serve its signed contract, generate its skills
+  // and answer its offers. Refuse-to-start posture, as for `prefer` (AE-30): a declaration
+  // that fails validation, names another origin, or arrives with a prior version that does
+  // not check out would otherwise publish something the operator did not write. Only an
+  // ABSENT declaration means "none": `null` is a declaration that failed to load, and refused.
+  let tools = null;
+  if (declaration !== undefined) {
+    const read = readDeclaration(declaration);
+    if (read.origin !== doorOrigin) {
+      throw new TypeError(`createAgentEntry: the declaration's entry.baseUrl is ${read.origin} and this `
+        + `entry answers at ${doorOrigin} — a contract is served only from an origin it names`);
+    }
+    if (Array.isArray(skills) && skills.length) {
+      throw new TypeError('createAgentEntry: pass `skills` or a `declaration`, not both — with a '
+        + 'declaration the card\'s skills are generated from its offers');
+    }
+    if (prefer !== null && prefer !== undefined && read.prefer !== null
+        && canonicalJSON(validatePrefer(prefer)) !== canonicalJSON(read.prefer)) {
+      throw new TypeError('createAgentEntry: `prefer` and the declaration\'s entry.prefer disagree');
+    }
+    const history = toolsHistory ?? [];
+    if (!Array.isArray(history)) {
+      throw new TypeError('createAgentEntry: toolsHistory must be the list of prior compiled contracts, v1 first');
+    }
+    history.forEach((prior, i) => {
+      if (!contractHashOk(prior)) {
+        throw new TypeError(`createAgentEntry: toolsHistory[${i}] does not match its own hash — a `
+          + 'published version is immutable');
+      }
+      if (prior.version !== i + 1) {
+        throw new TypeError(`createAgentEntry: toolsHistory[${i}] is version ${String(prior.version).slice(0, 12)}, `
+          + `not ${i + 1} — the history is every prior version, in order, with no gap`);
+      }
+      if (!Array.isArray(prior.origins) || !prior.origins.includes(doorOrigin)) {
+        throw new TypeError(`createAgentEntry: toolsHistory[${i}] does not name ${doorOrigin}`);
+      }
+    });
+    const contract = compileDeclaration(declaration, { version: history.length + 1 });
+    const byId = new Map();
+    const byVerb = new Map();
+    const ambiguous = new Set();
+    for (const offer of contract.offers) {
+      if (!offer.door) continue;
+      byId.set(offer.id, offer);
+      if (!VERBS.includes(offer.verb)) continue;
+      if (byVerb.has(offer.verb)) ambiguous.add(offer.verb);
+      byVerb.set(offer.verb, offer);
+    }
+    for (const verb of ambiguous) byVerb.delete(verb);
+    tools = {
+      contract,
+      versions: [...history, contract].map((c) => Buffer.from(canonicalJSON(c), 'utf8')),
+      skills: skillsFromOffers(declaration),
+      prefer: read.prefer,
+      byId,
+      byVerb,
+      offerIds: new Set(contract.offers.map((o) => o.id)),
+    };
+  } else if (toolsHistory !== null && toolsHistory !== undefined) {
+    throw new TypeError('createAgentEntry: toolsHistory needs the declaration it precedes');
+  }
 
   const card = {
     protocolVersion: PROTOCOL_VERSION,
@@ -3357,7 +3889,7 @@ export function createAgentEntry({
     capabilities: { streaming: false, pushNotifications: false },
     defaultInputModes: ['text/plain'],
     defaultOutputModes: ['text/plain'],
-    skills,
+    skills: tools ? tools.skills : skills,
   };
   // T88, the REVERSE EDGE only, in the same top-level field and the same position
   // shared/protocol.build_agent_card uses, so one verifier rule reads a node's card and an
@@ -3369,8 +3901,14 @@ export function createAgentEntry({
   // producers stop emitting the old one, never after.
   // AE-30: the site's order rides on the NEUTRAL key only; the alias stays `open_door`
   // alone, so an old consumer that compares the two aliases byte for byte keeps passing.
-  const canonPrefer = validatePrefer(prefer);
+  const canonPrefer = validatePrefer(prefer) ?? (tools ? tools.prefer : null);
   if (openDoor) card.agentEntry = { open_door: true, ...(canonPrefer ? { prefer: canonPrefer } : {}) };
+  // Suite S1: where the signed contract and the collector are, on the NEUTRAL key only — the
+  // legacy alias stays `open_door` alone, as it did for `prefer`.
+  if (tools) {
+    card.agentEntry = { ...(card.agentEntry || {}),
+      tools: `${canonUrl}${TOOLS_PATH}`, events: `${canonUrl}${TOOLS_EVENTS_PATH}` };
+  }
   if (openDoor) card.muretai = { open_door: true };
   // Deliberately NO `relay`/`enc_pub` on the card: those advertise a store-and-forward
   // mailbox, and an agent entry has no listener draining one. Advertising a mailbox nobody
@@ -3812,6 +4350,18 @@ export function createAgentEntry({
     return sigEnvelope;
   }
 
+  /** The signed contract, on the card envelope's freshness window and for the same reason. */
+  let toolsSigEnvelope = null;
+  let toolsSigMintedAt = 0;
+  function toolsEnvelopeBytes() {
+    const now = nowEpoch();
+    if (!toolsSigEnvelope || now - toolsSigMintedAt >= CARD_SIG_REFRESH_S) {
+      toolsSigEnvelope = Buffer.from(JSON.stringify(makeToolsEnvelope(seedHex, tools.contract, now)), 'utf8');
+      toolsSigMintedAt = now;
+    }
+    return toolsSigEnvelope;
+  }
+
   /** Record contact from an account. Returns the row (or a promise of it, with a store). */
   function noteContact(accountDid) {
     const now = nowEpoch();
@@ -4166,6 +4716,21 @@ export function createAgentEntry({
         `text is ${over} bytes over the ${MAX_TEXT_BYTES}-byte limit`);
     }
 
+    // 3c. Suite S1: `metadata.offer` picks which offer this message is (AT-11). Verbs ride
+    //     the ONE method; they are never methods of their own. A value this door does not
+    //     answer at the door is refused here, before any crypto, so it mints no account row,
+    //     and the refusal does not echo it. A door without a declaration ignores the key, as
+    //     it always ignored unknown metadata.
+    let chosen = null;
+    if (tools && Object.hasOwn(meta, 'offer')) {
+      const pick = meta.offer;
+      chosen = typeof pick === 'string' ? (tools.byId.get(pick) ?? tools.byVerb.get(pick) ?? null) : null;
+      if (!chosen) {
+        return rpcError(reqId, ERRORS.INVALID_PARAMS,
+          'metadata.offer must be an offer id or a registry verb this door answers; the card\'s skills list them');
+      }
+    }
+
     const from = typeof meta.from === 'string' ? meta.from : null;
     const to = typeof meta.to === 'string' ? meta.to : null;
     const sig = typeof meta.sig === 'string' ? meta.sig : null;
@@ -4221,7 +4786,7 @@ export function createAgentEntry({
         // bearer credential and replayable while it lives), and the anon rate bound
         // above already applied. Identify, don't enrol.
         return respond(backendEnvelope(msg, { verified: false, peerDid: null,
-          wbaDid: wbaIdentify(reqHeaders) }), reqId, msg, '');
+          wbaDid: wbaIdentify(reqHeaders) }), reqId, msg, '', chosen);
       });
     }
     // 5. addressed to someone else. Checked BEFORE decoding `from`, so a junk DID in a
@@ -4351,7 +4916,7 @@ export function createAgentEntry({
             // vs the message signer) — both facts are honest, and the schema says which is
             // which.
             respond(backendEnvelope(msg, { verified: true, peerDid: from, ownerDid,
-              wbaDid: wbaIdentify(reqHeaders) }), reqId, msg, from)));
+              wbaDid: wbaIdentify(reqHeaders) }), reqId, msg, from, chosen)));
       });
     });
     });
@@ -4376,7 +4941,45 @@ export function createAgentEntry({
     } catch { /* a watcher never changes what this door does */ }
   }
 
-  function respond(env, reqId, msg, toDid) {
+  /** The default responder's reply for a door-bound offer (AT-10): `{verb, of, customer_did,
+   *  request, status}` plus `facts` or `url` by kind, plus a `deal` when the offer carries a
+   *  receipt and the visitor has a key to countersign with. Deterministic but for the deal's
+   *  salt and ts; payment is never touched (`checkout` hands over the site's own URL). */
+  function offerReply(offer, env, msg, toDid) {
+    const reply = { verb: offer.verb, of: offer.of, customer_did: toDid || null, request: env.text };
+    switch (offer.door.reply) {
+      case 'pending':
+        reply.status = 'pending_confirmation';
+        break;
+      case 'facts':
+        reply.status = 'answered';
+        reply.facts = { ...tools.contract.facts };
+        break;
+      case 'catalog':
+        reply.status = 'see_catalog';
+        break;
+      case 'checkout': {
+        const values = inputValues(env.text, offer.input);
+        const path = offer.door.url.replace(/\{([^{}]*)\}/g, (_, k) => encodeURIComponent(values[k] ?? ''));
+        reply.status = 'continue_at_checkout';
+        reply.url = `${doorOrigin}${path}`;
+        break;
+      }
+      default:   // human
+        reply.status = 'awaiting_person';
+        reply.note = 'Thank you. We will answer as soon as a person has read this.';
+    }
+    if (offer.door.receipt && toDid) {
+      reply.deal = dealBlock(seedHex, did, { ...reply },
+        { partyB: toDid, contextId: msg.contextId ?? null, ref: msg.messageId });
+    }
+    return JSON.stringify(reply);
+  }
+
+  function respond(env, reqId, msg, toDid, chosen = null) {
+    // Suite S1: the responder and the watcher are told which offer this was. Added only when
+    // one was chosen, so a door without a declaration hands over the same envelope as before.
+    if (chosen) env = { ...env, offer: chosen.id };
     // The answered case: the envelope already says who this was, and the stage says how they
     // arrived. `identified` is read off the envelope rather than the stage, because the
     // anonymous lane answers a visitor who genuinely presented no DID.
@@ -4387,6 +4990,16 @@ export function createAgentEntry({
               identified: env && env.peer_did ? 1 : 0,
               ip_vendor: pendingLook.ip_vendor, country: pendingLook.country,
               signature_agent: env && env.wba_did ? (wbaVendorOf.get(env.wba_did) ?? null) : null });
+    if (chosen && chosen.door.reply !== 'brain') {
+      let text;
+      try {
+        text = offerReply(chosen, env, msg, toDid);
+      } catch {
+        return rpcError(reqId, ERRORS.INTERNAL_ERROR, 'the door failed to answer this offer');
+      }
+      return finishReply(reqId, text, { inbound: { contextId: msg.contextId ?? null,
+        messageId: msg.messageId ?? null }, toDid });
+    }
     let answer;
     try {
       answer = responder(env);
@@ -4425,6 +5038,87 @@ export function createAgentEntry({
     SIG_ROUTES.add(AGENT_CARD_SIG_PATH);
   }
 
+  /** Suite S1: which agent-tools resource a path is, or null. Hangs off the mount like every
+   *  other route (and, on a guest mount, off the origin too, as the card does). A version
+   *  route exists only for a version this door has published; every other address under the
+   *  prefix stays 404 (AE-4). No declaration, no resources. */
+  const toolsPrefixes = tools ? (guestMount ? [mount, ''] : [mount]) : [];
+  function toolsResource(pathname) {
+    for (const prefix of toolsPrefixes) {
+      if (!pathname.startsWith(prefix)) continue;
+      const rest = pathname.slice(prefix.length);
+      if (rest === TOOLS_PATH) return { kind: 'contract' };
+      if (rest === TOOLS_SIG_PATH) return { kind: 'sig' };
+      if (rest === TOOLS_EVENTS_PATH) return { kind: 'events' };
+      const m = TOOLS_VERSION_ROUTE.exec(rest);
+      if (m && Number(m[1]) <= tools.versions.length) return { kind: 'version', n: Number(m[1]) };
+    }
+    return null;
+  }
+
+  // session -> events counted. Bounded by COLLECTOR_MAX_SESSIONS, oldest forgotten first.
+  const collectorSessions = new Map();
+
+  /** The collector's body, or null (AT-14): `{session, events:[{name, offer?, engine?, ms?}]}`
+   *  and nothing else. One bad part refuses the whole body, so a page cannot slip a DID, free
+   *  text or an input value in beside a good event. */
+  function collectorBody(doc) {
+    if (!isPlainObject(doc)) return null;
+    if (Object.keys(doc).some((k) => k !== 'session' && k !== 'events')) return null;
+    if (typeof doc.session !== 'string' || !COLLECTOR_SESSION.test(doc.session)) return null;
+    const { events } = doc;
+    if (!Array.isArray(events) || events.length === 0 || events.length > COLLECTOR_MAX_EVENTS_PER_SESSION) return null;
+    for (const e of events) {
+      if (!isPlainObject(e) || Object.keys(e).some((k) => !COLLECTOR_EVENT_KEYS.includes(k))) return null;
+      if (!COLLECTOR_EVENTS.includes(e.name)) return null;
+      if (e.offer !== undefined && (typeof e.offer !== 'string' || !tools.offerIds.has(e.offer))) return null;
+      if (e.engine !== undefined && !REFERRAL_ENGINES.includes(e.engine)) return null;
+      if (e.ms !== undefined && !(Number.isSafeInteger(e.ms) && e.ms >= 0 && e.ms <= COLLECTOR_MAX_MS)) return null;
+    }
+    return { session: doc.session, events };
+  }
+
+  /** POST /.well-known/agent-tools/events: the page's counts. Same-origin only, small,
+   *  allowlisted, never on the ledger, and each event goes to the observer as `stage: "page"`
+   *  with the door's usual who-is-knocking fields. 204 whether or not a watcher is set; a
+   *  session's events past the cap are dropped, not refused, so a long visit is not an error.
+   *  A refusal never echoes what the page sent. */
+  function collect(headers, body, family, seen) {
+    const origin = wbaHeaderGet(headers, 'origin');
+    if (origin === null || !tools.contract.origins.includes(origin)) {
+      return jsonResponse(403, { error: 'the collector takes same-origin beacons only' });
+    }
+    if (body.length > COLLECTOR_MAX_BODY_BYTES) {
+      return jsonResponse(413, { error: `a beacon is at most ${COLLECTOR_MAX_BODY_BYTES} bytes` });
+    }
+    let doc;
+    try {
+      doc = JSON.parse(jsonRpcBodyText(body));
+    } catch {
+      return jsonResponse(400, { error: 'the beacon is not JSON' });
+    }
+    const beacon = collectorBody(doc);
+    if (!beacon) {
+      return jsonResponse(400, { error: 'the beacon must be {session, events:[{name, offer?, engine?, ms?}]} '
+        + 'with allowlisted values and nothing else' });
+    }
+    const counted = collectorSessions.get(beacon.session) ?? 0;
+    const take = Math.min(beacon.events.length, COLLECTOR_MAX_EVENTS_PER_SESSION - counted);
+    collectorSessions.delete(beacon.session);
+    collectorSessions.set(beacon.session, counted + take);
+    while (collectorSessions.size > COLLECTOR_MAX_SESSIONS) {
+      collectorSessions.delete(collectorSessions.keys().next().value);
+    }
+    for (const e of beacon.events.slice(0, take)) {
+      observe({ stage: 'page', event: e.name, offer: e.offer ?? null, engine: e.engine ?? null,
+        ms: e.ms ?? null, identified: 0, verified: false, ua_family: family,
+        client_class: clientClass(family, 'page'),
+        peer_did: null, owner_did: null, wba_did: null, text: null,
+        ip_vendor: seen.ip_vendor, country: seen.country, signature_agent: null });
+    }
+    return { status: 204, headers: { 'Content-Length': '0', ...CORS_HEADERS }, body: Buffer.alloc(0) };
+  }
+
   /** What `Allow:` may truthfully say about THIS path, or null when the entry does not own
    *  it at all. RFC 9110 §10.2.1 makes `Allow` a statement about the target RESOURCE, so a
    *  single server-wide list is a wrong answer to a right question — and on a guest mount
@@ -4433,6 +5127,8 @@ export function createAgentEntry({
    *  never do. Whatever the GET route does for an address we do not own (404), OPTIONS and
    *  the method table do the same. */
   function allowFor(pathname) {
+    const resource = toolsResource(pathname);
+    if (resource) return resource.kind === 'events' ? ALLOW_DOOR : ALLOW_CARD;
     if (CARD_ROUTES.has(pathname) || SIG_ROUTES.has(pathname)) return ALLOW_CARD;
     if (isMountPath(pathname)) return guestMount ? ALLOW_DOOR : ALLOW_MOUNT;
     return null;
@@ -4491,6 +5187,14 @@ export function createAgentEntry({
         tally(family, 'card_get', { ...seen, signature_agent: signatureAgent });
         return { status: 200, headers: cardHeaders(env.length), body: env };
       }
+      // Suite S1: the signed contract, its envelope, and every version this door published,
+      // each as the canonical bytes. The collector is POST-only and falls to the 405 below.
+      const resource = toolsResource(pathname);
+      if (resource && resource.kind !== 'events') {
+        const body = resource.kind === 'sig' ? toolsEnvelopeBytes()
+          : tools.versions[(resource.kind === 'version' ? resource.n : tools.versions.length) - 1];
+        return { status: 200, headers: cardHeaders(body.length), body };
+      }
       // The human notice — NOT served on a guest mount, where GET belongs to the site (E3).
       // Falling through to 404 is deliberate and is the same non-disclosure the POST route
       // already makes: an entry beside other agents does not confirm what lives at an
@@ -4533,6 +5237,13 @@ export function createAgentEntry({
       return jsonResponse(404, { error: 'not found' });
     }
     if (method === 'POST') {
+      // Suite S1: the collector takes POST; the contract routes are GET-only resources the
+      // card names, so a POST there is 405 with their `Allow`, not the unowned-path 404.
+      const resource = toolsResource(pathname);
+      if (resource) {
+        if (resource.kind === 'events') return collect(headers, bodyBuffer || Buffer.alloc(0), family, seen);
+        return jsonResponse(405, { error: 'method not allowed' }, allowHeaders(ALLOW_CARD));
+      }
       // EXACTLY the address the card names. A POST anywhere else is not this contract —
       // and when this entry is mounted under a path, "anywhere else" INCLUDES the bare
       // host, which belongs to the site (or to the neighbour agent) and not to us.
