@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "app": { "name": "Harbor Lamp" },
+  "telemetry": { "enabled": true },
+  "tools": [
+    {
+      "id": "search_products",
+      "name": "search_products",
+      "title": "Search products",
+      "description": "Search the lamp catalogue by words or category.",
+      "input": {
+        "q": { "type": "string" },
+        "category": { "type": "string", "optional": true }
+      },
+      "output": { "items": { "type": "array" } },
+      "on": ["/shop/**"],
+      "run": { "type": "request", "method": "GET", "path": "/wp-json/wc/store/v1/products", "query": { "search": "q", "category": "category" } },
+      "risk": "read_only"
+    },
+    {
+      "id": "hold_item",
+      "name": "hold_item",
+      "description": "Hold one lamp for pickup within 48 hours.",
+      "input": {
+        "sku": { "type": "string" },
+        "name": { "type": "string" }
+      },
+      "on": ["/product/*"],
+      "run": { "type": "form", "selector": "#hold" },
+      "risk": "state_changing",
+      "confirmation": "recommended"
+    },
+    {
+      "id": "read_hours",
+      "name": "read_hours",
+      "description": "Read the shop's opening hours.",
+      "input": {},
+      "on": ["/", "/contact"],
+      "run": { "type": "extract", "selector": "#hours" },
+      "risk": "read_only"
+    },
+    {
+      "id": "view_cart",
+      "name": "view_cart",
+      "description": "Open the cart.",
+      "input": {},
+      "on": ["/**"],
+      "run": { "type": "navigate", "url": "/cart" },
+      "risk": "read_only"
+    },
+    {
+      "id": "buy_order",
+      "name": "buy_order",
+      "description": "Pay for a held lamp at the shop's own checkout.",
+      "input": { "hold_id": { "type": "string" } },
+      "on": ["/checkout/**"],
+      "run": { "type": "call", "function": "startCheckout" },
+      "risk": "financial",
+      "confirmation": "required"
+    }
+  ]
+}

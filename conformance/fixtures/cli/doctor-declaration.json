@@ -1,0 +1,44 @@
+{
+  "about": "The live door conformance/cli.mjs starts on 127.0.0.1 for `doctor --url`. `entry.baseUrl` is replaced with the loopback origin at run time. Every reply kind the default responder answers is door-bound once; `track_order` is page-only and must get no knock. `expected_status` is the status the door answers per door-bound offer (spec/tools-v1.md AT-12).",
+  "declaration": {
+    "v": 1,
+    "entry": { "name": "Harbor Lamp", "baseUrl": "http://127.0.0.1" },
+    "offers": [
+      { "verb": "find", "of": "products", "about": "Find lamps by words or category.",
+        "input": { "q": "string" },
+        "page": { "on": ["/shop/**"], "do": { "fetch": { "method": "GET", "path": "/wp-json/wc/store/v1/products", "query": { "search": "q" } } } },
+        "door": { "reply": "catalog" } },
+      { "verb": "find", "of": "hours", "about": "When the shop is open.",
+        "input": {},
+        "door": { "reply": "facts" } },
+      { "verb": "hold", "of": "item", "about": "Hold one lamp for pickup within 48 hours.",
+        "input": { "sku": "string", "name": "string" },
+        "door": { "reply": "pending", "receipt": true } },
+      { "verb": "book", "of": "table", "about": "Reserve a table.",
+        "input": { "party": "integer", "when": "string" },
+        "door": { "reply": "pending" } },
+      { "verb": "buy", "of": "order", "about": "Pay for a held lamp.",
+        "input": { "hold_id": "string" },
+        "door": { "reply": "checkout", "url": "/checkout?hold={hold_id}" } },
+      { "verb": "ask", "of": "anything", "about": "Ask the shop a question.",
+        "input": { "text": "string" },
+        "door": { "reply": "human" } },
+      { "verb": "track", "of": "order", "about": "Track an order.",
+        "input": { "order": "string" },
+        "page": { "on": ["/account/**"], "do": { "open": "/account/orders/{order}" } } }
+    ],
+    "facts": { "hours": "Tue-Sun 10:00-18:00", "pickup": "48h" }
+  },
+  "expected_status": {
+    "find_products": "see_catalog",
+    "find_hours": "answered",
+    "hold_item": "pending_confirmation",
+    "book_table": "pending_confirmation",
+    "buy_order": "continue_at_checkout",
+    "ask_anything": "awaiting_person"
+  },
+  "site_verb_without_effect": { "verb": "rent", "of": "bike", "about": "Rent a bike for the afternoon.",
+    "input": { "hours": "integer" }, "door": { "reply": "human" } },
+  "site_verb_with_effect": { "verb": "rent", "of": "bike", "about": "Rent a bike for the afternoon.",
+    "input": { "hours": "integer" }, "effect": "pays", "door": { "reply": "human" } }
+}

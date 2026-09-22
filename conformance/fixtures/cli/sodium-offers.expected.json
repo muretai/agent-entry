@@ -1,0 +1,36 @@
+{
+  "about": "What `init --from sodium.json` must write as agent-entry.json offers[] for fixtures/cli/sodium.json, in order (spec/tools-v1.md 3.1). The id splits at the first `_` into verb and of; description -> about; input keeps types only (v1 has no optional marker); on -> page.on; run request/form/extract/navigate/call -> page.do fetch/fill/read/open/call; risk -> effect (read_only none, state_changing changes, financial pays); confirmation -> ask (recommended advised, required always). `name`, `title` and `output` have no equivalent and are dropped. No offer gets a `door` binding: nothing is invented.",
+  "entry_name": "Harbor Lamp",
+  "offers": [
+    {
+      "verb": "search", "of": "products", "about": "Search the lamp catalogue by words or category.",
+      "input": { "q": "string", "category": "string" },
+      "effect": "none",
+      "page": { "on": ["/shop/**"], "do": { "fetch": { "method": "GET", "path": "/wp-json/wc/store/v1/products", "query": { "search": "q", "category": "category" } } } }
+    },
+    {
+      "verb": "hold", "of": "item", "about": "Hold one lamp for pickup within 48 hours.",
+      "input": { "sku": "string", "name": "string" },
+      "effect": "changes", "ask": "advised",
+      "page": { "on": ["/product/*"], "do": { "fill": { "form": "#hold" } } }
+    },
+    {
+      "verb": "read", "of": "hours", "about": "Read the shop's opening hours.",
+      "input": {},
+      "effect": "none",
+      "page": { "on": ["/", "/contact"], "do": { "read": "#hours" } }
+    },
+    {
+      "verb": "view", "of": "cart", "about": "Open the cart.",
+      "input": {},
+      "effect": "none",
+      "page": { "on": ["/**"], "do": { "open": "/cart" } }
+    },
+    {
+      "verb": "buy", "of": "order", "about": "Pay for a held lamp at the shop's own checkout.",
+      "input": { "hold_id": "string" },
+      "effect": "pays", "ask": "always",
+      "page": { "on": ["/checkout/**"], "do": { "call": "startCheckout" } }
+    }
+  ]
+}

@@ -1,0 +1,117 @@
+{
+  "about": "Sample project trees for `agent-entry init` detection (Agent Entry Suite S3). conformance/cli.mjs writes each tree into a fresh temporary directory, writes `gitignore` as `.gitignore` (null = no .gitignore at all), runs `git init` and commits the tree, then runs the CLI there. Trees are data rather than directories so no nested package.json or .gitignore lives inside this repository. `expect.framework` is the spelling `init --json` reports; `expect.route` is set when init hands off to another product instead of wiring the door into the tree.",
+  "frameworks": {
+    "next-app": {
+      "trade": "retail",
+      "expect": { "framework": "next-app" },
+      "gitignore": "node_modules\n.next\n.env\n.env*.local\n",
+      "files": {
+        "package.json": "{\n  \"name\": \"harbor-lamp-next-app\",\n  \"private\": true,\n  \"scripts\": { \"dev\": \"next dev\", \"build\": \"next build\" },\n  \"dependencies\": { \"next\": \"15.5.0\", \"react\": \"19.1.0\", \"react-dom\": \"19.1.0\" }\n}\n",
+        "next.config.mjs": "/** @type {import('next').NextConfig} */\nexport default {};\n",
+        "app/layout.tsx": "export default function RootLayout({ children }: { children: React.ReactNode }) {\n  return (\n    <html lang=\"en\">\n      <head />\n      <body>{children}</body>\n    </html>\n  );\n}\n",
+        "app/page.tsx": "export default function Home() {\n  return <main><h1>Harbor Lamp</h1></main>;\n}\n"
+      }
+    },
+    "next-pages": {
+      "trade": "restaurant",
+      "expect": { "framework": "next-pages" },
+      "gitignore": "node_modules\n.next\n.env\n.env*.local\n",
+      "files": {
+        "package.json": "{\n  \"name\": \"harbor-bistro-next-pages\",\n  \"private\": true,\n  \"scripts\": { \"dev\": \"next dev\" },\n  \"dependencies\": { \"next\": \"14.2.30\", \"react\": \"18.3.1\", \"react-dom\": \"18.3.1\" }\n}\n",
+        "next.config.js": "module.exports = { reactStrictMode: true };\n",
+        "pages/_app.tsx": "import type { AppProps } from 'next/app';\nexport default function App({ Component, pageProps }: AppProps) {\n  return <Component {...pageProps} />;\n}\n",
+        "pages/_document.tsx": "import { Html, Head, Main, NextScript } from 'next/document';\nexport default function Document() {\n  return (\n    <Html lang=\"en\">\n      <Head />\n      <body><Main /><NextScript /></body>\n    </Html>\n  );\n}\n",
+        "pages/index.tsx": "export default function Home() {\n  return <main><h1>Harbor Bistro</h1></main>;\n}\n"
+      }
+    },
+    "nuxt": {
+      "trade": "clinic",
+      "expect": { "framework": "nuxt" },
+      "gitignore": "node_modules\n.nuxt\n.output\n.env\n.env.*\n",
+      "files": {
+        "package.json": "{\n  \"name\": \"harbor-clinic-nuxt\",\n  \"private\": true,\n  \"type\": \"module\",\n  \"scripts\": { \"dev\": \"nuxt dev\" },\n  \"dependencies\": { \"nuxt\": \"3.17.5\", \"vue\": \"3.5.17\" }\n}\n",
+        "nuxt.config.ts": "export default defineNuxtConfig({ compatibilityDate: '2025-07-01' });\n",
+        "app.vue": "<template>\n  <main><h1>Harbor Clinic</h1></main>\n</template>\n"
+      }
+    },
+    "sveltekit": {
+      "trade": "repair",
+      "expect": { "framework": "sveltekit" },
+      "gitignore": "node_modules\n.svelte-kit\nbuild\n.env\n.env.*\n",
+      "files": {
+        "package.json": "{\n  \"name\": \"harbor-repair-sveltekit\",\n  \"private\": true,\n  \"type\": \"module\",\n  \"scripts\": { \"dev\": \"vite dev\" },\n  \"devDependencies\": { \"@sveltejs/kit\": \"2.22.2\", \"@sveltejs/adapter-auto\": \"6.0.1\", \"svelte\": \"5.35.0\", \"vite\": \"6.3.5\" }\n}\n",
+        "svelte.config.js": "import adapter from '@sveltejs/adapter-auto';\nexport default { kit: { adapter: adapter() } };\n",
+        "vite.config.js": "import { sveltekit } from '@sveltejs/kit/vite';\nimport { defineConfig } from 'vite';\nexport default defineConfig({ plugins: [sveltekit()] });\n",
+        "src/app.html": "<!doctype html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"utf-8\" />\n    %sveltekit.head%\n  </head>\n  <body>\n    <div>%sveltekit.body%</div>\n  </body>\n</html>\n",
+        "src/routes/+page.svelte": "<h1>Harbor Repair</h1>\n"
+      }
+    },
+    "astro": {
+      "trade": "restaurant",
+      "expect": { "framework": "astro" },
+      "gitignore": "node_modules\ndist\n.astro\n.env\n.env.*\n",
+      "files": {
+        "package.json": "{\n  \"name\": \"harbor-bistro-astro\",\n  \"private\": true,\n  \"type\": \"module\",\n  \"scripts\": { \"dev\": \"astro dev\" },\n  \"dependencies\": { \"astro\": \"5.11.0\" }\n}\n",
+        "astro.config.mjs": "import { defineConfig } from 'astro/config';\nexport default defineConfig({});\n",
+        "src/layouts/Layout.astro": "---\n---\n<html lang=\"en\">\n  <head><meta charset=\"utf-8\" /></head>\n  <body><slot /></body>\n</html>\n",
+        "src/pages/index.astro": "---\nimport Layout from '../layouts/Layout.astro';\n---\n<Layout><h1>Harbor Bistro</h1></Layout>\n"
+      }
+    },
+    "vite": {
+      "trade": "retail",
+      "expect": { "framework": "vite" },
+      "gitignore": "node_modules\ndist\n*.local\n.env\n",
+      "files": {
+        "package.json": "{\n  \"name\": \"harbor-lamp-vite\",\n  \"private\": true,\n  \"type\": \"module\",\n  \"scripts\": { \"dev\": \"vite\", \"build\": \"vite build\" },\n  \"devDependencies\": { \"vite\": \"6.3.5\" }\n}\n",
+        "index.html": "<!doctype html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"UTF-8\" />\n    <title>Harbor Lamp</title>\n  </head>\n  <body>\n    <div id=\"app\"></div>\n    <script type=\"module\" src=\"/src/main.js\"></script>\n  </body>\n</html>\n",
+        "src/main.js": "document.querySelector('#app').innerHTML = '<h1>Harbor Lamp</h1>';\n"
+      }
+    },
+    "express": {
+      "trade": "clinic",
+      "expect": { "framework": "express" },
+      "gitignore": "node_modules\n.env\n",
+      "files": {
+        "package.json": "{\n  \"name\": \"harbor-clinic-express\",\n  \"private\": true,\n  \"type\": \"module\",\n  \"main\": \"server.js\",\n  \"scripts\": { \"start\": \"node server.js\" },\n  \"dependencies\": { \"express\": \"5.1.0\" }\n}\n",
+        "server.js": "import express from 'express';\n\nconst app = express();\napp.get('/', (req, res) => res.send('<h1>Harbor Clinic</h1>'));\napp.listen(process.env.PORT || 3000);\n"
+      }
+    },
+    "static": {
+      "trade": "repair",
+      "expect": { "framework": "static", "route": "agent-entry-serverless" },
+      "gitignore": ".env\n.dev.vars\n",
+      "files": {
+        "index.html": "<!doctype html>\n<html lang=\"en\">\n  <head><meta charset=\"utf-8\"><title>Harbor Repair</title></head>\n  <body><h1>Harbor Repair</h1><a href=\"/about.html\">About</a></body>\n</html>\n",
+        "about.html": "<!doctype html>\n<html lang=\"en\">\n  <head><meta charset=\"utf-8\"><title>About</title></head>\n  <body><p>We fix lamps.</p></body>\n</html>\n",
+        "netlify.toml": "[build]\n  publish = \".\"\n"
+      }
+    },
+    "wordpress": {
+      "trade": "restaurant",
+      "expect": { "framework": "wordpress", "route": "agent-entry-wordpress" },
+      "gitignore": "wp-config.php\n.env\nwp-content/uploads/\n",
+      "files": {
+        "index.php": "<?php\ndefine( 'WP_USE_THEMES', true );\nrequire __DIR__ . '/wp-blog-header.php';\n",
+        "wp-blog-header.php": "<?php\nrequire_once __DIR__ . '/wp-load.php';\n",
+        "wp-load.php": "<?php\ndefine( 'ABSPATH', __DIR__ . '/' );\n",
+        "wp-config-sample.php": "<?php\ndefine( 'DB_NAME', 'database_name_here' );\ndefine( 'DB_USER', 'username_here' );\n$table_prefix = 'wp_';\n",
+        "wp-includes/version.php": "<?php\n$wp_version = '6.8.2';\n",
+        "wp-content/themes/harbor/style.css": "/*\nTheme Name: Harbor\n*/\n",
+        "wp-content/themes/harbor/index.php": "<?php get_header(); ?><h1>Harbor Bistro</h1><?php get_footer(); ?>\n"
+      }
+    }
+  },
+  "r1": {
+    "about": "R1: trees whose git would track the platform's secret slot. init must refuse; no seed may reach a path git reports as trackable. Each is the next-app tree with the named .gitignore; `tracked` files are force-added and committed so the ignore rule no longer applies to them.",
+    "base": "next-app",
+    "cases": {
+      "gitignore-without-env-entries": { "gitignore": "node_modules\n.next\n" },
+      "no-gitignore-at-all": { "gitignore": null },
+      "env-negated-back-in": { "gitignore": "node_modules\n.next\n.env*\n!.env*\n" },
+      "env-files-already-tracked": {
+        "gitignore": "node_modules\n.next\n.env\n.env*.local\n",
+        "tracked": { ".env": "NEXT_PUBLIC_SHOP=harbor\n", ".env.local": "NEXT_PUBLIC_SHOP=harbor\n" }
+      }
+    }
+  }
+}
