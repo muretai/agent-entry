@@ -77,7 +77,7 @@ fi
 claim_lock() {
   local wt="$1"
   case "$(iso_lock_state "$wt" "$owner")" in
-    mine) iso_lock_touch "$wt" ;;
+    mine) iso_lock_touch "$wt" "$owner" ;;
     free)
       iso_lock_write "$wt" "$owner" "$kind" "$branch" "$task"
       ;;

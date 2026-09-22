@@ -17,7 +17,7 @@ kind="$(iso_kind_of_branch "$branch")"
 owner="$(iso_owner)"
 claimed="yes"
 case "$(iso_lock_state "$wt" "$owner")" in
-  mine) claimed="already"; iso_lock_touch "$wt" ;;
+  mine) claimed="already"; iso_lock_touch "$wt" "$owner" ;;
   free) iso_lock_write "$wt" "$owner" "$kind" "$branch" "(claimed in place)" ;;
   dead)
     echo "note: taking over from a session that is gone ($(iso_lock_describe "$wt"))" >&2

@@ -15,13 +15,13 @@ Do these steps in this order. Do not skip or reorder them.
 1. `bash .cursor/skills/isolated-session/scripts/stale.sh`
 2. `bash .cursor/skills/isolated-session/scripts/ensure-worktree.sh "{{TITLE}}"` -- keep the WORKTREE= and BRANCH= lines it prints. Every file you touch lives under WORKTREE. If the ticket named a branchHint, prefer a slug that includes it.
 3. `cd <WORKTREE>` and run `bash .cursor/skills/isolated-session/scripts/assert-head.sh <BRANCH> <WORKTREE>` before your first edit.
-4. Do the task in the fenced block. Run each test file you change or add directly (`python3 tests/test_x.py`), then `python3 tools/run_tests.py --affected main..HEAD -j4` from the worktree. Do not run two test suites at once.
-5. `python3 tools/ledger.py new "{{TITLE}}" --plan host --unit isolated-session --tests "test_dispatch_take.py"` is not yours unless the task asked for a note; follow the task. Never edit PLAN.md, docs/IMPLEMENTATION_BACKLOG.md or docs/SPECIFICATION.md -- they are generated at landing.
+4. Do the task in the fenced block. Run each test file you change or add directly (`python3 -I tests/test_x.py`), then `python3 -I tools/run_tests.py --affected main..HEAD -j4` from the worktree. Do not run two test suites at once.
+5. `python3 -I tools/ledger.py new "{{TITLE}}" --plan host --unit isolated-session --tests "test_dispatch_take.py"` is not yours unless the task asked for a note; follow the task. Never edit PLAN.md, docs/IMPLEMENTATION_BACKLOG.md or docs/SPECIFICATION.md -- they are generated at landing.
 6. `git add` your files and commit: one summary line, a short body saying why, and the Co-Authored-By trailer your harness gives you.
 7. `cd {{PRIMARY}} && bash .cursor/skills/isolated-session/scripts/finish-worktree.sh <BRANCH> <WORKTREE>`. If it refuses, fix inside WORKTREE, commit, run it again. The publisher, not you, writes GitHub. Never push.
 8. Finish the ticket, then write {{REPORT}}:
-   - `python3 operator_cli.py --as {{AS}} coord {{PEER}} deliver "delivered" --thread {{CONTEXT}}`
-   - post `[deliverable]` to the Room (`python3 operator_cli.py --as {{AS}} dm {{ROOM}} "[deliverable] {{CONTEXT}}"`)
+   - `python3 -I operator_cli.py --as {{AS}} coord {{PEER}} deliver "delivered" --thread {{CONTEXT}}`
+   - post `[deliverable]` to the Room (`python3 -I operator_cli.py --as {{AS}} dm {{ROOM}} "[deliverable] {{CONTEXT}}"`)
    - `/remember note [task] {{CONTEXT}} | taken-by={{DID}} lane=delivered at=<iso>` to the same Room
    On a provider limit (rate limit / quota / usage cap on the last lines): post `[failed]` to the Room, `/remember` with `lane=failed`, and `bash .cursor/skills/isolated-session/scripts/dispatch-capacity.sh full "provider limit"` -- never a local respawn. A test failure is not a spent seat.
 

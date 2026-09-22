@@ -51,6 +51,7 @@ FILES = [
     f"{skill}/scripts/herd-spawn.sh",
     f"{skill}/scripts/dispatch-take.sh",
     f"{skill}/scripts/dispatch-capacity.sh",
+    f"{skill}/scripts/herd-watch.sh",
     f"{skill}/briefs/worker.md",
     f"{skill}/briefs/dispatch-ticket.md",
 ]

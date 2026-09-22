@@ -26,7 +26,7 @@ if ! iso_is_linked "$wt"; then
   fi
 else
   case "$(iso_lock_state "$wt" "$owner")" in
-    mine) iso_lock_touch "$wt" ;;
+    mine) iso_lock_touch "$wt" "$owner" ;;
     free)
       echo "abort: no session holds ${wt} -- run claim-worktree.sh (or ensure-worktree.sh) first" >&2
       exit 1

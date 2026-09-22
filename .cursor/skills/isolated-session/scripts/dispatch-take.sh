@@ -4,8 +4,14 @@
 #   dispatch-take.sh --as <agent> --context <contextId> [--capacity-file <path>]
 #                    [--primary <repo checkout>] [--room <did>]
 #
-# Reads the accepted coord thread from the node (operator_cli JSON), checks the
-# thread is accepted by this DID, checks the local stance is open, checks the
+# Reads the accepted coord thread from the node (operator_cli JSON: the node's own
+# <node>/operator_cli.py, named by `node=` in $DISPATCH_DIR/node), checks the
+# thread is accepted by this DID (or, when this desk's own `coord accept` is held
+# in the action quarantine and a line of the standing accept policy
+# $DISPATCH_DIR/accept -- `did=<did> repo=<name> kind=sketch|land`, mode 0600 --
+# matches the verified propose exactly, releases it with the same
+# `quarantine approve <id>` a person runs; stdout says ACCEPT=policy or
+# ACCEPT=person), checks the local stance is open, checks the
 # Room /mem carries no taken-by line for that contextId, writes the /remember
 # line, and spawns a worker through herd-spawn.sh (worker profile) in the
 # resolved repo. Ticket fields reach the brief as fenced DATA through --var;
@@ -75,7 +81,6 @@ primary_arg = os.environ.get("DISPATCH_PRIMARY") or ""
 room_arg = os.environ.get("DISPATCH_ROOM") or ""
 here = Path(os.environ["DISPATCH_HERE"])
 skill_repo = Path(os.environ["DISPATCH_SKILL_REPO"])
-cli = Path(os.environ.get("DISPATCH_CLI") or (skill_repo / "operator_cli.py"))
 spawn_sh = here / "herd-spawn.sh"
 brief_tpl = here.parent / "briefs" / "dispatch-ticket.md"
 py = sys.executable
@@ -90,19 +95,6 @@ def iso_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# -- --as on a missing key refuses (never mint) --------------------------------
-sys.path.insert(0, str(skill_repo))
-from agent import paths as _paths  # noqa: E402
-
-keys = _paths.keys_root(None)
-key_path = keys / (as_name + ".key")
-signer_path = keys / (as_name + ".signer.json")
-if not key_path.exists() and not signer_path.exists():
-    die(2, "no identity %r at %s. --as on a missing key refuses; create it first."
-        % (as_name, key_path))
-
-
-# -- capacity: open or full, never a remaining-% --------------------------------
 if capacity_file:
     cap_path = Path(capacity_file)
     dispatch_dir = cap_path.parent
@@ -110,6 +102,26 @@ else:
     dispatch_dir = Path(os.environ.get("DISPATCH_DIR")
                         or (Path.home() / ".muretai" / "dispatch"))
     cap_path = dispatch_dir / "capacity"
+
+
+# -- the node, and --as on a missing key refuses (never mint) --------------------
+# The same rules as the landing lease (landing-lease.py): operator_cli is
+# <node>/operator_cli.py (or DISPATCH_CLI) run with MURETAI_STATE_DIR=<node>, the key
+# must be in <node>/keys, and a missing or untrusted node line refuses. Never this
+# checkout's operator_cli, never the cwd's.
+import importlib.util  # noqa: E402
+
+_spec = importlib.util.spec_from_file_location("_landing_lease", str(here / "landing-lease.py"))
+lease_lib = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(lease_lib)
+try:
+    node = lease_lib.resolve_node(dispatch_dir)
+    lease_lib.require_identity(node, as_name)
+except lease_lib.Refusal as _r:
+    die(_r.code, _r.msg)
+
+
+# -- capacity: open or full, never a remaining-% --------------------------------
 
 stance, cap_reason = "open", ""
 if cap_path.is_file() and not cap_path.is_symlink():
@@ -128,9 +140,7 @@ if stance == "full":
 
 # -- operator_cli JSON (stdout is one object; banner is on stderr) ---------------
 def op(*args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [py, str(cli), "--as", as_name, *args],
-        capture_output=True, text=True, timeout=timeout)
+    return lease_lib.run_cli(node, as_name, *args, timeout=timeout)
 
 
 def op_json(*args: str, timeout: float = 30.0) -> dict:
@@ -251,18 +261,13 @@ if propose is None:
 peer = propose.get("peer_did") or ""
 if propose.get("direction") != "in":
     die(2, "thread %s was not proposed TO this DID (not mine)" % context)
-if not accept_out:
-    die(2, "thread %s is not accepted by this DID" % context)
-
-st = op_json("coord-state", peer, "--thread", context, "--json")
-status = (st.get("status") or "").lower()
-if status not in ("agreed", "confirmed", "delivered", "completed"):
-    die(2, "thread %s status is %r, not accepted" % (context, st.get("status")))
 
 
 # -- ticket fields ride in the existing coord payload text ----------------------
+# `kind` (sketch|land) is one more payload key next to `repo`; only the standing
+# accept policy reads it, and a ticket without one always goes to a person.
 def parse_ticket(text: str) -> dict:
-    out = {"title": "", "task": "", "repo": "", "branchHint": ""}
+    out = {"title": "", "task": "", "repo": "", "branchHint": "", "kind": ""}
     raw = (text or "").strip()
     if not raw:
         return out
@@ -302,6 +307,154 @@ def looks_like_path(name: str) -> bool:
     if re.fullmatch(r"[0-9a-fA-F]{40}", name):
         return True
     return False
+
+
+# -- the standing accept policy (plan P5) ----------------------------------------
+# Core never holds a teammate's propose; what a person releases today is THIS
+# desk's own outbound `coord accept`, held in the action quarantine. The policy's
+# one act is the same `quarantine approve <id>` a person types, and only for a
+# verified propose whose wire sender, repo and kind match one grant line exactly.
+# It never sends, introduces, trusts, or writes to the Room.
+GRANT_KINDS = ("sketch", "land")
+
+
+def accept_grants(ddir: Path) -> list[tuple[str, str, str]]:
+    """(did, repo, kind) lines from <dispatch dir>/accept. A missing file is no
+    grants. A symlink, a file owned by another uid, or one any group/other bit is
+    set on is ignored WHOLE with one stderr line (a grant file others can write
+    is a grant file others author). A malformed line is skipped with one stderr
+    line naming the file and line number -- never widened into a wildcard."""
+    path = ddir / "accept"
+    try:
+        stt = os.lstat(path)
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        sys.stderr.write("dispatch-take: ignoring %s: %s\n" % (path, e))
+        return []
+    import stat as _stat
+    why = ""
+    if _stat.S_ISLNK(stt.st_mode):
+        why = "it is a symlink"
+    elif not _stat.S_ISREG(stt.st_mode):
+        why = "it is not a regular file"
+    elif stt.st_uid != os.getuid():
+        why = "it is owned by uid %d, not this user" % stt.st_uid
+    elif stt.st_mode & 0o077:
+        why = "mode %04o is wider than 0600" % (stt.st_mode & 0o777)
+    if why:
+        sys.stderr.write("dispatch-take: ignoring the accept policy %s: %s\n" % (path, why))
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        sys.stderr.write("dispatch-take: ignoring %s: %s\n" % (path, e))
+        return []
+    grants: list[tuple[str, str, str]] = []
+    for n, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        fields: dict = {}
+        bad = "*" in s
+        for tok in s.split():
+            k, eq, v = tok.partition("=")
+            if not eq or k not in ("did", "repo", "kind") or k in fields or not v:
+                bad = True
+                break
+            fields[k] = v
+        if not bad and len(fields) == 3:
+            did, repo, kind = fields["did"], fields["repo"], fields["kind"]
+            if did.startswith("did:") and kind in GRANT_KINDS and not looks_like_path(repo):
+                grants.append((did, repo, kind))
+                continue
+        sys.stderr.write("dispatch-take: %s line %d is not `did=<did> repo=<name> "
+                         "kind=sketch|land`; skipped\n" % (path, n))
+    return grants
+
+
+def held_accept_for_thread(peer_did: str) -> str:
+    """The id of the held CLI-surface `coord <peer> accept ... --thread <context>`,
+    or "". MCP-surface holds and every other action stay with a person."""
+    r = op("quarantine", "list", "--json")
+    if r.returncode != 0:
+        return ""
+    lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    try:
+        doc = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return ""
+    held = doc.get("held") if isinstance(doc, dict) else None
+    if not isinstance(held, list):
+        return ""
+    for h in held:
+        if not isinstance(h, dict):
+            continue
+        if h.get("surface") != "cli" or h.get("action") != "coord accept":
+            continue
+        argv = (h.get("detail") or {}).get("argv") or []
+        if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
+            continue
+        names_peer = any(argv[i] == "coord" and argv[i + 1] == peer_did
+                         and argv[i + 2] == "accept" for i in range(len(argv) - 2))
+        on_thread = any(argv[i] == "--thread" and argv[i + 1] == context
+                        for i in range(len(argv) - 1)) or ("--thread=" + context) in argv
+        hid = h.get("id")
+        if names_peer and on_thread and isinstance(hid, str) and hid:
+            return hid
+    return ""
+
+
+def policy_accept() -> bool:
+    """Release the held accept under a matching grant. True only when the
+    approve itself succeeded."""
+    grants = accept_grants(dispatch_dir)
+    if propose.get("verified") is not True:
+        return False
+    kind = ticket.get("kind") or ""
+    if kind not in GRANT_KINDS or not repo_name or looks_like_path(repo_name):
+        return False
+    if (peer, repo_name, kind) not in grants:
+        return False
+    hid = held_accept_for_thread(peer)
+    if not hid:
+        return False
+    r = op("quarantine", "approve", hid, "--json")
+    if r.returncode != 0:
+        sys.stderr.write("dispatch-take: quarantine approve %s failed (%s); a person accepts\n"
+                         % (hid, r.returncode))
+        return False
+    sys.stdout.write("ACCEPT=policy %s %s %s\n" % (peer, repo_name, kind))
+    sys.stdout.flush()
+    return True
+
+
+def accepted_out() -> bool:
+    for m in op_json("inbox", "--json").get("messages") or []:
+        coord = m.get("coord") or {}
+        if (m.get("context_id") == context and isinstance(coord, dict)
+                and coord.get("type") == "accept" and m.get("direction") == "out"):
+            return True
+    return False
+
+
+if not accept_out and policy_accept():
+    accept_out = accepted_out()
+    if not accept_out:
+        die(2, "thread %s: the held accept was released but no outbound accept "
+            "is on the thread yet" % context)
+else:
+    sys.stdout.write("ACCEPT=person\n")
+    sys.stdout.flush()
+if not accept_out:
+    die(2, "thread %s is not accepted by this DID" % context)
+
+st = op_json("coord-state", peer, "--thread", context, "--json")
+status = (st.get("status") or "").lower()
+if status not in ("agreed", "confirmed", "delivered", "completed"):
+    die(2, "thread %s status is %r, not accepted" % (context, st.get("status")))
 
 
 if looks_like_path(repo_name):

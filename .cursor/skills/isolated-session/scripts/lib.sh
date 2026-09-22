@@ -37,7 +37,7 @@ iso_herd_dir() {
 # exist yet is skipped) is owned by this user or root and writable by nobody else;
 # else 1 with the first offending directory on stdout.
 iso_private_path() {
-  python3 - "$1" <<'PY'
+  python3 -I - "$1" <<'PY'
 import os, sys
 p = os.path.realpath(sys.argv[1])
 me = os.getuid()
@@ -54,6 +54,126 @@ while True:
         sys.exit(0)
     p = parent
 PY
+}
+
+# --- the credential and interpreter wall ------------------------------------
+#
+# ONE definition, here, because three gates run code on the repository's behalf and all
+# three need the same wall: the landing (finish-worktree.sh), the daily review engine
+# (tools/security_daily.sh) and the weekly clock (tools/security_weekly.sh). It used to
+# live in finish-worktree.sh alone, and the header there claimed "EVERY python the
+# landing runs on BASE's behalf goes through here" -- which was false one call before the
+# review it protects: the daily engine ran four bare `python3`s and the landing handed
+# `herd-spawn.sh` to a bare `bash`, so the reviewer's own brief and its permission list
+# were rendered by an interpreter nothing had walled
+# (ISSUE(security-audit-2026-09-18-daily-2026-09-18-7)). Two copies of a wall are how one
+# of them goes out of date; `tests/test_gate_pythons_are_isolated.py` now checks the claim
+# mechanically, over every script a gate runs.
+#
+# What it clears: git's credential helpers, the terminal prompt, ssh, gh's config (the
+# keychain token is reached through hosts.yml, which is not in an empty directory), and
+# PYTHONNOUSERSITE -- a branch's own test run executes as the operator by accepted design,
+# so it can write `usercustomize.py` into the USER SITE directory, which is outside the
+# checkout: `git status --porcelain` after the tests stays green, the lint never sees it
+# and no reviewer opens it, yet every later plain `python3` imports it at start-up.
+# A python run through here is additionally given `-I` by its caller wherever `-I` does
+# not break the call (`python3 -m agent.plugins` needs the caller's directory on sys.path).
+
+# The empty gh config directory, made once per process under an UNPREDICTABLE name (never
+# /tmp/<name>-$$: a symlink planted there would be followed as the operator). Callers arm
+# it at top level so a `credless` inside a `$( )` does not make one of its own; a call that
+# arrives unarmed still gets a wall, and a machine where mktemp fails gets a path that does
+# not exist, which is the fail-closed direction for `gh`.
+iso_credless_arm() {
+  if [[ -n "${ISO_GH_EMPTY:-}" && -d "${ISO_GH_EMPTY:-/nonexistent}" ]]; then
+    return 0
+  fi
+  ISO_GH_EMPTY="$(mktemp -d "${TMPDIR:-/tmp}/iso-gh-XXXXXX" 2>/dev/null)" ||
+    ISO_GH_EMPTY="/nonexistent/iso-gh"
+  return 0
+}
+
+credless() {
+  iso_credless_arm
+  env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0= \
+      GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_SSH_COMMAND=/usr/bin/false \
+      GH_CONFIG_DIR="$ISO_GH_EMPTY" GH_TOKEN= GITHUB_TOKEN= GH_ENTERPRISE_TOKEN= \
+      PYTHONNOUSERSITE=1 "$@"
+}
+
+# --- text an operator reads -------------------------------------------------
+
+# One value, safe to put on a line a person reads. Every code point in an INVISIBLE
+# Unicode category -- Cc, Cf, Zl, Zp, Cs, Co, Cn -- becomes its `\xNN` / `\uNNNN` /
+# `\UNNNNNNNN` spelling: a path carrying a carriage return and an erase-line escape
+# otherwise REWRITES the sentence in front of it, and the sentence in front of a
+# collision refusal is the one an operator reads immediately before deleting something
+# by hand. The value stays identifiable; it is not deleted, only spelled out. The
+# PREPUSH receipt line does the same to core.hooksPath (iso_prepush_line); this is that
+# treatment, named.
+#
+# By CATEGORY, and not by a byte range, for the reason `agent/quarantine.py:_visible`
+# already carries: `tr '\000-\037\177'` stops at 0x7F, so U+009B (the 8-bit CSI, "erase
+# line" in a UTF-8 xterm or VTE), U+202E, U+2028 and the zero-width joiners reached the
+# refusal untouched. A category is not an enumeration the next character is missing from.
+#
+# python3 is how a category is asked for, and it runs ISOLATED (`-I`): no user site
+# directory, so a `usercustomize.py` that a branch's own test run wrote OUTSIDE the
+# checkout -- invisible to the dirtiness guard, to the lint and to any reviewer -- is
+# never imported, and no PYTHON* variable is read. This used to be the pipeline's only
+# `python3 -c`, so a hook that failed for `-c` alone killed THIS helper and left every
+# other python the landing runs working, dropping the whole pipeline back to the byte
+# range this helper exists to replace
+# (ISSUE(security-audit-2026-09-18-daily-2026-09-18-3)).
+#
+# The byte-level `tr` is kept for a machine with NO python3 at all -- worse, but never
+# nothing, and the caller SAYS so on stderr, because a fallback weaker than the guard it
+# stands in for may not be chosen in silence. A python3 that IS here and cannot run is not
+# a fallback: this returns non-zero, printing nothing, and the caller refuses the landing
+# (iso_safe_text_mode below is how the caller asks, once, before anything prints).
+iso_safe_text() {
+  local out
+  if out="$(printf '%s' "${1:-}" | python3 -I -c '
+import sys, unicodedata
+BAD = frozenset(("Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"))
+out = []
+for ch in sys.stdin.buffer.read().decode("utf-8", "replace"):
+    if unicodedata.category(ch) in BAD:
+        cp = ord(ch)
+        out.append("\\x%02x" % cp if cp < 0x100 else
+                   "\\u%04x" % cp if cp < 0x10000 else "\\U%08x" % cp)
+    else:
+        out.append(ch)
+sys.stdout.buffer.write("".join(out).encode("utf-8"))
+' 2>/dev/null)"; then
+    printf '%s' "$out"
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    return 1
+  fi
+  printf '%s' "${1:-}" | LC_ALL=C tr '\000-\037\177' '?'
+  return 0
+}
+
+# Which escaper `iso_safe_text` will actually use on this machine. Asked ONCE, by the
+# landing, before anything prints a name the diff chose:
+#   python  the category table -- the only answer a landing may print names under
+#   tr      no python3 at all: the byte-level fallback, which the caller announces
+#   none    a python3 that IS here and cannot run: the caller refuses the landing
+# The probe is the helper itself, over a value that tells the two weak answers apart --
+# U+009B, the 8-bit CSI, spelled out in octal so this file stays ASCII (principle 6). `tr`
+# stops at 0x7F and leaves it byte-identical; the category table spells it `\x9b`.
+iso_safe_text_mode() {
+  local probe out
+  probe="$(printf 'a\302\233b')"
+  if ! out="$(iso_safe_text "$probe")"; then
+    printf 'none\n'
+  elif [[ "$out" == 'a\x9bb' ]]; then
+    printf 'python\n'
+  else
+    printf 'tr\n'
+  fi
 }
 
 # --- checkout geometry ------------------------------------------------------
@@ -86,6 +206,57 @@ iso_worktree_of() {
 # 0 when $1 (a worktree root) is a linked worktree rather than the primary checkout.
 iso_is_linked() {
   [[ -f "$1/.git" ]]
+}
+
+# --- what the publisher says about origin -------------------------------------
+# The owner's uid holds no GitHub credential, so it can never fetch origin itself. The
+# publisher -- another user, the only token holder -- leaves two world-readable files per
+# repository under its state directory, and these helpers are how a landing (and, later,
+# ensure-worktree.sh) reads them:
+#   origin/<name>.bundle   refs/remotes/origin/<branch> of its clone, rewritten every run
+#   status/<name>.txt      its last decision (result=, reason=, ...)
+# (company/ops/publisher/muretai-publish.py).
+ISO_PUBLISHER_STATE="/Users/Shared/muretai-publisher"
+
+# The publisher's name for the repository checkout $1 belongs to: the basename of the
+# `handoff` remote's URL without `.git` (/Users/Shared/muretai-handoff/trunk.git ->
+# trunk), which is how publisher.json names it. Not the checkout's directory name
+# (muretai-trunk != trunk), and not publisher.json itself, which lives in the publisher's
+# home. Returns 1, printing nothing, when there is no hand-off or the name is not a plain
+# file name -- a name that could climb out of the state directory is no name.
+iso_publisher_name() {  # $1 any path in the checkout
+  local url name
+  url="$(git -C "$1" remote get-url handoff 2>/dev/null)" || return 1
+  url="${url%/}"
+  name="${url##*/}"
+  name="${name%.git}"
+  case "$name" in
+    ''|.*|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  printf '%s\n' "$name"
+}
+
+# 0 when the publisher status file $1 says it HELD the hand-off because it is not a
+# fast-forward of origin -- the one state in which this Mac's own landings are known to
+# be unpublished and blocked by origin having moved. Anything else (published, held for
+# a review or a scan, an error, no file) is 1.
+iso_publisher_held_not_ff() {  # $1 status file
+  local result reason
+  [[ -f "$1" ]] || return 1
+  result="$(sed -n 's/^result=//p' "$1" 2>/dev/null | head -1)"
+  reason="$(sed -n 's/^reason=//p' "$1" 2>/dev/null | head -1)"
+  [[ "$result" == "held" && "$reason" == *"not a fast-forward"* ]]
+}
+
+# The modification time of $1 in epoch seconds: GNU stat first (Linux is the main
+# target), BSD stat second. Prints nothing and returns 1 when neither answers.
+iso_mtime() {  # $1 path
+  local t
+  t="$(stat -c %Y "$1" 2>/dev/null)" || t="$(stat -f %m "$1" 2>/dev/null)" || return 1
+  case "$t" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$t"
 }
 
 # --- who owns this session --------------------------------------------------
@@ -255,12 +426,19 @@ iso_lock_liveness() {  # $1 lock file
 }
 
 # free | mine | dead | other -- the lock of worktree $1 as seen by owner $2.
+#
+# A lock that names a herd worker (`owner_worker=`, written by the pair hand-over below) is
+# `mine` only for the session whose HERD_WORKER is that worker: a test author and its
+# implementer carry the SAME owner key, so after the hand-over the key alone no longer
+# says which of the two holds the folder, and the author is `other` (or `dead`) like any
+# second chat.
 iso_lock_state() {
-  local lock owner
+  local lock owner worker
   lock="$(iso_lock_path "$1")" || { echo free; return 0; }
   [[ -f "$lock" ]] || { echo free; return 0; }
   owner="$(iso_lock_get "$lock" owner)"
-  if [[ "$owner" == "$2" ]]; then
+  worker="$(iso_lock_get "$lock" owner_worker)"
+  if [[ "$owner" == "$2" && ( -z "$worker" || "$worker" == "${HERD_WORKER:-}" ) ]]; then
     echo mine
   elif iso_lock_alive "$lock"; then
     echo other
@@ -290,12 +468,187 @@ iso_lock_write() {
   } > "$lock"
 }
 
-# Mark worktree $1's lock as seen now (called on every `mine` verdict).
+# Mark worktree $1's lock as seen now (called on every `mine` verdict, $2 the owner that
+# verdict was for). A lock handed to this session's herd worker and not yet bound to a
+# process is bound first (iso_lock_bind), so liveness follows this session from its
+# first guarded command on.
 iso_lock_touch() {
   local lock
   lock="$(iso_lock_path "$1")" || return 0
   [[ -f "$lock" ]] || return 0
+  iso_lock_bind "$1" "${2:-$(iso_owner)}"
   iso_lock_set "$lock" owner_seen "$(date +%s)"
+}
+
+# --- the pair hand-over -------------------------------------------------------
+# ISSUE(pair-worktree-lock-dies-with-the-test-author-session). A test author and its
+# implementer share one worktree and one ISOLATED_SESSION_OWNER key, and the lock used to
+# record the AUTHOR's process: the author's tab closing released it (SessionEnd drops every
+# lock of its key) or left it `gone`, and the implementer -- forbidden to claim -- stopped.
+#
+# The hold now passes in two steps, because the spawn runs in the coordinator's process and
+# cannot know the implementer's pid:
+#   1. herd-spawn.sh, starting worker W with `--env ISOLATED_SESSION_OWNER=K`, rewrites
+#      every lock of ITS repository whose owner is K: `owner_worker=W`, the process fields
+#      emptied (iso_lock_handover). From that moment the key alone is not enough -- the
+#      author, whose HERD_WORKER is not W, is refused (iso_lock_state) -- and the lock is
+#      live by its seen-time TTL, like any key-owned lock with no process.
+#   2. W's session, at its first guarded command (the hook, assert-head, claim, ensure),
+#      finds a lock naming its key AND its HERD_WORKER with no process, and records its own
+#      (iso_lock_bind). Liveness then follows W's process, exactly as it followed the
+#      author's.
+# Nothing is ever written through a symlink: both steps open the lock's directory and the
+# lock itself with O_NOFOLLOW, refuse anything that is not a regular file, and replace the
+# file by renaming a sibling over it (which replaces a directory ENTRY and never writes into
+# what an entry points at). A symlinked lock or lock directory is left exactly as it is.
+# The write is a compare-and-set: the precondition is re-read from the file just opened.
+iso_lock_py() {
+  python3 -I - "$@" <<'PY'
+import os, stat, sys, time
+
+NAME = "isolated-session.lock"
+NOFOLLOW_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def read_lock(dfd):
+    try:
+        fd = os.open(NAME, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=dfd)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks = []
+        while True:
+            b = os.read(fd, 65536)
+            if not b:
+                break
+            chunks.append(b)
+    finally:
+        os.close(fd)
+    pairs = []
+    for line in b"".join(chunks).decode("utf-8", "replace").splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            pairs.append([k, v])
+    return pairs
+
+
+def get(pairs, key):
+    for k, v in pairs:
+        if k == key:
+            return v
+    return ""
+
+
+def put(pairs, key, value):
+    value = value.replace("\n", " ").replace("\r", " ")
+    for p in pairs:
+        if p[0] == key:
+            p[1] = value
+            return
+    pairs.append([key, value])
+
+
+def write_lock(dfd, pairs):
+    tmp = "%s.tmp.%d" % (NAME, os.getpid())
+    try:
+        os.unlink(tmp, dir_fd=dfd)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("".join("%s=%s\n" % (k, v) for k, v in pairs))
+    os.rename(tmp, NAME, src_dir_fd=dfd, dst_dir_fd=dfd)
+
+
+mode = sys.argv[1]
+if mode == "handover":
+    # argv: common git dir, key, worker. Prints each worktree whose hold passed.
+    common, key, worker = sys.argv[2:5]
+    try:
+        top = os.open(os.path.join(common, "worktrees"), NOFOLLOW_DIR)
+    except OSError:
+        sys.exit(0)
+    try:
+        entries = sorted(os.listdir(top))
+    except OSError:
+        entries = []
+    for entry in entries:
+        try:
+            dfd = os.open(entry, NOFOLLOW_DIR, dir_fd=top)
+        except OSError:
+            continue                      # a symlink, a file, gone: not ours to touch
+        try:
+            pairs = read_lock(dfd)
+            if pairs is None or get(pairs, "owner") != key:
+                continue
+            put(pairs, "owner_worker", worker)
+            for k in ("owner_pid", "owner_started", "owner_comm"):
+                put(pairs, k, "")
+            put(pairs, "owner_seen", str(int(time.time())))
+            put(pairs, "handed_over", time.strftime("%Y-%m-%d %H:%M"))
+            try:
+                write_lock(dfd, pairs)
+            except OSError:
+                continue
+            where = entry
+            try:
+                gfd = os.open("gitdir", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+                with os.fdopen(gfd, encoding="utf-8", errors="replace") as f:
+                    where = os.path.dirname(f.readline().strip()) or entry
+            except OSError:
+                pass
+            print(where)
+        finally:
+            os.close(dfd)
+elif mode == "bind":
+    # argv: lock dir, key, worker, pid, started, comm. Binds only a lock that names this
+    # key AND this worker and carries no process yet.
+    ldir, key, worker, pid, started, comm = sys.argv[2:8]
+    try:
+        dfd = os.open(ldir, NOFOLLOW_DIR)
+    except OSError:
+        sys.exit(0)
+    try:
+        pairs = read_lock(dfd)
+        if (pairs is None or not worker or get(pairs, "owner") != key
+                or get(pairs, "owner_worker") != worker or get(pairs, "owner_pid")):
+            sys.exit(0)
+        put(pairs, "owner_pid", pid)
+        put(pairs, "owner_started", started)
+        put(pairs, "owner_comm", comm)
+        put(pairs, "owner_seen", str(int(time.time())))
+        write_lock(dfd, pairs)
+    finally:
+        os.close(dfd)
+PY
+}
+
+# Step 1, from herd-spawn.sh: pass every lock of the repository at $1 whose owner is key $2
+# to herd worker $3. A key that is a bare pid is a chat's own process, never a pair's key,
+# and is ignored. Prints each worktree whose hold passed.
+iso_lock_handover() {  # $1 any path in the repository, $2 key, $3 worker
+  local gd
+  [[ -n "${2:-}" && -n "${3:-}" ]] || return 0
+  iso_is_pid "$2" && return 0
+  gd="$(git -C "$1" rev-parse --git-common-dir 2>/dev/null)" || return 0
+  [[ "$gd" == /* ]] || gd="$(cd "$1" && cd "$gd" && pwd)"
+  iso_lock_py handover "$gd" "$2" "$3"
+}
+
+# Step 2: bind worktree $1's lock to this session's process when it was handed to this
+# session's herd worker under owner key $2 and nothing is bound yet.
+iso_lock_bind() {  # $1 worktree, $2 owner
+  local lock worker pid
+  worker="${HERD_WORKER:-}"
+  [[ -n "$worker" && -n "${2:-}" ]] || return 0
+  lock="$(iso_lock_path "$1")" || return 0
+  [[ "$(iso_lock_get "$lock" owner_worker)" == "$worker" ]] || return 0
+  [[ -z "$(iso_lock_get "$lock" owner_pid)" ]] || return 0
+  pid="$(iso_owner_pid)"
+  iso_lock_py bind "$(dirname "$lock")" "$2" "$worker" "$pid" "$(iso_proc_start "$pid")" \
+    "$(iso_proc_comm "$pid")" >/dev/null 2>&1 || true
 }
 
 iso_lock_release() {
@@ -496,12 +849,14 @@ iso_seen_ago() {  # $1 lock file -> "3m ago"
 
 # One line a person can read about who holds worktree $1.
 iso_lock_describe() {
-  local lock owner kind
+  local lock owner kind worker
   lock="$(iso_lock_path "$1")" || return 0
   [[ -f "$lock" ]] || { echo "nobody"; return 0; }
   owner="$(iso_lock_get "$lock" owner)"
   kind="$(iso_lock_get "$lock" owner_kind)"
   [[ -n "$kind" ]] || kind="$(iso_owner_kind "$owner")"
+  worker="$(iso_lock_get "$lock" owner_worker)"
+  [[ -z "$worker" ]] || owner="${owner} worker=${worker}"
   printf 'owner %s (%s, %s, %s, seen %s) since %s, task "%s"\n' \
     "$owner" "$kind" "$(iso_lock_get "$lock" owner_comm)" "$(iso_lock_liveness "$lock")" \
     "$(iso_seen_ago "$lock")" "$(iso_lock_get "$lock" started_iso)" "$(iso_lock_get "$lock" task)"
@@ -523,7 +878,7 @@ iso_lock_fix_hint() {  # $1 worktree, $2 me
 # The open-session inventory for primary $1, one worktree per line. Used by
 # stale.sh and by the hook's SessionStart context.
 iso_sessions_report() {
-  local primary="$1" wt lock owner state kind branch okind
+  local primary="$1" wt lock owner state kind branch okind worker
   local found=0
   while IFS= read -r wt; do
     lock="$(iso_lock_path "$wt" 2>/dev/null)" || continue
@@ -539,6 +894,8 @@ iso_sessions_report() {
     branch="$(iso_lock_get "$lock" branch)"
     okind="$(iso_lock_get "$lock" owner_kind)"
     [[ -n "$okind" ]] || okind="$(iso_owner_kind "$owner")"
+    worker="$(iso_lock_get "$lock" owner_worker)"
+    [[ -z "$worker" ]] || owner="${owner} worker=${worker}"
     printf '   %-60s %-6s %-40s owner=%s (%s, %s, %s, seen %s) since %s\n' \
       "$wt" "$kind" "$branch" "$owner" "$okind" "$(iso_lock_get "$lock" owner_comm)" "$state" \
       "$(iso_seen_ago "$lock")" "$(iso_lock_get "$lock" started_iso)"
