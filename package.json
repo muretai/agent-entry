@@ -26,8 +26,9 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node conformance/run.mjs && node conformance/seam-twin.mjs && node conformance/recipes.mjs && node conformance/who-is-knocking.mjs && node conformance/vendor-ranges-helper.mjs && node conformance/muse-connector.mjs && node conformance/tools.mjs && node conformance/offers.mjs && node conformance/collector.mjs && node conformance/page.mjs",
+    "test": "node conformance/run.mjs && node conformance/seam-twin.mjs && node conformance/recipes.mjs && node conformance/who-is-knocking.mjs && node conformance/vendor-ranges-helper.mjs && node conformance/muse-connector.mjs && node conformance/tools.mjs && node conformance/offers.mjs && node conformance/collector.mjs && node conformance/page.mjs && node conformance/cli.mjs",
     "test:page": "node conformance/page.mjs",
+    "test:cli": "node conformance/cli.mjs",
     "test:muse": "node conformance/muse-connector.mjs",
     "test:tools": "node conformance/tools.mjs",
     "test:offers": "node conformance/offers.mjs",
