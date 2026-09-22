@@ -1,0 +1,18 @@
+{
+  "about": "Example URLs (inside fenced code blocks and inline code spans) that each documentation section already carried before Suite S4. conformance/docs.mjs lets these through unchanged; any OTHER example URL in the section must use a placeholder host (example.com, *.test, *.invalid, 192.0.2.0/24). Do not add to this list: a new example uses a placeholder host instead.",
+  "README.md#Put it on a site": [
+    "https://raw.githubusercontent.com/muretai/agent-entry/main/muretai-agent-entry.mjs",
+    "https://muretai.net/rel/agent-entry",
+    "https://studio.example/",
+    "https://studio.example",
+    "http://127.0.0.1:8788"
+  ],
+  "README.md#What a customer can do here": [],
+  "README.md#Pairs with WebMCP": [],
+  "README.md#Counting visits": [
+    "https://www.google-analytics.com/mp/collect?measurement_id=${GA_ID}&api_secret=${GA_SECRET}"
+  ],
+  "connectors/muse.md": [
+    "https://shop.example/.well-known/agent-card.json"
+  ]
+}
