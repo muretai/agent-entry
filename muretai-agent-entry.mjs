@@ -54,11 +54,12 @@ import {
 import { createServer } from 'node:http';
 import { Buffer } from 'node:buffer';
 import {
-  chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync,
+  appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync,
+  realpathSync, renameSync, statSync, writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { basename, dirname, join, relative, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // ---------------------------------------------------------------- protocol constants
 
@@ -4985,11 +4986,16 @@ export function createAgentEntry({
     // anonymous lane answers a visitor who genuinely presented no DID.
     // The three who-is-knocking fields go on the OBSERVER's copy only; `env` itself — the
     // frozen backend-handoff shape the responder gets below — is not touched.
+    // Suite S3: a chosen offer also tells the watcher its reply kind and whether this reply
+    // carries a `deal`, so a counts log can say "completed" and "receipts issued" without
+    // ever holding the reply, a DID or the text (AT-25). Observer copy only, chosen only.
     observe({ ...env, stage: pendingStage, ua_family: pendingFamily,
               client_class: clientClass(pendingFamily, pendingStage),
               identified: env && env.peer_did ? 1 : 0,
               ip_vendor: pendingLook.ip_vendor, country: pendingLook.country,
-              signature_agent: env && env.wba_did ? (wbaVendorOf.get(env.wba_did) ?? null) : null });
+              signature_agent: env && env.wba_did ? (wbaVendorOf.get(env.wba_did) ?? null) : null,
+              ...(chosen ? { reply: chosen.door.reply,
+                receipt: Boolean(chosen.door.receipt && toDid && chosen.door.reply !== 'brain') } : {}) });
     if (chosen && chosen.door.reply !== 'brain') {
       let text;
       try {
@@ -5427,6 +5433,86 @@ function messageText(msg) {
     .join('\n');
 }
 
+// ---------------------------------------------------------------- counting sinks (Suite S3)
+//
+// Two ready observers for `createAgentEntry({ observer })`. Both keep to the observer's own
+// rule (a watcher never changes an answer) and to the collector's (AT-14): what leaves the door
+// is a count, never a DID, text, an input value, a message or context id, or an address. They
+// read a fixed allowlist of the envelope's fields, so a field the door adds later is dropped
+// until it is added here on purpose.
+
+const SINK_FIELDS = ['stage', 'event', 'offer', 'engine', 'ms', 'reply', 'receipt', 'identified',
+  'verified', 'ua_family', 'client_class', 'ip_vendor', 'country', 'signature_agent', 'refused'];
+const SINK_TOKEN = /^[A-Za-z0-9_.:-]{1,64}$/;
+const GA_ENDPOINT = 'https://www.google-analytics.com/mp/collect';
+const GA_EVENT_NAME = /^[A-Za-z][A-Za-z0-9_]{0,39}$/;
+
+/** The allowlisted fields of an observer envelope: numbers, booleans and short tokens only. A
+ *  string that could be a DID is dropped even under an allowed key. */
+function sinkFields(env) {
+  const out = {};
+  if (!env || typeof env !== 'object') return out;
+  for (const key of SINK_FIELDS) {
+    const v = env[key];
+    if (typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v))) out[key] = v;
+    else if (typeof v === 'string' && SINK_TOKEN.test(v) && !v.startsWith('did:')) out[key] = v;
+  }
+  return out;
+}
+
+/**
+ * fileSink(path) -> observer. Appends one JSON line per observed event to `path`: `t` (epoch
+ * seconds) plus the allowlisted fields. It is the log `agent-entry counts --log` reads (AT-25).
+ * The line never carries a DID, the text or an input value. Synchronous and local, so the
+ * counts page sees what the door saw, in order; a write that fails is dropped, never thrown.
+ */
+export function fileSink(filePath) {
+  if (typeof filePath !== 'string' || !filePath) throw new TypeError('fileSink: a log file path is required');
+  const path = resolve(filePath);
+  try { mkdirSync(dirname(path), { recursive: true }); } catch { /* the first append will say */ }
+  return function fileObserver(env) {
+    try {
+      const fields = sinkFields(env);
+      if (!fields.stage) return;
+      appendFileSync(path, `${JSON.stringify({ t: nowEpoch(), ...fields })}\n`, { mode: 0o600 });
+    } catch { /* a watcher never changes what the door does */ }
+  };
+}
+
+/**
+ * gaSink({ measurementId, apiSecret, fetchImpl? }) -> observer posting each event to the GA4
+ * Measurement Protocol (AT-26): one POST per event to `/mp/collect?measurement_id&api_secret`,
+ * a body of `client_id` and `events` only, `engagement_time_msec` (an integer above 0) and
+ * `session_id` on every event, and typed dimensions: numbers, booleans and short tokens. The
+ * `client_id` is random per sink and never derived from a visitor's key. A page event keeps its
+ * collector name; a door stage is sent as `door_<stage>`. A failing endpoint is swallowed.
+ */
+export function gaSink({ measurementId, apiSecret, fetchImpl = globalThis.fetch, endpoint = GA_ENDPOINT } = {}) {
+  if (typeof measurementId !== 'string' || !measurementId.trim()) {
+    throw new TypeError('gaSink: measurementId is required (the G-XXXXXXXXXX of a GA4 data stream)');
+  }
+  if (typeof apiSecret !== 'string' || !apiSecret.trim()) {
+    throw new TypeError('gaSink: apiSecret is required (a Measurement Protocol API secret of that stream)');
+  }
+  if (typeof fetchImpl !== 'function') throw new TypeError('gaSink: fetch is unavailable; pass fetchImpl');
+  const url = `${endpoint}?measurement_id=${encodeURIComponent(measurementId)}&api_secret=${encodeURIComponent(apiSecret)}`;
+  const clientId = `${randomBytes(4).readUInt32BE(0)}.${nowEpoch()}`;
+  const sessionId = String(nowEpoch());
+  return function gaObserver(env) {
+    try {
+      const { event, ...fields } = sinkFields(env);
+      const name = fields.stage === 'page' ? event : (fields.stage ? `door_${fields.stage}` : null);
+      if (typeof name !== 'string' || !GA_EVENT_NAME.test(name)) return;
+      const params = { ...fields, engagement_time_msec: Number.isSafeInteger(fields.ms) && fields.ms > 0 ? fields.ms : 1,
+        session_id: sessionId };
+      const body = JSON.stringify({ client_id: clientId, events: [{ name, params }] });
+      Promise.resolve()
+        .then(() => fetchImpl(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body }))
+        .then(undefined, () => {});
+    } catch { /* a watcher never changes what the door does */ }
+  };
+}
+
 // ---------------------------------------------------------------- visiting side: one-command knock
 
 function cardBaseFromUrl(cardUrl) {
@@ -5685,6 +5771,1442 @@ async function knockMain(argv) {
   }
 }
 
+// ---------------------------------------------------------------- the site's CLI (Suite S3)
+//
+// `agent-entry init | publish (deploy) | doctor | counts`, beside `knock`, on the same bin.
+// Exit status: 0 done / every check passed, 1 refused / a check FAILed, 2 misuse. `--json`
+// prints exactly one JSON document on stdout. The seed is the site's own key: minted here, kept
+// in a file git ignores, read back from there, and never printed, logged or published (AT-22).
+// Node's child_process is imported only when a verb needs git, so this file still loads where
+// the door runs without it.
+
+class CliRefusal extends Error {}
+class CliMisuse extends Error {}
+
+const SEED_NAME = 'AGENT_ENTRY_SEED_HEX';
+const SEED_IN_FILE = /^[ \t]*(?:export[ \t]+)?AGENT_ENTRY_SEED_HEX[ \t]*=[ \t]*["']?([0-9a-f]{64})["']?[ \t]*\r?$/m;
+const ANY_SEED_LINE = /AGENT_ENTRY_SEED_HEX\s*=\s*["']?[0-9a-f]{64}\b/;
+const DOOR_MODULE = 'agent-entry.door.mjs';
+const DECLARATION_FILE = 'agent-entry.json';
+const SKILL_FILE = '.agents/skills/agent-entry/SKILL.md';
+const PAGE_RUNTIME = 'agent-entry-page.mjs';
+const PAGE_SRC = `/${PAGE_RUNTIME}`;
+const TRADES = Object.keys(OFFER_STARTERS);
+const REPLY_STATUS = Object.freeze({ catalog: 'see_catalog', facts: 'answered', pending: 'pending_confirmation',
+  checkout: 'continue_at_checkout', human: 'awaiting_person' });
+const EXAMPLE_INPUT = Object.freeze({ string: 'example', integer: 2, number: 2, boolean: true });
+const DOOR_STAGES = new Set(['signed_post', 'anon_post', 'refused_post']);
+const LOOPBACK_BIND = new Map([['127.0.0.1', '127.0.0.1'], ['localhost', '127.0.0.1'], ['::1', '::1']]);
+
+/** What `init` wires per framework, and what `publish` / `doctor` read back. `static` is the
+ *  directory the framework serves as-is; `slot` the git-ignored file the seed lives in; `glue`
+ *  the files (one of each group) that must load the door module; `template` the documents that
+ *  carry the page tag. Static hosts and WordPress are handed to the product that serves them. */
+const FRAMEWORKS = Object.freeze({
+  'next-app': { static: 'public', slot: '.env.local',
+    glue: [['middleware.js', 'middleware.ts', 'src/middleware.js', 'src/middleware.ts']],
+    template: ['app/layout.tsx', 'app/layout.jsx', 'app/layout.js', 'src/app/layout.tsx', 'src/app/layout.jsx', 'src/app/layout.js'] },
+  'next-pages': { static: 'public', slot: '.env.local',
+    glue: [['pages/api/agent-entry.js', 'src/pages/api/agent-entry.js']],
+    config: [['next.config.js', 'next.config.mjs', 'next.config.ts'], '/api/agent-entry'],
+    template: ['pages/_document.tsx', 'pages/_document.jsx', 'pages/_document.js', 'src/pages/_document.tsx', 'src/pages/_document.js'] },
+  nuxt: { static: 'public', slot: '.env',
+    glue: [['server/middleware/agent-entry.mjs', 'server/middleware/agent-entry.js', 'server/middleware/agent-entry.ts']],
+    template: ['nuxt.config.ts', 'nuxt.config.js', 'nuxt.config.mjs'] },
+  sveltekit: { static: 'static', slot: '.env',
+    glue: [['src/hooks.server.js', 'src/hooks.server.ts']], template: ['src/app.html'] },
+  astro: { static: 'public', slot: '.env',
+    glue: [['src/middleware.js', 'src/middleware.ts', 'src/middleware/index.js', 'src/middleware/index.ts']],
+    template: ['src/layouts/Layout.astro'] },
+  vite: { static: 'public', slot: '.env',
+    glue: [['vite.config.js', 'vite.config.mjs', 'vite.config.ts', 'vite.config.mts']], template: ['index.html'] },
+  express: { static: 'public', slot: '.env', glue: null, template: [] },
+  static: { route: 'agent-entry-serverless', static: '.' },
+  wordpress: { route: 'agent-entry-wordpress', static: '.' },
+});
+
+const USAGE = {
+  init: 'usage: agent-entry init (--trade restaurant|retail|clinic|repair | --from sodium.json) --base-url <url> [--name <name>] [--json]\n'
+    + '  Detects the framework, mints the site seed into a git-ignored file, writes agent-entry.json and\n'
+    + '  .agents/skills/agent-entry/SKILL.md, and wires the door routes, the signposts and the page tag.',
+  publish: 'usage: agent-entry publish [--version <n>] [--json]   (alias: agent-entry deploy)\n'
+    + '  Validates agent-entry.json, compiles and signs it, and writes <static dir>/.well-known/agent-tools.json,\n'
+    + '  agent-tools.sig.json and agent-tools/v<n>.json. A published version is never rewritten.',
+  doctor: 'usage: agent-entry doctor [--url <site url>] [--json]\n'
+    + '  Local: seed kept out of git, contract published and verifying, door module and page tag wired, and\n'
+    + '  one in-process knock per door-bound offer. --url: the same against the live site, over the network.',
+  counts: 'usage: agent-entry counts --log <fileSink log> [--store <file store>] [--json] [--serve [--port <p>] [--host 127.0.0.1|::1]]\n'
+    + '  Per offer: asked on the page, asked at the door, completed, receipts; referrals by engine; returning\n'
+    + '  customers (a count); door knocks by stage and client class. --serve renders one page on loopback only.',
+};
+const CLI_USAGE = 'usage: agent-entry <init|publish|deploy|doctor|counts|knock> ... (agent-entry <verb> --help)';
+
+/** Flags per verb: 'string' takes a value, 'boolean' does not. Unknown flags are misuse. */
+function parseFlags(argv, spec) {
+  const flags = {};
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (!arg.startsWith('--')) throw new CliMisuse(`unexpected argument ${JSON.stringify(arg.slice(0, 60))}`);
+    const [name, inline] = arg.slice(2).split(/=(.*)/s, 2);
+    if (!Object.hasOwn(spec, name)) throw new CliMisuse(`unknown flag --${name.slice(0, 40)}`);
+    if (spec[name] === 'boolean') {
+      if (inline !== undefined) throw new CliMisuse(`--${name} takes no value`);
+      flags[name] = true;
+    } else {
+      const value = inline !== undefined ? inline : argv[i + 1];
+      if (inline === undefined) i += 1;
+      if (value === undefined || (inline === undefined && value.startsWith('--'))) throw new CliMisuse(`--${name} needs a value`);
+      flags[name] = value;
+    }
+  }
+  return flags;
+}
+
+let gitSpawn = null;
+/** `git <args>` in `cwd`: { status, stdout }. status -1 when git could not run at all. */
+function git(cwd, args) {
+  const r = gitSpawn('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  return { status: r.error ? -1 : r.status, stdout: r.stdout || '' };
+}
+
+const readJsonFile = (path) => JSON.parse(readFileSync(path, 'utf8'));
+const posix = (p) => p.split('\\').join('/');
+const shortError = (e) => String(e && e.message ? e.message : e).split('\n')[0].slice(0, 300);
+
+function readPackageJson(root) {
+  try { return readJsonFile(join(root, 'package.json')); } catch { return null; }
+}
+
+/** The framework a project directory is, by what is on disk; null when none is recognised. */
+function detectFramework(root) {
+  if (['wp-includes/version.php', 'wp-config.php', 'wp-config-sample.php'].some((p) => existsSync(join(root, p)))) return 'wordpress';
+  const pkg = readPackageJson(root);
+  if (pkg) {
+    const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+    if (deps.next) return ['app', 'src/app'].some((p) => existsSync(join(root, p))) ? 'next-app' : 'next-pages';
+    if (deps.nuxt) return 'nuxt';
+    if (deps['@sveltejs/kit']) return 'sveltekit';
+    if (deps.astro) return 'astro';
+    if (deps.express) return 'express';
+    if (deps.vite) return 'vite';
+    return null;
+  }
+  return existsSync(join(root, 'index.html')) ? 'static' : null;
+}
+
+const firstExisting = (root, rels) => rels.find((rel) => existsSync(join(root, rel))) ?? null;
+
+/** The seed for a project: { hex, path } from its slot (or a sibling env file), else from the
+ *  environment ({ path: null }), else { hex: null }. */
+function findSeed(root, framework) {
+  const slots = [...new Set([FRAMEWORKS[framework]?.slot, '.env.local', '.env'].filter(Boolean))];
+  for (const rel of slots) {
+    try {
+      const m = SEED_IN_FILE.exec(readFileSync(join(root, rel), 'utf8'));
+      if (m) return { hex: m[1], path: rel };
+    } catch { /* not there */ }
+  }
+  const env = String(process.env[SEED_NAME] || '').trim();
+  return /^[0-9a-f]{64}$/.test(env) ? { hex: env, path: null } : { hex: null, path: null };
+}
+
+/** R1 (AT-22): why git would carry a seed written to `slot`, or null when it would not. Judged
+ *  by git itself, so a negated rule, a global excludes file or an already-tracked file all
+ *  count as git counts them. */
+function seedSlotRefusal(root, slot) {
+  if (git(root, ['rev-parse', '--is-inside-work-tree']).status !== 0) {
+    return `${root} is not inside a git repository, so git cannot confirm ${slot} stays out of commits. `
+      + `Run \`git init\`, add ${slot} to .gitignore, and run init again.`;
+  }
+  if (git(root, ['ls-files', '--cached', '--', slot]).stdout.trim()) {
+    return `${slot} is already tracked by git, so a seed written there would be committed. Remove it from the `
+      + `index (\`git rm --cached ${slot}\`), keep it listed in .gitignore, and run init again.`;
+  }
+  if (git(root, ['check-ignore', '-q', '--', slot]).status !== 0) {
+    return `.gitignore does not ignore ${slot}, so git would track the seed. Add a line \`${slot}\` to .gitignore `
+      + '(init does not edit it for you) and run init again.';
+  }
+  if (existsSync(join(root, slot))
+      && git(root, ['ls-files', '--cached', '--others', '--exclude-standard', '--', slot]).stdout.trim()) {
+    return `git reports ${slot} as trackable, so a seed written there would be committed. Fix .gitignore and run init again.`;
+  }
+  return null;
+}
+
+/** Write the seed line into `slot` (appending to an existing file) with mode 0600. Keeps a seed
+ *  already there: a second seed is a second DID, and every visitor's account would be lost. */
+function mintSeed(root, slot) {
+  const path = join(root, slot);
+  const existing = existsSync(path) ? readFileSync(path, 'utf8') : null;
+  const m = existing === null ? null : SEED_IN_FILE.exec(existing);
+  if (m) {
+    chmodSync(path, 0o600);
+    return { hex: m[1], wrote: false };
+  }
+  const hex = newSeedHex();
+  const line = `${SEED_NAME}=${hex}\n`;
+  if (existing === null) {
+    writeFileSync(path, `# The Agent Entry seed: this site's private key. Never commit, print or share it.\n${line}`,
+      { flag: 'wx', mode: 0o600 });
+  } else {
+    appendFileSync(path, `${existing.endsWith('\n') || existing === '' ? '' : '\n'}${line}`);
+  }
+  chmodSync(path, 0o600);
+  return { hex, wrote: true };
+}
+
+// ------------------------------------------ init: sodium.json -> offers (spec 3.1)
+
+const SODIUM_RISK = Object.freeze({ read_only: 'none', reversible: 'reversible', state_changing: 'changes',
+  destructive: 'changes', financial: 'pays' });
+const SODIUM_CONFIRM = Object.freeze({ recommended: 'advised', required: 'always' });
+
+/** A whole sodium.json v1 file as `offers[]`, `page` filled and `door` left empty, or a refusal
+ *  naming the tool (AT-2's whole-refusal posture: nothing is converted when one tool cannot be). */
+function offersFromSodium(doc) {
+  if (!isPlainObject(doc) || !Array.isArray(doc.tools) || doc.tools.length === 0) {
+    throw new CliRefusal('sodium.json: `tools` must be a non-empty list');
+  }
+  if (doc.version !== undefined && doc.version !== 1) throw new CliRefusal('sodium.json: only version 1 files can be converted');
+  const offers = doc.tools.map((tool, i) => {
+    const id = typeof tool?.id === 'string' && tool.id ? tool.id
+      : (typeof tool?.name === 'string' && tool.name ? tool.name : `tools[${i}]`);
+    const refuse = (why) => {
+      throw new CliRefusal(`sodium.json: tool "${id.slice(0, 64)}" ${why}. Nothing was converted: the whole file is refused.`);
+    };
+    if (!isPlainObject(tool)) refuse('is not an object');
+    const run = isPlainObject(tool.run) ? tool.run : {};
+    if (run.type === 'interaction' || Object.hasOwn(run, 'steps')) {
+      refuse('runs interaction steps, and v1 has no page action for them yet (the `steps` action is a follow-up)');
+    }
+    const cut = id.indexOf('_');
+    if (cut <= 0 || cut === id.length - 1) refuse('cannot be split into a verb and an object at its first "_"');
+    if (typeof tool.description !== 'string' || !tool.description) refuse('has no description to become `about`');
+    const input = {};
+    for (const [key, field] of Object.entries(isPlainObject(tool.input) ? tool.input : {})) {
+      const type = typeof field === 'string' ? field : field?.type;
+      if (!INPUT_TYPES.includes(type)) refuse(`has input "${String(key).slice(0, 40)}" of type ${JSON.stringify(type)}, which v1 has no field type for`);
+      input[key] = type;
+    }
+    if (!Array.isArray(tool.on) || tool.on.length === 0) refuse('names no `on` routes');
+    const on = tool.on.map((p) => (typeof p === 'string' ? p : refuse('is registered on a {path, when} route, which v1 cannot express')));
+    let action;
+    switch (run.type) {
+      case 'request':
+        action = { fetch: { method: run.method ?? 'GET', path: run.path, ...(run.query !== undefined ? { query: run.query } : {}) } };
+        break;
+      case 'form': action = { fill: { form: run.selector } }; break;
+      case 'extract': action = { read: run.selector }; break;
+      case 'navigate': action = { open: run.url }; break;
+      case 'call': action = { call: run.function }; break;
+      default: refuse(`has a run type ${JSON.stringify(run.type ?? null).slice(0, 40)} that v1 does not know`);
+    }
+    const effect = Object.hasOwn(SODIUM_RISK, tool.risk) ? SODIUM_RISK[tool.risk] : refuse('has no risk v1 can map to an effect');
+    const offer = { verb: id.slice(0, cut), of: id.slice(cut + 1), about: tool.description, input, effect };
+    // Raise only (AT-5): a confirmation below the effect's floor adds nothing, and Sodium's
+    // `destructive` floor is `required`, which v1 spells as ask `always`.
+    const floor = ASK_ORDER.indexOf(ASK_FLOOR[effect]);
+    let ask = Object.hasOwn(SODIUM_CONFIRM, tool.confirmation) ? SODIUM_CONFIRM[tool.confirmation] : null;
+    if (tool.risk === 'destructive') ask = 'always';
+    if (ask !== null && ASK_ORDER.indexOf(ask) >= floor) offer.ask = ask;
+    offer.page = { on, do: action };
+    return { id, offer };
+  });
+  return offers;
+}
+
+/** Validate a declaration the CLI built; a refusal names the sodium tool when there is one. */
+function checkedDeclaration(declaration, toolIds = null) {
+  try {
+    validateDeclaration(declaration);
+  } catch (e) {
+    const m = /offers\[(\d+)\]/.exec(e.message);
+    const tool = toolIds && m ? toolIds[Number(m[1])] : null;
+    throw new CliRefusal(tool ? `sodium.json: tool "${tool}" does not convert: ${e.message}` : e.message);
+  }
+  return declaration;
+}
+
+// ------------------------------------------ init: the wiring
+
+const pageTagHtml = (extra = '') => `<script type="module" src="${PAGE_SRC}"${extra}></script>`;
+const linkTagHtml = () => `<link rel="${AGENT_ENTRY_REL}" href="${AGENT_CARD_PATH}">`;
+
+/** `./x` import specifier from file `fromRel` to project file `toRel`. */
+function importSpecifier(fromRel, toRel) {
+  const spec = posix(relative(dirname(join('/', fromRel)), join('/', toRel)));
+  return spec.startsWith('.') ? spec : `./${spec}`;
+}
+
+/** The door module every framework's glue imports. Framework-free: a Web-standard handler and
+ *  a Node/Connect one. The seed is read at start from the environment or the slot, never kept
+ *  in this file (AT-22). */
+function doorModuleSource(framework) {
+  const { slot, static: staticDir } = FRAMEWORKS[framework];
+  return [
+    '// Written by `agent-entry init` (@muretai/agent-entry). This site\'s door: the Agent Card and',
+    '// its signature, the signed tools contract and its versions, the page collector and the signed',
+    '// POST, all built from agent-entry.json and from what `agent-entry publish` wrote. Change',
+    '// agent-entry.json, then run `agent-entry publish`; `agent-entry doctor` checks the wiring.',
+    `// The seed is read from ${SEED_NAME} in the environment, or else from the git-ignored file`,
+    '// named below. It is never written into this file.',
+    "import { existsSync, readFileSync } from 'node:fs';",
+    "import { bodySignpost, createAgentEntry } from '@muretai/agent-entry';",
+    '',
+    `const SEED_SLOT = new URL(${JSON.stringify(`./${slot}`)}, import.meta.url);`,
+    `const WELL_KNOWN = new URL(${JSON.stringify(`./${staticDir}/.well-known/`)}, import.meta.url);`,
+    "const declaration = JSON.parse(readFileSync(new URL('./agent-entry.json', import.meta.url), 'utf8'));",
+    '',
+    'function readSeed() {',
+    `  const fromEnv = String(process.env.${SEED_NAME} || '').trim();`,
+    '  if (fromEnv) return fromEnv;',
+    "  if (!existsSync(SEED_SLOT)) return '';",
+    `  const found = /^[ \\t]*(?:export[ \\t]+)?${SEED_NAME}[ \\t]*=[ \\t]*["']?([0-9a-f]{64})["']?[ \\t]*\\r?$/m`,
+    "    .exec(readFileSync(SEED_SLOT, 'utf8'));",
+    "  return found ? found[1] : '';",
+    '}',
+    '',
+    '/** Every version `agent-entry publish` wrote before the current one, v1 first. */',
+    'function priorVersions() {',
+    "  const current = new URL('agent-tools.json', WELL_KNOWN);",
+    '  if (!existsSync(current)) return [];',
+    "  const { version } = JSON.parse(readFileSync(current, 'utf8'));",
+    '  const out = [];',
+    '  for (let n = 1; n < version; n += 1) {',
+    "    out.push(JSON.parse(readFileSync(new URL('agent-tools/v' + n + '.json', WELL_KNOWN), 'utf8')));",
+    '  }',
+    '  return out;',
+    '}',
+    '',
+    'export const entry = createAgentEntry({',
+    '  seedHex: readSeed(),',
+    '  name: declaration.entry.name,',
+    '  baseUrl: declaration.entry.baseUrl,',
+    '  declaration,',
+    '  toolsHistory: priorVersions(),',
+    '});',
+    '',
+    '// The three signposts: the <head> link, the HTTP Link header, and the in-body anchor.',
+    `export const PAGE_TAG = ${JSON.stringify(pageTagHtml())};`,
+    `export const LINK_TAG = ${JSON.stringify(linkTagHtml())};`,
+    `export const LINK_HEADER = ${JSON.stringify(`<${AGENT_CARD_PATH}>; rel="${AGENT_ENTRY_REL}"`)};`,
+    'export const BODY_SIGNPOST = bodySignpost();',
+    '',
+    'const MOUNT = entry.mount;',
+    '',
+    '/** True for a request the door answers: its well-known paths, and POST / OPTIONS at its url. */',
+    'export function isDoorRequest(method, pathname) {',
+    "  if (pathname === (MOUNT || '/') || pathname === MOUNT + '/') return MOUNT !== '' || method === 'POST' || method === 'OPTIONS';",
+    '  if (MOUNT && !pathname.startsWith(MOUNT + \'/\')) return false;',
+    '  const rest = pathname.slice(MOUNT.length);',
+    "  return rest.startsWith('/.well-known/agent-card') || rest === '/.well-known/agent.json'",
+    "    || rest.startsWith('/.well-known/agent-tools');",
+    '}',
+    '',
+    '/** Web-standard handler: Next middleware, SvelteKit hooks, Astro middleware, Nitro. */',
+    'export async function handleWebRequest(request) {',
+    '  const url = new URL(request.url);',
+    "  const body = request.method === 'GET' || request.method === 'HEAD' ? Buffer.alloc(0)",
+    '    : Buffer.from(await request.arrayBuffer());',
+    '  const out = await entry.handleRequestAsync(request.method, url.pathname + url.search,',
+    '    Object.fromEntries(request.headers), body, {});',
+    "  const empty = request.method === 'HEAD' || [101, 204, 205, 304].includes(out.status);",
+    '  return new Response(empty ? null : out.body, { status: out.status, headers: out.headers });',
+    '}',
+    '',
+    '/** Node / Connect handler: Express, Vite\'s dev and preview servers, Next API routes. */',
+    'export function nodeMiddleware(req, res, next) {',
+    "  const pathname = String(req.url || '/').split('?')[0];",
+    '  if (!isDoorRequest(req.method, pathname)) {',
+    "    res.setHeader('Link', LINK_HEADER);",
+    "    return typeof next === 'function' ? next() : undefined;",
+    '  }',
+    '  const chunks = [];',
+    "  req.on('data', (c) => chunks.push(c));",
+    "  req.on('end', () => {",
+    '    entry.handleRequestAsync(req.method, req.url, req.headers, Buffer.concat(chunks),',
+    '      { remoteAddress: req.socket && req.socket.remoteAddress })',
+    "      .then((out) => { res.writeHead(out.status, out.headers); res.end(req.method === 'HEAD' ? undefined : out.body); })",
+    '      .catch(() => { res.statusCode = 500; res.end(); });',
+    '  });',
+    '  return undefined;',
+    '}',
+    '',
+  ].join('\n');
+}
+
+/** Insert `add` before the first `marker`; null when the marker is absent. */
+function insertBefore(text, marker, add) {
+  const at = text.indexOf(marker);
+  return at === -1 ? null : text.slice(0, at) + add + text.slice(at);
+}
+
+/** Insert `add` right after the first match of `re`; null when there is none. */
+function insertAfter(text, re, add) {
+  const m = re.exec(text);
+  return m ? text.slice(0, m.index + m[0].length) + add + text.slice(m.index + m[0].length) : null;
+}
+
+/** An HTML document: the link and the page tag in <head>, the signpost first in <body>. */
+function wireHtml(text, scriptExtra = '') {
+  let out = insertBefore(text, '</head>', `  ${linkTagHtml()}\n    ${pageTagHtml(scriptExtra)}\n  `);
+  if (out === null) return null;
+  out = insertAfter(out, /<body\b[^>]*>/i, `\n    ${bodySignpost()}`);
+  return out;
+}
+
+/** A JSX root (Next layout or _document): the same three, as JSX. */
+function wireJsx(text, headTag) {
+  const head = `\n        <link rel="${AGENT_ENTRY_REL}" href="${AGENT_CARD_PATH}" />\n        <script type="module" src="${PAGE_SRC}" />\n      `;
+  const selfClosing = new RegExp(`<${headTag}\\s*/>`);
+  let out;
+  if (selfClosing.test(text)) out = text.replace(selfClosing, `<${headTag}>${head}</${headTag}>`);
+  else if (new RegExp(`<${headTag}\\b[^>]*>`).test(text)) out = insertAfter(text, new RegExp(`<${headTag}\\b[^>]*>`), head);
+  else out = insertAfter(text, /<(?:html|Html)\b[^>]*>/, `\n      <${headTag}>${head}</${headTag}>`);
+  if (out === null) return null;
+  return insertAfter(out, /<body\b[^>]*>/, bodySignpost());
+}
+
+/** Wire the door into a project. Edits are skipped where the page tag is already present, so a
+ *  second init changes nothing it already wrote. Returns { wrote: [rel], manual: [lines] }. */
+function wireProject(root, framework) {
+  const fw = FRAMEWORKS[framework];
+  const wrote = [];
+  const manual = [];
+  const create = (rel, content) => {
+    const path = join(root, rel);
+    if (existsSync(path)) return false;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, content);
+    wrote.push(rel);
+    return true;
+  };
+  const edit = (rel, fn, what) => {
+    const path = join(root, rel);
+    const text = readFileSync(path, 'utf8');
+    if (text.includes(PAGE_SRC) || text.includes(DOOR_MODULE)) return;
+    const next = fn(text);
+    if (next === null || next === text) { manual.push(`${rel}: add ${what} by hand (init found no place for it)`); return; }
+    writeFileSync(path, next);
+    wrote.push(rel);
+  };
+  const glueAt = (group, content) => {
+    const present = firstExisting(root, group);
+    if (present === null) { create(group[0], content(group[0])); return; }
+    if (!readFileSync(join(root, present), 'utf8').includes(DOOR_MODULE)) {
+      manual.push(`${present}: this file already exists, so init did not replace it; have it hand door requests to ${DOOR_MODULE}`);
+    }
+  };
+  const template = () => firstExisting(root, fw.template);
+
+  create(DOOR_MODULE, doorModuleSource(framework));
+  switch (framework) {
+    case 'next-app': {
+      const layout = template();
+      const srcDir = layout && layout.startsWith('src/');
+      const group = srcDir ? ['src/middleware.js', 'src/middleware.ts'] : ['middleware.js', 'middleware.ts'];
+      glueAt(group, (rel) => [
+        "// Written by `agent-entry init`: the door's routes (card, signature, contract, collector, POST /).",
+        "import { NextResponse } from 'next/server';",
+        `import { LINK_HEADER, handleWebRequest, isDoorRequest } from '${importSpecifier(rel, DOOR_MODULE)}';`,
+        '',
+        'export async function middleware(request) {',
+        '  if (isDoorRequest(request.method, request.nextUrl.pathname)) return handleWebRequest(request);',
+        '  const response = NextResponse.next();',
+        "  response.headers.set('Link', LINK_HEADER);",
+        '  return response;',
+        '}',
+        '',
+        "export const config = { matcher: ['/', '/.well-known/:path*'], runtime: 'nodejs' };",
+        '',
+      ].join('\n'));
+      if (layout) edit(layout, (t) => wireJsx(t, 'head'), 'the link, the page tag and the body signpost');
+      else manual.push('app/layout: add the link, the page tag and the body signpost (no root layout found)');
+      break;
+    }
+    case 'next-pages': {
+      const pagesDir = existsSync(join(root, 'src/pages')) && !existsSync(join(root, 'pages')) ? 'src/pages' : 'pages';
+      glueAt([`${pagesDir}/api/agent-entry.js`], (rel) => [
+        "// Written by `agent-entry init`: the door's routes, reached through the rewrites in next.config.",
+        `import { nodeMiddleware } from '${importSpecifier(rel, DOOR_MODULE)}';`,
+        '',
+        'export const config = { api: { bodyParser: false } };',
+        '',
+        'export default function agentEntry(req, res) {',
+        "  const path = typeof req.query.path === 'string' && req.query.path.startsWith('/') ? req.query.path : '/';",
+        '  req.url = path;',
+        '  nodeMiddleware(req, res, () => { res.statusCode = 404; res.end(); });',
+        '}',
+        '',
+      ].join('\n'));
+      const rewrites = [
+        '  async rewrites() {',
+        '    return {',
+        '      beforeFiles: [',
+        "        { source: '/.well-known/:file(agent-card.json|agent.json|agent-card.sig.json|agent-tools.json|agent-tools.sig.json)',",
+        "          destination: '/api/agent-entry?path=/.well-known/:file' },",
+        "        { source: '/.well-known/agent-tools/:file', destination: '/api/agent-entry?path=/.well-known/agent-tools/:file' },",
+        "        { source: '/', has: [{ type: 'header', key: 'content-type', value: 'application/json.*' }],",
+        "          destination: '/api/agent-entry?path=/' },",
+        '      ],',
+        '    };',
+        '  },',
+      ].join('\n');
+      const config = firstExisting(root, FRAMEWORKS['next-pages'].config[0]);
+      if (config === null) {
+        create('next.config.js', `module.exports = {\n${rewrites}\n};\n`);
+      } else {
+        const text = readFileSync(join(root, config), 'utf8');
+        if (!text.includes('/api/agent-entry')) {
+          const next = /\brewrites\s*\(/.test(text) ? null
+            : insertAfter(text, /(?:module\.exports\s*=|export\s+default)\s*\{/, `\n${rewrites}\n `);
+          if (next === null) manual.push(`${config}: add rewrites of the door paths to /api/agent-entry by hand`);
+          else { writeFileSync(join(root, config), next); wrote.push(config); }
+        }
+      }
+      const doc = template();
+      if (doc) edit(doc, (t) => wireJsx(t, 'Head'), 'the link, the page tag and the body signpost');
+      else {
+        create(`${pagesDir}/_document.js`, [
+          "import { Html, Head, Main, NextScript } from 'next/document';",
+          '',
+          'export default function Document() {',
+          '  return (',
+          '    <Html>',
+          '      <Head>',
+          `        <link rel="${AGENT_ENTRY_REL}" href="${AGENT_CARD_PATH}" />`,
+          `        <script type="module" src="${PAGE_SRC}" />`,
+          '      </Head>',
+          `      <body>${bodySignpost()}<Main /><NextScript /></body>`,
+          '    </Html>',
+          '  );',
+          '}',
+          '',
+        ].join('\n'));
+      }
+      break;
+    }
+    case 'nuxt': {
+      glueAt(fw.glue[0], (rel) => [
+        "// Written by `agent-entry init`: the door's routes (card, signature, contract, collector, POST /).",
+        "import { defineEventHandler, sendWebResponse, setResponseHeader, toWebRequest } from 'h3';",
+        `import { LINK_HEADER, handleWebRequest, isDoorRequest } from '${importSpecifier(rel, DOOR_MODULE)}';`,
+        '',
+        'export default defineEventHandler(async (event) => {',
+        "  if (!isDoorRequest(event.method, event.path.split('?')[0])) {",
+        "    setResponseHeader(event, 'Link', LINK_HEADER);",
+        '    return undefined;',
+        '  }',
+        '  return sendWebResponse(event, await handleWebRequest(toWebRequest(event)));',
+        '});',
+        '',
+      ].join('\n'));
+      const config = template();
+      if (config) {
+        edit(config, (t) => (/\bapp\s*:/.test(t) ? null : insertAfter(t, /defineNuxtConfig\(\s*\{/,
+          `\n  app: { head: { link: [{ rel: '${AGENT_ENTRY_REL}', href: '${AGENT_CARD_PATH}' }], `
+          + `script: [{ type: 'module', src: '${PAGE_SRC}' }] } },`)), 'app.head: the link and the page tag');
+      } else manual.push('nuxt.config: add app.head with the link and the page tag by hand');
+      const app = firstExisting(root, ['app.vue', 'app/app.vue']);
+      if (app) {
+        const text = readFileSync(join(root, app), 'utf8');
+        const at = text.lastIndexOf('</template>');
+        if (!text.includes(AGENT_ENTRY_REL) && at !== -1) {
+          writeFileSync(join(root, app), `${text.slice(0, at)}  ${bodySignpost()}\n${text.slice(at)}`);
+          wrote.push(app);
+        }
+      } else manual.push('app.vue: add the body signpost (BODY_SIGNPOST in the door module) by hand');
+      break;
+    }
+    case 'sveltekit':
+    case 'astro': {
+      const handler = framework === 'sveltekit'
+        ? (rel) => [
+          "// Written by `agent-entry init`: the door's routes (card, signature, contract, collector, POST /).",
+          `import { LINK_HEADER, handleWebRequest, isDoorRequest } from '${importSpecifier(rel, DOOR_MODULE)}';`,
+          '',
+          'export async function handle({ event, resolve }) {',
+          '  if (isDoorRequest(event.request.method, event.url.pathname)) return handleWebRequest(event.request);',
+          '  const response = await resolve(event);',
+          "  response.headers.set('Link', LINK_HEADER);",
+          '  return response;',
+          '}',
+          '',
+        ].join('\n')
+        : (rel) => [
+          "// Written by `agent-entry init`: the door's routes (card, signature, contract, collector, POST /).",
+          '// The door answers requests, so this site needs on-demand rendering (an Astro adapter).',
+          `import { LINK_HEADER, handleWebRequest, isDoorRequest } from '${importSpecifier(rel, DOOR_MODULE)}';`,
+          '',
+          'export async function onRequest(context, next) {',
+          '  if (isDoorRequest(context.request.method, context.url.pathname)) return handleWebRequest(context.request);',
+          '  const response = await next();',
+          "  response.headers.set('Link', LINK_HEADER);",
+          '  return response;',
+          '}',
+          '',
+        ].join('\n');
+      glueAt(fw.glue[0], handler);
+      const doc = template() ?? (framework === 'astro' ? firstLayout(root) : null);
+      if (doc) edit(doc, (t) => wireHtml(t, framework === 'astro' ? ' is:inline' : ''), 'the link, the page tag and the body signpost');
+      else manual.push(`${fw.template[0]}: add the link, the page tag and the body signpost by hand`);
+      break;
+    }
+    case 'vite': {
+      glueAt(fw.glue[0], (rel) => [
+        "// Written by `agent-entry init`: the door's routes on Vite's dev and preview servers. A static",
+        '// build has no server: deploy the door beside it (see .agents/skills/agent-entry/SKILL.md).',
+        "import { defineConfig } from 'vite';",
+        `import { nodeMiddleware } from '${importSpecifier(rel, DOOR_MODULE)}';`,
+        '',
+        "const agentEntry = { name: 'agent-entry',",
+        '  configureServer(server) { server.middlewares.use(nodeMiddleware); },',
+        '  configurePreviewServer(server) { server.middlewares.use(nodeMiddleware); } };',
+        '',
+        'export default defineConfig({ plugins: [agentEntry] });',
+        '',
+      ].join('\n'));
+      const doc = template();
+      if (doc) edit(doc, (t) => wireHtml(t), 'the link, the page tag and the body signpost');
+      else manual.push('index.html: add the link, the page tag and the body signpost by hand');
+      break;
+    }
+    case 'express': {
+      const main = expressMain(root);
+      if (main === null) { manual.push(`your server file: app.use() the nodeMiddleware exported by ${DOOR_MODULE}`); break; }
+      edit(main, (t) => {
+        const appVar = /\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*express\(\s*\)\s*;?/.exec(t);
+        if (!appVar) return null;
+        const spec = importSpecifier(main, DOOR_MODULE);
+        const esm = /^\s*import\s/m.test(t) || main.endsWith('.mjs');
+        const importLine = esm ? `import { nodeMiddleware as agentEntry } from '${spec}';`
+          : `const { nodeMiddleware: agentEntry } = require('${spec}');`;
+        const withUse = insertAfter(t, new RegExp(appVar[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+          `\n// agent-entry: the door's routes and signposts, and the vendored page runtime.\n${appVar[1]}.use(agentEntry);\n`
+          + `${appVar[1]}.use(express.static('${fw.static}'));`);
+        const lines = withUse.split('\n');
+        let last = -1;
+        lines.forEach((l, i) => { if (esm ? /^\s*import\s/.test(l) : /\brequire\(/.test(l)) last = i; });
+        lines.splice(last + 1, 0, importLine);
+        return lines.join('\n');
+      }, 'app.use(agentEntry)');
+      manual.push(`your HTML pages: put PAGE_TAG and LINK_TAG from ${DOOR_MODULE} in <head>, BODY_SIGNPOST in <body>`);
+      break;
+    }
+    default:
+      break;
+  }
+
+  // The page runtime, vendored into the static dir so it is served from the site's own origin.
+  const runtime = packagePageRuntime();
+  if (runtime !== null) {
+    const rel = posix(join(fw.static, PAGE_RUNTIME));
+    const path = join(root, rel);
+    if (!existsSync(path) || !readFileSync(path).equals(runtime)) {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, runtime);
+      wrote.push(rel);
+    }
+  }
+  return { wrote, manual };
+}
+
+function firstLayout(root) {
+  try {
+    const name = readdirSync(join(root, 'src/layouts')).find((n) => n.endsWith('.astro'));
+    return name ? `src/layouts/${name}` : null;
+  } catch { return null; }
+}
+
+function expressMain(root) {
+  const pkg = readPackageJson(root);
+  const candidates = [pkg?.main, 'server.js', 'server.mjs', 'app.js', 'index.js', 'src/server.js', 'src/index.js']
+    .filter((p) => typeof p === 'string' && p && !p.startsWith('/') && !p.includes('..'));
+  return firstExisting(root, candidates);
+}
+
+/** The page runtime this package ships (agent-entry-page.mjs beside this file), or null. */
+function packagePageRuntime() {
+  try {
+    const path = fileURLToPath(new URL(`./${PAGE_RUNTIME}`, import.meta.url));
+    return existsSync(path) ? readFileSync(path) : null;
+  } catch { return null; }
+}
+
+function skillSource(framework) {
+  const { static: staticDir } = FRAMEWORKS[framework];
+  return [
+    '---',
+    'name: agent-entry',
+    'description: Fill and extend this site\'s agent-entry.json, the verbs a customer can do here (find, book, hold, buy, ask and more), and bind each offer to the page and to the door. Use when asked what visiting AI agents can do on this site, to add or change an offer, or right after `agent-entry init`.',
+    '---',
+    '',
+    '# Agent Entry on this site',
+    '',
+    '`agent-entry.json` is the one declaration of what a customer can DO here. Each entry in',
+    '`offers[]` is a verb and an object (`find products`, `book table`), an `about` line and an',
+    '`input` field map, plus up to two bindings. The door (`agent-entry.door.mjs`) turns it into the',
+    'Agent Card\'s skills, a signed tools contract and default replies; the page runtime',
+    `(\`${PAGE_SRC}\`) registers the offers that have a \`page\` binding as WebMCP tools.`,
+    '',
+    '## What to do',
+    '',
+    '1. Read how the site already works, its pages, forms and API routes, before writing anything.',
+    '2. For each offer a page can do, add a `page` binding grounded in what the page already does:',
+    '   `{"on": ["/shop/**"], "do": {...}}` with exactly one of `open` (a same-origin path),',
+    '   `read` (a CSS selector), `fill` (`{"form": "<selector>"}`), `fetch` (`{"method", "path",',
+    '   "query"}` mapping query parameters to input fields) or `call` (a function the page registers).',
+    '3. Keep or add `door` bindings: `{"reply": "catalog" | "facts" | "pending" | "checkout" |',
+    '   "brain" | "human"}`. `checkout` needs `url`, the path of the site\'s own checkout: the door',
+    '   never takes a payment.',
+    '4. Add only offers the site really supports. Use the registry verbs (find, ask, quote, book,',
+    '   hold, order, buy, track, change, cancel, join). A verb outside it gets no defaults and',
+    '   must declare `effect` (`none`, `reversible`, `changes`, `pays`).',
+    '5. Run `npx @muretai/agent-entry publish`, then `npx @muretai/agent-entry doctor`, and fix',
+    '   every FAIL it names.',
+    '',
+    '## Never',
+    '',
+    `- Never copy, print, log or commit the seed (${SEED_NAME}). It is this site's private key;`,
+    '  it lives only in the git-ignored file init wrote, or in the host\'s secret settings.',
+    `- Never edit a published version under \`${staticDir}/.well-known/agent-tools/\`: versions are`,
+    '  immutable, and `publish` writes the next one.',
+    '- Never turn a page tool into a new A2A method: offers ride `message/send` with `metadata.offer`.',
+    '',
+  ].join('\n');
+}
+
+async function initMain(argv) {
+  const flags = parseFlags(argv, { trade: 'string', from: 'string', name: 'string', 'base-url': 'string', json: 'boolean' });
+  const root = process.cwd();
+  if (flags.trade !== undefined && !TRADES.includes(flags.trade)) {
+    throw new CliMisuse(`--trade must be one of ${TRADES.join(', ')}`);
+  }
+  if (flags.trade !== undefined && flags.from !== undefined) throw new CliMisuse('give --trade or --from, not both');
+  const framework = detectFramework(root);
+  if (framework === null) {
+    throw new CliRefusal('init found no framework here (Next, Nuxt, SvelteKit, Astro, Vite, Express, a static site '
+      + 'or WordPress). Run it in the project\'s root directory.');
+  }
+  const fw = FRAMEWORKS[framework];
+  const trade = flags.trade ?? null;
+
+  if (fw.route) {
+    // Handed off: the serverless templates and the WordPress plugin mint and keep their own seed
+    // in the platform's secret store, so nothing is written here.
+    const doc = { framework, trade, did: null, seed: null, route: fw.route, wrote: [] };
+    emit(flags.json, doc, [
+      `${framework === 'static' ? 'A static site' : 'WordPress'} is served by ${fw.route}, not wired by init.`,
+      `Install ${fw.route}: it mints the site's seed in the platform's own secret store and serves the door.`,
+    ]);
+    return 0;
+  }
+
+  // Everything that can refuse is decided before anything is written.
+  const declPath = join(root, DECLARATION_FILE);
+  let declaration = null;
+  if (flags.from !== undefined || !existsSync(declPath)) {
+    if (flags.from === undefined && trade === null) throw new CliMisuse('give --trade (restaurant, retail, clinic, repair) or --from sodium.json');
+    if (existsSync(declPath)) throw new CliRefusal(`${DECLARATION_FILE} already exists; init --from never overwrites it. Move it aside first.`);
+    if (typeof flags['base-url'] !== 'string') throw new CliMisuse('--base-url is required: the URL visitors reach this site at');
+    const pkg = readPackageJson(root);
+    let offers;
+    let toolIds = null;
+    let appName = null;
+    if (flags.from !== undefined) {
+      let doc;
+      try { doc = readJsonFile(resolve(root, flags.from)); } catch (e) {
+        throw new CliRefusal(`cannot read ${flags.from}: ${shortError(e)}`);
+      }
+      const converted = offersFromSodium(doc);
+      offers = converted.map((c) => c.offer);
+      toolIds = converted.map((c) => c.id);
+      appName = typeof doc.app?.name === 'string' && doc.app.name ? doc.app.name : null;
+    } else {
+      offers = JSON.parse(JSON.stringify(OFFER_STARTERS[trade]));
+    }
+    const name = flags.name ?? appName ?? (typeof pkg?.name === 'string' && pkg.name ? pkg.name : basename(root));
+    declaration = checkedDeclaration({ v: 1, entry: { name, baseUrl: flags['base-url'] }, offers }, toolIds);
+  }
+  const refusal = seedSlotRefusal(root, fw.slot);
+  if (refusal) throw new CliRefusal(refusal);
+
+  const wrote = [];
+  const seed = mintSeed(root, fw.slot);
+  if (seed.wrote) wrote.push(fw.slot);
+  if (declaration !== null) {
+    writeFileSync(declPath, `${JSON.stringify(declaration, null, 2)}\n`, { flag: 'wx' });
+    wrote.push(DECLARATION_FILE);
+  }
+  if (!existsSync(join(root, SKILL_FILE))) {
+    mkdirSync(dirname(join(root, SKILL_FILE)), { recursive: true });
+    writeFileSync(join(root, SKILL_FILE), skillSource(framework));
+    wrote.push(SKILL_FILE);
+  }
+  const wiring = wireProject(root, framework);
+  wrote.push(...wiring.wrote);
+  const did = didFromSeedHex(seed.hex);
+  emit(flags.json, { framework, trade, did, seed: { path: fw.slot }, wrote, ...(wiring.manual.length ? { manual: wiring.manual } : {}) }, [
+    `Agent Entry for a ${framework} site. Door key: ${did}`,
+    `The seed is in ${fw.slot} (git-ignored, mode 0600). It is this site's private key: never commit or share it.`,
+    ...(wrote.length ? ['Wrote:', ...wrote.map((p) => `  ${p}`)] : ['Nothing to write: this project is already set up.']),
+    ...(wiring.manual.length ? ['By hand:', ...wiring.manual.map((m) => `  ${m}`)] : []),
+    `Next: have your coding agent follow ${SKILL_FILE}, then run \`agent-entry publish\` and \`agent-entry doctor\`.`,
+  ]);
+  return 0;
+}
+
+// ------------------------------------------ publish
+
+/** The published versions under `<static>/.well-known/agent-tools/`, v1 first, each checked
+ *  against its own hash, its number and its canonical bytes; a refusal on a gap or an edit. */
+function readPublished(root, wkRel) {
+  const dir = join(root, wkRel, 'agent-tools');
+  const numbers = existsSync(dir)
+    ? readdirSync(dir).map((n) => /^v([1-9][0-9]{0,8})\.json$/.exec(n)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b)
+    : [];
+  numbers.forEach((n, i) => {
+    if (n !== i + 1) throw new CliRefusal(`${wkRel}/agent-tools/ has a gap: v${i + 1} is missing before v${n}. Restore it from git.`);
+  });
+  return numbers.map((n) => {
+    const text = readFileSync(join(dir, `v${n}.json`), 'utf8');
+    let contract = null;
+    try { contract = JSON.parse(text); } catch { /* below */ }
+    if (!contractHashOk(contract) || contract.version !== n || text !== canonicalJSON(contract)) {
+      throw new CliRefusal(`${wkRel}/agent-tools/v${n}.json no longer matches its own hash: version ${n} was edited after it was `
+        + 'published, and a published version is immutable. Restore it from git.');
+    }
+    return contract;
+  });
+}
+
+/** Write `bytes` to `path` through a temporary file, so a reader never sees half a file. */
+function writeAtomic(path, bytes) {
+  const tmpPath = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmpPath, bytes);
+  renameSync(tmpPath, path);
+}
+
+async function publishMain(argv) {
+  const flags = parseFlags(argv, { version: 'string', json: 'boolean' });
+  let target = null;
+  if (flags.version !== undefined) {
+    if (!/^[1-9][0-9]{0,8}$/.test(flags.version)) throw new CliMisuse('--version must be a positive integer');
+    target = Number(flags.version);
+  }
+  const root = process.cwd();
+  const declPath = join(root, DECLARATION_FILE);
+  if (!existsSync(declPath)) throw new CliRefusal(`no ${DECLARATION_FILE} here: run agent-entry init first`);
+  let declaration;
+  try { declaration = readJsonFile(declPath); } catch (e) { throw new CliRefusal(`${DECLARATION_FILE} is not JSON: ${shortError(e)}`); }
+  let read;
+  try { read = readDeclaration(declaration); } catch (e) { throw new CliRefusal(e.message); }
+  const framework = detectFramework(root);
+  const seed = findSeed(root, framework);
+  if (!seed.hex) {
+    throw new CliRefusal(`no seed: ${SEED_NAME} is in none of this project's env files nor in the environment. `
+      + 'Run agent-entry init, which mints it into a git-ignored file.');
+  }
+  const wkRel = posix(join(FRAMEWORKS[framework]?.static ?? 'public', '.well-known'));
+  const prior = readPublished(root, wkRel);
+  prior.forEach((c) => {
+    if (!c.origins.includes(read.origin)) {
+      throw new CliRefusal(`v${c.version} was published for ${c.origins.join(', ')}, not ${read.origin}: a door serves only the `
+        + 'history of its own origin.');
+    }
+  });
+  const n = prior.length;
+  let version;
+  if (target === null) {
+    version = n > 0 && compileDeclaration(declaration, { version: n }).hash === prior[n - 1].hash ? n : n + 1;
+  } else if (target <= n) {
+    if (compileDeclaration(declaration, { version: target }).hash !== prior[target - 1].hash) {
+      throw new CliRefusal(`v${target} is already published with other content, and version ${target} is immutable. `
+        + `Publish without --version to make v${n + 1}.`);
+    }
+    version = target;
+  } else if (target === n + 1) {
+    version = target;
+  } else {
+    throw new CliRefusal(`--version ${target} leaves a gap: the next version is v${n + 1}`);
+  }
+
+  const contract = version <= n ? prior[version - 1] : compileDeclaration(declaration, { version });
+  const wk = join(root, wkRel);
+  const current = join(wk, 'agent-tools.json');
+  const sigPath = join(wk, 'agent-tools.sig.json');
+  const bytes = canonicalJSON(contract);
+  let changed = false;
+  if (version > n) {
+    mkdirSync(join(wk, 'agent-tools'), { recursive: true });
+    writeFileSync(join(wk, 'agent-tools', `v${version}.json`), bytes, { flag: 'wx' });
+    changed = true;
+  }
+  const currentStale = !existsSync(current) || readFileSync(current, 'utf8') !== bytes || !existsSync(sigPath);
+  if (version === Math.max(n, version) && (changed || currentStale)) {
+    writeAtomic(current, bytes);
+    writeAtomic(sigPath, JSON.stringify(makeToolsEnvelope(seed.hex, contract, nowEpoch())));
+    changed = true;
+  }
+  emit(flags.json, { version, hash: contract.hash }, [changed
+    ? `Published v${version} (sha256 ${contract.hash.slice(0, 16)}…) to ${wkRel}/agent-tools.json, .sig.json and agent-tools/v${version}.json.`
+    : `v${version} is already published with this content; nothing to do.`]);
+  return 0;
+}
+
+// ------------------------------------------ doctor
+
+/** One way to reach a door: (method, path, {headers, body}) -> {status, headers, text}. */
+function localTransport(entry) {
+  return async (method, path, { headers = {}, body = null } = {}) => {
+    const out = await entry.handleRequestAsync(method, path, headers, body === null ? Buffer.alloc(0) : Buffer.from(body),
+      { remoteAddress: '127.0.0.1' });
+    const h = {};
+    for (const [k, v] of Object.entries(out.headers || {})) h[k.toLowerCase()] = String(v);
+    return { status: out.status, headers: h, text: Buffer.from(out.body || '').toString('utf8') };
+  };
+}
+
+function liveTransport(origin) {
+  return async (method, path, { headers = {}, body = null } = {}) => {
+    const url = new URL(path, origin);
+    if (url.origin !== origin) throw new Error(`refusing to leave ${origin}`);
+    const res = await fetch(url, { method, body, redirect: 'manual', signal: AbortSignal.timeout(15000),
+      headers: { 'user-agent': 'agent-entry-doctor/1', ...headers } });
+    const h = {};
+    res.headers.forEach((v, k) => { h[k] = v; });
+    return { status: res.status, headers: h, text: await res.text() };
+  };
+}
+
+/** A signed knock for one offer: `<verb> <of> {<example input>}` with metadata.offer = its id. */
+function offerKnock(seedHex, toDid, offer) {
+  const from = didFromSeedHex(seedHex);
+  const messageId = newId();
+  const timestamp = nowEpoch();
+  const keys = Object.keys(offer.input);
+  const example = Object.fromEntries(keys.map((k) => [k, EXAMPLE_INPUT[offer.input[k]] ?? 'example']));
+  const text = keys.length ? `${offer.verb} ${offer.of} ${JSON.stringify(example)}` : `${offer.verb} ${offer.of}`;
+  const fields = { from, to: toDid, messageId, contextId: null, timestamp, text };
+  return {
+    from,
+    body: JSON.stringify({ jsonrpc: '2.0', id: messageId, method: 'message/send', params: { message: {
+      kind: 'message', role: 'user', messageId, contextId: null, parts: [{ kind: 'text', text }],
+      metadata: { from, to: toDid, timestamp, sig: signEnvelope(seedHex, fields), offer: offer.id } } } }),
+  };
+}
+
+/** The checks a door answers for, over any transport (AT-24): card and its signature, the card
+ *  url, the signposts, the contract and its signature and versions, the collector, the AT-4
+ *  warning, and exactly one signed knock per door-bound offer. Stops at the first unreachable
+ *  request: nothing is guessed past it. */
+async function doorChecks(send, base, add, { knockSeed: kSeed, expectDid = null, expectHash = null }) {
+  const url = new URL(base);
+  const origin = url.origin;
+  const mount = url.pathname.replace(/\/+$/, '');
+  const getJson = async (path) => {
+    const r = await send('GET', mount + path, { headers: { accept: 'application/json' } });
+    let json = null;
+    if (r.status === 200) { try { json = JSON.parse(r.text); } catch { /* not JSON */ } }
+    return { ...r, json };
+  };
+  try {
+    const card = (await getJson(AGENT_CARD_PATH)).json;
+    if (!isPlainObject(card) || typeof card.did !== 'string') {
+      add('card', 'FAIL', 'the Agent Card is served', `GET ${AGENT_CARD_PATH} returned no card`);
+      return;
+    }
+    const cardEnv = (await getJson(AGENT_CARD_SIG_PATH)).json;
+    const verifiedCard = cardEnv ? verifyCardEnvelope(cardEnv, card.did) : null;
+    if (!verifiedCard || canonicalJSON(verifiedCard) !== canonicalJSON(card)) {
+      add('card.sig', 'FAIL', 'the card signature verifies', `${AGENT_CARD_SIG_PATH} does not verify against the card's did`);
+    } else add('card.sig', 'PASS', 'the Agent Card is served and signed', card.did);
+    if (expectDid !== null && card.did !== expectDid) {
+      add('card.did', 'FAIL', 'the card names this site\'s key', 'the door runs with another seed than the project\'s slot');
+    }
+    let cardUrlOk = false;
+    try { cardUrlOk = canonicalBaseUrl(card.url, { warn: false }) === canonicalBaseUrl(base, { warn: false }); } catch { /* below */ }
+    add('card.url', cardUrlOk ? 'PASS' : 'FAIL', 'the card url names this site', cardUrlOk ? card.url : `card.url is ${String(card.url).slice(0, 120)}`);
+
+    const front = await send('GET', mount || '/', { headers: { accept: 'text/html' } });
+    const linked = String(front.headers.link || '').includes(AGENT_ENTRY_REL);
+    const inBody = front.text.includes(`rel="${AGENT_ENTRY_REL}"`);
+    add('signposts', linked || inBody ? 'PASS' : 'FAIL', 'the front page points agents at the door',
+      [linked && 'Link header', inBody && 'in the HTML'].filter(Boolean).join(', ') || `GET ${mount || '/'} carries no ${AGENT_ENTRY_REL} link`);
+
+    const toolsUrl = `${card.url}${TOOLS_PATH}`;
+    if (card.agentEntry?.tools !== toolsUrl) {
+      add('contract', 'FAIL', 'the card names the signed tools contract', 'agentEntry.tools is missing: this door was started without a declaration');
+      return;
+    }
+    const plain = await getJson(TOOLS_PATH);
+    const sigDoc = (await getJson(TOOLS_SIG_PATH)).json;
+    const contract = sigDoc ? verifyToolsEnvelope(sigDoc, card.did, { origin }) : null;
+    if (!contract || !plain.json || plain.text !== canonicalJSON(contract)) {
+      add('contract', 'FAIL', 'the tools contract verifies', `${TOOLS_SIG_PATH} does not verify under ${card.did} for ${origin}, or differs from ${TOOLS_PATH}`);
+      return;
+    }
+    add('contract', 'PASS', 'the tools contract is signed by the card\'s key', `v${contract.version}, sha256 ${contract.hash.slice(0, 16)}…`);
+    if (expectHash !== null && contract.hash !== expectHash) {
+      add('contract.published', 'FAIL', 'the door serves the published contract', 'the door compiles another contract than the published one: run agent-entry publish');
+    }
+    let versionsOk = true;
+    for (let n = 1; n <= contract.version; n += 1) {
+      const v = await getJson(`/.well-known/agent-tools/v${n}.json`);
+      if (!contractHashOk(v.json) || v.json.version !== n || (n === contract.version && v.json.hash !== contract.hash)) {
+        versionsOk = false;
+        add(`contract.v${n}`, 'FAIL', `version ${n} is served unchanged`, `/.well-known/agent-tools/v${n}.json is missing or fails its hash`);
+      }
+    }
+    if (versionsOk) add('contract.versions', 'PASS', 'every published version is served unchanged', `v1..v${contract.version}`);
+
+    const events = await send('OPTIONS', mount + TOOLS_EVENTS_PATH, { headers: { origin } });
+    const collectorOk = card.agentEntry?.events === `${card.url}${TOOLS_EVENTS_PATH}` && events.status === 204
+      && /\bPOST\b/.test(String(events.headers.allow || ''));
+    add('collector', collectorOk ? 'PASS' : 'FAIL', 'the page collector is advertised and open',
+      collectorOk ? TOOLS_EVENTS_PATH : `OPTIONS ${TOOLS_EVENTS_PATH} answered ${events.status}`);
+
+    for (const offer of contract.offers) {
+      if (offer.effect === undefined) {
+        add(`offer.${offer.id}.effect`, 'WARN', `${offer.id} declares no effect`,
+          `"${offer.verb}" is not a registry verb, so ${offer.id} gets no effect, no ask floor and no handoff (AT-4). `
+          + 'Declare "effect" on it, or use a registry verb.');
+      }
+    }
+
+    const requirement = card.securitySchemes?.[SIGNED_ENVELOPE_SCHEME]?.agentEntry;
+    const endpoint = new URL(requirement?.endpoint || card.supportedInterfaces?.find((i) => i?.protocolBinding === 'JSONRPC')?.url
+      || `${card.url}/`);
+    if (endpoint.origin !== origin) {
+      add('door', 'FAIL', 'the door answers on this site', `the card sends visitors to ${endpoint.origin}`);
+      return;
+    }
+    for (const offer of contract.offers) {
+      if (!offer.door) {
+        add(`offer.${offer.id}`, 'INFO', `${offer.id} is page-only`, 'checked on the page, not knocked at the door');
+        continue;
+      }
+      const knock = offerKnock(kSeed, card.did, offer);
+      const r = await send('POST', endpoint.pathname + endpoint.search,
+        { headers: { 'content-type': 'application/json', accept: 'application/json' }, body: knock.body });
+      let reply = null;
+      try { reply = JSON.parse(r.text); } catch { /* below */ }
+      const msg = reply?.result;
+      const meta = msg?.metadata || {};
+      const replyFields = { from: meta.from, to: meta.to, messageId: msg?.messageId, contextId: msg?.contextId ?? null,
+        timestamp: meta.timestamp, text: msg ? messageText(msg) : '', sig: meta.sig };
+      const fail = (why) => add(`offer.${offer.id}`, 'FAIL', `${offer.id} answers at the door`, why);
+      if (reply?.error) { fail(`the door refused the knock (${reply.error.code}): ${String(reply.error.message || '').slice(0, 160)}`); continue; }
+      if (r.status !== 200 || meta.from !== card.did || meta.to !== knock.from
+          || !verifyEnvelope(replyFields, { recipientDid: knock.from, signerDid: card.did })) {
+        fail('the reply is not signed by the card\'s key');
+        continue;
+      }
+      if (offer.door.reply === 'brain') {
+        add(`offer.${offer.id}`, 'PASS', `${offer.id} answers at the door`, 'a signed reply from the site\'s own responder');
+        continue;
+      }
+      let body = null;
+      try { body = JSON.parse(replyFields.text); } catch { /* below */ }
+      const want = REPLY_STATUS[offer.door.reply];
+      if (!isPlainObject(body) || body.verb !== offer.verb || body.of !== offer.of || body.status !== want) {
+        fail(`declared reply "${offer.door.reply}" (${want}), but the door answered ${isPlainObject(body) ? JSON.stringify(body.status ?? null).slice(0, 60) : 'no reply object'}`);
+        continue;
+      }
+      if (offer.door.reply === 'checkout' && (typeof body.url !== 'string' || new URL(body.url).origin !== origin)) {
+        fail('the checkout handoff does not stay on this site');
+        continue;
+      }
+      if (offer.door.receipt && (body.deal?.type !== 'DealReceipt' || body.deal.partyA !== card.did || body.deal.partyB !== knock.from)) {
+        fail('the offer carries a receipt, but the reply has no deal block for this visitor');
+        continue;
+      }
+      add(`offer.${offer.id}`, 'PASS', `${offer.id} answers at the door`, `${want}${offer.door.receipt ? ' with a deal block' : ''}`);
+    }
+  } catch (e) {
+    add('reach', 'FAIL', `the site answers at ${base}`, `could not reach it: ${shortError(e)}`);
+  }
+}
+
+/** Map `@muretai/agent-entry` to this very file, so a project's door module loads here even
+ *  before its dependencies are installed, and runs the same code this doctor checks. */
+async function resolvePackageToSelf() {
+  const mod = await import('node:module');
+  const self = import.meta.url;
+  if (typeof mod.registerHooks === 'function') {
+    mod.registerHooks({ resolve: (specifier, context, next) => (specifier === '@muretai/agent-entry'
+      ? { url: self, shortCircuit: true } : next(specifier, context)) });
+    return true;
+  }
+  if (typeof mod.register === 'function') {
+    mod.register(`data:text/javascript,${encodeURIComponent(`export async function resolve(s, c, n) {
+      return s === '@muretai/agent-entry' ? { url: ${JSON.stringify(self)}, shortCircuit: true } : n(s, c); }`)}`);
+    return true;
+  }
+  return false;
+}
+
+/** Remove comments, so a tag or an import that is commented out does not count. */
+function withoutComments(text) {
+  return text.replace(/<!--[\s\S]*?-->/g, '').replace(/\{\/\*[\s\S]*?\*\/\}/g, '').replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:'"\\])\/\/[^\n]*/g, '$1');
+}
+
+/** True when `rel` really imports the door module: a static import, re-export, dynamic import
+ *  or require whose relative specifier resolves to the project's door module. */
+function importsDoorModule(root, rel) {
+  const text = withoutComments(readFileSync(join(root, rel), 'utf8'));
+  const specs = [...text.matchAll(/(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|^\s*import\s+)['"]([^'"]+)['"]/gm)].map((m) => m[1]);
+  return specs.some((s) => s.startsWith('.') && resolve(root, dirname(rel), s) === resolve(root, DOOR_MODULE));
+}
+
+async function doctorLocal(root, add) {
+  const framework = detectFramework(root);
+  const fw = framework ? FRAMEWORKS[framework] : null;
+
+  let declaration = null;
+  let read = null;
+  if (!existsSync(join(root, DECLARATION_FILE))) {
+    add('declaration', 'FAIL', `${DECLARATION_FILE} is present`, 'none here: run agent-entry init');
+  } else {
+    try {
+      declaration = readJsonFile(join(root, DECLARATION_FILE));
+      read = readDeclaration(declaration);
+      add('declaration', 'PASS', `${DECLARATION_FILE} is valid`, `${read.offers.length} offers for ${read.origin}`);
+    } catch (e) {
+      add('declaration', 'FAIL', `${DECLARATION_FILE} is valid`, shortError(e));
+    }
+  }
+
+  // The seed: present, private, and nowhere git would carry it. Rows name files, never the key.
+  const seed = findSeed(root, framework);
+  const inRepo = git(root, ['rev-parse', '--is-inside-work-tree']).status === 0;
+  if (!seed.hex) {
+    add('seed.present', 'FAIL', 'the site seed is present', `${SEED_NAME} is in none of the env files nor in the environment`);
+  } else {
+    add('seed.present', 'PASS', 'the site seed is present', seed.path ? `in ${seed.path}` : 'from the environment');
+    if (seed.path) {
+      const loose = statSync(join(root, seed.path)).mode & 0o077;
+      add('seed.mode', loose ? 'FAIL' : 'PASS', 'the seed file is readable by its owner only',
+        loose ? `${seed.path} is readable by others: chmod 600 ${seed.path}` : `${seed.path} is mode 0600`);
+      if (inRepo) {
+        const committed = git(root, ['ls-files', '--cached', '--', seed.path]).stdout.trim() !== '';
+        const ignored = git(root, ['check-ignore', '-q', '--', seed.path]).status === 0;
+        if (committed) {
+          add('seed.committed', 'FAIL', 'the seed is not committed',
+            `${seed.path} is tracked by git, so the site's secret key is in the repository. Mint a new seed, remove the file from git and from its history, and keep it in .gitignore.`);
+        } else if (!ignored) {
+          add('seed.ignored', 'FAIL', 'the seed file is git-ignored', `.gitignore does not ignore ${seed.path}`);
+        } else add('seed.ignored', 'PASS', 'the seed is git-ignored and not committed', seed.path);
+      }
+    }
+    if (inRepo) {
+      const trackable = git(root, ['ls-files', '-z', '--cached', '--others', '--exclude-standard']).stdout.split('\0').filter(Boolean);
+      const leaks = trackable.filter((rel) => {
+        if (rel === seed.path) return false;
+        try {
+          const st = statSync(join(root, rel));
+          if (!st.isFile() || st.size > 2 * 1024 * 1024) return false;
+          const text = readFileSync(join(root, rel), 'utf8');
+          return ANY_SEED_LINE.test(text) || text.includes(seed.hex);
+        } catch { return false; }
+      });
+      add('seed.copies', leaks.length ? 'FAIL' : 'PASS', 'no file git would carry holds the seed',
+        leaks.length ? `the seed is in ${leaks.slice(0, 5).join(', ')}` : `${trackable.length} trackable files checked`);
+    } else {
+      add('seed.git', 'WARN', 'git guards the seed', 'this is not a git repository, so nothing proves the seed stays out of commits');
+    }
+  }
+
+  // What publish wrote, checked against the seed and the declaration.
+  const wkRel = posix(join(fw?.static ?? 'public', '.well-known'));
+  let publishedHash = null;
+  if (read && seed.hex) {
+    try {
+      const prior = readPublished(root, wkRel);
+      const sigPath = join(root, wkRel, 'agent-tools.sig.json');
+      if (prior.length === 0 || !existsSync(sigPath)) throw new CliRefusal(`nothing is published under ${wkRel}: run agent-entry publish`);
+      let env = null;
+      try { env = readJsonFile(sigPath); } catch { /* below */ }
+      const contract = env ? verifyToolsEnvelope(env, didFromSeedHex(seed.hex), { origin: read.origin }) : null;
+      const current = prior[prior.length - 1];
+      if (!contract) throw new CliRefusal(`${wkRel}/agent-tools.sig.json does not verify under this site's key for ${read.origin}`);
+      if (contract.hash !== current.hash || readFileSync(join(root, wkRel, 'agent-tools.json'), 'utf8') !== canonicalJSON(current)) {
+        throw new CliRefusal(`${wkRel}/agent-tools.json and .sig.json are not the latest version v${current.version}`);
+      }
+      if (compileDeclaration(declaration, { version: current.version }).hash !== current.hash) {
+        throw new CliRefusal(`${DECLARATION_FILE} changed since v${current.version} was published: run agent-entry publish`);
+      }
+      publishedHash = current.hash;
+      add('published', 'PASS', 'the published contract verifies and matches the declaration', `v${current.version} under ${wkRel}`);
+    } catch (e) {
+      add('published', 'FAIL', 'the published contract verifies and matches the declaration', shortError(e));
+    }
+  }
+
+  // The wiring, as the framework will load it.
+  if (!fw || fw.route) {
+    add('wiring', 'FAIL', 'the door is wired into this project',
+      fw ? `a ${framework} site is served by ${fw.route}: run its own checks` : 'no framework recognised here');
+    return;
+  }
+  const doorPath = join(root, DOOR_MODULE);
+  if (!existsSync(doorPath)) {
+    add('wiring.door', 'FAIL', 'the door module is present', `no ${DOOR_MODULE}: run agent-entry init`);
+    return;
+  }
+  const glueGroups = framework === 'express' ? [[expressMain(root)].filter(Boolean)] : fw.glue;
+  for (const group of glueGroups) {
+    const found = group.filter((rel) => existsSync(join(root, rel)));
+    const wired = found.find((rel) => importsDoorModule(root, rel));
+    add('wiring.routes', wired ? 'PASS' : 'FAIL', 'the framework hands door requests to the door module',
+      wired ? `${wired} loads ${DOOR_MODULE}` : `${found[0] ?? group[0] ?? 'the server file'} does not import ${DOOR_MODULE}`);
+  }
+  if (fw.config) {
+    const config = firstExisting(root, fw.config[0]);
+    const ok = config !== null && withoutComments(readFileSync(join(root, config), 'utf8')).includes(fw.config[1]);
+    add('wiring.rewrites', ok ? 'PASS' : 'FAIL', 'the door paths are rewritten to the door route',
+      ok ? config : `no rewrite to ${fw.config[1]} in ${config ?? 'next.config.js'}`);
+  }
+  const templateRel = firstExisting(root, fw.template) ?? (framework === 'astro' ? firstLayout(root) : null);
+  if (fw.template.length === 0) {
+    add('page.tag', 'WARN', 'the pages load the page runtime',
+      `no HTML template this CLI can read: put PAGE_TAG from ${DOOR_MODULE} in your pages' <head>`);
+  } else {
+    const tagged = templateRel !== null && withoutComments(readFileSync(join(root, templateRel), 'utf8')).includes(PAGE_SRC);
+    add('page.tag', tagged ? 'PASS' : 'FAIL', 'the pages load the page runtime',
+      tagged ? `${templateRel} loads ${PAGE_SRC}` : `${templateRel ?? fw.template[0]} has no script tag for ${PAGE_SRC}`);
+  }
+  const runtime = packagePageRuntime();
+  const vendored = join(root, fw.static, PAGE_RUNTIME);
+  if (runtime === null) {
+    add('page.runtime', 'INFO', 'the page runtime is served', `this build of the package ships no ${PAGE_RUNTIME} to vendor yet`);
+  } else if (!existsSync(vendored)) {
+    add('page.runtime', 'FAIL', 'the page runtime is served', `${posix(join(fw.static, PAGE_RUNTIME))} is missing, so ${PAGE_SRC} would 404: run agent-entry init`);
+  } else {
+    const same = readFileSync(vendored).equals(runtime);
+    add('page.runtime', same ? 'PASS' : 'WARN', 'the page runtime is served',
+      same ? posix(join(fw.static, PAGE_RUNTIME)) : `${posix(join(fw.static, PAGE_RUNTIME))} differs from this package's copy: run agent-entry init to update it`);
+  }
+
+  // The door module itself, loaded the way the framework loads it, then knocked in process.
+  if (!read) return;
+  let entry = null;
+  try {
+    if (!(await resolvePackageToSelf())) throw new Error('this Node cannot map @muretai/agent-entry for the check (needs Node 20.6 or later)');
+    entry = (await import(pathToFileURL(doorPath).href)).entry;
+    if (!entry || typeof entry.handleRequestAsync !== 'function') throw new Error(`${DOOR_MODULE} exports no door \`entry\``);
+    add('wiring.door', 'PASS', 'the door module starts', `${DOOR_MODULE} serves ${entry.did}`);
+  } catch (e) {
+    add('wiring.door', 'FAIL', 'the door module starts', shortError(e));
+    return;
+  }
+  await doorChecks(localTransport(entry), canonicalBaseUrl(declaration.entry.baseUrl, { warn: false }), add,
+    { knockSeed: newSeedHex(), expectDid: seed.hex ? didFromSeedHex(seed.hex) : null, expectHash: publishedHash });
+}
+
+async function doctorMain(argv) {
+  const flags = parseFlags(argv, { url: 'string', json: 'boolean' });
+  let base = null;
+  if (flags.url !== undefined) {
+    let u;
+    try { u = new URL(flags.url); } catch { throw new CliMisuse('--url must be an absolute http(s) URL, e.g. https://shop.example'); }
+    if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.username || u.password) {
+      throw new CliMisuse('--url must be an http(s) URL without credentials');
+    }
+    base = `${u.origin}${u.pathname.replace(/\/+$/, '')}`;
+  }
+  const rows = [];
+  const add = (id, level, label, detail = '') => rows.push({ id, level, label, detail: String(detail) });
+  if (base === null) {
+    await doctorLocal(process.cwd(), add);
+  } else {
+    let kSeed;
+    try {
+      kSeed = knockSeed(process.env.AGENT_ENTRY_KNOCK_KEY || resolve(homedir(), '.config', 'muretai-agent-entry', 'knock-seed'));
+    } catch (e) { throw new CliRefusal(shortError(e)); }
+    await doorChecks(liveTransport(new URL(base).origin), base, add, { knockSeed: kSeed });
+  }
+  const failed = rows.some((r) => r.level === 'FAIL');
+  const pageUrl = base ?? 'http://localhost:<port>';
+  emit(flags.json, { mode: base === null ? 'local' : 'live', rows }, [
+    ...rows.map((r) => `${r.level.padEnd(4)}  ${r.label}${r.detail ? ` - ${r.detail}` : ''}`),
+    '',
+    `Page tools, in a browser with WebMCP: npx agent-browser open ${pageUrl} && npx agent-browser webmcp list`,
+    failed ? 'doctor: FAIL' : 'doctor: every check passed',
+  ]);
+  return failed ? 1 : 0;
+}
+
+// ------------------------------------------ counts
+
+/** The counts (AT-25) from fileSink lines and a createFileStore file. Keyed by offer id; the
+ *  only thing read from the store is how many accounts wrote twice or more. */
+function tallyCounts(lines, accounts) {
+  const offers = new Map();
+  const referrals = new Map();
+  const byStage = new Map();
+  const byClass = new Map();
+  const bump = (map, key) => map.set(key, (map.get(key) || 0) + 1);
+  const row = (id) => {
+    if (!offers.has(id)) offers.set(id, { page_asked: 0, door_asked: 0, completed: 0, receipts: 0 });
+    return offers.get(id);
+  };
+  for (const e of lines) {
+    if (!isPlainObject(e)) continue;
+    const offer = typeof e.offer === 'string' && SINK_TOKEN.test(e.offer) ? e.offer : null;
+    if (e.stage === 'page') {
+      if (e.event === 'referral' && typeof e.engine === 'string' && REFERRAL_ENGINES.includes(e.engine)) bump(referrals, e.engine);
+      if (offer && e.event === 'offer_started') row(offer).page_asked += 1;
+      if (offer && e.event === 'offer_succeeded') row(offer).completed += 1;
+      continue;
+    }
+    if (!DOOR_STAGES.has(e.stage)) continue;
+    bump(byStage, e.stage);
+    bump(byClass, typeof e.client_class === 'string' && CLIENT_CLASSES.has(e.client_class) ? e.client_class : 'unknown');
+    if (offer && e.stage !== 'refused_post') {
+      const r = row(offer);
+      r.door_asked += 1;
+      // Completed at the door: a signed reply whose status is final for its kind (AT-25).
+      if (e.reply === 'facts' || e.reply === 'checkout') r.completed += 1;
+      if (e.receipt === true) r.receipts += 1;
+    }
+  }
+  const returning = accounts.filter((a) => Array.isArray(a) && isPlainObject(a[1]) && Number(a[1].messages) >= 2).length;
+  return { offers: Object.fromEntries(offers), referrals: Object.fromEntries(referrals), returning_customers: returning,
+    knocks: { by_stage: Object.fromEntries(byStage), by_class: Object.fromEntries(byClass) } };
+}
+
+function readCounts(logPath, storePath) {
+  if (!existsSync(logPath)) throw new CliRefusal(`no counts log at ${logPath}: pass the file fileSink(path) writes`);
+  const lines = readFileSync(logPath, 'utf8').split('\n').filter(Boolean).map((l) => {
+    try { return JSON.parse(l); } catch { return null; }
+  });
+  let accounts = [];
+  if (storePath !== null) {
+    if (!existsSync(storePath)) throw new CliRefusal(`no store at ${storePath}: pass the file createFileStore(path) writes`);
+    try { accounts = readJsonFile(storePath).accounts || []; } catch (e) { throw new CliRefusal(`the store is not readable: ${shortError(e)}`); }
+  }
+  return tallyCounts(lines, Array.isArray(accounts) ? accounts : []);
+}
+
+function countsText(c) {
+  const ids = Object.keys(c.offers);
+  const pairs = (o) => Object.entries(o).map(([k, n]) => `${k} ${n}`).join(', ') || 'none';
+  return [
+    `${'offer'.padEnd(24)} ${'page asked'.padStart(10)} ${'door asked'.padStart(10)} ${'completed'.padStart(10)} ${'receipts'.padStart(9)}`,
+    ...ids.map((id) => {
+      const o = c.offers[id];
+      return `${id.padEnd(24)} ${String(o.page_asked).padStart(10)} ${String(o.door_asked).padStart(10)} ${String(o.completed).padStart(10)} ${String(o.receipts).padStart(9)}`;
+    }),
+    ...(ids.length ? [] : ['(no offer asked yet)']),
+    '',
+    `referrals by answer engine: ${pairs(c.referrals)}`,
+    `returning customers: ${c.returning_customers}`,
+    `door knocks by stage: ${pairs(c.knocks.by_stage)}`,
+    `door knocks by client class: ${pairs(c.knocks.by_class)}`,
+  ];
+}
+
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
+
+function countsHtml(c) {
+  const cells = (xs, tag = 'td') => xs.map((x) => `<${tag}>${escapeHtml(x)}</${tag}>`).join('');
+  const list = (o) => Object.entries(o).map(([k, n]) => `<li>${escapeHtml(k)}: ${escapeHtml(n)}</li>`).join('') || '<li>none</li>';
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Entry counts</title>
+<style>body{font:15px/1.5 system-ui,sans-serif;margin:2rem auto;max-width:52rem;padding:0 1rem;color:#1b1b1f;background:#fff}
+table{border-collapse:collapse;width:100%}th,td{padding:.35rem .6rem;border-bottom:1px solid #ddd;text-align:right}
+th:first-child,td:first-child{text-align:left}h2{font-size:1rem;margin-top:1.6rem}
+@media (prefers-color-scheme:dark){body{color:#e8e8ec;background:#141417}th,td{border-color:#333}}</style></head>
+<body><h1>What customers asked for</h1>
+<table><thead><tr>${cells(['offer', 'asked on the page', 'asked at the door', 'completed', 'receipts'], 'th')}</tr></thead><tbody>
+${Object.entries(c.offers).map(([id, o]) => `<tr>${cells([id, o.page_asked, o.door_asked, o.completed, o.receipts])}</tr>`).join('\n')}
+</tbody></table>
+<h2>Referrals by answer engine</h2><ul>${list(c.referrals)}</ul>
+<h2>Returning customers</h2><p>${escapeHtml(c.returning_customers)}</p>
+<h2>Door knocks by stage</h2><ul>${list(c.knocks.by_stage)}</ul>
+<h2>Door knocks by client class</h2><ul>${list(c.knocks.by_class)}</ul>
+<p>Counts only: no key, no message and no address is kept here.</p></body></html>
+`;
+}
+
+async function countsMain(argv) {
+  const flags = parseFlags(argv, { log: 'string', store: 'string', json: 'boolean', serve: 'boolean', port: 'string', host: 'string' });
+  if (typeof flags.log !== 'string') throw new CliMisuse('--log is required: the file fileSink(path) writes');
+  const logPath = resolve(flags.log);
+  const storePath = typeof flags.store === 'string' ? resolve(flags.store) : null;
+  if (!flags.serve) {
+    const c = readCounts(logPath, storePath);
+    emit(flags.json, c, countsText(c));
+    return 0;
+  }
+  // R6 (AT-25): loopback only. Refused before anything binds.
+  const asked = flags.host ?? '127.0.0.1';
+  const host = LOOPBACK_BIND.get(asked.toLowerCase().replace(/^\[|\]$/g, ''));
+  if (!host) throw new CliRefusal(`counts --serve binds loopback only (127.0.0.1 or ::1), not ${asked.slice(0, 60)}`);
+  if (flags.port !== undefined && !/^\d{1,5}$/.test(flags.port)) throw new CliMisuse('--port must be a number from 0 to 65535');
+  const port = flags.port === undefined ? 0 : Number(flags.port);
+  if (port > 65535) throw new CliMisuse('--port must be a number from 0 to 65535');
+  readCounts(logPath, storePath);   // refuse now, not on the first page view
+  return new Promise((resolveServe) => {
+    const server = createServer((req, res) => {
+      // A page on loopback is still reachable by a DNS-rebinding page in the owner's browser:
+      // answer only requests addressed to a loopback name.
+      const hostHeader = String(req.headers.host || '').toLowerCase().replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
+      if (!LOOPBACK_BIND.has(hostHeader)) { res.writeHead(403); res.end(); return; }
+      if ((req.method !== 'GET' && req.method !== 'HEAD') || req.url.split('?')[0] !== '/') { res.writeHead(404); res.end(); return; }
+      let html;
+      try { html = countsHtml(readCounts(logPath, storePath)); } catch (e) { res.writeHead(500); res.end(shortError(e)); return; }
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'" });
+      res.end(req.method === 'HEAD' ? undefined : html);
+    });
+    server.on('error', (e) => { console.error(`counts: ${shortError(e)}`); resolveServe(1); });
+    server.listen(port, host, () => {
+      const at = server.address();
+      console.log(`counts: http://${at.family === 'IPv6' || at.family === 6 ? '[::1]' : '127.0.0.1'}:${at.port}/`);
+    });
+    const stop = () => server.close(() => resolveServe(0));
+    process.once('SIGINT', stop);
+    process.once('SIGTERM', stop);
+  });
+}
+
+// ------------------------------------------ dispatch
+
+function emit(json, doc, lines) {
+  if (json) process.stdout.write(`${JSON.stringify(doc)}\n`);
+  else for (const line of lines) console.log(line);
+}
+
+async function cliMain(argv) {
+  const [verb, ...rest] = argv;
+  const verbs = { init: initMain, publish: publishMain, deploy: publishMain, doctor: doctorMain, counts: countsMain };
+  if (verb === 'knock') return knockMain(argv);
+  if (!Object.hasOwn(verbs, verb)) {
+    console.error(CLI_USAGE);
+    return 2;
+  }
+  if (rest.includes('--help') || rest.includes('-h')) {
+    console.log((verb === 'deploy' ? USAGE.publish.replace('agent-entry publish', 'agent-entry deploy') : USAGE[verb]));
+    return 0;
+  }
+  try {
+    gitSpawn = (await import('node:child_process')).spawnSync;
+    return await verbs[verb](rest);
+  } catch (e) {
+    if (e instanceof CliMisuse) {
+      console.error(`agent-entry ${verb}: ${e.message}`);
+      console.error(USAGE[verb === 'deploy' ? 'publish' : verb].split('\n')[0]);
+      return 2;
+    }
+    console.error(`agent-entry ${verb}: ${e instanceof CliRefusal ? e.message : shortError(e)}`);
+    return 1;
+  }
+}
+
 /** Is this file the program being run? Compared as REAL paths: `npx @muretai/agent-entry
  *  knock` starts it through the `node_modules/.bin/agent-entry` symlink, so argv[1] is the
  *  link while import.meta.url is the file it points at. */
@@ -5697,6 +7219,8 @@ function isMainModule() {
   }
 }
 
+// Not awaited at the top level: `doctor` imports the site's door module, which imports this
+// file, and a module still inside its top-level await would make that import wait on itself.
 if (isMainModule()) {
-  process.exitCode = await knockMain(process.argv.slice(2));
+  cliMain(process.argv.slice(2)).then((code) => { process.exitCode = code; });
 }

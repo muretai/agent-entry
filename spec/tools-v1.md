@@ -435,6 +435,104 @@ one from the page's own origin. Every call counts `offer_started`, and then `off
 with an integer `ms`, `offer_failed`, or `ask_denied`. A handoff also counts `handoff`. Each
 registration counts `offer_registered`. No beacon carries an input value or a DID.
 
+### 2.8 The site's CLI
+
+The reference CLI is the package bin: `agent-entry init | publish (alias deploy) | doctor |
+counts`, beside `knock`. Exit status is 0 when done or when every check passed, 1 when refused
+or when a check FAILed, and 2 on misuse. With `--json`, stdout is exactly one JSON document. The
+conformance runner is `conformance/cli.mjs`.
+
+**AT-22. `init` never leaves the seed where git would carry it.** `init` mints the site's seed
+locally and writes it as the line `AGENT_ENTRY_SEED_HEX=<64 hex>` into the framework's secret
+file (`.env.local` for Next, `.env` otherwise), with mode 0600.
+
+- Whether git would carry that file is judged by git itself (`check-ignore`, `ls-files --cached`,
+  and `ls-files --cached --others --exclude-standard`), not by reading `.gitignore` as text. So a
+  negated rule, a global excludes file and an already-tracked file all count as git counts them.
+- When git would track the file, or the project is not a git repository, `init` **MUST** refuse
+  (exit 1, naming `.gitignore` or the tracking). It then writes no seed anywhere, does not
+  rewrite `.gitignore`, and leaves tracked files untouched.
+- A second `init` **MUST** keep the seed already there. A new seed is a new DID, and every
+  visitor's account would be lost.
+- The seed **MUST NOT** be printed, logged, published, or written into any wired file. Wired
+  code reads it from the environment or the slot at start.
+- A static host is handed to `agent-entry-serverless`, and WordPress to `agent-entry-wordpress`.
+  Those products keep the seed in the platform's own secret store, so `init` writes no seed for
+  them.
+- `init --from sodium.json` follows §3.1. One tool with no v1 equivalent (`interaction{steps}`,
+  a `{path, when}` route, a non-scalar input type) refuses the whole file, naming the tool, and
+  writes nothing (AT-2's posture).
+
+**AT-23. `publish` never rewrites a version.** `publish` validates the declaration (a refusal
+names the field), compiles it, signs it with the site's seed, and writes three files under
+`<static dir>/.well-known/`: `agent-tools.json` (canonical bytes), `agent-tools.sig.json` (the
+`agenttools` envelope) and `agent-tools/v<n>.json`.
+
+- Without `--version`, identical content is a no-op, and changed content becomes max + 1.
+- `--version n` with content other than the published v`n` **MUST** refuse (exit 1, naming
+  `v<n>`) and write nothing. A version number past max + 1 is a gap and also refuses.
+- A prior version whose bytes no longer match its own hash, number or canonical form, or that
+  names another origin, **MUST** refuse, so `publish` never builds on an edited history.
+- A missing seed or an invalid declaration refuses before anything is written.
+- The door accepts what `publish` wrote as its `toolsHistory` (AT-10).
+
+**AT-24. `doctor` checks the wiring as it runs, and knocks every door-bound offer once.**
+
+- Locally, `doctor` checks five things:
+  - the seed is present, mode 0600, git-ignored, not committed, and in no file git would carry;
+  - the published contract verifies under the seed's DID and origin and matches the
+    declaration;
+  - each framework file that must hand requests to the door module really imports it;
+  - the page template carries the page tag, and the vendored page runtime matches the package's;
+  - the door module starts: it is loaded as the framework loads it and exercised in process.
+- Against a live site (`--url`), `doctor` checks the card and its signature, the card's url, the
+  signposts, the contract, its signature and every version, and the collector.
+- In both modes, `doctor` sends **exactly one** signed knock per door-bound offer, and none for a
+  page-only offer. The knock has `metadata.offer` set to the offer id, and its text ends with the
+  offer's example input as a JSON object.
+- A reply that is unsigned, or whose status differs from the declared kind's (AT-12), FAILs
+  that offer only. So does a missing `deal` where the offer carries a receipt.
+- A site-added verb without `effect` is a **WARN** row that names the offer and `effect` (AT-4).
+  It is never a FAIL and never silent.
+- Rows use the shape `{id, level: PASS|FAIL|WARN|INFO, label, detail}`, and no row carries the
+  seed.
+- `doctor` launches no browser. A target it cannot reach is a FAIL: it fails closed and sends
+  nothing past the first failed request.
+
+**AT-25. Counts are anonymous and local.** `fileSink(path)` is an observer that appends one JSON
+line per event, holding `t` and an allowlist of the envelope's fields (`stage`, `event`, `offer`,
+`engine`, `ms`, `reply`, `receipt`, `identified`, `verified`, `ua_family`, `client_class`,
+`ip_vendor`, `country`, `signature_agent`, `refused`). Only numbers, booleans and short tokens
+are kept. The line **MUST NOT** carry a DID, text, an input value, or a message or context id.
+
+- For a chosen offer, the observer's copy of the envelope also carries `reply` (the kind) and
+  `receipt` (whether this reply carries a `deal`). The responder's envelope is unchanged.
+- `counts` reports `{offers: {<id>: {page_asked, door_asked, completed, receipts}}, referrals,
+  returning_customers, knocks: {by_stage, by_class}}`:
+  - `page_asked` counts `offer_started`, and `door_asked` counts answered door stages naming the
+    offer;
+  - `returning_customers` is the number of store accounts with two or more messages. It is a
+    count only;
+  - `knocks` counts the door's POST stages.
+- **Completed.** On the page, `completed` counts `offer_succeeded`. At the door, it counts the
+  signed replies whose status is final for their kind: `answered` (`facts`) and
+  `continue_at_checkout` (`checkout`). A `pending_confirmation` that is later confirmed is out of
+  scope for v1, as are `see_catalog`, `awaiting_person` and `brain` replies.
+- `counts --serve` **MUST** bind loopback only (`127.0.0.1` or `::1`). It refuses any other host
+  before binding and answers only requests addressed to a loopback name.
+
+**AT-26. `gaSink` sends counts, never people.** `gaSink({measurementId, apiSecret, fetchImpl?})`
+refuses a missing id or secret and returns an observer.
+
+- Each event is one POST to the GA4 Measurement Protocol, `/mp/collect?measurement_id&api_secret`.
+- The body is `client_id` and `events` only. `client_id` is random per sink and never derived
+  from a key.
+- Every event carries `engagement_time_msec` (an integer above 0) and `session_id`. Its other
+  params are AT-25's allowlist, as numbers, booleans and short tokens.
+- A page event keeps its collector name. A door stage is sent as `door_<stage>`.
+- No DID, text, input value, message or context id, or address appears in the body. A failing
+  endpoint never throws out of the observer.
+
 ## 3. Informative
 
 ### 3.1 Mapping from `sodium.json`
@@ -459,8 +557,9 @@ bindings, and its `door` bindings are left empty:
 | server-signed deploy receipt | the site's own `agenttools` envelope (AT-8); no third-party key |
 | `tool_*` telemetry names | the collector names (AT-14) |
 
-The converter is `init --from sodium.json`. It is part of the CLI slice (S3), not of this
-document.
+The converter is `init --from sodium.json` (AT-22). The field shapes it reads (`input: {f: {type,
+optional}}`, `run: {type, …}`) follow the Sodium facts recorded on 2026-09-22 and have not yet
+been checked against a real published `sodium.json`.
 
 ### 3.2 Relation to commerce verbs elsewhere
 
@@ -483,6 +582,10 @@ countersigned deal attach later.
   runtime shows `ask` as compiled, and the declaration is the site's own statement.
 - **Checkout** is a same-origin path, checked at validation. A declaration cannot send a
   customer's payment to another origin through the door's reply.
+- **The CLI mints and stores the site's private key** (AT-22). Git is the guard that keeps it
+  out of commits, so `init` refuses where git would carry it and `doctor` FAILs when git does. A
+  file on disk with mode 0600 is still readable by anyone who controls the machine or its
+  backups. Moving the seed into the host's secret store is the operator's step.
 
 ## 5. Requirement index
 
@@ -509,3 +612,8 @@ countersigned deal attach later.
 | AT-19 | page runtime: same origin only |
 | AT-20 | page runtime: SPA resync and abort |
 | AT-21 | page runtime: count emission |
+| AT-22 | `init`: the seed slot git would never carry; `--from sodium.json` |
+| AT-23 | `publish`: immutable versions, refusals that write nothing |
+| AT-24 | `doctor`: local and live checks, one knock per door-bound offer, the AT-4 warning |
+| AT-25 | counts: `fileSink` privacy, `completed`, loopback-only `--serve` |
+| AT-26 | `gaSink`: Measurement Protocol body rule |
