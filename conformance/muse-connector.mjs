@@ -488,6 +488,48 @@ await section('static', async () => {
   check(pkg.version === '1.13.0', 'static/version-is-the-released-one', `package.json version is ${pkg.version}`);
 });
 
+// ---------------------------------------------------------------- 7. no public "not tested in Muse" caveat
+
+/** Prose as a reader sees it: emphasis markers gone, line wraps and runs of space one space. */
+const flat = (text) => text.replace(/[*_]+/g, '').replace(/\s+/g, ' ');
+
+await section('caveat', async () => {
+  // The public pages say what the command is and what covers it, with no "not tested" clause.
+  // A phrase split across a line wrap or broken by emphasis is the same phrase.
+  const caveats = [/\bnot tested\b/i, /\bnot yet tested\b/i, /\buntested\b/i, /未検証/];
+  for (const rel of ['README.md', join('connectors', 'muse.md'), join('spec', 'v1.md'), join('spec', 'tools-v1.md')]) {
+    const path = join(ROOT, rel);
+    const present = existsSync(path);
+    check(present, `caveat/${rel}/exists`, 'a missing page cannot be said to carry no caveat');
+    if (!present) continue;
+    const text = flat(readFileSync(path, 'utf8'));
+    for (const re of caveats) {
+      const m = re.exec(text);
+      check(m === null, `caveat/${rel}/no-${re.source.replace(/\\b/g, '')}`,
+        m ? `…${text.slice(Math.max(0, m.index - 60), m.index + m[0].length + 40)}…` : '');
+    }
+  }
+
+  // The README Muse bullet keeps its link to the page; only the caveat wording goes.
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+  const start = readme.indexOf('## Knock from any runtime');
+  const end = start < 0 ? -1 : readme.indexOf('\n## ', start + 3);
+  const knockSection = start < 0 ? '' : readme.slice(start, end < 0 ? undefined : end);
+  const museBullet = knockSection.split(/\n(?=- )/).find((b) => b.startsWith('- **Muse'));
+  check(Boolean(museBullet && /\]\((?:\.\/)?connectors\/muse\.md(?:#[^)]*)?\)/.test(museBullet)),
+    'caveat/readme-Muse-bullet-still-links-connectors/muse.md', museBullet ? museBullet.slice(0, 200) : 'no Muse bullet');
+
+  // connectors/muse.md's first paragraph still says what the page is for, and still says what
+  // covers the command: the positive half of the edited sentence stays.
+  const musePath = join(ROOT, 'connectors', 'muse.md');
+  const muse = existsSync(musePath) ? readFileSync(musePath, 'utf8') : '';
+  const first = flat(paragraphs(muse).find((p) => p.trim() && !p.trim().startsWith('#')) || '');
+  check(/\bMuse\b/.test(first) && /\bread/i.test(first) && /\bcustom connector\b/i.test(first) && /\bshop\b/i.test(first),
+    'caveat/muse-md-first-paragraph-says-Muse-reads-it-for-a-custom-connector-for-a-shop', first.slice(0, 240));
+  check(/\bcovered by this package's conformance suite\b/i.test(first),
+    'caveat/muse-md-first-paragraph-says-the-conformance-suite-covers-the-command', first.slice(0, 400));
+});
+
 // ---------------------------------------------------------------- verdict
 
 for (const dir of scratch) {
