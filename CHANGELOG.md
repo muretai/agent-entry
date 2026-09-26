@@ -3,7 +3,7 @@
 Releases before 1.12.0 are recorded in the commit history and in the README's "Since 1.x"
 paragraphs.
 
-## 1.13.0 — Agent Entry Suite S1 to S4: one declaration, verbs first, on the door and the page (unreleased)
+## 1.13.0 — Agent Entry Suite S1 to S4: one declaration, verbs first, on the door and the page (2026-09-26)
 
 A site can now describe what a customer can do there in one declaration, `agent-entry.json`,
 keyed by verbs (`find`, `book`, `hold`, `buy`, `ask`, …). The door turns it into a signed tool

@@ -485,7 +485,7 @@ await section('static', async () => {
   check(Boolean(home), 'static/changelog-has-connectors-Muse-recipe', '');
   const heading = home ? home.split('\n', 1)[0] : '';
   check(/unreleased|not yet published/i.test(heading), 'static/changelog-Muse-line-is-unreleased', heading);
-  check(pkg.version === '1.12.0', 'static/no-version-bump', `package.json version is ${pkg.version}`);
+  check(pkg.version === '1.13.0', 'static/version-is-the-released-one', `package.json version is ${pkg.version}`);
 });
 
 // ---------------------------------------------------------------- verdict

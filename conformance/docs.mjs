@@ -27,8 +27,8 @@
  *   - Every example URL in those sections that was not already there before S4 uses a placeholder
  *     host (example.com, *.test, *.invalid, 192.0.2.0/24) — and the check is shown to refuse a
  *     real one.
- *   - CHANGELOG.md: the unreleased 1.13.0 record carries a "Suite S4" heading beside S2 and S3.
- *   - package.json: the version is the pre-S4 one. Documentation is not a release.
+ *   - CHANGELOG.md: the released 1.13.0 record carries a "Suite S4" heading beside S2 and S3.
+ *   - package.json: the version is the one this release cut.
  *
  * Run:  node conformance/docs.mjs      (from the package root)
  */
@@ -42,7 +42,7 @@ import * as door from '../muretai-agent-entry.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
-const PRE_S4_VERSION = '1.12.0';
+const RELEASED_VERSION = '1.13.0';
 
 let pass = 0;
 const failures = [];
@@ -334,10 +334,10 @@ await section('hosts', async () => {
 await section('no-release', async () => {
   const raw = read('package.json');
   const pkg = JSON.parse(raw);
-  check(pkg.version === PRE_S4_VERSION, 'no-release/package-version-is-the-pre-S4-version',
-    `package.json version is ${JSON.stringify(pkg.version)}, expected ${PRE_S4_VERSION} — a release is the owner's agent-entry-release skill`);
+  check(pkg.version === RELEASED_VERSION, 'release/package-version-is-the-released-version',
+    `package.json version is ${JSON.stringify(pkg.version)}, expected ${RELEASED_VERSION} — the version this release cut`);
   const lines = raw.split('\n').filter((l) => /^\s*"version"\s*:/.test(l));
-  check(lines.length === 1 && lines[0] === `  "version": "${PRE_S4_VERSION}",`, 'no-release/version-line-byte-identical',
+  check(lines.length === 1 && lines[0] === `  "version": "${RELEASED_VERSION}",`, 'no-release/version-line-byte-identical',
     JSON.stringify(lines));
 });
 
@@ -347,7 +347,8 @@ await section('changelog', async () => {
   const headings = CHANGELOG.split('\n').filter((l) => /^## /.test(l));
   const h113 = headings.filter((l) => /^## 1\.13\.0\b/.test(l));
   check(h113.length === 1, 'changelog/one-1.13.0-section', JSON.stringify(h113));
-  check(h113.length === 1 && /unreleased/i.test(h113[0]), 'changelog/1.13.0-is-unreleased', h113[0] || '');
+  check(h113.length === 1 && /\(20\d\d-\d\d-\d\d\)/.test(h113[0])
+    && !/unreleased/i.test(h113[0]), 'changelog/1.13.0-is-released-and-dated', h113[0] || '');
   const rec = mdSection(CHANGELOG, 2, '1.13.0') || '';
   const sub = rec.split('\n').filter((l) => /^### /.test(l));
   check(sub.some((l) => /^### Suite S4\b/.test(l)), 'changelog/1.13.0-has-a-Suite-S4-heading',
