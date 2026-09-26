@@ -1,15 +1,15 @@
 {
-  "_": "Written by .cursor/skills/isolated-session/scripts/vendor.sh pull; never edit the copies by hand. `vendor.sh check` holds them to these digests with no home checkout present. The skill's home is the core trunk; edit it there and pull again.",
+  "_": "Written by .cursor/skills/isolated-session/scripts/vendor.sh pull; never edit the copies by hand. `vendor.sh check` holds them to these digests, and to the closure of what the scripts reference, with no home checkout present. The skill's home is the core trunk; edit it there and pull again.",
   "from": "muretai-trunk",
   "repository": "private",
-  "commit": "84508b684f902c98e853b16b455211741df7ad42",
-  "date": "2026-09-22",
+  "commit": "89f2717ff7703b01304e1fb18a0475ef474b58c1",
+  "date": "2026-09-27",
   "files": {
     ".cursor/skills/isolated-session/SKILL.md": {
-      "sha256": "00c7782df179a597d8ed9445b41f8b328171a543a9c5bc888be53e8f6345e573"
+      "sha256": "1a4d5606db73bbdd4e5bd3b3fbf15e2f024ec564b10c8f0c785a706f4517e36c"
     },
     ".cursor/skills/isolated-session/scripts/lib.sh": {
-      "sha256": "2725fe6ad9d561447131c45118426ed7e744e784cf0cba1607de77aa88b30360"
+      "sha256": "cc9dbe4c2435e1b4636526179b7aaed28d5dc7e19fc0bee9e47a12e14cf9f77d"
     },
     ".cursor/skills/isolated-session/scripts/ensure-worktree.sh": {
       "sha256": "907d2c8a42692ef93a6b0aeb75d232f56c0b59cafac86dc6bf2c4c61cd3b100e"
@@ -21,7 +21,19 @@
       "sha256": "9c932e5d21b387ec0e626e2686284034510a57e25b73856a574581a73b892890"
     },
     ".cursor/skills/isolated-session/scripts/finish-worktree.sh": {
-      "sha256": "1fe13c9eaddb72b8f8425512ccf82669672d4718bd442ef00b5b2403d2294b70"
+      "sha256": "794ac27e96613fc09bac63a53f05d8591e91c72a075cf4385d8d965ec6685dd5"
+    },
+    ".cursor/skills/isolated-session/scripts/landing-lease.sh": {
+      "sha256": "360ed59710392c5c4deddcc7114f4bce2325747ecbb03d36fef0d3d87cd35acb"
+    },
+    ".cursor/skills/isolated-session/scripts/landing-lease.py": {
+      "sha256": "8e90d2a9475df0b2a26e76494ca49aeb4e888683037eb8a7d25cc10c030bb974"
+    },
+    ".cursor/skills/isolated-session/scripts/lease_core.py": {
+      "sha256": "8912ff5e3b07617e17717cbaddca10713993859af26424c7260e49c9a1e2d70f"
+    },
+    ".cursor/skills/isolated-session/scripts/dispatch-init.sh": {
+      "sha256": "4f5424f3f7831658ddff472b1bf3ac3c68dd0a22620ed65d4ce0f3cc4eddb5de"
     },
     ".cursor/skills/isolated-session/scripts/stale.sh": {
       "sha256": "e95302630a7bdd23ccc24f6ca685f6c707e527bd8e057e589b30a558d1fe3b1b"
@@ -30,10 +42,19 @@
       "sha256": "3999050b4f36f9cd88c4acfecf8d00b908bc2133bc4781d1fde0d9298b379576"
     },
     ".cursor/skills/isolated-session/scripts/vendor.sh": {
-      "sha256": "7d403ac84c97107cc70f764a4d7b4f4c3a77a4e781dcd43d6306d3e7089b8a81"
+      "sha256": "773151be6706b2f7247e8d755095f8125b62d769eec2d30e08fca523d34a2189"
     },
     ".cursor/skills/isolated-session/scripts/herd-spawn.sh": {
-      "sha256": "935c693c6f5cbe3d58a00909465ab921e089dd0783f08c7a43294c2966a43fd2"
+      "sha256": "2cb149d56cedba5797b21844ab1b450656cd64399d04bc7db60a578e054c0735"
+    },
+    ".cursor/skills/isolated-session/scripts/land.sh": {
+      "sha256": "af5ca62bd019834b2a4eb8c4d76b5d5e55152e556b4b37b418199bea6cbbb8e0"
+    },
+    ".cursor/skills/isolated-session/scripts/walls/darwin.sh": {
+      "sha256": "f65e7da5374b031577091fe411543d435a99e2e52673a8e52c2ac948419d66ce"
+    },
+    ".cursor/skills/isolated-session/scripts/walls/darwin.sb.template": {
+      "sha256": "71e7e4d3a6cbdac0b99c4f994b7bae620ffdde24afed1028980eb8f506a99508"
     },
     ".cursor/skills/isolated-session/scripts/dispatch-take.sh": {
       "sha256": "26f3b57a07b8b969ad5e81b00307fcc323c40c7d0eb2391dc36f1f6e349c3012"
@@ -41,14 +62,17 @@
     ".cursor/skills/isolated-session/scripts/dispatch-capacity.sh": {
       "sha256": "45c6d826441e086b2d2d89825989ebb66bbb68d59cad29dd234a78ff0d8aa152"
     },
+    ".cursor/skills/isolated-session/scripts/herd-watch.sh": {
+      "sha256": "a17e34d608a5b7dd27fe0d1049ff9b0591400d95bd24ca4978b4b071c256eca8"
+    },
     ".cursor/skills/isolated-session/briefs/worker.md": {
-      "sha256": "dd139877aafa37561772d07d2c517e81170d26c5bc768d15ebee7f29329502dc"
+      "sha256": "c5e6f72519ba5379019272ab48f521b0f45dea60fdf3cde24fcc7d2a77b60d79"
     },
     ".cursor/skills/isolated-session/briefs/dispatch-ticket.md": {
-      "sha256": "1733603f44630dee15462dbc9ab91c9b34df221c7bde14dc0c317e4e710ccfab"
+      "sha256": "7b2d38149ac3ae604e0b277f274a6c479b13268aaaaa01970a0269470237b729"
     },
     "tests/test_isolated_session.py": {
-      "sha256": "cd2b869135728231723f74789e49933727cd392cb8fc86d48cd742f12fe1d949"
+      "sha256": "dbca2c6dca404aabd14ffe12e7eba48a64d603759e04d3a93396572c67e0b495"
     }
   }
 }

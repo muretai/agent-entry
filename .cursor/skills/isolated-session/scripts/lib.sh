@@ -214,9 +214,11 @@ iso_is_linked() {
 # repository under its state directory, and these helpers are how a landing (and, later,
 # ensure-worktree.sh) reads them:
 #   origin/<name>.bundle   refs/remotes/origin/<branch> of its clone, rewritten every run
-#   status/<name>.txt      its last decision (result=, reason=, ...)
-# (company/ops/publisher/muretai-publish.py).
-ISO_PUBLISHER_STATE="/Users/Shared/muretai-publisher"
+#   status/<name>.txt      its last decision (result=, reason=, origin=, ...)
+# (company/ops/publisher/muretai-publish.py). MURETAI_PUBLISHER_STATE moves the whole
+# directory -- the same knob tools/appl-init.sh reads -- so a test, or a machine whose
+# publisher keeps its state elsewhere, never needs a path of its own for either file.
+ISO_PUBLISHER_STATE="${MURETAI_PUBLISHER_STATE:-/Users/Shared/muretai-publisher}"
 
 # The publisher's name for the repository checkout $1 belongs to: the basename of the
 # `handoff` remote's URL without `.git` (/Users/Shared/muretai-handoff/trunk.git ->
@@ -257,6 +259,192 @@ iso_mtime() {  # $1 path
     ''|*[!0-9]*) return 1 ;;
   esac
   printf '%s\n' "$t"
+}
+
+# --- what origin holds: ONE answer, and it fails closed ------------------------
+# "What does origin hold?" used to have two answers: the landing's (fetch, else the
+# publisher bundle inside a window, else "the origin/BASE this repository already
+# has") and the owner's rebase script's, which with no bundle fell back to a five-day-
+# old one and only PRINTED that origin might be newer. Rebasing onto a stale view of
+# origin rewrites or duplicates published commits
+# (ISSUE(origin-view-has-two-rules-and-one-of-them-serves-a-stale-bundle)). This is
+# the one answer; finish-worktree.sh and the owner's scripts all call it.
+#
+# iso_origin_view <repo> <base>:
+#   1. `git fetch origin`. The owner's uid holds no GitHub credential, so here that
+#      fails; git's prompt noise is replaced by ONE line saying so.
+#   2. Else the publisher bundle <state>/origin/<name>.bundle (<name> from the `handoff`
+#      remote, iso_publisher_name), and only when ALL of these hold:
+#        * <state>/origin, <state>/status, the bundle and the status file are what they
+#          claim -- directories and regular files, never symlinks (lstat, not stat);
+#        * LANDING_ORIGIN_BUNDLE / LANDING_PUBLISHER_STATUS, if set, name exactly those
+#          default paths -- a view read from anywhere else is not the publisher's;
+#        * the bundle is younger than LANDING_ORIGIN_BUNDLE_MAX_AGE_S (default 1800);
+#        * `git bundle verify` accepts it and it carries refs/remotes/origin/<base>;
+#        * its tip equals `origin=` in <state>/status/<name>.txt -- the publisher's own
+#          record of what it read, so a bundle left over from another run (ahead,
+#          behind or unrelated) is caught;
+#        * the tip is a fast-forward of the origin/<base> <repo> already has: an older
+#          view never replaces a newer one.
+#   3. Else it REFUSES: a line containing "refusing" on stderr, return 1, and no ref
+#      moved. There is no "go on with what we have" -- that was the bug.
+# On success refs/remotes/origin/<base> in <repo> is origin's tip and
+# ISO_ORIGIN_VIEW_SOURCE is `fetch` or `bundle`. git's own bundle errors never reach
+# the operator: each refusal says what was wrong in words of its own.
+# A repository with NO origin remote has no origin to be stale about; the CALLER decides
+# that (finish-worktree.sh does not call this there), so the refusal cannot creep into
+# repositories that never had an origin.
+ISO_ORIGIN_VIEW_SOURCE=""
+
+_iso_ov_show() {  # a value for a refusal line; never fails
+  iso_safe_text "$1" 2>/dev/null || printf '%s' "$1" | LC_ALL=C tr '\000-\037\177' '?'
+}
+
+_iso_ov_refuse() {  # $1.. lines; the first says "refusing"
+  local line
+  for line in "$@"; do
+    printf '%s\n' "$line" >&2
+  done
+  return 1
+}
+
+iso_origin_view() {  # $1 repo, $2 base
+  local repo="$1" base="$2"
+  local ov_err="" ov_name="" ov_state="" ov_odir="" ov_sdir="" ov_bundle="" ov_status=""
+  local ov_max="" ov_mtime="" ov_age="" ov_tip="" ov_claimed="" ov_got="" ov_have="" ov_show=""
+  ISO_ORIGIN_VIEW_SOURCE=""
+  ov_err="$(mktemp "${TMPDIR:-/tmp}/iso-origin-XXXXXX")" || {
+    _iso_ov_refuse "iso_origin_view: refusing: could not make a scratch file; origin was not read"
+    return 1
+  }
+  # never a terminal prompt: a landing that waits on a password nobody will type is a hang
+  if GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch origin --quiet 2>"$ov_err"; then
+    rm -f "$ov_err"
+    ISO_ORIGIN_VIEW_SOURCE="fetch"
+    return 0
+  fi
+  if grep -qiE "could not read (username|password)|terminal prompts disabled|authentication failed|permission denied \(publickey" "$ov_err" 2>/dev/null; then
+    echo "note: this user holds no GitHub credential, so origin cannot be fetched here; origin is read from the publisher bundle" >&2
+  else
+    ov_show="$(sed -n 's/^fatal: //p' "$ov_err" 2>/dev/null | head -1)"
+    echo "note: origin could not be fetched ($(_iso_ov_show "${ov_show:-no reason given}")); reading the publisher bundle" >&2
+  fi
+  rm -f "$ov_err"
+
+  if ! ov_name="$(iso_publisher_name "$repo")"; then
+    _iso_ov_refuse "iso_origin_view: refusing: origin could not be fetched, and no \`handoff\` remote names a" \
+      "publisher repository, so there is no publisher bundle to read origin from."
+    return 1
+  fi
+  ov_state="$ISO_PUBLISHER_STATE"
+  ov_odir="${ov_state}/origin"
+  ov_sdir="${ov_state}/status"
+  ov_bundle="${ov_odir}/${ov_name}.bundle"
+  ov_status="${ov_sdir}/${ov_name}.txt"
+  if [[ -n "${LANDING_ORIGIN_BUNDLE:-}" && "$LANDING_ORIGIN_BUNDLE" != "$ov_bundle" ]]; then
+    _iso_ov_refuse "iso_origin_view: refusing: LANDING_ORIGIN_BUNDLE=$(_iso_ov_show "$LANDING_ORIGIN_BUNDLE") is not the publisher's" \
+      "bundle $(_iso_ov_show "$ov_bundle"); origin is read from the publisher's state or not at all" \
+      "(move the whole directory with MURETAI_PUBLISHER_STATE)."
+    return 1
+  fi
+  if [[ -n "${LANDING_PUBLISHER_STATUS:-}" && "$LANDING_PUBLISHER_STATUS" != "$ov_status" ]]; then
+    _iso_ov_refuse "iso_origin_view: refusing: LANDING_PUBLISHER_STATUS=$(_iso_ov_show "$LANDING_PUBLISHER_STATUS") is not the publisher's" \
+      "status $(_iso_ov_show "$ov_status"); origin is read from the publisher's state or not at all" \
+      "(move the whole directory with MURETAI_PUBLISHER_STATE)."
+    return 1
+  fi
+  ov_max="${LANDING_ORIGIN_BUNDLE_MAX_AGE_S:-1800}"
+  case "$ov_max" in
+    ''|*[!0-9]*)
+      _iso_ov_refuse "iso_origin_view: refusing: LANDING_ORIGIN_BUNDLE_MAX_AGE_S=$(_iso_ov_show "$ov_max") is not a whole number of seconds."
+      return 1
+      ;;
+  esac
+
+  # what the files ARE, before anything is read from them: a symlink is never followed
+  if [[ -L "$ov_odir" || ! -d "$ov_odir" || -L "$ov_sdir" || ! -d "$ov_sdir" ]]; then
+    _iso_ov_refuse "iso_origin_view: refusing: $(_iso_ov_show "$ov_odir") and $(_iso_ov_show "$ov_sdir") must both be real" \
+      "directories of the publisher's state (a symlink is not followed); origin was not read."
+    return 1
+  fi
+  if [[ -L "$ov_bundle" ]]; then
+    _iso_ov_refuse "iso_origin_view: refusing: the publisher bundle $(_iso_ov_show "$ov_bundle") is a symlink; it is not followed."
+    return 1
+  fi
+  if [[ ! -f "$ov_bundle" ]]; then
+    _iso_ov_refuse "iso_origin_view: refusing: origin could not be fetched and there is no publisher bundle at" \
+      "$(_iso_ov_show "$ov_bundle"); origin is not known, so nothing is judged against it."
+    return 1
+  fi
+  if [[ -L "$ov_status" ]]; then
+    _iso_ov_refuse "iso_origin_view: refusing: the publisher status $(_iso_ov_show "$ov_status") is a symlink; it is not followed."
+    return 1
+  fi
+  if [[ ! -f "$ov_status" || ! -r "$ov_status" ]]; then
+    _iso_ov_refuse "iso_origin_view: refusing: the publisher status $(_iso_ov_show "$ov_status") is missing or unreadable," \
+      "so the bundle cannot be checked against what the publisher read; it is not trusted on its own."
+    return 1
+  fi
+  if ! ov_mtime="$(iso_mtime "$ov_bundle")"; then
+    _iso_ov_refuse "iso_origin_view: refusing: could not read the modification time of the publisher bundle $(_iso_ov_show "$ov_bundle")."
+    return 1
+  fi
+  ov_age=$(( $(date +%s) - ov_mtime ))
+  if (( ov_age > ov_max )); then
+    _iso_ov_refuse "iso_origin_view: refusing: the publisher bundle $(_iso_ov_show "$ov_bundle") is stale" \
+      "(${ov_age}s old, limit ${ov_max}s: LANDING_ORIGIN_BUNDLE_MAX_AGE_S); the publisher is late, and a late bundle is not origin."
+    return 1
+  fi
+  if ! git -C "$repo" bundle verify --quiet "$ov_bundle" >/dev/null 2>&1; then
+    _iso_ov_refuse "iso_origin_view: refusing: the publisher bundle $(_iso_ov_show "$ov_bundle") is not a readable git bundle" \
+      "(git bundle verify rejected it: damaged, truncated or not a bundle at all)."
+    return 1
+  fi
+  ov_tip="$(git -C "$repo" bundle list-heads "$ov_bundle" "refs/remotes/origin/${base}" 2>/dev/null |
+            awk -v want="refs/remotes/origin/${base}" '$2 == want { print $1; exit }')" || ov_tip=""
+  case "$ov_tip" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+    *)
+      _iso_ov_refuse "iso_origin_view: refusing: the publisher bundle $(_iso_ov_show "$ov_bundle") carries no refs/remotes/origin/${base}."
+      return 1
+      ;;
+  esac
+  ov_claimed="$(sed -n 's/^origin=//p' "$ov_status" 2>/dev/null | head -1 | tr -d '[:space:]')" || ov_claimed=""
+  if [[ "$ov_claimed" != "$ov_tip" ]]; then
+    _iso_ov_refuse "iso_origin_view: refusing: the publisher bundle's origin/${base} is ${ov_tip:0:7}, but its status" \
+      "$(_iso_ov_show "$ov_status") says origin=$(_iso_ov_show "${ov_claimed:0:7}")$([[ -z "$ov_claimed" ]] && printf '(none)');" \
+      "the two disagree, so neither is taken as origin."
+    return 1
+  fi
+  # the objects: git's own text for a pack that will not unpack stays in the scratch file
+  ov_err="$(mktemp "${TMPDIR:-/tmp}/iso-origin-XXXXXX")" || {
+    _iso_ov_refuse "iso_origin_view: refusing: could not make a scratch file; origin was not read"
+    return 1
+  }
+  if ! git -C "$repo" fetch --quiet --no-tags "$ov_bundle" "refs/remotes/origin/${base}" >/dev/null 2>"$ov_err" ||
+     ! ov_got="$(git -C "$repo" rev-parse --verify --quiet "FETCH_HEAD^{commit}")" ||
+     [[ "$ov_got" != "$ov_tip" ]]; then
+    rm -f "$ov_err"
+    _iso_ov_refuse "iso_origin_view: refusing: the publisher bundle $(_iso_ov_show "$ov_bundle") could not be unpacked" \
+      "to ${ov_tip:0:7} (its pack is damaged or truncated); origin was not read."
+    return 1
+  fi
+  rm -f "$ov_err"
+  ov_have="$(git -C "$repo" rev-parse --verify --quiet "refs/remotes/origin/${base}" || true)"
+  if [[ -n "$ov_have" && "$ov_have" != "$ov_tip" ]] &&
+     ! git -C "$repo" merge-base --is-ancestor "$ov_have" "$ov_tip"; then
+    _iso_ov_refuse "iso_origin_view: refusing: the publisher bundle's origin/${base} (${ov_tip:0:7}) is not a fast-forward" \
+      "of the origin/${base} this repository already has (${ov_have:0:7}); an older view never replaces a newer one."
+    return 1
+  fi
+  if [[ "$ov_have" != "$ov_tip" ]]; then
+    if ! git -C "$repo" update-ref "refs/remotes/origin/${base}" "$ov_tip" ${ov_have:+"$ov_have"}; then
+      _iso_ov_refuse "iso_origin_view: refusing: could not set origin/${base} to ${ov_tip:0:7}."
+      return 1
+    fi
+  fi
+  ISO_ORIGIN_VIEW_SOURCE="bundle"
+  return 0
 }
 
 # --- who owns this session --------------------------------------------------

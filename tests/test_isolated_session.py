@@ -840,6 +840,10 @@ def plant_spawner(primary: Path) -> None:
     scripts.mkdir(parents=True, exist_ok=True)
     for name in ("herd-spawn.sh", "lib.sh"):
         shutil.copy(SCRIPTS / name, scripts / name)
+    # ... and BASE's real walls/: HERD_WALL unset is require, so a BASE with no plug
+    # beside its spawner starts no reviewer (REVIEW=needed), which is not this case
+    if not (scripts / "walls").exists():
+        shutil.copytree(SCRIPTS / "walls", scripts / "walls")
 
 
 def plant_review_gear(primary: Path) -> None:
@@ -899,7 +903,11 @@ def test_landing_scans_the_diff_and_spawns_its_review(tmp: Path) -> None:
        "the worktree and the branch are still there to fix")
     ok(not (primary / ".git" / "landing.lock").exists(), "the landing lock was released")
     ok(not stub_log.exists(), "and no reviewer is spawned for a refusal")
-    ok("--diff main..HEAD --json" in sec_log.read_text(), "the lint was asked about the branch's range")
+    # one lint run per commit of the range, as the publisher asks it -- never the net diff
+    # (ISSUE(landing-and-publisher-asked-different-questions))
+    head = git("rev-parse", branch, cwd=primary)
+    ok("--diff %s^..%s --json" % (head, head) in sec_log.read_text(),
+       "the lint was asked about the branch's commit, one commit per run")
 
     print("  (d) clean")
     r = script("finish-worktree.sh", branch, str(wt), cwd=primary, FAKE_SEC_VERDICT="clean", **herdr_up)
@@ -1082,8 +1090,9 @@ def test_landing_judges_the_diff_with_base_guards(tmp: Path) -> None:
     ok(r.returncode != 0 and "refused the diff" in r.stderr and git("rev-parse", "main", cwd=primary) == main_before,
        "BASE's lint says refused: the landing is refused and main is unchanged")
     ok(not lint_marker.exists(), "the branch's lint never ran")
-    ok(".sec-base-" in sec_log.read_text() and "--diff main..HEAD --json" in sec_log.read_text(),
-       "the lint that ran was BASE's copy in the landing's scratch directory, asked about the branch's range")
+    head = git("rev-parse", branch, cwd=primary)
+    ok(".sec-base-" in sec_log.read_text() and "--diff %s^..%s --json" % (head, head) in sec_log.read_text(),
+       "the lint that ran was BASE's copy in the landing's scratch directory, asked about the branch's commit")
     ok(not list(wt.glob(".sec-base-*")) and "?? .sec-base" not in git("status", "--porcelain", cwd=wt),
        "and that scratch directory is gone from the worktree before the refusal")
     r = script("finish-worktree.sh", branch, str(wt), cwd=primary, FAKE_SEC_VERDICT="needs-eyes", **herdr_up)
@@ -1744,28 +1753,39 @@ def test_a_diverged_base_stops_the_landing(tmp: Path) -> None:
 
 
 def test_the_ff_is_judged_offline_and_without_an_origin(tmp: Path) -> None:
-    """An offline landing is a supported case: the fetch may fail, and the ff is then
-    judged against whatever origin/BASE the repository already has. A repository with no
-    origin/BASE at all lands exactly as before."""
+    """An origin that exists but cannot be reached, with no publisher bundle (no
+    hand-off names one), is NOT a supported landing any more: judging the ff against
+    "whatever origin/BASE the repository already has" is the stale-view hazard
+    ISSUE(origin-view-has-two-rules-and-one-of-them-serves-a-stale-bundle) removed
+    (coordinator ruling 2026-09-23). The landing refuses and moves nothing, whether
+    origin/BASE was fetched earlier or never. A repository with NO origin remote has no
+    origin to be stale about, and lands exactly as before.
+    (ISSUE(no-offline-break-glass-for-a-repo-without-a-publisher) records the cost.)"""
     root = tmp / "offline"
     a, remote = make_repo(root)
     b = clone_of(remote, root / "b")
     commit_in(a, "theirs.txt")
     publish(a)
-    theirs = git("rev-parse", "main", cwd=a)
 
     # B learns about origin's commit when the session opens, and THEN the network goes.
     got = parse(script("ensure-worktree.sh", "work while the network is down", cwd=b).stdout)
     wt, branch = Path(got["WORKTREE"]), got["BRANCH"]
     commit_in(wt, "mine.txt")
     git("remote", "set-url", "origin", str(root / "gone.git"), cwd=b)
+    b_main, b_origin, tip = git("rev-parse", "main", cwd=b), \
+        git("rev-parse", "refs/remotes/origin/main", cwd=b), git("rev-parse", branch, cwd=b)
 
     r = script("finish-worktree.sh", branch, str(wt), cwd=b)
-    ok(r.returncode == 0, "an unreachable origin does not stop the landing: " + r.stderr.strip()[-160:])
-    m = FF_LINE.match(base_ff(r.stdout))
-    ok(m is not None and m.group(1) == "1" and theirs.startswith(m.group(3)),
-       "it is judged against the origin/main the repository had: BASE_FF=" + base_ff(r.stdout))
-    ok((b / "theirs.txt").exists() and (b / "mine.txt").exists(), "and both changes are on main")
+    ok(r.returncode != 0, "an unreachable origin with no publisher bundle refuses the landing (exit %d): "
+       % r.returncode + r.stderr.strip()[-160:])
+    ok("refusing" in r.stderr, "and says it refuses: " + r.stderr.strip()[-160:])
+    ok("MERGED=yes" not in r.stdout, "no landing receipt")
+    ok(git("rev-parse", "main", cwd=b) == b_main and not (b / "theirs.txt").exists()
+       and not (b / "mine.txt").exists(),
+       "main did not move: it is NOT judged against the origin/main the repository had")
+    ok(git("rev-parse", "refs/remotes/origin/main", cwd=b) == b_origin, "origin/main did not move")
+    ok(git("rev-parse", branch, cwd=b) == tip and wt.exists(), "the branch and the worktree are as they were")
+    ok(not (b / ".git" / "landing.lock").exists(), "no landing lock is left behind")
 
     print("  an origin remote whose BASE has never been fetched")
     c = clone_of(remote, root / "c")
@@ -1774,10 +1794,14 @@ def test_the_ff_is_judged_offline_and_without_an_origin(tmp: Path) -> None:
     got = parse(script("ensure-worktree.sh", "no tracking ref here", cwd=c).stdout)
     wt, branch = Path(got["WORKTREE"]), got["BRANCH"]
     commit_in(wt, "alone.txt")
+    c_main, tip = git("rev-parse", "main", cwd=c), git("rev-parse", branch, cwd=c)
     r = script("finish-worktree.sh", branch, str(wt), cwd=c)
-    ok(r.returncode == 0, "it lands: " + r.stderr.strip()[-120:])
-    ok(base_ff(r.stdout) == "none (no origin/BASE)",
-       "and says there was nothing to fast-forward from: BASE_FF=" + base_ff(r.stdout))
+    ok(r.returncode != 0, "it refuses too (exit %d): " % r.returncode + r.stderr.strip()[-120:])
+    ok("refusing" in r.stderr and "MERGED=yes" not in r.stdout, "said, with no landing receipt")
+    ok(git("rev-parse", "main", cwd=c) == c_main and not (c / "alone.txt").exists(), "main did not move")
+    ok(not git("rev-parse", "--verify", "--quiet", "refs/remotes/origin/main", cwd=c, check=False),
+       "and no origin/main was made up")
+    ok(git("rev-parse", branch, cwd=c) == tip and wt.exists(), "the branch and the worktree are as they were")
 
     print("  a repository with no origin remote at all")
     solo = root / "solo"

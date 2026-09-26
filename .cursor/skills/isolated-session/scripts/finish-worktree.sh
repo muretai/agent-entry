@@ -15,11 +15,17 @@
 # (scripts/herd-spawn.sh; never blocking, never failing the landing).
 # A repository without those tools (a pinned copy of this skill) lands as before and
 # says TESTS=none / SEC=none / LEDGER=none / REVIEW=none in the receipt.
+# A landing its tests refused says MERGED=no with TESTS=, TESTS_RED= (the diff's own
+# reds), TESTS_COULD_NOT_RUN= (suites the room refused -- a landing behind a wall), and
+# TESTS_REFUSAL=environment|red: `environment` when only the room refused, `red` when any
+# ordinary red is present. The two lists are disjoint.
 #
-# The guards are BASE's, never the branch's. The tests run from the branch by design;
-# the gate does not: the lint, the reviewer's brief and the spawner are read out of
-# BASE's blobs (`git show BASE:path`), so a branch that rewrites any of them is judged
-# by the copies main already had. And a diff that touches a gate file at all (the lint,
+# The guards are BASE's, never the branch's. The branch's TESTS run by design; the gate
+# does not: this script re-runs itself from BASE's copy of this skill and of the gate
+# tools before it sources anything (see "the code that judges a landing is BASE's"
+# below), and the lint, the reviewer's brief and the spawner are read out of BASE's blobs
+# (`git show BASE:path`), so a branch that rewrites any of them is judged by the copies
+# main already had. And a diff that touches a gate file at all (the lint,
 # the ledger, the runner, these scripts, the briefs, the hook configs) is needs-eyes
 # whatever the lint said -- this script decides that itself, from the paths, because
 # the lint is one of the files on that list.
@@ -125,8 +131,216 @@ if [[ ! -d "$worktree" ]]; then
 fi
 worktree="$(cd "$worktree" && pwd)"
 here="$(cd "$(dirname "$0")" && pwd)"
+
+# --- the code that judges a landing is BASE's: re-run from BASE's own copy ----------
+# Everything below this block -- lib.sh, assert-head.sh, the landing lease
+# (landing-lease.sh/.py), the test runner, the ledger, the lint -- used to be taken from
+# wherever THIS file was started, which is the branch's own tree whenever the operator ran
+# the worktree's copy. So a branch cut before a gate fix ran the OLD gate (2026-09-22:
+# three landings after 1596abac ran the old landing-lease.py and refused, "relay is not
+# reachable"), and a branch that rewrote its own runner merged with a red test
+# (ISSUE(finish-worktree-runs-the-worktree-s-own-lease-code)).
+#
+# So before anything is sourced, BASE's copy of this skill's scripts directory and of the
+# gate tools is written out of BASE's BLOBS (`git cat-file blob`, regular files only -- a
+# symlink at a gate path is never followed, in BASE, in the branch or in the primary's
+# working tree) into a private directory (mktemp -d, mode 700), and THAT copy of this file
+# is run with the same arguments. The directory lives until this process exits, so the
+# lease release, the ledger and the review spawn after the fast-forward -- which moves the
+# primary's working tree to the branch's code -- still run BASE's copy. Always the blobs,
+# never the primary's working tree: a blob cannot be edited under us or swapped for a link.
+#
+# The one shape that stays open: an operator who runs a branch's EDITED copy of this file
+# has handed the branch control before this block exists
+# (ISSUE(branch-edited-finish-is-trusted-when-run-directly)); the documented call is the
+# primary's copy, by absolute path.
+#
+# A copy of this file that lives OUTSIDE the repository being landed (a vendored skill
+# driving another repository, a test harness) is nothing the branch wrote: when BASE
+# carries no finish-worktree.sh of its own, that copy runs, still with BASE's tools. A copy
+# INSIDE the repository with no BASE copy to hand over to is refused.
+gate_scripts_rel=".cursor/skills/isolated-session/scripts"
+gate_tools="tools/run_tests.py tools/affected_tests.py tools/sec_lint.py tools/audit_scope.py
+            tools/ledger.py tools/backlog_build.py tools/spec_build.py company/ops/backlog_to_core.py"
+here_real="$(cd "$here" && pwd -P)"
+gate_dir=""
+if [[ -n "${ISO_FINISH_GATE_DIR:-}" && "${ISO_FINISH_GATE_SELF:-}" == "$here_real" &&
+      -d "${ISO_FINISH_GATE_DIR}" && ! -L "${ISO_FINISH_GATE_DIR}" && -O "${ISO_FINISH_GATE_DIR}" ]]; then
+  gate_dir="$ISO_FINISH_GATE_DIR"
+fi
+gate_from_base="${ISO_FINISH_GATE_FROM:-}"
+# never inherited: a test this landing runs starts its own finish, which gates itself
+unset ISO_FINISH_GATE_DIR ISO_FINISH_GATE_SELF ISO_FINISH_GATE_FROM
+if [[ -z "$gate_dir" ]]; then
+  # One stderr line, before any lock, lease or ref is touched.
+  gate_refuse() {
+    echo "refusing to land ${branch}: $1; nothing moved." >&2
+    exit 1
+  }
+  g_common="$(git -C "$worktree" rev-parse --git-common-dir 2>/dev/null)" ||
+    gate_refuse "${worktree} is not a git checkout, so there is no BASE to take the gate code from"
+  [[ "$g_common" == /* ]] || g_common="${worktree}/${g_common}"
+  g_common="$(cd "$g_common" 2>/dev/null && pwd -P)" ||
+    gate_refuse "could not resolve the git directory of ${worktree}"
+  if git -C "$worktree" symbolic-ref --quiet refs/remotes/origin/HEAD >/dev/null 2>&1; then
+    g_base="$(git -C "$worktree" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+  else
+    g_base="main"
+  fi
+  if ! git -C "$worktree" show-ref --verify --quiet "refs/heads/${g_base}" 2>/dev/null &&
+     git -C "$worktree" show-ref --verify --quiet "refs/heads/master" 2>/dev/null; then
+    g_base="master"
+  fi
+  g_sha="$(git -C "$worktree" rev-parse --verify --quiet "refs/heads/${g_base}^{commit}" 2>/dev/null)" ||
+    gate_refuse "there is no branch ${g_base} in $(dirname "$g_common") to take the gate code from"
+  # is the copy that was started part of the repository being landed?
+  g_here_common="$(git -C "$here_real" rev-parse --git-common-dir 2>/dev/null || true)"
+  g_here_inside="no"
+  if [[ -n "$g_here_common" ]]; then
+    [[ "$g_here_common" == /* ]] || g_here_common="${here_real}/${g_here_common}"
+    g_here_common="$(cd "$g_here_common" 2>/dev/null && pwd -P || true)"
+    if [[ "$g_here_common" == "$g_common" ]]; then
+      g_here_inside="yes"
+    fi
+  fi
+  g_dir="$(mktemp -d "${TMPDIR:-/tmp}/finish-gate-XXXXXX" 2>/dev/null)" ||
+    gate_refuse "could not create a private directory for ${g_base}'s gate code under ${TMPDIR:-/tmp}"
+  trap 'rm -rf "$g_dir"' EXIT
+  chmod 700 "$g_dir" 2>/dev/null || gate_refuse "could not make ${g_dir} private"
+  g_real="$(cd "$g_dir" && pwd -P)"
+  # One path out of BASE's tree: 0 written, 1 not in BASE as a regular file, 2 failed.
+  gate_put() {  # $1 path relative to the top of the tree
+    local rec="" meta="" mode=""
+    rec="$(git -C "$worktree" ls-tree --full-tree "$g_sha" -- "$1" 2>/dev/null)" || return 2
+    [[ -n "$rec" && "${rec#*$'\t'}" == "$1" ]] || return 1
+    meta="${rec%%$'\t'*}"
+    mode="${meta%% *}"
+    case "$mode" in
+      100644|100755) ;;
+      *) return 1 ;;
+    esac
+    mkdir -p "${g_dir}/$(dirname "$1")" 2>/dev/null || return 2
+    git -C "$worktree" cat-file blob "${meta##* }" > "${g_dir}/$1" 2>/dev/null || return 2
+    chmod 700 "${g_dir}/$1" 2>/dev/null || return 2
+  }
+  g_names="$(git -C "$worktree" ls-tree --full-tree --name-only "$g_sha" -- "${gate_scripts_rel}/" 2>/dev/null)" ||
+    gate_refuse "could not list ${gate_scripts_rel} in ${g_base}"
+  for g_path in $g_names $gate_tools; do
+    case "$g_path" in
+      *[!A-Za-z0-9._/-]*) continue ;;       # a name this block would have to quote: not ours
+    esac
+    g_rc=0
+    gate_put "$g_path" || g_rc=$?
+    [[ "$g_rc" != "2" ]] || gate_refuse "could not write ${g_base}:${g_path} into ${g_dir}"
+  done
+  if [[ -f "${g_dir}/${gate_scripts_rel}/finish-worktree.sh" && -f "${g_dir}/${gate_scripts_rel}/lib.sh" ]]; then
+    g_run="${g_dir}/${gate_scripts_rel}/finish-worktree.sh"
+    g_self="${g_real}/${gate_scripts_rel}"
+    g_from="${g_base}@${g_sha}"
+  elif [[ "$g_here_inside" == "yes" ]]; then
+    gate_refuse "${g_base} carries no ${gate_scripts_rel}/finish-worktree.sh and lib.sh as regular files, and the copy started (${here}) belongs to the repository being landed; run a copy of the skill from outside it"
+  else
+    g_run="${here_real}/$(basename "$0")"
+    g_self="$here_real"
+    g_from=""
+  fi
+  set +e
+  ISO_FINISH_GATE_DIR="$g_dir" ISO_FINISH_GATE_SELF="$g_self" ISO_FINISH_GATE_FROM="$g_from" \
+    bash "$g_run" "$@"
+  g_rc=$?
+  set -e
+  rm -rf "$g_dir"
+  trap - EXIT
+  exit "$g_rc"
+fi
+# From here on this is the gate's own run: `here` is BASE's scripts directory (or the
+# outside copy above), and every gate tool comes from gate_dir -- never the worktree's.
+gate_runner="${gate_dir}/tools/run_tests.py"
+gate_ledger="${gate_dir}/tools/ledger.py"
+
 . "$here/lib.sh"
 iso_credless_arm
+
+# --- behind a herd worker's wall, the landing is the launcher's to run ----------------
+# A walled worker (herd-spawn.sh) cannot run the landing's gate: suites that build a wall,
+# walk the process tree or write beside its HERD_DIR entry die of the wall, and the merge
+# writes the primary, which the wall denies (2026-09-24: `32 ok, 1 skip, 5 fail` walled,
+# all green from an operator's shell). The gate is not the worker's work, so it runs
+# OUTSIDE the wall: the launcher herd-spawn.sh put outside it serves a landing REQUEST by
+# running the PRIMARY's finish-worktree.sh, unwalled, on the branch and worktree the
+# worker was STARTED on -- state the launcher holds, never anything this request says.
+# The launcher marks the agent's environment with HERD_GATE_* (walled spawns only); this
+# block only asks, waits, and prints what came back. It asks only for the landing the
+# launcher would do anyway -- the same branch in the same worktree -- so a test fixture
+# that runs finish on some OTHER branch from inside a worker still lands in the wall (and
+# its suites say they could not run), and never sets the worker's real landing off.
+# The variables are cleared either way: nothing this landing starts inherits the channel.
+# The receipt that comes back carries the launcher's own GATE= line saying where it ran.
+hg_channel="${HERD_GATE_CHANNEL:-}"
+hg_branch="${HERD_GATE_BRANCH:-}"
+hg_worktree="${HERD_GATE_WORKTREE:-}"
+unset HERD_GATE_CHANNEL HERD_GATE_BRANCH HERD_GATE_WORKTREE
+if [[ -n "$hg_channel" && "$branch" == "$hg_branch" && -n "$hg_worktree" &&
+      "$(cd "$worktree" && pwd -P)" == "$hg_worktree" && -d "$hg_channel" && ! -L "$hg_channel" ]]; then
+  set +e
+  landing_python - "$hg_channel" "$branch" "$worktree" <<'PY'
+import json, os, sys, time
+chan, branch, worktree = sys.argv[1:4]
+req, res = os.path.join(chan, "gate.request"), os.path.join(chan, "gate.result")
+ACK_S, WAIT_S = 30, 6 * 3600
+
+
+def refuse(why: str) -> None:
+    print("refusing to land %s: %s; nothing moved." % (branch, why), file=sys.stderr)
+    print("MERGED=no")
+    sys.exit(1)
+
+
+try:
+    if os.path.lexists(res):
+        os.unlink(res)                       # an answer to an EARLIER request is not ours
+    tmp = "%s.%d" % (req, os.getpid())
+    with open(tmp, "x", encoding="utf-8") as f:
+        json.dump({"branch": branch, "worktree": worktree}, f)
+    os.replace(tmp, req)
+except OSError as e:
+    refuse("behind the worker's wall the gate cannot run here, and the landing request "
+           "could not be written to %s (%s)" % (chan, e.strerror or type(e).__name__))
+print("the gate runs outside the worker's wall: landing %s was handed to the herd launcher; "
+      "waiting for its receipt" % branch, file=sys.stderr, flush=True)
+t0 = time.time()
+while os.path.lexists(req):
+    if time.time() - t0 > ACK_S:
+        try:
+            os.unlink(req)
+        except OSError:
+            pass
+        refuse("behind the worker's wall the gate cannot run here, and the herd launcher did not "
+               "take the landing request within %ds (is this worker still under its launcher?)" % ACK_S)
+    time.sleep(0.2)
+while not os.path.lexists(res):
+    if time.time() - t0 > WAIT_S:
+        refuse("the herd launcher took the landing request and gave no receipt within %ds" % WAIT_S)
+    time.sleep(0.5)
+try:
+    with open(res, encoding="utf-8", errors="replace") as f:
+        got = json.load(f)
+    os.unlink(res)
+    rc, out, err = int(got["rc"]), str(got["stdout"]), str(got["stderr"])
+except (OSError, ValueError, KeyError, TypeError) as e:
+    # the landing outside DID run: whether it moved BASE is the primary's to say, not ours
+    print("the herd launcher ran the landing of %s outside the worker's wall, and its receipt "
+          "could not be read (%s): look at the primary before landing again" % (branch, type(e).__name__),
+          file=sys.stderr)
+    sys.exit(1)
+sys.stderr.write(err)
+sys.stdout.write(out)
+sys.exit(rc)
+PY
+  hg_rc=$?
+  set -e
+  exit "$hg_rc"
+fi
 
 # --- before anything prints a name somebody else chose ----------------------------
 # Every such name goes through iso_safe_text, which spells out each code point in an
@@ -201,6 +415,13 @@ else
   git_common="$(cd "$git_common" && pwd)"
 fi
 primary="$(dirname "$git_common")"
+# Where a refusal tells the operator to find this skill's scripts: never the private
+# directory this run came from, which is gone the moment it exits. The name stays spelled
+# as $here's sibling so vendor.sh's closure still sees that finish needs dispatch-init.sh.
+hint_init="$here/dispatch-init.sh"
+if [[ -n "$gate_from_base" ]]; then
+  hint_init="${primary}/${gate_scripts_rel}/${hint_init##*/}"
+fi
 
 if git -C "$worktree" symbolic-ref --quiet refs/remotes/origin/HEAD >/dev/null 2>&1; then
   base="$(git -C "$worktree" symbolic-ref --short refs/remotes/origin/HEAD | sed 's#^origin/##')"
@@ -931,11 +1152,11 @@ self_rebase_base() {
           *) sr_only="no" ;;
         esac
       done <<< "$sr_conf"
-      if [[ "$sr_only" != "yes" || ! -f "$sr_wt/tools/ledger.py" ]]; then
+      if [[ "$sr_only" != "yes" || ! -f "$gate_ledger" ]]; then
         self_rebase_refuse "$sr_wt" "$sr_from" "$sr_conf"
       fi
-      # the generated files have one right answer: the ledger, rebuilt on this tree
-      if ! landing_python "$sr_wt/tools/ledger.py" --into "$sr_wt" build >/dev/null 2>&1; then
+      # the generated files have one right answer: the ledger (BASE's), rebuilt on this tree
+      if ! landing_python "$gate_ledger" --into "$sr_wt" build >/dev/null 2>&1; then
         self_rebase_refuse "$sr_wt" "$sr_from" "$sr_conf"
       fi
       for sr_one in $generated; do
@@ -993,92 +1214,36 @@ self_rebase_base() {
   fi
 }
 
-# --- what origin holds: fetched, else the publisher's bundle -----------------------
+# --- what origin holds: lib.sh:iso_origin_view, and nothing else --------------------
 # The owner's uid holds no GitHub credential (company/ops/publisher/README.md), so on this
-# machine the fetch below always fails, and for as long as it failed silently the landing
-# judged BASE against whatever origin/BASE a person last brought down by hand -- hours
-# old while the other Mac moved origin, which is how seven landings came to sit on a BASE
-# origin had never seen (plan 2026-09-18-no-stops, S7). The publisher CAN fetch, and on
-# every run it writes origin's branch to a world-readable bundle
-# (<state>/origin/<name>.bundle); when the fetch fails, that is what origin/BASE is read
-# from.
-#   * LANDING_ORIGIN_BUNDLE names the file; else the publisher's default path for the
-#     repository the `handoff` remote names (iso_publisher_name). No hand-off, no file:
-#     the landing goes on as it always did, against the origin/BASE it already has.
-#   * Older than LANDING_ORIGIN_BUNDLE_MAX_AGE_S (default 1800): the publisher is late,
-#     and a late bundle is not origin. Said on one line, then treated as absent.
-#   * A file that is THERE and cannot be read as a bundle carrying origin/BASE -- or a
-#     named one that is not there -- is a refusal: a source somebody pointed at is never
-#     quietly swapped for "whatever we had".
-#   * Only a fast-forward of the origin/BASE this repository already has is taken: a
-#     bundle is up to half an hour old, and an older view never replaces a newer one.
+# machine the fetch always fails, and for as long as it failed silently the landing judged
+# BASE against whatever origin/BASE a person last brought down by hand -- hours old while
+# the other Mac moved origin, which is how seven landings came to sit on a BASE origin had
+# never seen (plan 2026-09-18-no-stops, S7). Then it read the publisher's bundle -- but
+# with no bundle, or a stale one, it still went on "against the origin/BASE this
+# repository already has", and the owner's rebase script kept a rule of its own that fell
+# back to a five-day-old bundle
+# (ISSUE(origin-view-has-two-rules-and-one-of-them-serves-a-stale-bundle)).
+# Now there is ONE rule, iso_origin_view (lib.sh): the fetch, else the publisher's bundle
+# cross-checked against its status, else a REFUSAL with nothing moved. It runs before the
+# landing lock is taken, so a refusal leaves no lock behind.
+# A repository with NO origin remote has no origin to be stale about and lands as it
+# always did ("BASE_FF=none (no origin/BASE)"); that boundary is drawn HERE, by not
+# calling the helper, so the refusal cannot creep into repositories that never had one.
 origin_read="no"         # origin/BASE was read THIS landing (fetched, or from the bundle)
 origin_source=""         # " from bundle" when it came from the bundle, for BASE_FF=
 if git -C "$worktree" remote get-url origin >/dev/null 2>&1; then
-  if git -C "$worktree" fetch origin --quiet; then
-    origin_read="yes"
-  else
-    ob_named="no"
-    ob_path=""
-    if [[ -n "${LANDING_ORIGIN_BUNDLE:-}" ]]; then
-      ob_named="yes"
-      ob_path="$LANDING_ORIGIN_BUNDLE"
-    elif ob_name="$(iso_publisher_name "$primary")"; then
-      ob_path="${ISO_PUBLISHER_STATE}/origin/${ob_name}.bundle"
-    fi
-    ob_max="${LANDING_ORIGIN_BUNDLE_MAX_AGE_S:-1800}"
-    case "$ob_max" in
-      ''|*[!0-9]*)
-        echo "refusing to land ${branch}: LANDING_ORIGIN_BUNDLE_MAX_AGE_S=$(iso_safe_text "$ob_max") is not a whole number of seconds; nothing moved." >&2
-        exit 1
-        ;;
-    esac
-    ob_show="$(iso_safe_text "$ob_path")"
-    if [[ -n "$ob_path" && ! -f "$ob_path" ]]; then
-      if [[ "$ob_named" == "yes" ]]; then
-        {
-          echo "refusing to land ${branch}: origin could not be fetched, and LANDING_ORIGIN_BUNDLE=${ob_show}"
-          echo "is not a file. The source you named was not read, so origin was not read at all;"
-          echo "nothing moved (${base}, ${branch} and ${worktree} are as they were)."
-        } >&2
-        exit 1
-      fi
-      echo "note: origin could not be fetched and there is no publisher bundle at ${ob_show}; judging ${base} against the origin/${base} this repository already has" >&2
-    elif [[ -n "$ob_path" ]]; then
-      ob_now="$(date +%s)"
-      if ! ob_mtime="$(iso_mtime "$ob_path")"; then
-        echo "refusing to land ${branch}: could not read the modification time of the origin bundle ${ob_show}; nothing moved." >&2
-        exit 1
-      fi
-      ob_age=$(( ob_now - ob_mtime ))
-      if (( ob_age > ob_max )); then
-        echo "note: the origin bundle ${ob_show} is stale (${ob_age}s old, limit ${ob_max}s: LANDING_ORIGIN_BUNDLE_MAX_AGE_S) -- ignored; judging ${base} against the origin/${base} this repository already has" >&2
-      else
-        ob_err="$(finish_tmp)"
-        if ! git -C "$worktree" fetch --quiet --no-tags "$ob_path" "refs/remotes/origin/${base}" 2>"$ob_err" ||
-           ! ob_tip="$(git -C "$worktree" rev-parse --verify --quiet "FETCH_HEAD^{commit}")"; then
-          {
-            echo "refusing to land ${branch}: origin could not be fetched, and the origin bundle"
-            echo "${ob_show}$([[ "$ob_named" == "yes" ]] && printf ' (LANDING_ORIGIN_BUNDLE)') could not be read as one carrying refs/remotes/origin/${base}:"
-            printf '   %s\n' "$(iso_safe_text "$(tail -1 "$ob_err" 2>/dev/null || true)")"
-            echo "Nothing moved (${base}, ${branch} and ${worktree} are as they were)."
-          } >&2
-          rm -f "$ob_err"
-          exit 1
-        fi
-        rm -f "$ob_err"
-        ob_have="$(git -C "$worktree" rev-parse --verify --quiet "refs/remotes/origin/${base}" || true)"
-        if [[ -z "$ob_have" ]] || git -C "$worktree" merge-base --is-ancestor "$ob_have" "$ob_tip"; then
-          if [[ "$ob_have" != "$ob_tip" ]]; then
-            git -C "$worktree" update-ref "refs/remotes/origin/${base}" "$ob_tip" ${ob_have:+"$ob_have"}
-          fi
-          origin_read="yes"
-          origin_source=" from bundle"
-        else
-          echo "note: the origin bundle ${ob_show} is not a fast-forward of the origin/${base} this repository already has; kept what it has" >&2
-        fi
-      fi
-    fi
+  if ! iso_origin_view "$worktree" "$base"; then
+    {
+      echo "refusing to land ${branch}: origin/${base} has no current view (the reason is above), and a"
+      echo "landing is never judged against an old one. Nothing moved (${base}, ${branch} and"
+      echo "${worktree} are as they were); run finish again once the publisher has written a current bundle."
+    } >&2
+    exit 1
+  fi
+  origin_read="yes"
+  if [[ "$ISO_ORIGIN_VIEW_SOURCE" == "bundle" ]]; then
+    origin_source=" from bundle"
   fi
 fi
 
@@ -1159,15 +1324,18 @@ base_ff_where=""
 merged="no"
 base_tip=""
 remote_base="origin/${base}"
-# Room landing lease (ISSUE(two-machines-land-without-talking)): held after the
-# local lock, released on every path that took it -- success, red tests, the rest.
+# Landing lease (ISSUE(two-machines-land-without-talking), now a Durable Object: see
+# ../worker/): held after the local lock, released on every path that took it --
+# success, red tests, a failed publish, the rest -- with the epoch it was granted, so a
+# release can never free a lease that has since passed to another machine.
 lease_held="no"
 lease_did_hold="no"
 lease_as=""
 lease_repo=""
 lease_room=""
+lease_epoch=""
 cleanup() {
-  # Room lease first, while this landing still holds the local lock, then the lock
+  # The lease first, while this landing still holds the local lock, then the lock
   # by name: one `rm` on a path this shell already had, before anything that forks
   # to *find* the lock (see land_lock above for what a fork costs after a failed
   # write). Only then the temp merge worktree, which needs git and may fail.
@@ -1175,9 +1343,10 @@ cleanup() {
   if [[ "$lease_held" == "yes" ]]; then
     lease_held="no"
     if [[ -n "${LANDING_LEASE_CLI:-}" ]]; then
-      "$LANDING_LEASE_CLI" release --as "$lease_as" --repo "$lease_repo" --room "$lease_room" >/dev/null 2>&1 || true
+      "$LANDING_LEASE_CLI" release --as "$lease_as" --repo "$lease_repo" --room "$lease_room" ${lease_epoch:+--epoch "$lease_epoch"} >/dev/null 2>&1 || true
     else
-      bash "$here/landing-lease.sh" release --as "$lease_as" --repo "$lease_repo" --room "$lease_room" >/dev/null 2>&1 || true
+      DISPATCH_SKILL_REPO="$primary" bash "$here/landing-lease.sh" release --as "$lease_as" --repo "$lease_repo" \
+        ${lease_epoch:+--epoch "$lease_epoch"} >/dev/null 2>&1 || true
     fi
   fi
   if [[ "$holding_land" == "yes" ]]; then
@@ -1259,16 +1428,20 @@ on_exit() {
 }
 trap on_exit EXIT
 
-# --- Room landing lease: after the local lock, before origin fetch/ff/rebase ------
-# Two Macs publish to one origin. This machine must hold the Room [landing] lease
-# for this repository before it moves git state, and release it on every path
-# after a successful take (cleanup, including red tests). A live foreign hold
-# refuses and leaves BASE, origin and the worktree unmoved.
-# LANDING_LEASE=off is honoured when the room file is absent, and when it is present
-# but this machine cannot say who it is or which repository this is; a present room
-# file that resolves still takes (safer: an operator cannot silently skip a configured
-# Room). Throwaway harnesses that never set DISPATCH_DIR and have no dispatch directory
-# do not talk to the owner's live Room.
+# --- Landing lease: after the local lock, before origin fetch/ff/rebase ------------
+# Two Macs publish to one origin. This machine must hold the landing lease for this
+# repository before it moves git state, and release it on every path after a
+# successful take (cleanup, including red tests). A live foreign hold refuses and
+# leaves BASE, origin and the worktree unmoved. The take is ONE process and ONE POST
+# (landing-lease.sh); its exit code says which failure it was: 2 this machine's
+# configuration, 3 the lease service unreachable, 4 held by another, 5 refused by the
+# service (its reason verbatim). None of them is ever reported as another.
+# LANDING_LEASE=off or APPL_LEASE=off is the break-glass for a lease-service outage:
+# either one disables the lease ENTIRELY, even where it is configured -- no take, no
+# release, no request -- and the receipt says `LEASE=off (break-glass)` so the landing
+# is visibly unleased (owner ruling, 20260922T150818Z). Otherwise the room file still
+# says whether this machine is configured to land under a lease at all. Throwaway
+# harnesses that never set DISPATCH_DIR and have no dispatch directory take none.
 #
 # A present room file that does NOT resolve is a refusal, before anything moves, and the
 # refusal prints the one command that configures the machine (dispatch-init.sh), with a
@@ -1320,10 +1493,10 @@ landing_lease_repo_from_repos() {
 
 dispatch_dir="${DISPATCH_DIR:-${HOME}/.muretai/dispatch}"
 room_file="${dispatch_dir}/room"
-if [[ ! -f "$room_file" || -L "$room_file" ]]; then
-  if [[ "${LANDING_LEASE:-}" == "off" ]]; then
-    echo "LEASE=off"
-  elif [[ -n "${DISPATCH_DIR:-}" || -d "$dispatch_dir" ]]; then
+if [[ "${LANDING_LEASE:-}" == "off" || "${APPL_LEASE:-}" == "off" ]]; then
+  echo "LEASE=off (break-glass)"
+elif [[ ! -f "$room_file" || -L "$room_file" ]]; then
+  if [[ -n "${DISPATCH_DIR:-}" || -d "$dispatch_dir" ]]; then
     {
       echo "refusing to land ${branch}: no Room file at ${room_file}"
       echo "  write did=<the Room's did> to that file (the Room this machine takes the landing"
@@ -1342,9 +1515,7 @@ else
   fi
   lease_room="$(landing_lease_read_kv "$room_file" did || true)"
   if [[ -z "$lease_as" || -z "$lease_repo" || -z "$lease_room" ]]; then
-    if [[ "${LANDING_LEASE:-}" == "off" ]]; then
-      echo "LEASE=off"
-    elif [[ -z "$lease_room" ]]; then
+    if [[ -z "$lease_room" ]]; then
       {
         echo "refusing to land ${branch}: the Room file ${room_file} has no did= line"
         echo "  write did=<the Room's did> to it, then run finish again; nothing moved."
@@ -1364,7 +1535,7 @@ else
           echo "  maps no repository to this checkout (no line in ${dispatch_dir}/repos names ${primary})"
         fi
         echo "Configure it once, then run finish again; nothing moved:"
-        echo "  bash $(printf '%q' "$here")/dispatch-init.sh --as ${lease_as:-<agent>} --repo ${lease_repo:-<name>}=${li_path}"
+        echo "  bash $(printf '%q' "$hint_init") --as ${lease_as:-<agent>} --repo ${lease_repo:-<name>}=${li_path}"
         if [[ -z "$lease_repo" ]]; then
           echo "  (<name> is the repository's name in the Room lease: the same on every machine that lands it)"
         fi
@@ -1381,7 +1552,9 @@ else
       lease_node_err="no node= line in ${dispatch_dir}/node: this machine has not said which node the lease runs through"
     else
       set +e
-      lease_node_err="$(python3 -I "$here/landing-lease.py" check-node "$lease_node" --as-prefix node 2>&1 >/dev/null)"
+      # DISPATCH_SKILL_REPO: `here` is BASE's copy in a private directory outside any
+      # checkout, so the client cannot find this repository from its own location
+      lease_node_err="$(DISPATCH_SKILL_REPO="$primary" python3 -I "$here/landing-lease.py" check-node "$lease_node" --as-prefix node 2>&1 >/dev/null)"
       lease_node_rc=$?
       set -e
       if [[ "$lease_node_rc" == "0" ]]; then
@@ -1392,7 +1565,7 @@ else
       {
         echo "refusing to land ${branch}: ${lease_node_err}"
         echo "Configure it once, then run finish again; nothing moved:"
-        echo "  bash $(printf '%q' "$here")/dispatch-init.sh --as ${lease_as} --repo ${lease_repo}=$(printf '%q' "$primary") --node <absolute path of this machine's node>"
+        echo "  bash $(printf '%q' "$hint_init") --as ${lease_as} --repo ${lease_repo}=$(printf '%q' "$primary") --node <absolute path of this machine's node>"
       } >&2
       exit 1
     fi
@@ -1402,7 +1575,8 @@ else
     if [[ -n "${LANDING_LEASE_CLI:-}" ]]; then
       "$LANDING_LEASE_CLI" take --as "$lease_as" --repo "$lease_repo" --room "$lease_room" >"$lease_out" 2>"$lease_err"
     else
-      bash "$here/landing-lease.sh" take --as "$lease_as" --repo "$lease_repo" --room "$lease_room" >"$lease_out" 2>"$lease_err"
+      DISPATCH_SKILL_REPO="$primary" bash "$here/landing-lease.sh" take --as "$lease_as" --repo "$lease_repo" \
+        >"$lease_out" 2>"$lease_err"
     fi
     lease_rc=$?
     set -e
@@ -1414,23 +1588,44 @@ else
       case "$line" in
         held-by=*) lease_held_by="${line#held-by=}" ;;
         until=*) lease_until="${line#until=}" ;;
+        epoch=*) lease_epoch="${line#epoch=}" ;;
         expired-lease-by=*) lease_expired_by="${line#expired-lease-by=}" ;;
       esac
     done < "$lease_out"
+    case "$lease_epoch" in
+      *[!0-9]*) lease_epoch="" ;;
+    esac
+    # what the lease tool printed is the backend's words: every value that reaches the
+    # receipt goes through iso_safe_text, like every other outside string in this file
+    lease_held_by="$(iso_safe_text "$lease_held_by")"
+    lease_until="$(iso_safe_text "$lease_until")"
+    lease_expired_by="$(iso_safe_text "$lease_expired_by")"
     if [[ "$lease_rc" == "4" ]]; then
       echo "LEASE=refused held-by ${lease_held_by} until ${lease_until}"
       {
-        echo "refusing to land ${branch}: Room landing lease is held by ${lease_held_by} until ${lease_until}"
+        echo "refusing to land ${branch}: the landing lease is held by ${lease_held_by} until ${lease_until}"
         cat "$lease_out"
       } >&2
       rm -f "$lease_out" "$lease_err"
       exit 1
     fi
     if [[ "$lease_rc" != "0" ]]; then
+      # the client's own one-line reason, without its "landing-lease: " prefix: a refusal
+      # names the service's reason verbatim, and unreachable says so -- never each other
+      lease_why=""
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] && lease_why="${line#landing-lease: }"
+      done < "$lease_err"
+      case "$lease_rc" in
+        3) lease_what="the lease service is unreachable" ;;
+        5) lease_what="the lease service refused the take" ;;
+        2) lease_what="this machine's lease configuration is incomplete" ;;
+        *) lease_what="the landing lease take failed (exit ${lease_rc})" ;;
+      esac
       {
-        echo "refusing to land ${branch}: landing lease take failed (exit ${lease_rc})"
+        echo "refusing to land ${branch}: ${lease_what}: $(iso_safe_text "${lease_why:-no reason given}")"
         cat "$lease_out"
-        echo "  room file: ${room_file}"
+        echo "  nothing moved."
       } >&2
       rm -f "$lease_out" "$lease_err"
       exit 1
@@ -1438,7 +1633,7 @@ else
     lease_held="yes"
     lease_did_hold="yes"
     if [[ -n "$lease_expired_by" ]]; then
-      echo "LEASE=held (expired lease by ${lease_expired_by} superseded)"
+      echo "LEASE=held (expired lease by ${lease_expired_by} superseded) expired-lease-by=${lease_expired_by}"
     else
       echo "LEASE=held ${lease_held_by} until ${lease_until}"
     fi
@@ -1650,7 +1845,9 @@ fi
 "$here/assert-head.sh" "$branch" "$worktree" >/dev/null
 
 # --- a session never lands a generated file ------------------------------------
-ledger_tool="$worktree/tools/ledger.py"
+# BASE's ledger, from the gate directory: a branch that brings or rewrites
+# tools/ledger.py is judged by the one BASE had, and by none when BASE had none.
+ledger_tool="$gate_ledger"
 if [[ -f "$ledger_tool" ]]; then
   ledger_err="$(finish_tmp)"
   if ! landing_python "$ledger_tool" --into "$worktree" check --diff "$base" --diff-only 2>"$ledger_err"; then
@@ -1667,7 +1864,10 @@ if [[ -f "$ledger_tool" ]]; then
 fi
 
 # --- the tests the diff owes -----------------------------------------------------
-runner="$worktree/tools/run_tests.py"
+# BASE's runner, from the gate directory, pointed at the branch's tree with --root: the
+# branch's TESTS run, its runner never does (a runner that reports every file green is
+# how a red branch merged).
+runner="$gate_runner"
 tests_line="none (no tools/run_tests.py in this repository)"
 tests_secs=""
 tests_files=""
@@ -1689,16 +1889,61 @@ if [[ -f "$runner" ]]; then
       branch_tests_backend_path="${tests_usersite}"
     fi
 
-    report="$(finish_tmp)"
     tests_err="$(finish_tmp)"
     tests_tail="$(finish_tmp)"
-    # the branch's tests, with no push credential in reach (credless, above), the harness
-    # isolated, and the CHILDREN walled but still able to reach the operator's optional
-    # backend through PYTHONPATH (branch_tests_python)
-    set +e
-    ( cd "$worktree" && branch_tests_python tools/run_tests.py --affected "${base}..HEAD" --json -j "${ISOLATED_SESSION_LAND_JOBS:-4}" ) > "$report" 2>"$tests_err"
-    rc=$?
-    set -e
+    # A receipt the launcher already took, and only one that lives in the spawn's walls
+    # directory: any other path, including one a worker set, runs the tests. The variables
+    # are cleared before anything this landing starts, so a test cannot hand them on.
+    tests_from_wall=no
+    rec_path="${ISO_FINISH_TESTS_RECEIPT:-}"
+    walls_path="${ISO_FINISH_WALLS_DIR:-}"
+    unset ISO_FINISH_TESTS_RECEIPT ISO_FINISH_WALLS_DIR
+    if [[ -n "$rec_path" && -n "$walls_path" ]]; then
+      rec_rc="$(python3 -I - "$rec_path" "$walls_path" <<'PY'
+import json, os, sys
+rec, walls = sys.argv[1], sys.argv[2]
+
+def real(p):
+    return os.path.realpath(p)
+
+try:
+    if os.path.islink(rec) or os.path.islink(walls):
+        raise OSError("link")
+    rec_r, walls_r = real(rec), real(walls)
+    if not os.path.isdir(walls_r) or not os.path.isfile(rec_r) or os.path.dirname(rec_r) != walls_r:
+        raise OSError("place")
+    rc_path = os.path.join(walls, "tests.json")
+    if os.path.islink(rc_path):
+        raise OSError("link")
+    rc_r = real(rc_path)
+    if os.path.dirname(rc_r) != walls_r or not os.path.isfile(rc_r):
+        raise OSError("rc")
+    rc = json.load(open(rc_r)).get("rc")
+    if type(rc) is not int:
+        raise OSError("rc")
+    sys.stdout.write(rec_r + "\n" + str(rc) + "\n")
+except OSError:
+    sys.stdout.write("no\n")
+PY
+)"
+      if [[ "$rec_rc" != "no" && "$rec_rc" != $'no\n' ]]; then
+        report="${rec_rc%%$'\n'*}"
+        rc="${rec_rc#*$'\n'}"
+        rc="${rc%%$'\n'*}"
+        tests_from_wall=yes
+        : > "$tests_err"
+      fi
+    fi
+    if [[ "$tests_from_wall" != "yes" ]]; then
+      report="$(finish_tmp)"
+      # the branch's tests, with no push credential in reach (credless, above), the harness
+      # isolated, and the CHILDREN walled but still able to reach the operator's optional
+      # backend through PYTHONPATH (branch_tests_python)
+      set +e
+      ( cd "$worktree" && branch_tests_python "$runner" --root "$worktree" --affected "${base}..HEAD" --gate --json -j "${ISOLATED_SESSION_LAND_JOBS:-4}" ) > "$report" 2>"$tests_err"
+      rc=$?
+      set -e
+    fi
     # The tail of a failing file is the BRANCH's own output, so it is a name-the-diff-chose
     # sink like any other: it goes to a file as NUL-separated records and is escaped here,
     # rather than being printed raw from inside the summary
@@ -1715,22 +1960,26 @@ files = d.get("files", [])
 counts = {}
 for r in files:
     counts[r["status"]] = counts.get(r["status"], 0) + 1
-line = ", ".join(f"{counts.get(k, 0)} {k}" for k in ("ok", "skip", "fail", "timeout") if counts.get(k))
+# could-not-run is the verdict of the runner for a file behind a wall: counted on its
+# own, never among the files that ran, and it refuses the landing like a red
+line = ", ".join(f"{counts.get(k, 0)} {k}" for k in ("ok", "skip", "fail", "timeout", "could-not-run")
+                 if counts.get(k))
 failed = " ".join(d.get("failed", []))
+unrun = " ".join(d.get("could_not_run", []))
 names = " ".join(r["file"] for r in files)
 # unit separator, not a tab: bash `read` folds runs of IFS whitespace, so an empty
 # `failed` column would shift the columns after it
 print("\x1f".join([f"{line or '0 files'} (of {len(files)}; {d.get('selection', '')})",
-                   str(d.get("wall_s", "")), failed, names]))
+                   str(d.get("wall_s", "")), failed, unrun, names]))
 with open(tail_path, "w", encoding="utf-8") as fh:
     for r in files:
-        if r["status"] in ("fail", "timeout"):
+        if r["status"] in ("fail", "timeout", "could-not-run"):
             fh.write(f"--- {r['file']}: {r['status']} {r.get('reason', '')}\0")
             for ln in r.get("tail", "").splitlines()[-15:]:
                 fh.write("   | " + ln + "\0")
 PY
 )"
-    IFS=$'\x1f' read -r tests_line tests_secs tests_failed tests_files <<< "$summary"
+    IFS=$'\x1f' read -r tests_line tests_secs tests_failed tests_unrun tests_files <<< "$summary"
     while IFS= read -r -d '' tail_rec; do
       [[ -n "$tail_rec" ]] || continue
       if ! tail_esc="$(iso_safe_text "$tail_rec")"; then
@@ -1749,8 +1998,17 @@ PY
     if [[ "$rc" != "0" ]]; then
       {
         echo "refusing to land ${branch}: ${tests_line}"
-        echo "red: $(iso_safe_text "$tests_failed")"
-        echo "The worktree is untouched (already rebased onto ${base}); fix, commit, run finish again."
+        [[ -z "$tests_failed" ]] || echo "red: $(iso_safe_text "$tests_failed")"
+        if [[ -n "$tests_unrun" ]]; then
+          # behind a wall: not a red, and not a pass -- the gate never got to judge these
+          echo "could not run (this landing is behind a wall, so these are no verdict on the diff): $(iso_safe_text "$tests_unrun")"
+          echo "The landing's gate belongs outside the wall: from a herd worker, the launcher runs it there."
+        fi
+        if [[ "$tests_from_wall" == "yes" ]]; then
+          echo "The repair agent is asked before a person lands."
+        else
+          echo "The worktree is untouched (already rebased onto ${base}); fix, commit, run finish again."
+        fi
       } >&2
       # A refusal is a receipt too: the counted verdict goes on STDOUT with the rest of
       # the receipt's spelling, so a reader (a herd coordinator, a test) sees what the
@@ -1760,6 +2018,19 @@ PY
       echo "TESTS=${tests_line}"
       if [[ -n "$tests_failed" ]]; then
         echo "TESTS_RED=$(iso_safe_text "$tests_failed")"
+      fi
+      if [[ -n "$tests_unrun" ]]; then
+        echo "TESTS_COULD_NOT_RUN=$(iso_safe_text "$tests_unrun")"
+      fi
+      # The refusal's class. `environment`: every suite that did not pass is one the room
+      # refused (the runner measured a wall AND the suite carried the room's words), so
+      # nothing here is a verdict on the diff. `red`: at least one ordinary failure or
+      # timeout -- the diff's own, whatever else the room refused beside it. TESTS_RED= and
+      # TESTS_COULD_NOT_RUN= never name the same file.
+      if [[ -n "$tests_unrun" && -z "$tests_failed" ]]; then
+        echo "TESTS_REFUSAL=environment"
+      else
+        echo "TESTS_REFUSAL=red"
       fi
       rm -f "$report" "$tests_err"
       exit 1
@@ -1791,8 +2062,98 @@ fi
 # needs-eyes on top. A BASE without the tool says SEC=none; the branch's copy is
 # never the fallback. The rebuild runs THESE copies against the revision's data,
 # never the revision's tools/ (ISSUE(scanner-executes-scanned-revision)).
+#
+# EVERY COMMIT of the range is judged, one lint run per commit (`c^..c`, the first parent
+# for a merge), exactly as the publisher judges them (muretai-publish.py `evaluate`). The
+# scan used to run ONCE over the net diff `BASE..HEAD`, so a commit that added a refused
+# line and a later commit of the same branch that rewrote it landed `clean` -- f6b03cee
+# went onto main that way, and only the publisher, asking the per-commit question, refused
+# it and then held trunk (ISSUE(landing-and-publisher-asked-different-questions)). A
+# refusal in any commit refuses the landing and names that commit's short sha; a later
+# commit never excuses it -- the branch is rebased or amended instead. The verdict is the
+# worst of the commits' verdicts, the review list the union of theirs, and the SCANNED
+# list the union of every path any commit touched, printed on the receipt
+# (SEC_SCANNED= / SEC_SCANNED_FILES=) so it is read, not inferred. The gate list is taken
+# from that same union, so a gate file edited in one commit and restored in the next is
+# still a gate change. A range that touches no path says `nothing-to-scan`, never `clean`.
+#
+# $1 the checkout to run in, $2 the lint, $3 the range's base; writes the aggregate JSON
+# (the lint's own shape plus `scanned_files`, `commits`, `broken`) to $4 and the scanned
+# paths, NUL-separated and as git spelled them, to $5. Non-zero only when it could not run.
+sec_scan_commits() {  # $1 cwd, $2 lint, $3 base rev, $4 json out, $5 paths out
+  ( cd "$1" && landing_python - "$2" "$3" "$4" "$5" <<'PY'
+import json, subprocess, sys
+lint, base, out_json, out_paths = sys.argv[1:5]
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+GIT = ["git", "-c", "core.quotepath=false"]
+
+def git_out(*args):
+    return subprocess.run(GIT + list(args), capture_output=True, check=True).stdout
+
+commits = git_out("rev-list", "--reverse", "--topo-order", base + "..HEAD").decode().split()
+scanned, review, findings, seen, broken, refused_in = {}, set(), [], set(), [], []
+verdicts = set()
+for c in commits:
+    has_parent = subprocess.run(GIT + ["rev-parse", "--verify", "--quiet", c + "^"],
+                                capture_output=True).returncode == 0
+    parent = c + "^" if has_parent else EMPTY_TREE
+    touched = [p for p in git_out("diff", "--name-only", "-z", "--no-renames", "--diff-filter=ACMRDT",
+                                  parent, c).split(b"\0") if p]
+    if not touched:
+        continue                     # an empty commit: nothing of it to judge
+    for p in touched:
+        scanned.setdefault(p, None)
+    r = subprocess.run([sys.executable, "-I", lint, "--diff", parent + ".." + c, "--json"],
+                       capture_output=True, text=True)
+    try:
+        d = json.loads(r.stdout)
+        verdict = str(d["verdict"])
+    except (ValueError, KeyError, TypeError):
+        broken.append("%s: %s" % (c[:7], (r.stderr.strip() or "no JSON from the lint")[-300:]))
+        continue
+    if r.returncode == 2 and verdict != "refused":
+        verdict = "refused"          # the exit code is the contract; the word must agree
+    if verdict not in ("clean", "needs-eyes", "refused"):
+        broken.append("%s: the lint said %r" % (c[:7], verdict))
+        continue
+    verdicts.add(verdict)
+    if verdict == "refused":
+        refused_in.append(c[:7])
+    review.update(str(f) for f in (d.get("review_files") or d.get("audited_files", [])))
+    for f in d.get("findings", []):
+        key = (f.get("file"), f.get("line"), f.get("rule"), f.get("level"), f.get("text"))
+        if key in seen:
+            continue                 # the same finding again in a later commit: named once, first commit
+        seen.add(key)
+        f = dict(f)
+        f["commit"] = c[:7]
+        findings.append(f)
+if broken:
+    verdict = "broken"
+elif "refused" in verdicts:
+    verdict = "refused"
+elif "needs-eyes" in verdicts:
+    verdict = "needs-eyes"
+elif scanned:
+    verdict = "clean"
+else:
+    verdict = "nothing-to-scan"
+findings.sort(key=lambda f: (0 if f.get("level") == "refuse" else 1, str(f.get("file")), f.get("line") or 0))
+names = sorted(p.decode("utf-8", "replace") for p in scanned)
+with open(out_json, "w", encoding="utf-8") as fh:
+    json.dump({"verdict": verdict, "review_files": sorted(review), "findings": findings,
+               "scanned_files": names, "commits": len(commits), "refused_in": refused_in,
+               "broken": broken}, fh)
+with open(out_paths, "wb") as fh:
+    for p in sorted(scanned):
+        fh.write(p + b"\0")
+PY
+  )
+}
+
 sec_line="none (base has no tools/sec_lint.py)"
 sec_verdict="none"
+sec_scanned_line=""
 sec_files=""
 sec_gate=""
 gate_files=""
@@ -1817,21 +2178,25 @@ if git -C "$worktree" cat-file -e "${base}:tools/sec_lint.py" 2>/dev/null; then
       git -C "$worktree" show "${base}:${extra}" > "$sec_base/${extra}"
     fi
   done
-  # the gate list, from BASE's table. NUL-separated and never quoted: with git's default
-  # quotepath a non-ASCII name arrives octal-quoted and matches no entry (the LONG S
-  # case); deletions, renames (as D + A) and type changes included
-  while IFS= read -r -d '' f; do
-    [[ -n "$f" ]] || continue
-    gate_files="${gate_files}${gate_files:+ }${f}"
-  done < <(git -C "$worktree" -c core.quotepath=false diff --name-only -z --no-renames --diff-filter=ACMRDT "${base}..HEAD" |
-           landing_python "$sec_base/tools/sec_lint.py" --gate-files 2>/dev/null || true)
   sec_report="$(finish_tmp)"
   sec_err="$(finish_tmp)"
   sec_find_file="$(finish_tmp)"
+  sec_paths="$(finish_tmp)"
   set +e
-  ( cd "$worktree" && landing_python "$sec_base/tools/sec_lint.py" --diff "${base}..HEAD" --json ) > "$sec_report" 2>"$sec_err"
+  sec_scan_commits "$worktree" "$sec_base/tools/sec_lint.py" "$base" "$sec_report" "$sec_paths" 2>"$sec_err"
   sec_rc=$?
   set -e
+  # the gate list, from BASE's table, over the SAME union the scan judged (every path
+  # any commit touched). NUL-separated and never quoted: with git's default quotepath a
+  # non-ASCII name arrives octal-quoted and matches no entry (the LONG S case);
+  # deletions, renames (as D + A) and type changes included
+  if [[ "$sec_rc" == "0" ]]; then
+    while IFS= read -r -d '' f; do
+      [[ -n "$f" ]] || continue
+      gate_files="${gate_files}${gate_files:+ }${f}"
+    done < <(landing_python "$sec_base/tools/sec_lint.py" --gate-files < "$sec_paths" 2>/dev/null || true)
+  fi
+  rm -f "$sec_paths"
   rm -rf "$sec_base"
   # The findings go to a file as NUL-separated records, not down the same stream as the
   # summary: a finding's `file` and `text` come straight out of the lint, which reads paths
@@ -1842,22 +2207,27 @@ if git -C "$worktree" cat-file -e "${base}:tools/sec_lint.py" 2>/dev/null; then
 import json, sys
 path, rc, findings_path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 try:
+    if rc != 0:
+        raise ValueError("the per-commit scan did not run")
     d = json.load(open(path))
     verdict = str(d["verdict"])
+    if verdict == "broken":
+        raise ValueError("a commit got no verdict")
 except Exception:
-    print("BROKEN\x1f0\x1f")
+    print("BROKEN\x1f0\x1f\x1f0\x1f\x1f")
     sys.exit(0)
-if rc == 2 and verdict != "refused":
-    verdict = "refused"          # the exit code is the contract; the word must agree
-# review_files (the audited surface + guard files + files with an eyes-level line) is
-# what the reviewer opens; an older lint without it names the audited surface only
-files = [str(f) for f in (d.get("review_files") or d.get("audited_files", []))]
+# review_files (the audited surface + guard files + files with an eyes-level line), the
+# union over the commits, is what the reviewer opens
+files = [str(f) for f in d.get("review_files", [])]
+scanned = [str(f) for f in d.get("scanned_files", [])]
 # unit separator (see the tests summary above)
-print("\x1f".join([verdict, str(len(files)), " ".join(files)]))
+print("\x1f".join([verdict, str(len(files)), " ".join(files), str(len(scanned)), " ".join(scanned),
+                   " ".join(d.get("refused_in", []))]))
 with open(findings_path, "w", encoding="utf-8") as fh:
     for f in d.get("findings", []):
         where = f.get("file", "?") if not f.get("line") else f"{f.get('file', '?')}:{f.get('line')}"
-        fh.write(f"   {where}: [{f.get('level', '?')}] {f.get('rule', '')}: {f.get('text', '')}\0")
+        fh.write(f"   {where}: [{f.get('level', '?')}] {f.get('rule', '')}: {f.get('text', '')}"
+                 f" (commit {f.get('commit', '?')})\0")
 PY
 )"
   sec_head="${sec_summary%%$'\n'*}"
@@ -1872,7 +2242,9 @@ PY
     sec_findings="${sec_findings}${sec_esc}"$'\n'
   done < "$sec_find_file"
   rm -f "$sec_find_file"
-  IFS=$'\x1f' read -r sec_verdict sec_count sec_files <<< "$sec_head"
+  IFS=$'\x1f' read -r sec_verdict sec_count sec_files sec_scanned_n sec_scanned_files sec_refused_in <<< "$sec_head"
+  # what was scanned, on the receipt whatever the verdict: every path any commit touched
+  sec_scanned_line="SEC_SCANNED=${sec_scanned_n:-0}"$'\n'"SEC_SCANNED_FILES=$(iso_safe_text "${sec_scanned_files:-}")"
   # a gate file changed: needs-eyes whatever the lint said (a refusal stays a refusal),
   # and the reviewer opens those files too
   if [[ -n "$gate_files" ]]; then
@@ -1895,6 +2267,10 @@ PY
     clean)
       sec_line="clean"
       ;;
+    nothing-to-scan)
+      # no commit of the range touched a path: nothing was judged, which is not "clean"
+      sec_line="nothing-to-scan"
+      ;;
     needs-eyes)
       # sec_files stays as git spelled it -- the brief and the reviewer's checkout need
       # the real names -- and only the RECEIPT LINE is spelled out
@@ -1909,15 +2285,34 @@ PY
       ;;
     refused)
       {
-        echo "refusing to land ${branch}: tools/sec_lint.py refused the diff:"
+        echo "refusing to land ${branch}: tools/sec_lint.py refused the diff, in commit(s) $(iso_safe_text "${sec_refused_in:-?}") of the range:"
         [[ -n "$sec_findings" ]] && printf '%s' "$sec_findings"
-        echo "The worktree is untouched (already rebased onto ${base}); fix, commit, run finish again."
+        echo "Every commit is judged on its own, as the publisher judges it: a later commit that"
+        echo "removes the line does not excuse the one that added it, because that commit would"
+        echo "still be in ${base}'s history. Rebase or amend the branch so no commit carries it"
+        echo "(git rebase -i ${base}), then run finish again. The worktree is untouched (already"
+        echo "rebased onto ${base}); nothing moved."
       } >&2
+      # a refusal is a receipt too (as a red test's is): what the landing measured, on stdout
+      echo "MERGED=no"
+      echo "SEC=refused (in commit(s) $(iso_safe_text "${sec_refused_in:-?}"))"
+      printf '%s\n' "$sec_scanned_line"
       rm -f "$sec_report" "$sec_err"
       exit 1
       ;;
     *)
-      { echo "refusing to land ${branch}: tools/sec_lint.py gave no verdict:"; cat "$sec_err"; } >&2
+      { echo "refusing to land ${branch}: tools/sec_lint.py gave no verdict for a commit of the range:"
+        landing_python - "$sec_report" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    for b in json.load(open(sys.argv[1])).get("broken", []):
+        print("   " + str(b))
+except Exception:
+    pass
+PY
+        cat "$sec_err"; } >&2
+      echo "MERGED=no"
+      echo "SEC=no-verdict"
       rm -f "$sec_report" "$sec_err"
       exit 1
       ;;
@@ -1933,6 +2328,77 @@ else
   done
   if [[ -n "$gate_files" ]]; then
     echo "note: ${base} has no tools/sec_lint.py, so the diff was not scanned; it changes gate file(s): $(iso_safe_text "$gate_files")" >&2
+  fi
+fi
+
+# --- the invariant gate, beside the lint ------------------------------------------
+# BASE's tools/invariants.py, with BASE's sec_lint.py beside it (the table lives there,
+# not in the tree being judged). A BASE without the tool is INV=none and is not a
+# refusal, the same shape as SEC=none. refused stops the landing before the merge.
+inv_line="none"
+if git -C "$worktree" cat-file -e "${base}:tools/invariants.py" 2>/dev/null; then
+  inv_base="$(mktemp -d "${worktree}/.inv-base-XXXXXX")"
+  mkdir -p "$inv_base/tools"
+  git -C "$worktree" show "${base}:tools/invariants.py" > "$inv_base/tools/invariants.py"
+  if git -C "$worktree" cat-file -e "${base}:tools/sec_lint.py" 2>/dev/null; then
+    git -C "$worktree" show "${base}:tools/sec_lint.py" > "$inv_base/tools/sec_lint.py"
+  fi
+  inv_out="$(finish_tmp)"
+  inv_err="$(finish_tmp)"
+  set +e
+  ( cd "$worktree" && landing_python "$inv_base/tools/invariants.py" --diff "${base}..HEAD" --json >"$inv_out" 2>"$inv_err" )
+  inv_rc=$?
+  set -e
+  inv_meta="$(landing_python - "$inv_out" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.stdout.write("refused\x1f\x1fthe gate printed no verdict")
+    raise SystemExit(0)
+changed = d.get("changed") or []
+why = [str(n) for n in (d.get("notes") or [])]
+for guard, marks in sorted((d.get("results_by_guard") or {}).items()):
+    why.extend("%s %s: %s" % (guard, k, v) for k, v in sorted(marks.items()) if v != "pass")
+sys.stdout.write(str(d.get("verdict") or "refused") + "\x1f" + " ".join(str(p) for p in changed)
+                 + "\x1f" + "; ".join(why))
+PY
+)"
+  inv_verdict="${inv_meta%%$'\x1f'*}"
+  inv_rest="${inv_meta#*$'\x1f'}"
+  inv_changed="${inv_rest%%$'\x1f'*}"
+  inv_why="${inv_rest#*$'\x1f'}"
+  if [[ -z "$inv_why" && -s "$inv_err" ]]; then
+    inv_why="$(tail -n 3 "$inv_err" | tr '\n' ' ')"
+  fi
+  rm -rf "$inv_base"
+  rm -f "$inv_out" "$inv_err"
+  case "$inv_verdict" in
+    clean|needs-eyes) ;;
+    *) inv_verdict="refused" ;;
+  esac
+  if [[ "$inv_rc" != "0" ]]; then
+    inv_verdict="refused"
+  fi
+  if [[ "$inv_verdict" == "refused" ]]; then
+    echo "refusing to land ${branch}: tools/invariants.py refused the diff. The worktree is untouched; nothing moved." >&2
+    if [[ -n "$inv_why" ]] && inv_why_safe="$(iso_safe_text "$inv_why")"; then
+      echo "  why: ${inv_why_safe}" >&2
+    fi
+    echo "MERGED=no"
+    echo "INV=refused"
+    exit 1
+  fi
+  if [[ "$inv_verdict" == "needs-eyes" && -n "$inv_changed" ]]; then
+    if ! inv_changed_safe="$(iso_safe_text "$inv_changed")"; then
+      echo "refusing to land ${branch}: an invariant path could not be printed safely." >&2
+      echo "MERGED=no"
+      echo "INV=refused"
+      exit 1
+    fi
+    inv_line="needs-eyes (${inv_changed_safe})"
+  else
+    inv_line="$inv_verdict"
   fi
 fi
 
@@ -2092,6 +2558,8 @@ echo "TESTS=${tests_line}"
 # prints them with every invisible code point spelled out (iso_safe_text) -- a test file
 # is a name the diff chose, and this line is read in a terminal
 echo "SEC=${sec_line}"
+echo "INV=${inv_line}"
+[[ -n "$sec_scanned_line" ]] && printf '%s\n' "$sec_scanned_line"
 echo "LEDGER=${ledger_line}"
 echo "BASE=${base}"
 echo "BRANCH=${branch}"
@@ -2103,7 +2571,7 @@ echo "PUSHED=${pushed}"
 # Never a failed landing: the line says what happened.
 #
 # --- held until published ------------------------------------------------------------
-# The Room lease serializes two Macs' LANDINGS, but a landing that released it at the
+# The landing lease serializes two Macs' LANDINGS, but a landing that released it at the
 # hand-off push left the gap it exists to close: the other Mac could take the lease, land
 # and publish before this Mac's publisher ran, and this hand-off was then "not a
 # fast-forward of origin" -- held until a person rebased it (plan 2026-09-19-multi-mac-appl,
@@ -2185,32 +2653,21 @@ publish_wait() {  # $1 epoch the push started, $2 epoch it finished, $3 the tip 
   done
 }
 
-# origin/BASE again, the way the landing read it: the fetch, else the publisher's bundle
-# (LANDING_ORIGIN_BUNDLE, else its default path), and only as a fast-forward of what this
-# repository already has -- an older view never replaces a newer one.
+# origin/BASE again, the way the landing read it: lib.sh:iso_origin_view, the one rule --
+# which also takes only a fast-forward of what this repository already has. Its refusal
+# (stale, mismatched, missing, older than what we have) is kept for pw_why.
+pw_reread_why=""
 publish_reread_origin() {
-  local rr_path="" rr_name="" rr_tip="" rr_have=""
-  if credless git -C "$primary" fetch origin --quiet >/dev/null 2>&1; then
+  local rr_err=""
+  rr_err="$(finish_tmp)"
+  if iso_origin_view "$primary" "$base" 2>"$rr_err"; then
+    rm -f "$rr_err"
     return 0
   fi
-  if [[ -n "${LANDING_ORIGIN_BUNDLE:-}" ]]; then
-    rr_path="$LANDING_ORIGIN_BUNDLE"
-  elif rr_name="$(iso_publisher_name "$primary")"; then
-    rr_path="${ISO_PUBLISHER_STATE}/origin/${rr_name}.bundle"
-  else
-    return 1
-  fi
-  [[ -f "$rr_path" ]] || return 1
-  git -C "$primary" fetch --quiet --no-tags "$rr_path" "refs/remotes/origin/${base}" >/dev/null 2>&1 || return 1
-  rr_tip="$(git -C "$primary" rev-parse --verify --quiet "FETCH_HEAD^{commit}")" || return 1
-  rr_have="$(git -C "$primary" rev-parse --verify --quiet "refs/remotes/origin/${base}" || true)"
-  if [[ -n "$rr_have" ]] && ! git -C "$primary" merge-base --is-ancestor "$rr_have" "$rr_tip"; then
-    return 1
-  fi
-  if [[ "$rr_have" != "$rr_tip" ]]; then
-    git -C "$primary" update-ref "refs/remotes/origin/${base}" "$rr_tip" ${rr_have:+"$rr_have"} || return 1
-  fi
-  return 0
+  pw_reread_why="$(grep -i "refusing" "$rr_err" 2>/dev/null | head -1 | sed 's/^iso_origin_view: refusing: //')" ||
+    pw_reread_why=""
+  rm -f "$rr_err"
+  return 1
 }
 
 # Puts local BASE back at $1 after a round moved it and the hand-off would not take it.
@@ -2237,7 +2694,7 @@ publish_round() {
     return 1
   fi
   if ! publish_reread_origin; then
-    pw_why="origin could not be read again (no fetch, and no publisher bundle that is a fast-forward of ${remote_base})"
+    pw_why="origin could not be read again ($(iso_safe_text "${pw_reread_why:-no reason given}" || printf 'a reason that could not be printed safely'))"
     return 1
   fi
   pr_onto="$(git -C "$primary" rev-parse --verify --quiet "$remote_base")" || {
@@ -2277,8 +2734,8 @@ publish_round() {
           *) pr_only="no" ;;
         esac
       done <<< "$pr_conf"
-      [[ "$pr_only" == "yes" && -f "$pr_wt/tools/ledger.py" ]] || break
-      landing_python "$pr_wt/tools/ledger.py" --into "$pr_wt" build >/dev/null 2>&1 || break
+      [[ "$pr_only" == "yes" && -f "$gate_ledger" ]] || break
+      landing_python "$gate_ledger" --into "$pr_wt" build >/dev/null 2>&1 || break
       for pr_one in $generated; do
         if [[ -e "$pr_wt/$pr_one" ]] ||
            git -C "$pr_wt" ls-files --error-unmatch -- "$pr_one" >/dev/null 2>&1; then
@@ -2314,10 +2771,11 @@ publish_round() {
     return 1
   fi
 
-  # the tests the rebased range owes, on the rebased tree
-  if [[ -f "$pr_wt/tools/run_tests.py" && "${ISOLATED_SESSION_LAND_TESTS:-1}" != "0" ]]; then
+  # the tests the rebased range owes, on the rebased tree -- run by the gate's runner, not
+  # the copy the merge just put on BASE
+  if [[ -f "$gate_runner" && "${ISOLATED_SESSION_LAND_TESTS:-1}" != "0" ]]; then
     pr_rc=0
-    ( cd "$pr_wt" && branch_tests_python tools/run_tests.py --affected "${pr_onto}..HEAD" --json \
+    ( cd "$pr_wt" && branch_tests_python "$gate_runner" --root "$pr_wt" --affected "${pr_onto}..HEAD" --gate --json \
         -j "${ISOLATED_SESSION_LAND_JOBS:-4}" ) >/dev/null 2>&1 || pr_rc=$?
     if [[ "$pr_rc" != "0" ]]; then
       pw_why="the tests went red on ${base} rebased onto ${remote_base} (${pr_onto:0:7}; tools/run_tests.py exit ${pr_rc})"
@@ -2343,19 +2801,28 @@ publish_round() {
         git -C "$primary" show "${base_before}:${pr_extra}" > "$pr_sec/${pr_extra}" 2>/dev/null || true
       fi
     done
+    # every commit of what the rebase rewrote, as the publisher will judge them
+    # (sec_scan_commits), never the net diff
     pr_rc=0
-    ( cd "$pr_wt" && landing_python "$pr_sec/tools/sec_lint.py" --diff "${pr_onto}..HEAD" --json ) >/dev/null 2>&1 || pr_rc=$?
-    rm -rf "$pr_sec"
+    pr_json="$(finish_tmp)" || { pw_why="could not stage the lint"; rm -rf "$pr_sec"; cleanup_publish_wt; return 1; }
+    pr_paths="$(finish_tmp)" || { pw_why="could not stage the lint"; rm -rf "$pr_sec" "$pr_json"; cleanup_publish_wt; return 1; }
+    sec_scan_commits "$pr_wt" "$pr_sec/tools/sec_lint.py" "$pr_onto" "$pr_json" "$pr_paths" >/dev/null 2>&1 || pr_rc=$?
+    if [[ "$pr_rc" == "0" ]] &&
+       landing_python -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["verdict"] == "refused" else 1)' \
+         "$pr_json" 2>/dev/null; then
+      pr_rc=2
+    fi
+    rm -rf "$pr_sec" "$pr_json" "$pr_paths"
     if [[ "$pr_rc" == "2" ]]; then
-      pw_why="tools/sec_lint.py refused ${base} rebased onto ${remote_base}"
+      pw_why="tools/sec_lint.py refused a commit of ${base} rebased onto ${remote_base}"
       cleanup_publish_wt
       return 1
     fi
   fi
 
   # the ledgers, rebuilt on the rebased tip
-  if [[ -f "$pr_wt/tools/ledger.py" ]]; then
-    if ! landing_python "$pr_wt/tools/ledger.py" --into "$pr_wt" build >/dev/null 2>&1; then
+  if [[ -f "$gate_ledger" ]]; then
+    if ! landing_python "$gate_ledger" --into "$pr_wt" build >/dev/null 2>&1; then
       pw_why="tools/ledger.py build failed on the rebased tree"
       cleanup_publish_wt
       return 1
@@ -2634,6 +3101,22 @@ PY
         rm -rf "$spawn_dir"
         review_line="needed -- could not read ${spawner_rel} from ${base_before}; run: ${run_hint}"
       else
+        # ... and BASE's worker wall beside it (scripts/walls/: the platform plug and its
+        # template), so the reviewer is walled like any herd session. Without it the spawner
+        # finds no plug and, HERD_WALL unset being require, starts no reviewer: the landing
+        # says REVIEW=needed with the command to run. The spawner copies what it runs into
+        # $HERD_DIR/walls/<name>/ at spawn, so this directory may go right after. Regular
+        # blobs only.
+        walls_rel="${spawner_rel%/*}/walls"
+        if mkdir "$spawn_dir/walls" 2>/dev/null; then
+          git -C "$primary" ls-tree "${base_before}" "${walls_rel}/" 2>/dev/null |
+            while read -r w_mode w_type _w_sha w_path; do
+              [[ "$w_type" == "blob" && ( "$w_mode" == "100644" || "$w_mode" == "100755" ) ]] || continue
+              w_base="${w_path##*/}"
+              case "$w_base" in *[!A-Za-z0-9._-]*|.*) continue ;; esac
+              git -C "$primary" show "${base_before}:${w_path}" > "$spawn_dir/walls/${w_base}" 2>/dev/null || rm -f "$spawn_dir/walls/${w_base}"
+            done || true
+        fi
         # The reviewer's checkout: detached at the sha main had before this landing,
         # under a review root that is a real directory of ours -- checked BEFORE the
         # cleanup walks it, so a review root swapped for a symlink to the session
