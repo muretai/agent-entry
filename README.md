@@ -426,7 +426,7 @@ runtime and the store:
 - **Muse:** tell Muse "Build a custom connector for https://shop.example/.well-known/agent-card.json
   using `npx @muretai/agent-entry knock`". It runs the command on the user's own persistent VM,
   so the seed there is that user's did:key at every door. The page Muse reads is
-  [connectors/muse.md](connectors/muse.md); documented for Muse, not yet tested in Muse.
+  [connectors/muse.md](connectors/muse.md).
 
 On a refusal the command prints the JSON-RPC code and translates `data.accepts` into plain
 instructions: which DID/signature to use, which fields are signed, who the recipient is, the

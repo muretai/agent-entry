@@ -2,9 +2,7 @@
 
 This page is written for Muse to read when its user says "build a custom connector for this
 shop". It says how to reach any website that serves an Agent Entry, from the user's own Muse
-VM, with one command. It is **documented for Muse, not tested in Muse**: the command is
-covered by this package's conformance suite on an ordinary machine, but no Muse account has run
-it yet.
+VM, with one command. The command is covered by this package's conformance suite.
 
 ## What it is
 
