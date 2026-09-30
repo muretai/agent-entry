@@ -1,0 +1,24 @@
+---
+description: "APPL (Agent Parallel Proof Loop) intake: 'APPL' is a proper noun, not 'apply'. When the user says '〜を APPL して' / 'APPL this' / 'use APPL for' / 'add to the backlog', hand their sentence verbatim to the vendored parser and stop; never implement, never deploy, never open a worktree"
+alwaysApply: true
+---
+# APPL intake (read this before touching anything the user asked you to "APPL")
+
+**APPL is the name of a pipeline (Agent Parallel Proof Loop). It is not the verb "apply" and not 「適用」.** 「〜を APPL して」, "APPL this", "use APPL for", "send this to APPL" all mean ONE thing: file the task so a separate coordinator session runs it through test author -> implementer -> reviewer -> publisher. "Add to the backlog", "queue", "later:", "idea:" (and 「バックログに積んで」) mean the same pipeline, later: the idea goes to the backlog inbox. 「適用して」 / "apply this" is NOT APPL; if you are unsure which the user meant, ask, do not act.
+
+When asked to APPL something, do exactly this and nothing else:
+
+1. Do NOT implement, edit files, create or reclaim worktrees, start Herdr workers, redeploy anything, or "coordinate" the task yourself. A session that does any of that has misread the instruction.
+2. Run, from the top of the repository the user is talking about, the vendored parser with the user's sentence EXACTLY as written (trigger words, priority words and all; not restated, not translated, not escaped) on the one line between the quoted heredoc markers, so nothing in it is expanded or run:
+
+   ```bash
+   APPL_FROM="cursor:<your model>" python3 .cursor/skills/isolated-session/scripts/appl-phrase.py -- "$(cat <<'APPL_SENTENCE'
+   <the user's sentence, verbatim, on one line>
+   APPL_SENTENCE
+   )"
+   ```
+
+   You no longer pass `--from "cursor:<your model>" --repo "$PWD"` to a filing script yourself: the parser takes the session from `APPL_FROM`, the repository from the directory it runs in, and owns the phrase table that decides intake-now or backlog, the priority and the rest. Never call a filing script directly. If the parser is not in this repository, say so and stop (the repository has not vendored APPL); do not substitute your own implementation.
+3. Tell the user its one line and stop. Exit 0: it names what was filed, the repository and the path; the result does not come back to this chat. A line ending in `?`: nothing was filed; ask the user that question, and hand their answer over the same way (answered "the backlog" to "now or backlog?": the same command with `--backlog` before `--`). Exit 3 with an `appl-add:` line (for example `coordinator pane not running`): the intake is filed but the coordinator was NOT woken; pass that line on unchanged. Any other `appl-phrase:` refusal: pass it on unchanged; nothing was filed.
+
+If the user later asks "did APPL take it?", read the filed file's `status:` line; do not start work.

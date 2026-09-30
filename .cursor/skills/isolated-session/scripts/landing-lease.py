@@ -6,6 +6,8 @@
     landing-lease.sh release --as <agent> --repo <name> --epoch <n>
     landing-lease.py doctor                 (one line for tools/appl-init.sh --check)
     landing-lease.py check-node <path> [--as-prefix NAME]
+    landing-lease.py check-lease <name> <agent> <node or ''> [--as-prefix NAME]
+    landing-lease.py check-endpoint <url> [--as-prefix NAME]
 
 Stdlib only. Python 3.9+. landing-lease.sh execs this file: ONE process and ONE signed
 HTTPS POST per verb (a take whose answer is lost is retried once, see lease_core.py). No
@@ -24,18 +26,33 @@ Muretai-specific half lives here:
             dispatch-init.sh call; there is no fallback to ~/muretai-node, and the cwd never
             matters. --as must name a key the node holds (it refuses, it never mints).
   identity  the request is signed by the node's dedicated lease identity, the `lease=<name>`
-            line beside node=, from <node>/keys/<name>.key -- never the agent identity
-            (whose key is never even opened) and never a binding token. A lease identity
-            bound to a principal is refused before any request: the DO allowlists this key,
-            so it must be one nothing else can drive.
+            line beside node= (written by `dispatch-init.sh --lease`), from
+            <node>/keys/<name>.key -- never the agent identity (whose key is never even
+            opened) and never a binding token. A lease identity bound to a principal is
+            refused before any request: the DO allowlists this key, so it must be one
+            nothing else can drive.
   signing   shared/crypto.py, loaded from the NODE (the checkout that holds the key), else
             from this checkout -- the file has no import outside the standard library.
   endpoint  LANDING_LEASE_ENDPOINT, else `url` in the [lease] configuration
             (LANDING_LEASE_CONFIG, default <dispatch dir>/lease.toml), else the
-            `endpoint=` line in <dispatch dir>/node. Never a constant in this repository.
+            `endpoint=` line in <dispatch dir>/node (written by `dispatch-init.sh
+            --lease-endpoint`). Never a constant in this repository.
+  host      `[lease] backend = "host"`: the same lease identity signs one `room.kv/cas`
+            JSON-RPC POST to a self-hosted room node (agent/roomkv.py) per verb, key
+            `landing:<repo>`. `url` in the [lease] section is the node's inbound URL -- the
+            do endpoint= line is never borrowed, and no url is exit 2 with nothing sent;
+            `room` is the lease room's DID, else the dispatch room's `did=` line. The
+            node's answer goes through the same lease_core.outcome_of table as `do`.
+            `do` stays the default: switching the dev loop is an owner decision taken
+            after measuring (ROOM_API_RTT_MS on the landing receipt).
 
 dispatch-take.sh and dispatch-init.sh load this file for the node rules (`resolve_node`,
 `check_node`, `require_identity`, `run_cli`); `check-node` is the shell-facing form.
+`check-lease` and `check-endpoint` are what dispatch-init.sh runs before it writes a
+lease= or endpoint= line: the checks a take applies (`check_lease`, and
+lease_core.check_url -- the one url validator), so a line the init accepts is one the
+take accepts. Every refusal here that names a dispatch-init.sh flag names one that
+exists (tests/test_dispatch_init_lease.py holds the two to each other).
 """
 from __future__ import annotations
 
@@ -59,8 +76,9 @@ sys.path.insert(0, str(HERE))
 import lease_core  # noqa: E402  (this directory, not a package)
 
 PROG = "landing-lease"
-INIT_HINT = ("bash .cursor/skills/isolated-session/scripts/dispatch-init.sh --as <agent> "
-             "--repo <name>=<path> --node <absolute path of this machine's node>")
+INIT_SH = "bash .cursor/skills/isolated-session/scripts/dispatch-init.sh"
+INIT_HINT = ("%s --as <agent> --repo <name>=<path> --node <absolute path of this machine's node>"
+             % INIT_SH)
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 USAGE = ("usage: landing-lease.sh take|renew|release --as <agent> --repo <name> "
@@ -273,6 +291,23 @@ def load_lease_key(node: Path, name: str, crypto) -> tuple:
     return seed, did
 
 
+def check_lease(node: Path, name: str, as_name: str) -> tuple:
+    """(crypto, seed, did) of the lease identity `name`, or ConfigError: an identity
+    name, not the agent itself, a plain key the node holds, bound to no principal. The
+    one rule shared by a take and by `dispatch-init.sh --lease`, so the init never
+    writes a line the take would refuse."""
+    if not NAME_RE.fullmatch(name):
+        raise lease_core.ConfigError("lease=%r is not an identity name" % name)
+    if name == as_name:
+        raise lease_core.ConfigError(
+            "lease=%s names the agent itself; the lease signs with a dedicated, unbound "
+            "identity, never the agent's" % name)
+    crypto = load_crypto(node)
+    seed, did = load_lease_key(node, name, crypto)
+    refuse_if_bound(did, name)
+    return crypto, seed, did
+
+
 def refuse_if_bound(did: str, name: str) -> None:
     """A binding record naming a principal (agent/binding.py's layout) is a refusal:
     the lease identity must be one no principal can drive. Unreadable fails closed.
@@ -323,6 +358,89 @@ class DoBackend(lease_core.Backend):
         sig = base64.b64encode(self._crypto.ed25519_sign(self._seed, msg)).decode("ascii")
         return lease_core.post_json(self.url, "/lease/" + urllib.parse.quote(self.repo, safe=""),
                                     {"payload": payload, "sig": sig})
+
+
+#: The node's lease verdicts, and the HTTP status the `do` service gives each, so both
+#: backends reach lease_core.outcome_of in one shape (held is 409 there, and only there).
+_HOST_STATUS = {"held": 409, "not-holder": 409, "stale-epoch": 409, "expired": 409,
+                "rate-limited": 429}
+
+
+class HostBackend(lease_core.Backend):
+    """One signed `room.kv/cas` JSON-RPC POST to a room node per verb (ROOM_MEMORY Phase 2).
+
+    The request is an A2A Message from the lease identity to the room, whose text is the
+    canonical JSON of exactly the kv fields sent beside it; its messageId is the nonce and
+    its timestamp the ts. No ttl_s: the lease length is the node's. The node's JSON-RPC
+    answer is mapped onto the `do` service's (status, body) shape -- a grant is the result
+    object, a refusal is {ok: false, reason, holder?, until?} -- so lease_core.outcome_of
+    and its exit codes apply unchanged."""
+
+    def __init__(self, url: str, room: str, repo: str, did: str, seed: bytes, crypto,
+                 epoch: Optional[int]):
+        self.url, self.room, self.key, self.me = url, room, "landing:" + repo, did
+        self._seed, self._crypto, self._epoch = seed, crypto, epoch
+
+    def send(self, verb: str):
+        fields = {"key": self.key, "verb": verb}
+        if verb != "take":
+            fields["expected_epoch"] = self._epoch
+        text = json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        mid, ts, ctx = "lease-" + secrets.token_hex(16), int(time.time()), "landing-lease"
+        # The protocol's signed payload (shared/crypto.signing_payload), spelled out so a
+        # node whose crypto.py predates sign_envelope still signs the same bytes.
+        payload = json.dumps({"contextId": ctx, "from": self.me, "messageId": mid,
+                              "text": text, "timestamp": ts, "to": self.room},
+                             sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        sig = base64.b64encode(self._crypto.ed25519_sign(
+            self._seed, payload.encode("utf-8"))).decode("ascii")
+        message = {"kind": "message", "role": "user",
+                   "parts": [{"kind": "text", "text": text}],
+                   "messageId": mid, "contextId": ctx,
+                   "metadata": {"timestamp": ts, "from": self.me, "to": self.room, "sig": sig}}
+        params = dict(fields)
+        params["message"] = message
+        body = {"jsonrpc": "2.0", "id": mid, "method": "room.kv/cas", "params": params}
+        status, answer, raw = lease_core.post_json(self.url, "/", body)
+        return host_answer(status, answer, raw)
+
+
+def host_answer(status: int, answer, raw: str):
+    """A room node's JSON-RPC answer as the (status, body, raw) lease_core.outcome_of reads."""
+    if not isinstance(answer, dict):
+        return status, None, raw
+    if isinstance(answer.get("redirect"), str):
+        return status, {"ok": False, "reason": "this node does not home the lease room; set "
+                        "url to its home node %s" % answer["redirect"]}, raw
+    result = answer.get("result")
+    if isinstance(result, dict):
+        return status, result, raw
+    err = answer.get("error")
+    if not isinstance(err, dict):
+        return status, None, raw
+    data = err.get("data")
+    if isinstance(data, dict) and isinstance(data.get("reason"), str) and data["reason"]:
+        out = {"ok": False, "reason": data["reason"]}
+        for k in ("holder", "until"):
+            if k in data:
+                out[k] = data[k]
+        return _HOST_STATUS.get(data["reason"], 403), out, raw
+    why = "%s (%s)" % (err.get("message") or "refused", err.get("code"))
+    if isinstance(data, str) and data:
+        why += ": " + data
+    return 403, {"ok": False, "reason": why}, raw
+
+
+def host_url(cfg: Dict[str, str]) -> str:
+    """The host backend's url: `url` in the [lease] section, and nothing else -- never the
+    do service's endpoint= line or LANDING_LEASE_ENDPOINT, which name a different service."""
+    return (cfg.get("url") or "").strip()
+
+
+def host_room(cfg: Dict[str, str], ddir: Path) -> str:
+    """The room the lease lives in: `room` in the [lease] section, else the dispatch room
+    (the `did=` line of <dispatch dir>/room)."""
+    return (cfg.get("room") or "").strip() or kv_file(ddir / "room", "did")
 
 
 def lease_url(cfg: Dict[str, str], ddir: Path) -> str:
@@ -376,7 +494,7 @@ def lease_main(argv: List[str]) -> int:
     except lease_core.ConfigError as e:
         return lease_core.emit(PROG, lease_core.Outcome("config", reason=str(e)))
 
-    def build_do(cfg: Dict[str, str]) -> lease_core.Backend:
+    def lease_identity() -> tuple:
         try:
             node = resolve_node(ddir)
             require_identity(node, as_name)
@@ -386,27 +504,37 @@ def lease_main(argv: List[str]) -> int:
         if not name:
             raise lease_core.ConfigError(
                 "no lease= line in %s: name this machine's dedicated, unbound lease identity "
-                "(a key in the node's keys/) on a lease=<name> line beside node="
-                % (ddir / "node"))
-        if not NAME_RE.match(name):
-            raise lease_core.ConfigError("lease=%r is not an identity name" % name)
-        if name == as_name:
+                "(a key in the node's keys/): %s --as %s --repo %s=<path> --lease <identity name>"
+                % (ddir / "node", INIT_SH, as_name, repo))
+        return check_lease(node, name, as_name)
+
+    def build_host(cfg: Dict[str, str]) -> lease_core.Backend:
+        url = host_url(cfg)
+        if not url:
             raise lease_core.ConfigError(
-                "lease=%s names the agent itself; the lease signs with a dedicated, unbound "
-                "identity, never the agent's" % name)
-        crypto = load_crypto(node)
-        seed, did = load_lease_key(node, name, crypto)
-        refuse_if_bound(did, name)
+                "backend = host needs url = <the room node's inbound URL> in the [lease] "
+                "section of %s (the do endpoint= line is not used for host)" % config_file(ddir))
+        lease_core.check_url(url)
+        room = host_room(cfg, ddir)
+        if not room.startswith("did:"):
+            raise lease_core.ConfigError(
+                "backend = host needs room = <the lease room's DID> in the [lease] section "
+                "of %s, or a did= line in %s" % (config_file(ddir), ddir / "room"))
+        crypto, seed, did = lease_identity()
+        return HostBackend(url, room, repo, did, seed, crypto, epoch)
+
+    def build_do(cfg: Dict[str, str]) -> lease_core.Backend:
+        crypto, seed, did = lease_identity()
         url = lease_url(cfg, ddir)
         if not url:
             raise lease_core.ConfigError(
-                "no lease endpoint configured: set url in the [lease] section of %s, an "
-                "endpoint=<url> line in %s, or LANDING_LEASE_ENDPOINT"
-                % (config_file(ddir), ddir / "node"))
+                "no lease endpoint configured: %s --as %s --repo %s=<path> --lease-endpoint "
+                "<https url> (or url in the [lease] section of %s, or LANDING_LEASE_ENDPOINT)"
+                % (INIT_SH, as_name, repo, config_file(ddir)))
         lease_core.check_url(url)
         return DoBackend(url, repo, did, seed, crypto, epoch)
 
-    return lease_core.dispatch(PROG, verb, cfg, {"do": build_do})
+    return lease_core.dispatch(PROG, verb, cfg, {"do": build_do, "host": build_host})
 
 
 def doctor_main() -> int:
@@ -425,7 +553,11 @@ def doctor_main() -> int:
         print("MISSING lease: backend %s is not implemented in this build -- set "
               "backend = \"do\" in the [lease] configuration" % name)
         return 1
-    url = lease_url(cfg, ddir)
+    url = host_url(cfg) if name == "host" else lease_url(cfg, ddir)
+    if not url and name == "host":
+        print("MISSING lease: backend host has no url -- add url = <the room node's inbound "
+              "URL> to the [lease] configuration")
+        return 1
     if not url:
         print("MISSING lease: backend %s has no url -- add endpoint=<https url of your lease "
               "Worker> to the node file in the dispatch directory" % name)
@@ -454,9 +586,62 @@ def check_node_main(argv: List[str]) -> int:
     return 0
 
 
+def _prefix(argv: List[str], at: int) -> str:
+    if len(argv) >= at + 2 and argv[at] == "--as-prefix":
+        return argv[at + 1]
+    return PROG
+
+
+def _config_refusal(prefix: str, e: lease_core.ConfigError) -> int:
+    sys.stderr.write("%s: %s\n" % (prefix, lease_core.printable(" ".join(str(e).split()), 600)))
+    return lease_core.EXIT_CONFIG
+
+
+def check_lease_main(argv: List[str]) -> int:
+    """`landing-lease.py check-lease <name> <agent> <node or ''> [--as-prefix NAME]`:
+    print the lease identity's DID and exit 0, or print the refusal and exit 2. An empty
+    node means the node= line in <dispatch dir>/node, resolved as a take resolves it."""
+    if len(argv) < 3:
+        sys.stderr.write("usage: landing-lease.py check-lease <name> <agent> <node or ''> "
+                         "[--as-prefix NAME]\n")
+        return 2
+    prefix = _prefix(argv, 3)
+    name, as_name, node_arg = argv[0], argv[1], argv[2]
+    try:
+        node = check_node(node_arg) if node_arg else resolve_node()
+        _crypto, _seed, did = check_lease(node, name, as_name)
+    except Refusal as r:
+        sys.stderr.write("%s: %s\n" % (prefix, r.msg))
+        return r.code
+    except lease_core.ConfigError as e:
+        return _config_refusal(prefix, e)
+    sys.stdout.write("%s\n" % did)
+    return 0
+
+
+def check_endpoint_main(argv: List[str]) -> int:
+    """`landing-lease.py check-endpoint <url> [--as-prefix NAME]`: exit 0 when a take
+    would use the url (lease_core.check_url, the one validator -- no second policy), else
+    print why and exit 2. A control character is refused first: urlsplit drops some of
+    them silently, and one written into the node file would be a second line."""
+    prefix = _prefix(argv, 1)
+    url = argv[0] if argv else ""
+    try:
+        if any(ord(c) < 32 or ord(c) == 127 for c in url):
+            raise lease_core.ConfigError("the lease url %r carries a control character" % url)
+        lease_core.check_url(url)
+    except lease_core.ConfigError as e:
+        return _config_refusal(prefix, e)
+    return 0
+
+
 if __name__ == "__main__":
     if sys.argv[1:2] == ["check-node"]:
         sys.exit(check_node_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["check-lease"]:
+        sys.exit(check_lease_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["check-endpoint"]:
+        sys.exit(check_endpoint_main(sys.argv[2:]))
     if sys.argv[1:2] == ["doctor"]:
         sys.exit(doctor_main())
     sys.exit(lease_main(sys.argv[1:]))

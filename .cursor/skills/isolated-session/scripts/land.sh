@@ -92,19 +92,32 @@ def tests_lines(wall):
     if not isinstance(data, dict):
         return ""
     files = data.get("files") if isinstance(data.get("files"), list) else []
+    # a file red on BASE too is counted `red-on-base`, never `fail`, and does not refuse
+    on_base = [x for x in (data.get("red_on_base") or []) if isinstance(x, str)]
     counts = {}
     for row in files:
         if isinstance(row, dict):
-            counts[row.get("status")] = counts.get(row.get("status"), 0) + 1
-    order = ("ok", "skip", "fail", "timeout", "could-not-run")
+            k = "red-on-base" if row.get("file") in on_base else row.get("status")
+            counts[k] = counts.get(k, 0) + 1
+    order = ("ok", "skip", "fail", "timeout", "could-not-run", "red-on-base")
     line = ", ".join("%d %s" % (counts[k], k) for k in order if counts.get(k))
     text = "TESTS=%s (of %d; %s)\n" % (line or "0 files", len(files), data.get("selection") or "")
-    failed = " ".join(x for x in (data.get("failed") or []) if isinstance(x, str))
+    # a timeout is not a fail: `<path> (timeout)` for a file killed at its budget, a failed
+    # one bare; both refuse. A runner without `timed_out` put timeouts on `failed`, and the
+    # per-file status still tells them apart
+    status = dict((row.get("file"), row.get("status")) for row in files if isinstance(row, dict))
+    timed_out = [x for x in (data.get("timed_out") or []) if isinstance(x, str)]
+    named = [x for x in (data.get("failed") or []) if isinstance(x, str)]
+    named += [x for x in timed_out if x not in named]
+    failed = " ".join(x + " (timeout)" if x in timed_out or status.get(x) == "timeout" else x
+                      for x in named)
     unrun = " ".join(x for x in (data.get("could_not_run") or []) if isinstance(x, str))
     if failed:
         text += "TESTS_RED=%s\n" % failed
     if unrun:
         text += "TESTS_COULD_NOT_RUN=%s\n" % unrun
+    if on_base:
+        text += "TESTS_RED_ON_BASE=%s\n" % " ".join(on_base)
     # the refusal's class, as finish-worktree.sh spells it: `environment` only when every
     # suite that did not pass is one the room could not run; any ordinary red makes it `red`
     text += "TESTS_REFUSAL=%s\n" % ("environment" if unrun and not failed else "red")
@@ -220,25 +233,176 @@ def record_of(cfg):
     return out
 
 
+SAFE_NAME = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+
+# The programs the gate runs out of its copy of BASE. Their imports are walked at BASE
+# (closure() below) to find which repository modules outside tools/ the copy must carry.
+GATE_ENTRIES = ("tools/ledger.py", "tools/sec_lint.py", "tools/invariants.py",
+                "tools/run_tests.py", "tools/audit_scope.py", "tools/backlog_build.py",
+                "tools/spec_build.py", "tools/affected_tests.py")
+# The modules outside tools/ that a gate program may reach through its own sys.path
+# insert (tools/ledger.py puts company/ops/ first). Where the insert points cannot be
+# read statically, so the list is pinned. It must name exactly the paths outside tools/ in
+# finish-worktree.sh's `gate_tools` -- tests/test_gate_closure_lists.py holds the two
+# to each other (ISSUE(gate-copy-lacks-the-ledgers-import)).
+GATE_CLOSURE = ("company/ops/backlog_to_core.py",)
+
+
+def imported_names(path):
+    """The top-level names a Python file imports absolutely, anywhere in it. A file that does
+    not parse imports nothing here: the gate program that runs it will crash, and
+    finish-worktree.sh calls that crash a broken gate."""
+    import ast
+    try:
+        tree = ast.parse(open(path, "rb").read(), path)
+    except (OSError, SyntaxError, ValueError):
+        return set()
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            names.add(node.module.split(".")[0])
+    return names
+
+
+def closure(dest):
+    """The GATE_CLOSURE paths BASE's gate actually imports: a walk from GATE_ENTRIES through
+    every tools/ module they import, and through each closure module already written into
+    `dest` (extract() calls this until it names nothing new). A closure path nothing
+    imports is not demanded, so a BASE without a ledger needs no company/ops/."""
+    by_name = {os.path.splitext(os.path.basename(p))[0]: p for p in GATE_CLOSURE}
+
+    def there(rel):
+        return os.path.isfile(os.path.join(dest, *rel.split("/")))
+
+    queue = [p for p in GATE_ENTRIES if there(p)]
+    seen, needed = set(queue), []
+    while queue:
+        rel = queue.pop(0)
+        for name in sorted(imported_names(os.path.join(dest, *rel.split("/")))):
+            if name in by_name:
+                nxt = by_name[name]
+                if nxt not in needed:
+                    needed.append(nxt)
+            else:
+                nxt = "tools/" + name + ".py"
+            if nxt not in seen and there(nxt):
+                seen.add(nxt)
+                queue.append(nxt)
+    return needed
+
+
 def extract(common, base_sha, wall):
     """BASE's scripts and tools, from the commit the spawn recorded, into walls/<name>/base.
-    The worker cannot write that directory, so it cannot swap the runner."""
+    The worker cannot write that directory, so it cannot swap the runner.
+
+    Returns (dest, "") or ("", why). Read blob by blob -- `ls-tree -r -z`, then `git show`
+    per entry -- the way finish-worktree.sh extracts BASE's walls/, never `git archive`:
+    the archive honours `.gitattributes` export-ignore, and the real tree marks `.cursor/`
+    so, which left the gate copy with tools/ and no skill at all
+    (ISSUE(land-extract-honours-export-ignore)). `--worktree-attributes` is no cure, since
+    it reads the worker-writable worktree. Only regular blobs (100644/100755, the exec bit
+    kept) are written; a symlink, a gitlink or anything else under these paths is refused
+    by name -- neither followed nor silently skipped. Each name below the prefix obeys the
+    walls/ basename rule, and a name that breaks it is refused the same way."""
     dest = os.path.join(wall, "base")
     if os.path.lexists(dest):
         if os.path.islink(dest):
-            return ""
+            return "", "the gate copy's directory is a link"
         shutil.rmtree(dest)
     os.mkdir(dest, 0o700)
-    arch = subprocess.run(["git", "--git-dir", common, "archive", base_sha, SKILL, "tools"],
-                          capture_output=True)
-    if arch.returncode != 0 or not arch.stdout:
+
+    def bail(why):
         shutil.rmtree(dest, ignore_errors=True)
-        return ""
-    tar = subprocess.run(["tar", "-x", "-C", dest], input=arch.stdout, capture_output=True)
-    if tar.returncode != 0:
-        shutil.rmtree(dest, ignore_errors=True)
-        return ""
-    return dest
+        return "", why
+
+    def put(path, mode):
+        """One regular blob of BASE into dest, exec bit kept; never through a link."""
+        target = os.path.join(dest, *path.split("/"))
+        os.makedirs(os.path.dirname(target), 0o700, exist_ok=True)
+        blob = subprocess.run(["git", "--git-dir", common, "show", "%s:%s" % (base_sha, path)],
+                              capture_output=True)
+        if blob.returncode != 0:
+            return False
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                     0o755 if mode == "100755" else 0o644)
+        try:
+            os.write(fd, blob.stdout)
+        finally:
+            os.close(fd)
+        return True
+
+    # Only the skill is demanded. tools/ is optional, and each gate program in it is decided
+    # per file at BASE (main() below): a repository that vendors this skill alone (agent-entry,
+    # muretai-site, muretai-docs, agent-seam) lands the way finish-worktree.sh lands it without
+    # them (ISSUE(land-sh-demands-a-runner-a-vendored-repo-does-not-have)).
+    roots = (SKILL.replace(os.sep, "/"), "tools")
+    skill = subprocess.run(["git", "--git-dir", common, "ls-tree", "-z", "--full-tree",
+                            base_sha, "--", roots[0] + "/"], capture_output=True)
+    if skill.returncode != 0 or not skill.stdout:
+        return bail("BASE's skill scripts are not in the recorded commit")
+    tree = subprocess.run(["git", "--git-dir", common, "ls-tree", "-r", "-z", "--full-tree",
+                           base_sha, "--"] + [r + "/" for r in roots], capture_output=True)
+    if tree.returncode != 0:
+        return bail("BASE's tree could not be listed")
+    for raw in tree.stdout.split(b"\0"):
+        if not raw:
+            continue
+        head, _, rawpath = raw.partition(b"\t")
+        path = rawpath.decode("utf-8", "replace")
+        fields = head.split()
+        if len(fields) != 3:
+            return bail("BASE's tree lists an entry land.sh cannot read")
+        mode, kind = fields[0].decode(), fields[1].decode()
+        if kind != "blob" or mode not in ("100644", "100755"):
+            return bail("BASE's %s is not a regular file" % path)
+        root = next((r for r in roots if path.startswith(r + "/")), "")
+        parts = path[len(root) + 1:].split("/") if root else []
+        if not parts or any(not p or p.startswith(".") or not set(p) <= SAFE_NAME for p in parts):
+            return bail("BASE's %s is not a name land.sh extracts" % path)
+        if not put(path, mode):
+            return bail("BASE's %s could not be read" % path)
+    # Every closure path outside tools/ is decided per file at BASE as well, whether or not a
+    # gate program imports it: absent is fine, present as anything but a regular blob (a
+    # symlink, a gitlink) is refused by name -- never followed, never read as absent.
+    for path in GATE_CLOSURE:
+        rec = subprocess.run(["git", "--git-dir", common, "ls-tree", "-z", "--full-tree",
+                              base_sha, "--", path], capture_output=True)
+        if rec.returncode != 0:
+            return bail("BASE's tree could not be listed at %s" % path)
+        head, _, rawpath = rec.stdout.rstrip(b"\0").partition(b"\t")
+        if rawpath.decode("utf-8", "replace") != path:
+            continue
+        fields = head.split()
+        if (len(fields) != 3 or fields[1] != b"blob"
+                or fields[0].decode() not in ("100644", "100755")):
+            return bail("BASE's %s is not a regular file" % path)
+    # ... and BASE's closure for the gate: every GATE_CLOSURE path its gate programs import,
+    # by blob like the rest. Demanded and missing at BASE is refused here, by name, before a
+    # test runs -- the ledger would otherwise die of ModuleNotFoundError inside finish, after
+    # the tests (ISSUE(gate-copy-lacks-the-ledgers-import)). Never the worktree's copy: the
+    # branch cannot supply a module BASE's gate lacks.
+    done = set()
+    while True:
+        todo = [p for p in closure(dest) if p not in done]
+        if not todo:
+            break
+        for path in todo:
+            done.add(path)
+            rec = subprocess.run(["git", "--git-dir", common, "ls-tree", "-z", "--full-tree",
+                                  base_sha, "--", path], capture_output=True)
+            head, _, rawpath = rec.stdout.rstrip(b"\0").partition(b"\t")
+            if rec.returncode != 0 or rawpath.decode("utf-8", "replace") != path:
+                return bail("BASE's gate imports %s, and the recorded commit does not carry it"
+                            % path)
+            fields = head.split()
+            if (len(fields) != 3 or fields[1] != b"blob"
+                    or fields[0].decode() not in ("100644", "100755")):
+                return bail("BASE's %s is not a regular file" % path)
+            if not put(path, fields[0].decode()):
+                return bail("BASE's %s could not be read" % path)
+    return dest, ""
 
 
 def write_json(path, obj):
@@ -290,33 +454,60 @@ def main(argv):
         return fail(runjson, "the recorded branch has no commit")
     if git(common, "merge-base", "--is-ancestor", base_sha, tip).returncode != 0:
         return fail(runjson, "the recorded base is not an ancestor of the branch")
-    dest = extract(common, base_sha, wall)
-    runner = os.path.join(dest, "tools", "run_tests.py") if dest else ""
-    if not (dest and os.path.isfile(runner) and not os.path.islink(runner)):
-        return fail(runjson, "BASE's runner is not in the recorded commit")
+    # BASE as this landing starts: the receipt's range begins here, never at the recorded
+    # base, whose range may hold commits other sessions landed since the spawn.
+    base_before = git(common, "rev-parse", "--verify", "--quiet",
+                      "refs/heads/" + base_ref + "^{commit}").stdout.strip()
+    if not base_before:
+        return fail(runjson, "the recorded base branch has no commit")
+    # Nothing of the worker's own would land when every recorded commit is already
+    # equivalent on BASE (`git cherry` lists no `+`): finish-worktree.sh would answer
+    # `already contained` with MERGED=yes, and a receipt over BASE's head would book other
+    # sessions' commits as this worker's (ISSUE(security-audit-2026-09-28-daily-2026-09-28-4)).
+    # Refused here, before finish runs, so no MERGED=yes line reaches the worker.
+    cherry = git(common, "cherry", "refs/heads/" + base_ref, tip, base_sha)
+    if cherry.returncode != 0:
+        return fail(runjson, "git cherry over the recorded commits failed")
+    if not any(line.startswith("+") for line in cherry.stdout.splitlines()):
+        return fail(runjson, "nothing of the worker's own work would land: every recorded commit "
+                             "is already equivalent on " + base_ref)
+    dest, why = extract(common, base_sha, wall)
+    if why:
+        return fail(runjson, why)
+    if not dest:
+        return fail(runjson, "BASE's skill scripts are not in the recorded commit")
     env = {k: v for k, v in os.environ.items() if not k.startswith("HERD_GATE_")}
     env.pop("ISO_FINISH_TESTS_RECEIPT", None)
     env.pop("ISO_FINISH_WALLS_DIR", None)
     # Outside the wall, as the operator's landing: no plug, no profile. `--gate` keeps the
     # runner honest if this launcher was itself started behind a wall: then a suite the
     # room refused is could-not-run, never a red on the diff and never a pass.
-    probe = nest_probe()
-    where = ("outside every wall" if probe in ("ok", "n/a")
-             else "INSIDE a wall this launcher was started in, so the room's refusals are could-not-run")
-    log(wall, "land: the landing of %s runs its tests in pid=%d (parent pid=%d, the launcher), "
-              "%s; nested sandbox-exec from here: %s"
-        % (branch, os.getpid(), os.getppid(), where, probe))
-    proc = subprocess.run(
-        [sys.executable, "-I", runner, "--root", worktree, "--affected", base_sha + ".." + tip,
-         "--gate", "--json", "-j", env.get("ISOLATED_SESSION_LAND_JOBS") or "4"],
-        cwd=worktree, env=tests_env(env), stdin=subprocess.DEVNULL, capture_output=True, text=True,
-        errors="replace")
-    runner_path = os.path.join(wall, "tests-runner.json")
-    with open(runner_path, "w", encoding="utf-8") as fh:
-        fh.write(proc.stdout)
-    write_json(os.path.join(wall, "tests.json"), {"rc": proc.returncode})
-    if proc.returncode != 0:
-        return fail(runjson, "the landing tests exited %d" % proc.returncode, tests_lines(wall))
+    # A BASE without a runner (extract() already refused one that is not a regular blob)
+    # runs no tests here: finish-worktree.sh finds no runner in the gate copy and says
+    # TESTS=none, exactly as an operator's landing does. The worktree's runner never runs.
+    runner = os.path.join(dest, "tools", "run_tests.py")
+    runner_path = ""
+    if os.path.isfile(runner) and not os.path.islink(runner):
+        probe = nest_probe()
+        where = ("outside every wall" if probe in ("ok", "n/a")
+                 else "INSIDE a wall this launcher was started in, so the room's refusals are could-not-run")
+        log(wall, "land: the landing of %s runs its tests in pid=%d (parent pid=%d, the launcher), "
+                  "%s; nested sandbox-exec from here: %s"
+            % (branch, os.getpid(), os.getppid(), where, probe))
+        proc = subprocess.run(
+            [sys.executable, "-I", runner, "--root", worktree, "--affected", base_sha + ".." + tip,
+             "--gate", "--json", "-j", env.get("ISOLATED_SESSION_LAND_JOBS") or "4"],
+            cwd=worktree, env=tests_env(env), stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, errors="replace")
+        runner_path = os.path.join(wall, "tests-runner.json")
+        with open(runner_path, "w", encoding="utf-8") as fh:
+            fh.write(proc.stdout)
+        write_json(os.path.join(wall, "tests.json"), {"rc": proc.returncode})
+        if proc.returncode != 0:
+            return fail(runjson, "the landing tests exited %d" % proc.returncode, tests_lines(wall))
+    else:
+        log(wall, "land: BASE carries no tools/run_tests.py, so the landing of %s runs no tests "
+                  "here (TESTS=none, as an operator's landing says it)" % branch)
     scripts = os.path.realpath(os.path.join(dest, SKILL))
     finish = os.path.join(scripts, "finish-worktree.sh")
     if not os.path.isfile(finish) or os.path.islink(finish) or not primary:
@@ -324,26 +515,49 @@ def main(argv):
     fenv = dict(env)
     fenv["ISO_FINISH_GATE_DIR"] = dest
     fenv["ISO_FINISH_GATE_SELF"] = scripts
-    fenv["ISO_FINISH_TESTS_RECEIPT"] = runner_path
-    fenv["ISO_FINISH_WALLS_DIR"] = wall
+    if runner_path:
+        fenv["ISO_FINISH_TESTS_RECEIPT"] = runner_path
+        fenv["ISO_FINISH_WALLS_DIR"] = wall
     landed = subprocess.run(
         ["/bin/bash", finish, branch, worktree], cwd=primary, env=fenv,
         stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace")
     sys.stdout.write(landed.stdout)
     if landed.stderr:
         sys.stderr.write(landed.stderr)
-    merged, review = "no", ""
+    merged, kind, review = "no", "", ""
     for line in landed.stdout.splitlines():
         if line.startswith("MERGED="):
             merged = line.split("=", 1)[1].strip()
+        elif line.startswith("MERGE_KIND="):
+            kind = line.split("=", 1)[1].strip()
         elif line.startswith("REVIEW="):
             review = line.split("=", 1)[1].strip().split(" ", 1)[0]
-    on_base = git(common, "merge-base", "--is-ancestor", tip,
-                  "refs/heads/" + base_ref).returncode == 0
-    if landed.returncode != 0 or merged != "yes" or not on_base:
+    if landed.returncode != 0 or merged != "yes":
         return fail(runjson, "the landing did not fast-forward the recorded base")
-    write_json(os.path.join(wall, "landing-receipt.json"),
-               {"base_sha": base_sha, "tip": tip, "review": review or "none", "merged": "yes"})
+    if kind == "already":
+        # BASE moved under the landing and took every recorded commit's equivalent first
+        return fail(runjson, "MERGE_KIND=already refused: nothing of the worker's own work landed")
+    base_tip = git(common, "rev-parse", "--verify", "--quiet",
+                   "refs/heads/" + base_ref + "^{commit}").stdout.strip()
+    if (not base_tip or base_tip == base_before
+            or git(common, "merge-base", "--is-ancestor", base_before, base_tip).returncode != 0):
+        return fail(runjson, "the landing did not move the recorded base past where it started")
+    # finish-worktree.sh REBASES a branch whose base moved before it fast-forwards, so the
+    # commits that landed may be copies of the recorded ones and the recorded tip on no base.
+    # A reviewer's receipt branch always starts at the BASE it reviewed, behind the tip main
+    # already holds, so its landing always takes this path. The landing counts when every
+    # recorded commit's patch is on the base now (`git cherry` lists none as missing).
+    if git(common, "merge-base", "--is-ancestor", tip, base_tip).returncode != 0:
+        cherry = git(common, "cherry", base_tip, tip, base_sha)
+        if cherry.returncode != 0 or any(line.startswith("+") for line in cherry.stdout.splitlines()):
+            return fail(runjson, "the landing did not fast-forward the recorded base")
+    # The landing's OWN range: BASE when it started .. BASE after it. At least one recorded
+    # commit was missing from BASE at the start and all are on it now, so that range holds
+    # the worker's work.
+    receipt = {"base_sha": base_before, "tip": base_tip, "review": review or "none", "merged": "yes"}
+    if base_tip != tip:
+        receipt["branch_tip"] = tip
+    write_json(os.path.join(wall, "landing-receipt.json"), receipt)
     return 0
 
 

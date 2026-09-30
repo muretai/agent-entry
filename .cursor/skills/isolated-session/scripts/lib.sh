@@ -56,6 +56,43 @@ while True:
 PY
 }
 
+# The owner's long-lived OAuth token for herd panes (`claude setup-token`, written by the
+# owner to $HOME/.muretai/herd/oauth-token, one line). Every pane refreshing the one shared
+# ~/.claude login knocked the others out at each rotation (a refresh token is single-use);
+# a pane given CLAUDE_CODE_OAUTH_TOKEN never touches that file. On stdout, the token with
+# its trailing newline stripped, and 0 -- only when the path is a REGULAR file (not a
+# symlink) of this user's whose mode has no group or world bit, holding one line of
+# printable, space-free ASCII. Anything else prints nothing and returns 1, exactly like an
+# absent file: the caller falls back to the shared login and never says why, so no
+# message can carry the value. The value is never written to a file by this function.
+iso_herd_oauth_token() {
+  [[ -n "${HOME:-}" ]] || return 1
+  python3 -I - "${HOME}/.muretai/herd/oauth-token" <<'PY'
+import os, stat, sys
+p = sys.argv[1]
+try:
+    st = os.lstat(p)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        sys.exit(1)
+    fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        data = os.read(fd, 4097)
+    finally:
+        os.close(fd)
+except OSError:
+    sys.exit(1)
+if len(data) > 4096:
+    sys.exit(1)
+if data.endswith(b"\n"):
+    data = data[:-1]
+if data.endswith(b"\r"):
+    data = data[:-1]
+if not data or any(b < 0x21 or b > 0x7e for b in data):
+    sys.exit(1)
+sys.stdout.write(data.decode("ascii"))
+PY
+}
+
 # --- the credential and interpreter wall ------------------------------------
 #
 # ONE definition, here, because three gates run code on the repository's behalf and all
@@ -456,13 +493,55 @@ iso_is_pid() {
   esac
 }
 
+# `ps`, bounded. A `ps` that STALLS instead of refusing (a loaded machine, a room that
+# holds the exec) used to stall every claim with it, key or no key: nothing in the claim
+# path put a limit on it. It runs in the background and a watchdog kills it at
+# ISO_PS_SECS; then this says so by name on stderr and returns 124. The watchdog's own
+# output goes to /dev/null, so a caller reading `$(iso_ps ...)` never waits on it, and no
+# stalled `ps` outlives the call. A fixed bound, not a knob: nothing turns it off.
+ISO_PS_SECS=3
+iso_ps() {
+  local p w rc=0
+  ps "$@" </dev/null &
+  p=$!
+  ( sleep "$ISO_PS_SECS"; kill -9 "$p" ) >/dev/null 2>&1 </dev/null &
+  w=$!
+  wait "$p" 2>/dev/null || rc=$?
+  kill "$w" 2>/dev/null || true
+  wait "$w" 2>/dev/null || true
+  if (( rc == 137 )); then
+    echo "iso_ps: \`ps $*\` timed out after ${ISO_PS_SECS}s and was killed" >&2
+    return 124
+  fi
+  return "$rc"
+}
+
 # The process that stands for "this session" by the process tree alone: the nearest
 # ancestor that is an agent host (Claude Code, Codex, Grok Build, Cursor, VS Code, Grok
 # Bot), else the top-most ancestor below the init process (a terminal tab).
+#
+# The walk needs `ps`, and where `ps` cannot run there is NO answer: this REFUSES -- nothing
+# on stdout (stdout is the answer; callers write `pid="$(iso_owner_pid)"`, so a message there
+# would become an owner), one line on stderr, return 2. It used to print $$ instead, the pid
+# of the one short-lived shell of that call: behind wall v1 (sandbox-exec) the setuid
+# /bin/ps cannot be exec'd, so every lock a walled worker claimed named a process gone a
+# second later, and the next session took the folder over
+# (ISSUE(walled-worker-cannot-claim-a-worktree)). A walled worker is given a key by
+# herd-spawn.sh and never needs the walk; a keyless one is refused, not guessed at.
+# `ps` is asked about this shell first: it always exists, so a failure there is `ps`
+# itself, never a process that went away mid-walk.
 iso_owner_pid() {
-  local pid=$$ last=$$ comm base
+  local pid=$$ last=$$ comm base prc=0
+  iso_ps -o pid= -p "$$" >/dev/null 2>&1 || prc=$?
+  if (( prc == 124 )); then
+    echo "iso_owner_pid: refusing: \`ps\` timed out after ${ISO_PS_SECS}s (killed), so the process walk that names this session's owner cannot be made; set ISOLATED_SESSION_OWNER to a stable key" >&2
+    return 2
+  elif (( prc != 0 )); then
+    echo "iso_owner_pid: refusing: \`ps\` cannot run here (a wall denies it), so the process walk that names this session's owner cannot be made; set ISOLATED_SESSION_OWNER to a stable key" >&2
+    return 2
+  fi
   while [[ -n "$pid" && "$pid" -gt 1 ]]; do
-    comm="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
+    comm="$(iso_ps -o comm= -p "$pid" 2>/dev/null || true)"
     base="${comm##*/}"
     case "$base" in
       claude|claude-code|codex|grok|xai-grok-pager|Cursor*|cursor*|Code*|code*|Electron|"Grok Bot"*|Grok*)
@@ -471,7 +550,7 @@ iso_owner_pid() {
         ;;
     esac
     last="$pid"
-    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+    pid="$(iso_ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
   done
   printf '%s\n' "$last"
 }
@@ -526,11 +605,11 @@ iso_owner_kind() {  # $1 owner, [$2 pid]
 # Recorded into the lock so a pid the OS hands out again after the owner died does
 # not look like a live owner.
 iso_proc_start() {
-  ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'
+  iso_ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'
 }
 
 iso_proc_comm() {
-  ps -o comm= -p "$1" 2>/dev/null | sed 's#.*/##'
+  iso_ps -o comm= -p "$1" 2>/dev/null | sed 's#.*/##'
 }
 
 # 0 when pid $1 is alive AND (when $2 is given) still the process the lock recorded.
@@ -635,16 +714,45 @@ iso_lock_state() {
   fi
 }
 
+# The process a KEYED owner's lock records, when one can be seen: the walk, asked quietly.
+# A key names its owner without the walk, so a walk that refuses (no `ps`: behind a wall) is
+# not an error here -- the answer is empty and the lock is live by its seen-time TTL like
+# any key-owned lock with no process. Never fatal: callers run under `set -e`, where a
+# refusing `pid="$(iso_owner_pid)"` would abort a claim the key alone makes good.
+iso_keyed_pid() {
+  iso_owner_pid 2>/dev/null || true
+}
+
 # Write the lock: $1 worktree, $2 owner, $3 kind, $4 branch, $5 task.
+#
+# The lock path must be a regular file or nothing, and that is checked BEFORE anything opens
+# it: a FIFO there used to read `free` and block the open for writing forever, and a symlink
+# there was written THROUGH -- a claim clobbered whatever the link named. Anything else is
+# refused by name and left exactly as it is. The write itself is a sibling temporary file
+# renamed over the lock, so a link planted after the check is replaced as a directory entry,
+# never written through.
 iso_lock_write() {
-  local lock pid
+  local lock pid started="" comm="" tmp
   lock="$(iso_lock_path "$1")" || return 1
-  if iso_is_pid "$2"; then pid="$2"; else pid="$(iso_owner_pid)"; fi
+  if [[ -L "$lock" || ( -e "$lock" && ! -f "$lock" ) ]]; then
+    echo "iso_lock_write: refusing: the lock ${lock} is not a regular file (a symlink, FIFO or other); it is left as it is and nothing is written through it" >&2
+    return 1
+  fi
+  if iso_is_pid "$2"; then pid="$2"; else pid="$(iso_keyed_pid)"; fi
+  # `|| true`: under `set -e` and pipefail a `ps` the wall denies must not abort the write
+  if [[ -n "$pid" ]]; then
+    started="$(iso_proc_start "$pid")" || true
+    comm="$(iso_proc_comm "$pid")" || true
+  fi
+  tmp="$(mktemp "${lock}.tmp.XXXXXX")" || {
+    echo "iso_lock_write: refusing: could not make a temporary file beside the lock ${lock}" >&2
+    return 1
+  }
   {
     echo "owner=$2"
     echo "owner_pid=$pid"
-    echo "owner_started=$(iso_proc_start "$pid")"
-    echo "owner_comm=$(iso_proc_comm "$pid")"
+    echo "owner_started=$started"
+    echo "owner_comm=$comm"
     echo "owner_kind=$(iso_owner_kind "$2" "$pid")"
     echo "owner_seen=$(date +%s)"
     echo "kind=$3"
@@ -653,7 +761,12 @@ iso_lock_write() {
     echo "started=$(date +%s)"
     echo "started_iso=$(date '+%Y-%m-%d %H:%M')"
     echo "host=$(hostname)"
-  } > "$lock"
+  } > "$tmp"
+  if [[ -d "$lock" ]] || ! mv -f "$tmp" "$lock"; then
+    rm -f "$tmp"
+    echo "iso_lock_write: refusing: could not put the lock in place at ${lock}" >&2
+    return 1
+  fi
 }
 
 # Mark worktree $1's lock as seen now (called on every `mine` verdict, $2 the owner that
@@ -834,7 +947,10 @@ iso_lock_bind() {  # $1 worktree, $2 owner
   lock="$(iso_lock_path "$1")" || return 0
   [[ "$(iso_lock_get "$lock" owner_worker)" == "$worker" ]] || return 0
   [[ -z "$(iso_lock_get "$lock" owner_pid)" ]] || return 0
-  pid="$(iso_owner_pid)"
+  # no process to be seen (behind a wall): nothing to bind, the handed-over lock stays
+  # live by its seen-time TTL
+  pid="$(iso_keyed_pid)"
+  [[ -n "$pid" ]] || return 0
   iso_lock_py bind "$(dirname "$lock")" "$2" "$worker" "$pid" "$(iso_proc_start "$pid")" \
     "$(iso_proc_comm "$pid")" >/dev/null 2>&1 || true
 }
@@ -843,6 +959,78 @@ iso_lock_release() {
   local lock
   lock="$(iso_lock_path "$1")" || return 0
   rm -f "$lock"
+}
+
+# --- a session branch at a named commit ---------------------------------------
+# The slug a task's branch carries: its first 32 ASCII characters plus a hash of the WHOLE
+# task string, so two tasks that agree on a prefix cannot land on one branch, and the same
+# task always gets the same branch back. ensure-worktree.sh's rule, stated once here so a
+# spawn site can name a branch without the script (the daily engine's fixtures carry lib.sh
+# and not ensure-worktree.sh).
+iso_task_slug() {  # $1 task
+  python3 -I - "$1" <<'PY'
+import hashlib, re, sys
+name = sys.argv[1].strip()
+digest = hashlib.sha1(name.encode()).hexdigest()
+ascii_part = re.sub(r"[^a-z0-9]+", "-", name.encode("ascii", "ignore").decode().lower()).strip("-")[:32].strip("-")
+print(f"{ascii_part}-{digest[:4]}" if len(ascii_part) >= 2 else "task-" + digest[:6])
+PY
+}
+
+# Open branch $3 AT COMMIT $4 in the new directory $2, from the repository at $1, and hold
+# it as any session holds its worktree: the lock under owner key $5 (task $6) and the
+# no-push hook. The reviewer spawn sites (tools/security_daily.sh, finish-worktree.sh's
+# reviewer block, and `ensure-worktree.sh --at`) open a reviewer's receipt branch this way:
+# ON A BRANCH, so herd-spawn.sh records it and a walled reviewer lands through the
+# launcher's gate, but at BASE, so the reviewer runs BASE's hooks and scripts
+# (ISSUE(walled-reviewer-cannot-write-its-receipt)). A branch of that name left with no
+# worktree -- an earlier run that never landed -- is never deleted with work on it: a tip
+# other than $4 is kept as the tag archive/<branch>-<sha7> first. A branch checked out
+# anywhere, or anything already at $2, is a refusal. One line on stderr and non-zero on any
+# failure; the PREPUSH receipt value on stdout on success.
+iso_open_at() {  # $1 any path in the repository, $2 new dir, $3 branch, $4 commit, $5 owner key, $6 task
+  local repo="$1" dir="$2" branch="$3" at="$4" owner="$5" task="${6:-}" sha old tag
+  if [[ -z "$dir" || -z "$branch" || -z "$at" || -z "$owner" ]]; then
+    echo "iso_open_at: a directory, a branch, a commit and an owner key are all required" >&2
+    return 2
+  fi
+  if ! sha="$(git -C "$repo" rev-parse --verify --quiet "${at}^{commit}")"; then
+    echo "iso_open_at: ${at} is not a commit in ${repo}" >&2
+    return 1
+  fi
+  if [[ -e "$dir" || -L "$dir" ]]; then
+    echo "iso_open_at: ${dir} is already in the way" >&2
+    return 1
+  fi
+  if git -C "$repo" worktree list --porcelain 2>/dev/null | grep -qxF "branch refs/heads/${branch}"; then
+    echo "iso_open_at: ${branch} is checked out in another worktree" >&2
+    return 1
+  fi
+  if old="$(git -C "$repo" rev-parse --verify --quiet "refs/heads/${branch}^{commit}")"; then
+    if [[ "$old" != "$sha" ]]; then
+      tag="archive/${branch}-${old:0:7}"
+      if ! git -C "$repo" tag "$tag" "$old" 2>/dev/null &&
+         [[ "$(git -C "$repo" rev-parse --verify --quiet "refs/tags/${tag}^{commit}" 2>/dev/null)" != "$old" ]]; then
+        echo "iso_open_at: ${branch} exists at ${old:0:12} and could not be kept as ${tag}" >&2
+        return 1
+      fi
+      echo "note: ${branch} was left at ${old:0:12} by an earlier run; kept as ${tag}" >&2
+    fi
+    git -C "$repo" branch -D "$branch" >/dev/null 2>&1 || {
+      echo "iso_open_at: could not reopen ${branch}" >&2
+      return 1
+    }
+  fi
+  mkdir -p "$(dirname "$dir")" 2>/dev/null || true
+  if ! git -C "$repo" worktree add --quiet --no-track -b "$branch" "$dir" "$sha" >/dev/null 2>&1; then
+    echo "iso_open_at: git could not open ${branch} at ${sha:0:12} in ${dir}" >&2
+    return 1
+  fi
+  if ! iso_lock_write "$dir" "$owner" dev "$branch" "$task"; then
+    echo "iso_open_at: ${dir} was opened on ${branch}, and its lock could not be written" >&2
+    return 1
+  fi
+  iso_prepush_line "$dir"
 }
 
 # --- the landing lock -------------------------------------------------------
@@ -987,7 +1175,7 @@ iso_land_lock_state() {  # $1 primary, $2 me -> free|mine|dead|other
 iso_land_lock_take() {  # $1 primary, $2 owner, $3 branch -> 0 when this call created it
   local lock pid
   lock="$(iso_land_lock_path "$1")" || return 1
-  if iso_is_pid "$2"; then pid="$2"; else pid="$(iso_owner_pid)"; fi
+  if iso_is_pid "$2"; then pid="$2"; else pid="$(iso_keyed_pid)"; fi
   (
     set -o noclobber
     {

@@ -3,19 +3,42 @@
 #   ensure-worktree.sh "<task>"            a dev session: branch feat/<slug>
 #   ensure-worktree.sh --design "<task>"   a design session: branch design/<slug>,
 #                                          only in a repository with .cursor/design-paths
+#   ensure-worktree.sh --at <sha> --into <dir> "<task>"
+#                                          the same branch feat/<slug>, made AT A COMMIT
+#                                          rather than at the tip of a base branch, in
+#                                          <dir>, with the same lock and no-push hook
+#                                          (lib.sh, iso_open_at). The primary-parked and
+#                                          diverged-base gates are about where a NEW
+#                                          session starts from, and do not apply to a
+#                                          commit named outright. The reviewer spawn sites
+#                                          open a reviewer's receipt branch the same way.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 . "$here/lib.sh"
 
 kind="dev"
-if [[ "${1:-}" == "--design" ]]; then
-  kind="design"
-  shift
-fi
+at=""
+into=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --design) kind="design"; shift ;;
+    --at) [[ $# -ge 2 ]] || { echo "ensure-worktree: --at needs a commit" >&2; exit 2; }; at="$2"; shift 2 ;;
+    --into) [[ $# -ge 2 ]] || { echo "ensure-worktree: --into needs a directory" >&2; exit 2; }; into="$2"; shift 2 ;;
+    *) break ;;
+  esac
+done
 task="${1:-}"
 if [[ -z "$task" ]]; then
   echo "usage: ensure-worktree.sh [--design] \"<task>\" [base-branch]" >&2
+  echo "       ensure-worktree.sh --at <sha> --into <dir> \"<task>\"" >&2
   exit 2
+fi
+if [[ -n "$at" || -n "$into" ]]; then
+  if [[ -z "$at" || -z "$into" || "$kind" == "design" ]]; then
+    echo "ensure-worktree: --at and --into go together, and not with --design" >&2
+    exit 2
+  fi
+  [[ "$into" == /* ]] || into="$(pwd)/${into}"
 fi
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "not a git repository" >&2
@@ -23,15 +46,9 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 # The slug carries a hash of the WHOLE task string, so two different tasks
 # whose first 32 characters happen to agree cannot land on one branch. It stays
-# deterministic, so re-running with the same task resumes the same worktree.
-slug="$(python3 - "$task" <<'PY'
-import hashlib, re, sys
-name = sys.argv[1].strip()
-digest = hashlib.sha1(name.encode()).hexdigest()
-ascii_part = re.sub(r"[^a-z0-9]+", "-", name.encode("ascii", "ignore").decode().lower()).strip("-")[:32].strip("-")
-print(f"{ascii_part}-{digest[:4]}" if len(ascii_part) >= 2 else "task-" + digest[:6])
-PY
-)"
+# deterministic, so re-running with the same task resumes the same worktree
+# (lib.sh, iso_task_slug).
+slug="$(iso_task_slug "$task")"
 common_git="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
 primary="$(dirname "$common_git")"
 repo="$(basename "$primary")"
@@ -47,6 +64,9 @@ prefix="feat"
 branch="${prefix}/${slug}"
 worktree_root="${PARALLEL_WORKTREE_ROOT:-$primary/.worktrees}"
 worktree="${worktree_root}/${slug}"
+if [[ -n "$at" ]]; then
+  worktree="$into"
+fi
 
 # A design session needs a repository that says which paths design owns. Without
 # that list there is nothing to keep the two kinds apart, so the session does not
@@ -125,12 +145,14 @@ if [[ -f "${toplevel}/.git" ]] || [[ "$git_dir" == *"/worktrees/"* ]]; then
   in_linked=1
 fi
 current_branch="$(git rev-parse --abbrev-ref HEAD)"
-if [[ "$in_linked" == "1" && "$current_branch" == "$branch" ]]; then
+# (a checkout --at a commit is always made fresh: re-entering one could hand back a
+# branch that has moved past the commit asked for)
+if [[ -z "$at" && "$in_linked" == "1" && "$current_branch" == "$branch" ]]; then
   claim_lock "$toplevel"
   report "$toplevel" no
   exit 0
 fi
-if [[ -d "$worktree/.git" || -f "$worktree/.git" ]]; then
+if [[ -z "$at" ]] && [[ -d "$worktree/.git" || -f "$worktree/.git" ]]; then
   existing_branch="$(git -C "$worktree" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   if [[ "$existing_branch" == "$branch" ]]; then
     claim_lock "$worktree"
@@ -142,6 +164,15 @@ if git worktree list --porcelain | awk '/^branch / { print $2 }' | grep -qx "ref
   echo "branch ${branch} is already checked out in another worktree" >&2
   git worktree list >&2
   exit 1
+fi
+if [[ -n "$at" ]]; then
+  base="$(git rev-parse --verify --quiet "${at}^{commit}")" || {
+    echo "ensure-worktree: --at ${at} is not a commit in ${primary}" >&2
+    exit 2
+  }
+  iso_open_at "$primary" "$worktree" "$branch" "$base" "$owner" "$task" >/dev/null || exit 1
+  report "$worktree" yes
+  exit 0
 fi
 force="${ISOLATED_SESSION_FORCE:-0}"
 

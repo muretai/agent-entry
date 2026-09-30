@@ -58,6 +58,23 @@ def ok(cond: bool, label: str) -> None:
     print("  ✅ " + label)
 
 
+def _consumer_lacks(*rels: str) -> set:
+    """Which of `rels` -- repository-relative paths OUTSIDE the skill, which no pull
+    carries -- this repository lacks as a consumer, each announced on one
+    `SKIP (consumer): <path>` line. A consumer is a repository whose skill directory holds
+    a VENDOR.json pulled from appl. In the home, and for a path the consumer has, nothing
+    is skipped: the case runs exactly as it does in the home."""
+    try:
+        pin = json.loads(SKILL_DIR.joinpath("VENDOR.json").read_text())
+        consumer = isinstance(pin, dict) and pin.get("from") == "appl"
+    except (OSError, ValueError):
+        consumer = False
+    gone = [r for r in rels if consumer and not (REPO / r).exists()]
+    for r in gone:
+        print("SKIP (consumer): " + r)
+    return set(gone)
+
+
 _private_home_dir: "Path | None" = None
 
 
@@ -510,9 +527,10 @@ def test_vendored_copies_are_pinned(tmp: Path) -> None:
     r = subprocess.run(["bash", str(copy / ".cursor/skills/isolated-session/scripts/vendor.sh"), "check"],
                        cwd=str(copy), env=_env(MURETAI_CORE=str(home)), capture_output=True, text=True)
     ok(r.returncode != 0 and "unpinned" in r.stderr, "an unpinned copy fails the check")
-    r = subprocess.run(["bash", str(copy / ".cursor/skills/isolated-session/scripts/vendor.sh"), "pull"],
+    r = subprocess.run(["bash", str(copy / ".cursor/skills/isolated-session/scripts/vendor.sh"), "pull",
+                        "--ref", "main"],
                        cwd=str(copy), env=_env(MURETAI_CORE=str(home)), capture_output=True, text=True)
-    ok(r.returncode == 0, "vendor.sh pull copies the skill from the home (" + r.stderr.strip()[:80] + ")")
+    ok(r.returncode == 0, "vendor.sh pull --ref main copies the skill from the home (" + r.stderr.strip()[:80] + ")")
     pin = json.loads((copy / ".cursor" / "skills" / "isolated-session" / "VENDOR.json").read_text())
     ok(pin["commit"] == pin_commit, "VENDOR.json records the home commit")
     ok("tests/test_isolated_session.py" in pin["files"] and (copy / "tests" / "test_isolated_session.py").exists()
@@ -525,7 +543,8 @@ def test_vendored_copies_are_pinned(tmp: Path) -> None:
     r = subprocess.run(["bash", str(copy / ".cursor/skills/isolated-session/scripts/vendor.sh"), "check"],
                        cwd=str(copy), env=_env(), capture_output=True, text=True)
     ok(r.returncode != 0 and "SKILL.md" in r.stderr, "a hand-patched copy fails it, naming the file")
-    r = subprocess.run(["bash", str(home / ".cursor/skills/isolated-session/scripts/vendor.sh"), "pull"],
+    r = subprocess.run(["bash", str(home / ".cursor/skills/isolated-session/scripts/vendor.sh"), "pull",
+                        "--ref", "main"],
                        cwd=str(home), env=_env(MURETAI_CORE=str(home)), capture_output=True, text=True)
     ok(r.returncode != 0, "the home refuses to pull into itself")
 
@@ -838,7 +857,7 @@ def plant_spawner(primary: Path) -> None:
     it out of BASE's blobs, never off the primary's working tree."""
     scripts = primary / ".cursor" / "skills" / "isolated-session" / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
-    for name in ("herd-spawn.sh", "lib.sh"):
+    for name in ("herd-spawn.sh", "lib.sh", "claim-worktree.sh", "assert-head.sh"):
         shutil.copy(SCRIPTS / name, scripts / name)
     # ... and BASE's real walls/: HERD_WALL unset is require, so a BASE with no plug
     # beside its spawner starts no reviewer (REVIEW=needed), which is not this case
@@ -974,7 +993,7 @@ def test_landing_scans_the_diff_and_spawns_its_review(tmp: Path) -> None:
     ok(brief.exists() and "{{" not in brief.read_text(), "the rendered brief has no placeholder left")
     rules = json.loads((herd / name / "permissions.json").read_text())["permissions"]
     ok("--permission-mode auto" in calls and "--settings " + str(herd / name / "permissions.json") in calls
-       and "Bash(python3 tools/audit_scope.py:*)" in rules["allow"]
+       and "Bash(python3 tools/audit_scope.py write-receipt:*)" in rules["allow"]
        and "Bash(python3 test_:*)" not in rules["allow"] and "Bash(python3 tools/run_tests.py:*)" not in rules["allow"],
        "the reviewer is started with the reviewer profile (a settings file): the receipt tools, no test runner, no test files")
     ok("--add-dir " + str(herd / name) + " " in calls
@@ -3452,41 +3471,49 @@ def test_the_daily_engine_is_a_gate_file(tmp: Path) -> None:
     and the publisher lets it through.
 
     Requirement B: the daily engine, and any script the daily plist runs, is a gate file."""
+    # this checkout's own lint, scope and plist: a consumer that has none of them skips each
+    gone = _consumer_lacks("tools/sec_lint.py", "company/ops/launchd/com.muretai.security-daily.plist",
+                           "tools/audit_scope.py")
     print("  (a) the lint's own table names it")
-    ok("tools/security_daily.sh" in gate_files_of("tools/security_daily.sh"),
-       "tools/sec_lint.py --gate-files calls tools/security_daily.sh a gate file")
-    ok("tools/security_weekly.sh" in gate_files_of("tools/security_weekly.sh"),
-       "(and still calls the weekly script one)")
-    ok(gate_files_of("agent/inbox.py") == [],
-       "(and an ordinary runtime file is not one, so the question is not answered yes twice)")
+    if "tools/sec_lint.py" not in gone:
+        ok("tools/security_daily.sh" in gate_files_of("tools/security_daily.sh"),
+           "tools/sec_lint.py --gate-files calls tools/security_daily.sh a gate file")
+        ok("tools/security_weekly.sh" in gate_files_of("tools/security_weekly.sh"),
+           "(and still calls the weekly script one)")
+        ok(gate_files_of("agent/inbox.py") == [],
+           "(and an ordinary runtime file is not one, so the question is not answered yes twice)")
 
-    daily_plist = REPO / "company" / "ops" / "launchd" / "com.muretai.security-daily.plist"
-    ok(daily_plist.is_file(), "the daily LaunchAgent is where the review said it is")
-    runs = scripts_a_plist_runs(daily_plist)
-    ok(bool(runs), "and it names at least one script under tools/: " + repr(runs))
-    missed = [p for p in runs if p not in gate_files_of(*runs)]
-    ok(not missed, "every script the daily plist runs is a gate file; missed: " + repr(missed))
+    if not gone & {"tools/sec_lint.py", "company/ops/launchd/com.muretai.security-daily.plist"}:
+        daily_plist = REPO / "company" / "ops" / "launchd" / "com.muretai.security-daily.plist"
+        ok(daily_plist.is_file(), "the daily LaunchAgent is where the review said it is")
+        runs = scripts_a_plist_runs(daily_plist)
+        ok(bool(runs), "and it names at least one script under tools/: " + repr(runs))
+        missed = [p for p in runs if p not in gate_files_of(*runs)]
+        ok(not missed, "every script the daily plist runs is a gate file; missed: " + repr(missed))
 
     print("  (b) the audited surface names it")
-    scope_repo, _ = make_repo(tmp / "dailygate" / "scope")
-    (scope_repo / "tools").mkdir(exist_ok=True)
-    (scope_repo / "shared").mkdir(exist_ok=True)
-    (scope_repo / "shared" / "version.py").write_text("RELEASE_SEQ = 1\n")
-    shutil.copy(str(REPO / "tools" / "audit_scope.py"), str(scope_repo / "tools" / "audit_scope.py"))
-    (scope_repo / "tools" / "security_daily.sh").write_text(DAILY_STUB)
-    git("add", "-A", cwd=scope_repo)
-    git("commit", "-m", "the audited surface, as this checkout has it", cwd=scope_repo)
-    (scope_repo / "tools" / "security_daily.sh").write_text(DAILY_STUB + "# reviewed once a day\n")
-    git("commit", "-qam", "touch the daily engine", cwd=scope_repo)
-    r = subprocess.run([sys.executable, str(scope_repo / "tools" / "audit_scope.py"),
-                        "scope", "--range", "HEAD~1..HEAD", "--json"],
-                       cwd=str(scope_repo), env=_env(), capture_output=True, text=True)
-    ok(r.returncode == 0, "audit_scope scope --range runs: " + (r.stderr.strip()[-200:] or "(quiet)"))
-    in_scope = json.loads(r.stdout or "{}").get("files", [])
-    ok("tools/security_daily.sh" in in_scope,
-       "a range that changed the daily engine puts it on the reviewer's list: " + repr(in_scope))
+    if "tools/audit_scope.py" not in gone:
+        scope_repo, _ = make_repo(tmp / "dailygate" / "scope")
+        (scope_repo / "tools").mkdir(exist_ok=True)
+        (scope_repo / "shared").mkdir(exist_ok=True)
+        (scope_repo / "shared" / "version.py").write_text("RELEASE_SEQ = 1\n")
+        shutil.copy(str(REPO / "tools" / "audit_scope.py"), str(scope_repo / "tools" / "audit_scope.py"))
+        (scope_repo / "tools" / "security_daily.sh").write_text(DAILY_STUB)
+        git("add", "-A", cwd=scope_repo)
+        git("commit", "-m", "the audited surface, as this checkout has it", cwd=scope_repo)
+        (scope_repo / "tools" / "security_daily.sh").write_text(DAILY_STUB + "# reviewed once a day\n")
+        git("commit", "-qam", "touch the daily engine", cwd=scope_repo)
+        r = subprocess.run([sys.executable, str(scope_repo / "tools" / "audit_scope.py"),
+                            "scope", "--range", "HEAD~1..HEAD", "--json"],
+                           cwd=str(scope_repo), env=_env(), capture_output=True, text=True)
+        ok(r.returncode == 0, "audit_scope scope --range runs: " + (r.stderr.strip()[-200:] or "(quiet)"))
+        in_scope = json.loads(r.stdout or "{}").get("files", [])
+        ok("tools/security_daily.sh" in in_scope,
+           "a range that changed the daily engine puts it on the reviewer's list: " + repr(in_scope))
 
     print("  (c) a branch that edits it lands needs-eyes, judged by BASE's real lint")
+    if gone & {"tools/sec_lint.py", "tools/audit_scope.py"}:
+        return
     primary, remote = make_repo(tmp / "dailygate" / "landing")
     (primary / "tools").mkdir(exist_ok=True)
     for name in ("sec_lint.py", "audit_scope.py"):
@@ -4396,7 +4423,7 @@ def test_the_spawner_runs_under_the_landings_wall(tmp: Path) -> None:
         ok(any(d.startswith("Bash(git push") for d in rules.get("deny", [])),
            "and it is the spawner's own list, `git push` denied: "
            + repr(rules.get("deny", [])[:6]))
-        ok("Bash(python3 tools/audit_scope.py:*)" in rules.get("allow", []),
+        ok("Bash(python3 tools/audit_scope.py write-receipt:*)" in rules.get("allow", []),
            "with the receipt tool allowed, as the reviewer profile says: "
            + repr(rules.get("allow", [])[:6]))
 
@@ -4657,6 +4684,8 @@ def plant_real_runner(primary: Path) -> None:
 
 
 def test_a_branch_cannot_shadow_the_stdlib_for_its_own_tests(tmp: Path) -> None:
+    if _consumer_lacks("tools/run_tests.py", "tools/affected_tests.py"):
+        return
     root = tmp / "stdlibshadow"
     primary, _ = make_repo(root / "repo")
     plant_real_runner(primary)
@@ -4762,6 +4791,8 @@ def backend_dir_of(base: Path):
 
 
 def test_the_optional_backend_is_last_on_the_childs_path(tmp: Path) -> None:
+    if _consumer_lacks("tools/run_tests.py", "tools/affected_tests.py"):
+        return
     root = tmp / "backendlast"
     backend_base = root / "userbase-backend"
     site_dir = backend_dir_of(backend_base)
@@ -4875,6 +4906,10 @@ def test_every_renderer_fills_the_published_brief(tmp: Path) -> None:
     its own, which is exactly what would let the two drift apart unseen. This case reads
     the published one.
     """
+    gone = _consumer_lacks(".claude/skills/security-audit/references/landing-review-brief.md",
+                           "tools/security_daily.sh")
+    if ".claude/skills/security-audit/references/landing-review-brief.md" in gone:
+        return
     tpl = (REPO / ".claude" / "skills" / "security-audit" / "references"
            / "landing-review-brief.md")
     ok(tpl.is_file(), "the published reviewer brief is at " + str(tpl.relative_to(REPO)))
@@ -4882,6 +4917,8 @@ def test_every_renderer_fills_the_published_brief(tmp: Path) -> None:
     ok(keys, "and it carries placeholders at all: " + repr(sorted(keys)))
     builtin = {"NAME", "PRIMARY", "REPORT"}          # herd-spawn.sh supplies these itself
     for renderer in (SCRIPTS / "finish-worktree.sh", REPO / "tools" / "security_daily.sh"):
+        if renderer.relative_to(REPO).as_posix() in gone:
+            continue
         # both spellings a renderer uses: `--var KEY=...` to the spawner, and the quoted
         # `"KEY=..."` arguments a script that renders the template itself passes
         supplied = builtin | set(re.findall(r"(?:--var\s+|[\"'])([A-Z][A-Z0-9_]*)=",

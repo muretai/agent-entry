@@ -24,7 +24,10 @@
 # exists and is not a symlink (herd-spawn wrote it), united with WORKERS. A worker spawned
 # after the watcher started is picked up on the next pass; the loop logs `WORKERS:` when
 # the set (or a status in it) changes. A listing that fails or comes back empty discovers
-# nobody and drops no state; WORKERS names are still watched.
+# nobody and drops no state; WORKERS names are still watched. Every pass also writes the
+# roll call to <HERD_DIR>/.watch/workers (`<UTC time> <w>[=<status>] ...`, removed when
+# herdr cannot be read): the coordinator's live-worker line (appl-hook.sh SessionStart)
+# comes from there, never from intake statuses.
 #
 # A report is announced only when report.md is strictly newer than the worker's
 # permissions.json (rewritten on every spawn), so a report left over from an earlier run
@@ -64,6 +67,15 @@
 # only when that cwd is a linked worktree: never the `in <dir>` the pane prints, which
 # the session being judged wrote itself.
 #
+# Dialogs. A worker herdr shows `blocked`, `done` or `idle` whose pane is at a dialog its
+# runtime's adapter recognizes (scripts/trust/<harness>.sh --recognize, pane text on stdin,
+# one kind word out: `trust`, `teach`, ...) is `dialog <kind> <w>` on the WORKERS: line and
+# gets ONE `STUCK: <w>` per stop (.watch/<w>.dialog) -- except the kind `logged-out`, which is
+# no dialog and goes down the logged-out path below. Nothing is typed into that pane -- no
+# approval, no CONTINUE, no restart -- even for a repository in the dispatch repos: a line
+# typed into a dialog could answer it, and answering is herd-spawn.sh's, at spawn, behind
+# the dispatch gate. This script carries no runtime's dialog text; the adapter does.
+#
 # Resume. A worker whose pane tail says `stopped retrying`, `usage limit` or `rate limit`
 # (any case) is prompted with CONTINUE below; a worker that is done (herdr does not see it
 # at its input) or gone from `herdr agent list`, with no report.md, is restarted in its
@@ -80,12 +92,84 @@
 # looked handled and nothing said it stalled. Each pass, every regular `<name>.md` directly
 # under <HERD_DIR>/coordinator/intake/ (name by appl-hook's rule; no symlink, no subdir)
 # whose HEADER `status:` names no agent in `herdr agent list`, whose first status word is
-# not done/landed/SUPERSEDED/blocked/question, and whose mtime is more than 300 s old is
+# not done/landed/SUPERSEDED/blocked/question/split, and whose mtime is more than 300 s old is
 # typed into the NAME pane as `intake <path>` -- the bytes tools/appl-add.sh sends -- and
 # logged `<UTC time> reprompt <file name>` in <HERD_DIR>/coordinator/coordinator.log. At
 # most once per 300 s per (intake, mtime), state in .watch/intakes.json; an edit restarts
 # the grace period. A failed agent listing judges nobody live: nothing is typed. Only the
 # file name ever leaves an intake; the watchdog never edits one, spawns or closes a tab.
+#
+# A logged-out target (with --notify only). The coordinator pane twice showed `Not logged
+# in - Please run /login` after an in-pane auto-update and the watchdog re-typed intakes into
+# it every 300 s for hours; /login is an interactive OAuth no script can do. Each pass reads
+# the NAME pane: when its last reply line (the last 20 lines, the input box and the status
+# line under it dropped, the U+23BF/U+23FA marks stripped) BEGINS with `Not logged in` or
+# `Login expired` (a mention mid-line never counts), or when its runtime's adapter
+# (--recognize, as for dialogs) prints the kind word `logged-out` -- the runtime's other
+# logged-out lines, a revoked OAuth token among them, are known only there -- nothing is typed into it -- no intake, no notification -- and, once per occurrence
+# (.watch/<NAME>.logged-out), `<UTC time> logged-out <NAME>` goes to coordinator.log and one
+# line naming the pane, /login and restart-coordinator-pane.sh to
+# <HERD_DIR>/coordinator/owner-step-login-<NAME>.txt. A pane that reads normally again
+# clears both and the watchdog resumes; an unreadable pane changes nothing.
+#
+# The idle sweep (every pass whose listings answered). A REPORT appl-hook.sh BLOCKS never
+# reaches the coordinator's model, and a worker pane answering `Not logged in` can do
+# nothing: both used to idle forever. A watched worker (a listed agent with its own
+# non-symlink rules file) that is not the coordinator pane (the --notify target, or
+# `muretai-coordinator`) and that no intake HEADER status names live (`tests|impl|review
+# <w>`, whole words) is closed through the sibling appl-close.sh -- which keeps all of its
+# own refusals -- and logged `<UTC time> swept <w>`: when herdr's agent_status has been
+# idle/done for more than 20 minutes (counted from the last pass that saw it working, else
+# the first that saw it idle; state in .watch/<w>.sweep, never through a link), or at once
+# when its pane is logged out (the same rule as the target, the adapter's `logged-out` kind
+# included; such a pane is never approved, prompted or restarted), which is
+# first logged `logged-out <w>` once per spawn and named, with every other logged-out pane,
+# in <HERD_DIR>/coordinator/owner-step-login-workers.txt. The worktree and the herd dir are
+# never touched. A worker whose <HERD_DIR>/<w>/close-requested (written by appl-hook.sh on a
+# final BLOCKED report; a regular file newer than the rules file) exists is due at once, and
+# the marker is removed once the close went through. An appl-close.sh refusal is
+# `sweep-refused <w>`: nothing is forced, the
+# next candidate is still tried, and that worker waits another 20 minutes.
+# A logged-out worker is also, once per spawn (.watch/<w>.respawn), given its own
+# close-requested marker and ONE intake filed through tools/appl-add.sh, titled
+# `RE-SPAWN <w> after login expiry`, naming the worker, its worktree (linked_worktree) and
+# the intakes whose header status names it -- so the work is picked up after /login. The
+# coordinator pane never is.
+#
+# The stall nudge (every pass whose listings answered, before the sweep may close anyone). A
+# spawn line herd-spawn.sh typed can sit unsubmitted, or never arrive (the prompt showing its
+# placeholder); four did on 2026-09-30, and one worker was swept after 20 minutes without its
+# brief. A watched worker herdr shows `idle` (never the coordinator pane), its brief.md handed
+# over, no current report.md, never seen working for this spawn, whose spawn record (the rules
+# file) is at least 180 s old, gets herd-spawn's own nudge: one Enter when its last prompt
+# line is exactly its spawn line, or one re-send of that line (built from abspath(HERD_DIR)/<w>,
+# never read from a file or a pane) when the prompt shows the placeholder. Any other screen,
+# a dialog or a logged-out pane is left alone. Once per spawn record (.watch/<w>.nudge),
+# logged `<UTC time> nudged <w>` in coordinator.log; the pass that nudges closes nothing and
+# restarts that worker's idle count.
+#
+# Stuck spawns (every pass whose listings answered, before the sweep). A spawned worker once
+# sat at its runtime's folder-trust dialog for 16 hours: herd-spawn.sh had removed its
+# brief.md, no report came, the idle sweep never fires on a `blocked` pane, and the slot
+# stayed taken. A watched worker (as the sweep means it, never the coordinator pane) is
+#   never-briefed: no regular brief.md in its herd dir, no report newer than its rules file,
+#     never seen `working` by this watcher, and a rules file more than 900 s old;
+#   parked: herdr `blocked` on every pass for more than 20 minutes, counted from the first
+#     blocked pass (any other status, or a prompt this pass approved, starts it over).
+# Once per spawn (.watch/<w>.stall): `<UTC time> never-briefed <w>` or `parked <w>` in
+# coordinator.log, then the logged-out path above -- close-requested marker (the sweep
+# closes through appl-close.sh, whose refusals stand) and ONE `RE-SPAWN <w>` intake, the
+# .watch/<w>.respawn state shared with the login-expiry filing so a worker gets one in all.
+# Runtime-neutral: judged from herdr's status and the herd dir alone, never from pane text or
+# any agent runtime's own configuration, and the stuck prompt is never answered.
+#
+# The backlog pull (every pass whose agent listing answered, last). When a slot is free --
+# the listing's rows other than the coordinator pane are fewer than the one number in
+# <HERD_DIR>/coordinator/worker-cap -- the pass runs appl-backlog-pull.sh ONCE with --repo
+# $APPL_BACKLOG_REPO (an absolute path; else this checkout), through appl-hook.sh's seam
+# APPL_BACKLOG_PULL. So an idea in the backlog inbox (tools/appl-backlog-add.sh) is filed
+# without waiting for a landing. No listing, no readable cap, no free slot, or a logged-out
+# --notify target: not run. The pull's output never reaches this pass's stdout.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 export HERD_WATCH_HERE="$here"
@@ -452,12 +536,13 @@ def main_verdict(argv):
 # ------------------------------------------------------------------ one pass
 
 NOTIFIED = ("REPORT:", "PROMPT:", "RESUMED:", "STUCK:")
+TARGET_OUT = False                 # the --notify pane is logged out this pass: type nothing
 
 
 def emit(line):
     print(line, flush=True)
     target = os.environ.get("HERD_WATCH_NOTIFY", "")
-    if target and NAME_RE.fullmatch(target) and line.startswith(NOTIFIED):
+    if target and NAME_RE.fullmatch(target) and line.startswith(NOTIFIED) and not TARGET_OUT:
         herdr("agent", "prompt", target, line, timeout=30)      # a down pane is not our failure
 
 
@@ -518,8 +603,77 @@ def linked_worktree(agent):
     return None
 
 
-def approve(w, agent, watch):
-    pane = read_pane(w)
+# A runtime's dialogs (folder trust, auto mode's teach dialog, ...) are known ONLY to its
+# adapter beside herd-spawn.sh, scripts/trust/<harness>.sh: `--recognize` reads a pane's text
+# on stdin and prints one kind word. This watcher carries no runtime's dialog text; it asks
+# every adapter there (herdr's listing names no harness, so none is chosen by name) and keeps
+# the first word that is a kind. It only NAMES the dialog -- `dialog <kind> <w>` on the
+# WORKERS: line and one STUCK: per stop, with no pane byte copied -- and never answers it: a
+# listed repository's dialog is answered at spawn, behind the dispatch gate, and anything
+# left at it is the operator's, or the parked backstop's (stalls()).
+KIND_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
+DIALOG_STATUSES = ("blocked", "done", "idle")
+
+
+def adapters():
+    d = os.path.join(os.environ.get("HERD_WATCH_HERE", ""), "trust")
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        p = os.path.join(d, n)
+        if n.endswith(".sh") and not os.path.islink(p) and os.path.isfile(p):
+            out.append(p)
+    return out
+
+
+_KINDS = {}                        # pane text -> kind word, so one pass asks the adapters once
+
+
+def dialog_kind(pane):
+    """the kind word an adapter gives this pane, or None; the adapter only recognizes here"""
+    if not pane:
+        return None
+    if pane not in _KINDS:
+        _KINDS[pane] = _ask_adapters(pane)
+    return _KINDS[pane]
+
+
+def _ask_adapters(pane):
+    for p in adapters():
+        try:
+            r = subprocess.run(["bash", p, "--recognize"], input=pane.encode("utf-8", "replace"),
+                               capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        out = r.stdout.decode("ascii", "replace")
+        if r.returncode == 0 and out.endswith("\n") and KIND_RE.fullmatch(out[:-1]):
+            return out[:-1]
+    return None
+
+
+def dialog_stuck(w, kind, watch):
+    """a worker at a recognized dialog: one STUCK line per stop, nothing typed"""
+    p = os.path.join(watch, w + ".dialog")
+    if read_file(p) != kind:
+        detail(watch, w, "DIALOG " + kind)
+        emit("STUCK: %s is at a dialog (%s) -- answer it in the pane yourself" % (w, kind))
+        write_file(p, kind)
+
+
+def dialog_left(w, watch):
+    """not at a dialog this pass: the next stop at one is a new stop"""
+    p = os.path.join(watch, w + ".dialog")
+    if os.path.lexists(p):
+        os.unlink(p)
+
+
+def approve(w, agent, watch, pane=None):
+    """True when the pane's prompt was answered `y` this pass (progress, not parking)"""
+    if pane is None:
+        pane = read_pane(w)
     line, _, why = verdict(pane, w, linked_worktree(agent))
     last = os.path.join(watch, w + ".last")
     if line.startswith("SAFE "):
@@ -528,6 +682,7 @@ def approve(w, agent, watch):
             emit("APPROVED: %s (detail in .watch/%s.detail)" % (w, w))
             if os.path.exists(last):
                 os.unlink(last)
+            return True
     elif line.startswith("BLOCKED "):
         key = line[len("BLOCKED "):]
         if key != read_file(last):
@@ -538,6 +693,7 @@ def approve(w, agent, watch):
         detail(watch, w, "NOPROMPT " + clean(pane[-300:], 300))
         emit("PROMPT: %s is blocked and the prompt did not parse -- read the pane yourself" % w)
         write_file(last, "NOPROMPT")
+    return False
 
 
 def stuck(w, pane, watch):
@@ -768,7 +924,9 @@ def check_report(w, herd):
 # ------------------------------------------------------------------ the intake watchdog
 
 GRACE = 300                        # an intake unchanged this long, with no live worker, stalled
-CLOSED = ("done", "landed", "SUPERSEDED", "blocked", "question")
+# `split` (`split <n> items`): the intake was cut into a skeleton chain; each item is filed
+# on its own, so the parent has nothing left to re-prompt
+CLOSED = ("done", "landed", "SUPERSEDED", "blocked", "question", "split")
 INTAKE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,124}\.md")   # appl-hook.sh's own rule
 HEADER_MAX = 1 << 16
 
@@ -796,9 +954,9 @@ def header_status(path):
     return None
 
 
-def log_reprompt(coord, name, now):
+def log_reprompt(coord, name, now, what="reprompt"):
     """one fixed-vocabulary line in coordinator.log, append-only, never through a link"""
-    line = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)) + " reprompt " + name + "\n"
+    line = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)) + " " + what + " " + name + "\n"
     try:
         fd = os.open(os.path.join(coord, "coordinator.log"),
                      os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -823,8 +981,8 @@ def intake_watchdog(agents, herd, watch, now):
     Nothing an intake says reaches stdout, the log or the pane: only its file name, which
     must pass appl-hook's name rule. It never edits an intake, spawns or closes anything."""
     target = os.environ.get("HERD_WATCH_NOTIFY", "")
-    if not target or not NAME_RE.fullmatch(target) or agents is None:
-        return
+    if not target or not NAME_RE.fullmatch(target) or agents is None or TARGET_OUT:
+        return                                         # logged out: no state moves either
     coord = os.path.join(herd, "coordinator")
     idir = os.path.join(coord, "intake")
     if os.path.islink(coord) or os.path.islink(idir) or not os.path.isdir(idir):
@@ -879,33 +1037,735 @@ def intake_watchdog(agents, herd, watch, now):
             pass
 
 
+# ------------------------------------------------------------------ a logged-out target
+
+# the two ways Claude Code says its login is gone: never signed in, or a refresh that failed
+LOGGED_OUT = ("Not logged in", "Login expired")
+# the kind word an adapter's --recognize prints for a logged-out screen: never a dialog (no
+# STUCK:, no `dialog <kind>`), always this logged-out path
+LOGOUT_KIND = "logged-out"
+# Non-ASCII glyphs are spelled as \u escapes: the .sh files are ASCII-only.
+MARKS = " \t\u23bf\u23fa"          # leading whitespace and the reply marks Claude Code draws
+BOX = set("\u2500\u2502\u256d\u256e\u256f\u2570 ")    # the input box's own lines
+INPUT_RE = re.compile(r"\u2502?\s*>\s*\u2502?")
+RESTART = ".cursor/skills/isolated-session/scripts/restart-coordinator-pane.sh"
+
+
+def last_reply(pane):
+    """The pane's last reply line, marks stripped, or None. The tail is the last 20 lines;
+    everything from the LAST input line down (the bare `>`, alone or inside the box's bars)
+    is the input box and the status line under it, and is dropped. Blank lines and the
+    box's border lines are skipped."""
+    lines = pane.splitlines()[-20:]
+    for i in range(len(lines) - 1, -1, -1):
+        if INPUT_RE.fullmatch(lines[i].strip()):
+            lines = lines[:i]
+            break
+    for line in reversed(lines):
+        s = line.lstrip(MARKS)
+        if s.strip() and not set(s) <= BOX:
+            return s
+    return None
+
+
+def logged_out(pane):
+    """the watcher's own two phrases, or the kind word LOGOUT_KIND from the runtime's adapter
+    (the runtime's other logged-out lines -- a revoked token -- are known only there)"""
+    r = last_reply(pane)
+    return (r is not None and r.startswith(LOGGED_OUT)) or dialog_kind(pane) == LOGOUT_KIND
+
+
+def owner_step(coord, target, now):
+    """<coord>/owner-step-login-<target>.txt: one line of the watcher's own words, never
+    through a link (a symlinked coordinator dir or file is left alone)"""
+    if os.path.islink(coord):
+        return
+    try:
+        if not os.path.isdir(coord):
+            os.mkdir(coord, 0o700)
+        fd = os.open(os.path.join(coord, "owner-step-login-" + target + ".txt"),
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        return
+    line = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)) + " the pane " + target
+            + " is logged out: run /login in it, or restart it with " + RESTART + "\n")
+    try:
+        os.write(fd, line.encode("ascii"))
+    finally:
+        os.close(fd)
+
+
+def check_target(herd, watch, now):
+    """ISSUE(coordinator-pane-logs-out-on-auto-update). A --notify pane whose last reply
+    begins `Not logged in` or `Login expired` cannot take anything typed into it, and /login is an interactive
+    OAuth no script can perform: the watcher stops typing into it (intakes and
+    notifications both), logs `<UTC time> logged-out <target>` once per occurrence and
+    leaves the owner one line. State is .watch/<target>.logged-out, because every pass is
+    a fresh process. A pane that reads normally again clears it; a pane that cannot be
+    read (or reads empty) proves nothing and changes nothing. No pane text is copied
+    anywhere: the log and the owner step are the watcher's own words."""
+    global TARGET_OUT
+    target = os.environ.get("HERD_WATCH_NOTIFY", "")
+    if not target or not NAME_RE.fullmatch(target):
+        return
+    pane = read_pane(target)
+    if not pane.strip():
+        return
+    coord = os.path.join(herd, "coordinator")
+    state = os.path.join(watch, target + ".logged-out")
+    if not logged_out(pane):
+        if os.path.lexists(state):
+            try:
+                os.unlink(state)
+                step = os.path.join(coord, "owner-step-login-" + target + ".txt")
+                if not os.path.islink(coord) and os.path.isfile(step) and not os.path.islink(step):
+                    os.unlink(step)
+            except OSError:
+                pass
+        return
+    TARGET_OUT = True
+    if os.path.lexists(state):
+        return                                         # this occurrence is logged already
+    try:
+        write_file(state, str(now) + "\n")
+    except OSError:
+        return                                         # cannot record it: logging every pass is worse
+    if not os.path.islink(coord):
+        if not os.path.isdir(coord):
+            try:
+                os.mkdir(coord, 0o700)
+            except OSError:
+                pass
+        log_reprompt(coord, target, now, "logged-out")
+    owner_step(coord, target, now)
+
+
+# ------------------------------------------------------------------ the idle sweep
+
+SWEEP_AFTER = 20 * 60              # a worker pane idle this long, and not live, is closed
+IDLE = ("idle", "done")
+LIVE = ("tests", "impl", "review")  # the header statuses that name a worker still at work
+COORDINATOR = "muretai-coordinator"   # the coordinator pane's name (briefs/coordinator.md)
+WORKERS_STEP = "owner-step-login-workers.txt"
+
+
+def never_swept():
+    """the coordinator pane under both of its names: the --notify target and COORDINATOR"""
+    target = os.environ.get("HERD_WATCH_NOTIFY", "")
+    return {COORDINATOR} | ({target} if target else set())
+
+
+def live_workers(herd):
+    """every name an intake HEADER status puts to work (`tests|impl|review <w> ...`, whole
+    words), or None when the intake directory cannot be read -- then nobody is known to be
+    idle for good and nothing is swept. No intake directory at all holds nobody."""
+    coord = os.path.join(herd, "coordinator")
+    idir = os.path.join(coord, "intake")
+    if os.path.islink(coord) or os.path.islink(idir):
+        return None
+    if not os.path.lexists(idir):
+        return set()
+    try:
+        entries = sorted(os.listdir(idir))
+    except OSError:
+        return None
+    out = set()
+    for name in entries:
+        if not INTAKE_RE.fullmatch(name):
+            continue
+        words = header_status(os.path.join(idir, name))   # O_NOFOLLOW, regular files only
+        if words and words[0] in LIVE:
+            out.update(words[1:])
+    return out
+
+
+def sweep_state(watch, w, kind="sweep"):
+    """(.watch/<w>.<kind> as a dict, its path); never read through a symlink"""
+    p = os.path.join(watch, w + "." + kind)
+    try:
+        fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return {}, p
+    try:
+        state = json.loads(os.read(fd, 4096).decode("ascii", "replace") or "{}")
+    except (OSError, ValueError):
+        state = {}
+    finally:
+        os.close(fd)
+    return (state if isinstance(state, dict) else {}), p
+
+
+def put_state(p, state):
+    """write a small state file under .watch/, never through a symlink"""
+    try:
+        if os.path.islink(p):
+            os.unlink(p)
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        return
+    try:
+        os.write(fd, (json.dumps(state, sort_keys=True) + "\n").encode("ascii"))
+    finally:
+        os.close(fd)
+
+
+def put_text(p, text):
+    """write a small text file under .watch/ whole (a temporary file, then a rename), never
+    through a symlink"""
+    tmp = p + ".tmp"
+    try:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.write(fd, text.encode("ascii", "replace"))
+        finally:
+            os.close(fd)
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def drop_state(p):
+    try:
+        os.unlink(p)
+    except OSError:
+        pass
+
+
+def close_requested(wdir, spawn):
+    """True when appl-hook.sh left <wdir>/close-requested for THIS spawn: a regular file of
+    ours, not a symlink, strictly newer than the rules file herd-spawn rewrites on every
+    spawn (a marker left by an earlier run under the same name closes nothing)."""
+    try:
+        st = os.lstat(os.path.join(wdir, "close-requested"))
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and st.st_mtime > spawn
+
+
+def appl_close(w):
+    """the sibling appl-close.sh <w>: True when it closed the tab (and logged `closed <w>`)"""
+    here = os.environ.get("HERD_WATCH_HERE", "")
+    try:
+        r = subprocess.run(["bash", os.path.join(here, "appl-close.sh"), w], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def workers_step(coord, names, now):
+    """<coord>/owner-step-login-workers.txt: one line naming every pane seen `Not logged in`
+    on this pass -- the login is shared, so one step covers them all. The watcher's own
+    words and the pane names only; never through a link."""
+    if os.path.islink(coord):
+        return
+    try:
+        if not os.path.isdir(coord):
+            os.mkdir(coord, 0o700)
+        p = os.path.join(coord, WORKERS_STEP)
+        if os.path.islink(p):
+            os.unlink(p)
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        return
+    line = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)) + " the panes " + " ".join(sorted(names))
+            + " are logged out: run /login in one of them; a swept worker keeps its worktree and"
+            " herd dir and is re-spawned after the login\n")
+    try:
+        os.write(fd, line.encode("ascii"))
+    finally:
+        os.close(fd)
+
+
+SAFE_PATH_RE = re.compile(r"/[A-Za-z0-9/._-]{0,400}")
+
+
+def intakes_naming(herd, w):
+    """the file names of the intakes whose HEADER status names w as a whole word"""
+    idir = os.path.join(herd, "coordinator", "intake")
+    if os.path.islink(os.path.join(herd, "coordinator")) or os.path.islink(idir):
+        return []
+    try:
+        entries = sorted(os.listdir(idir))
+    except OSError:
+        return []
+    return [n for n in entries if INTAKE_RE.fullmatch(n) and w in (header_status(os.path.join(idir, n)) or [])]
+
+
+RESPAWN_WHY = {
+    "logged-out": ("RE-SPAWN %s after login expiry",
+                   "herd-watch saw the worker pane %s logged out (its last reply began `Not logged in` or"
+                   " `Login expired`, or its runtime's adapter called the screen logged out) and asked for its tab to be closed. After /login, re-spawn it on the"
+                   " same worktree and branch so it picks up where it stopped."),
+    "never-briefed": ("RE-SPAWN %s that never reached its brief",
+                      "herd-watch saw the worker %s with no brief.md and no report in its herd directory,"
+                      " never shown working by herdr, long after its spawn, and asked for its tab to be"
+                      " closed. Nothing was typed into its pane. Re-spawn it on the same worktree and"
+                      " branch; if it stops at a first-run prompt again, answer that prompt once by hand."),
+    "parked": ("RE-SPAWN %s parked at a prompt",
+               "herd-watch saw herdr report the worker %s blocked on every pass for more than 20"
+               " minutes and asked for its tab to be closed. Nothing was typed into its pane. Re-spawn"
+               " it on the same worktree and branch so it picks up where it stopped."),
+}
+
+
+def file_respawn(w, agent, rules, herd, watch, why="logged-out"):
+    """ISSUE(worker-panes-lose-login-when-another-process-refreshes-the-oauth-token). A worker
+    pane whose login expired can do nothing until the owner logs in again, and the sweep
+    that closes it used to leave nothing asking for the work to be picked up. So, once per
+    spawn (.watch/<w>.respawn holds the rules file's mtime), write <HERD_DIR>/<w>/close-requested
+    -- the marker appl-hook.sh writes, a regular file, never through a link -- and file ONE
+    intake through tools/appl-add.sh titled `RE-SPAWN <w> ...` (the reason, `why`, picks the
+    title from RESPAWN_WHY), naming the worker, its worktree (the agent's cwd, only when it
+    is a linked worktree and a plain path) and the intakes whose header status names it.
+    The state is shared by every reason: a worker both logged out and never briefed, or
+    never briefed and then parked, gets one intake in all. Every word of the task is the
+    watcher's own or a name that passed its rule: no pane text reaches the intake. When the
+    --notify target is logged out too, appl-add.sh's wake is suppressed (the intake watchdog
+    types it once the pane reads normally again)."""
+    spath = os.path.join(watch, w + ".respawn")
+    if not os.path.islink(spath) and (read_file(spath) or "").strip() == str(rules[1]):
+        return
+    wdir = os.path.join(herd, w)
+    try:
+        p = os.path.join(wdir, "close-requested")
+        if os.path.islink(p):
+            os.unlink(p)
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, (why + " " + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n").encode("ascii"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass                                           # the intake is still worth filing
+    wt = linked_worktree(agent)
+    if wt is not None and not SAFE_PATH_RE.fullmatch(wt):
+        wt = None
+    own = intakes_naming(herd, w)
+    title, body = RESPAWN_WHY[why]
+    task = ((title % w) + "\n\n" + (body % w) + "\n\n" + "worker: %s\nworktree: %s\nintake: %s"
+            % (w, wt or "unknown", " ".join(own) or "none"))
+    here = os.environ.get("HERD_WATCH_HERE", "")
+    add = os.path.normpath(os.path.join(here, "..", "..", "..", "..", "tools", "appl-add.sh"))
+    argv = ["bash", add, "--", task, "--from", "herd-watch"] + (["--repo", wt] if wt else [])
+    env = dict(os.environ)
+    if TARGET_OUT:
+        env["APPL_ADD_HERDR"] = "false"                # nothing is typed into a logged-out pane
+    try:
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=60, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if r.returncode in (0, 3):                         # 3: filed, not woken -- the file is the record
+        put_raw(spath, str(rules[1]) + "\n")
+
+
+def put_raw(p, text):
+    """write a small state file under .watch/, never through a symlink"""
+    try:
+        if os.path.islink(p):
+            os.unlink(p)
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        return
+    try:
+        os.write(fd, text.encode("ascii"))
+    finally:
+        os.close(fd)
+
+
+def sweep(names, agent_by, tab_by, panes, herd, watch, now, nudged=()):
+    """Close the worker panes nobody will use again (2026-09-27). A REPORT the hook BLOCKS
+    never reaches the coordinator's model, and a worker pane answering `Not logged in` can do
+    nothing; both used to idle forever.
+
+    A candidate is a watched worker -- listed by herdr, with its own non-symlink rules file --
+    that is not the coordinator pane and that no intake HEADER status names as live
+    (`tests|impl|review <w>`). It is closed through the sibling appl-close.sh, which keeps
+    every refusal of its own, and logged `swept <w>`, when herdr's agent_status has been
+    idle/done since a pass more than SWEEP_AFTER ago (the time of the first idle pass, or of
+    the last pass that saw it working -- a working pass starts the count again), or at once
+    when its pane's last reply is `Not logged in` (logged `logged-out <w>` once per spawn,
+    and named in the one workers owner step), or at once when appl-hook.sh left it a
+    close-requested marker for this spawn (a final BLOCKED report: the hook never calls
+    herdr, so it asks, and this pass closes). A refusal is `sweep-refused <w>`: nothing is
+    forced, the next candidate is still tried, and that worker is not tried again for
+    another SWEEP_AFTER. State is .watch/<w>.sweep, since every pass is a fresh process."""
+    if os.path.islink(watch):
+        return
+    coord = os.path.join(herd, "coordinator")
+    log_ok = not os.path.islink(coord)
+    if log_ok and not os.path.isdir(coord):
+        try:
+            os.mkdir(coord, 0o700)
+        except OSError:
+            log_ok = False
+    live = live_workers(herd)
+    skip = never_swept()
+    out_now, newly_out = set(), False
+    for w in names:
+        agent = agent_by.get(w)
+        if w in skip or agent is None:
+            continue
+        rules = rules_file(os.path.join(herd, w))
+        if rules is None:
+            continue                                   # not spawned by herd-spawn: not ours
+        state, spath = sweep_state(watch, w)
+        before = dict(state)
+        pane = panes.get(w, "")
+        out = bool(pane.strip()) and logged_out(pane)
+        asked = close_requested(os.path.join(herd, w), rules[1])   # before this pass writes one
+        if out:
+            out_now.add(w)
+            if state.get("out") != rules[1]:           # once per spawn (the rules file's mtime)
+                state["out"] = rules[1]
+                newly_out = True
+                if log_ok:
+                    log_reprompt(coord, w, now, "logged-out")
+            file_respawn(w, agent, rules, herd, watch)    # once per spawn, its own state
+        elif pane.strip():
+            state.pop("out", None)
+        status = agent.get("agent_status", (tab_by.get(w) or {}).get("agent_status"))
+        since = state.get("since")
+        if w in nudged:
+            # nudged this pass: its spawn line only now had its chance, so the idle count
+            # starts again here and this pass closes nothing
+            state["since"] = now
+            put_state(spath, state)
+            continue
+        if status in IDLE or out:
+            if not isinstance(since, int):
+                since = state["since"] = now
+        else:
+            state["since"] = now                       # working: the count starts again
+            if status != "blocked":                    # a parked pane is not work: a refusal
+                state.pop("tried", None)               # of its close waits SWEEP_AFTER
+            since = None
+        tried = state.get("tried")
+        due = asked or (since is not None and (out or now - since > SWEEP_AFTER))
+        if (not due or live is None or w in live
+                or (isinstance(tried, int) and now - tried <= SWEEP_AFTER)):
+            if state != before:
+                put_state(spath, state)
+            continue
+        if appl_close(w):
+            drop_state(spath)
+            marker = os.path.join(herd, w, "close-requested")
+            if asked or out:
+                drop_state(marker)                     # the close it asked for went through
+            # a hook's close is the hook's decision: appl-close.sh's `closed <w>` is its record
+            if (out or not asked) and log_ok:
+                log_reprompt(coord, w, now, "swept")
+        else:
+            state["tried"] = now
+            put_state(spath, state)
+            if log_ok:
+                log_reprompt(coord, w, now, "sweep-refused")
+    if newly_out:
+        if TARGET_OUT:
+            out_now |= {os.environ.get("HERD_WATCH_NOTIFY", "")} - {""}
+        workers_step(coord, out_now, now)
+
+
+# ------------------------------------------------------------------ stuck spawns
+
+NEVER_BRIEFED_AFTER = 900          # a spawn this old that never got its brief is stuck
+PARK_AFTER = 20 * 60               # blocked on every pass this long is parked at a prompt
+
+
+def has_brief(wdir):
+    """a REGULAR <wdir>/brief.md whose line was handed over: herd-spawn.sh writes it before
+    the pane is started and removes it when nothing was typed into the pane -- except a spawn
+    stopped at a first-run prompt, which KEEPS it and leaves $HERD_DIR/.resume/<w> until its
+    `--resume` delivers the line (the P0 of 20260929T124218Z). While that record stands the
+    brief exists but was never delivered, so it does not count as one here."""
+    try:
+        if not stat.S_ISREG(os.lstat(os.path.join(wdir, "brief.md")).st_mode):
+            return False
+    except OSError:
+        return False
+    return not os.path.lexists(os.path.join(os.path.dirname(wdir), ".resume", os.path.basename(wdir)))
+
+
+def stalls(names, agent_by, tab_by, herd, watch, now, approved):
+    """A worker that never reached its brief, or sits parked at ANY prompt (2026-09-28: a
+    spawned worker stopped at its runtime's folder-trust dialog for 16 hours; herd-spawn.sh
+    had removed its brief.md, no report came, and the slot stayed taken while other pairs
+    queued -- the idle sweep never fires on a `blocked` pane, and nothing looked for a spawn
+    that never got its brief).
+
+    Runtime-NEUTRAL by design (owner principle 20260928T125026Z): the judgement is made from
+    what herdr reports and what herd-spawn.sh leaves in the herd directory, never from a
+    runtime's own configuration file, never from pane text, and the prompt is never answered.
+
+    A candidate is a watched worker -- listed, its own non-symlink rules file, not the
+    coordinator pane. It is
+      never-briefed: no regular brief.md, no report newer than its rules file, never shown
+        `working` by herdr on any pass this watcher made, and a rules file more than
+        NEVER_BRIEFED_AFTER old (judged on the first pass that sees it);
+      parked: herdr's status `blocked` on every pass for more than PARK_AFTER, counted from
+        the first blocked pass; any other status, or a prompt this pass approved, starts the
+        count over.
+    On detection, once per spawn: `<UTC time> never-briefed|parked <w>` in coordinator.log,
+    and file_respawn -- the close-requested marker the sweep then acts on through
+    appl-close.sh (whose refusals all stand), and ONE `RE-SPAWN <w>` intake shared with the
+    login-expiry filing. State is .watch/<w>.stall, keyed by the rules file's mtime, because
+    every pass is a fresh process."""
+    if os.path.islink(watch):
+        return
+    coord = os.path.join(herd, "coordinator")
+    log_ok = not os.path.islink(coord)
+    if log_ok and not os.path.isdir(coord):
+        try:
+            os.mkdir(coord, 0o700)
+        except OSError:
+            log_ok = False
+    skip = never_swept()
+    for w in names:
+        agent = agent_by.get(w)
+        if w in skip or agent is None:
+            continue
+        wdir = os.path.join(herd, w)
+        rules = rules_file(wdir)
+        if rules is None:
+            continue                                   # not spawned by herd-spawn: not ours
+        state, spath = sweep_state(watch, w, "stall")
+        if state.get("spawn") != rules[1]:
+            state = {"spawn": rules[1]}                # a new spawn starts afresh
+        before = dict(state)
+        status = agent.get("agent_status", (tab_by.get(w) or {}).get("agent_status"))
+        if status == "working":
+            state["worked"] = True
+        if status == "blocked" and w not in approved:
+            if not isinstance(state.get("blocked"), int):
+                state["blocked"] = now
+        else:
+            state.pop("blocked", None)
+        why = state.get("flagged") if state.get("flagged") in RESPAWN_WHY else None
+        if why is None:
+            if (not state.get("worked") and not has_brief(wdir) and current_report(wdir) is None
+                    and now - rules[1] > NEVER_BRIEFED_AFTER):
+                why = "never-briefed"
+            elif isinstance(state.get("blocked"), int) and now - state["blocked"] > PARK_AFTER:
+                why = "parked"
+            if why is not None:
+                state["flagged"] = why                 # one line per spawn, even if filing fails
+                if log_ok:
+                    log_reprompt(coord, w, now, why)
+        if state != before:
+            put_state(spath, state)
+        if why is not None:
+            file_respawn(w, agent, rules, herd, watch, why)   # once per spawn; retried if it failed
+
+
+# ------------------------------------------------------------------ the backlog pull
+
+COORD_AGENT = "dispatch-mac-a"     # the token herd-spawn marks the coordinator pane with
+
+
+def backlog_pull(agents, herd):
+    """Once per pass, when a slot is free, run the backlog pull (appl-backlog-pull.sh), so an
+    idea in the backlog inbox is filed without waiting for the next landing or SessionStart.
+    Live is this pass's own `herdr agent list` rows other than the coordinator pane (the
+    --notify target, a row named muretai-coordinator, or one whose tokens.muretai_agent is
+    dispatch-mac-a); the cap is the one number in <HERD_DIR>/coordinator/worker-cap, the
+    pull's own source. A failed listing, no readable cap, or live >= cap: the pull is not
+    run. The seam is appl-hook.sh's, APPL_BACKLOG_PULL (an executable run in place of
+    `bash <scripts>/appl-backlog-pull.sh`); --repo is $APPL_BACKLOG_REPO when it is an
+    absolute path, else the checkout this script lives in. The pull counts again under its
+    own lock and files at most one intake; its output and exit never reach this pass's
+    stdout (fixed vocabulary only)."""
+    if agents is None or TARGET_OUT:
+        return                                         # logged out: appl-add would type into it
+    coord = os.path.join(herd, "coordinator")
+    if os.path.islink(coord):
+        return
+    try:
+        fd = os.open(os.path.join(coord, "worker-cap"), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return
+    try:
+        text = os.read(fd, 64).decode("ascii", "replace").strip()
+    except OSError:
+        return
+    finally:
+        os.close(fd)
+    if not re.fullmatch(r"[0-9]{1,6}", text):
+        return
+    skip = never_swept()
+
+    def coordinator(a):
+        t = a.get("tokens")
+        return a.get("name") in skip or (isinstance(t, dict) and t.get("muretai_agent") == COORD_AGENT)
+
+    if sum(1 for a in agents if not coordinator(a)) >= int(text):
+        return
+    here = os.environ.get("HERD_WATCH_HERE", "")
+    repo = os.environ.get("APPL_BACKLOG_REPO", "")
+    if not repo.startswith("/"):
+        repo = os.path.normpath(os.path.join(here, "..", "..", "..", ".."))
+    exe = os.environ.get("APPL_BACKLOG_PULL", "")
+    argv = [exe] if exe else ["bash", os.path.join(here, "appl-backlog-pull.sh")]
+    try:
+        subprocess.run(argv + ["--repo", repo], env=dict(os.environ, HERD_DIR=herd),
+                       stdin=subprocess.DEVNULL, capture_output=True, timeout=180)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+# ------------------------------------------------------------------ the stall nudge
+
+NUDGE_AFTER = 180                  # a spawn record this old whose line did not land is nudged
+_BAR, _MARK = chr(0x2502), chr(0x276F)         # the box's side bar and the other prompt mark
+PROMPT_ROW_RE = re.compile(r"\s*" + _BAR + r"?\s*[>" + _MARK + r"](?: (.*?))?\s*" + _BAR + r"?\s*")
+PLACEHOLDER_RE = re.compile(r"Try \"[^\"]*\"")
+
+
+def spawn_line(herd, w):
+    """herd-spawn.sh's own line, built from abspath(HERD_DIR)/<w> -- never read from a file"""
+    wdir = os.path.join(herd, w)
+    return ("Read " + os.path.join(wdir, "brief.md") + " and follow it. Your report goes to "
+            + os.path.join(wdir, "report.md") + ".")
+
+
+def prompt_shape(pane, line):
+    """'typed' when the pane's LAST prompt line is exactly line, 'empty' when it shows the
+    runtime's placeholder, else None -- herd-spawn.sh's stall_shape, in the same words"""
+    text = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?", "", pane)
+    text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b.", "", text)
+    last = None
+    for row in text.splitlines():
+        m = PROMPT_ROW_RE.fullmatch(row)
+        if m:
+            last = (m.group(1) or "").strip()
+    if last is None:
+        return None
+    if last == line:
+        return "typed"
+    return "empty" if PLACEHOLDER_RE.fullmatch(last) else None
+
+
+def nudge(w, agent, tab, pane, herd, watch, now):
+    """The spawn line that did not land (2026-09-30: a worker sat at the placeholder for the
+    whole grace period and the idle sweep closed it without a key pressed). A watched worker
+    herdr shows `idle`, not the coordinator pane, with its brief.md handed over and no current
+    report, never seen working for this spawn, at least NUDGE_AFTER after its spawn record
+    (the rules file's mtime), whose pane shows one of herd-spawn's two stall shapes, gets the
+    same nudge: one Enter for the typed-but-unsubmitted spawn line, or one re-send of the
+    spawn line at the empty prompt. Once per spawn record (.watch/<w>.nudge, the watcher's own
+    directory, holds the rules file's mtime), logged `<UTC time> nudged <w>`. The only key is
+    Enter and the only text the line this function builds; nothing read from the pane is
+    typed. A dialog and a logged-out pane never get here. True when it nudged this pass."""
+    if w in never_swept() or agent is None:
+        return False
+    status = agent.get("agent_status", (tab or {}).get("agent_status"))
+    if status != "idle":
+        return False
+    wdir = os.path.join(herd, w)
+    rules = rules_file(wdir)
+    if rules is None or now - rules[1] < NUDGE_AFTER or not has_brief(wdir) or current_report(wdir) is not None:
+        return False
+    stall, _ = sweep_state(watch, w, "stall")
+    if stall.get("spawn") == rules[1] and stall.get("worked"):
+        return False                                   # it took its brief: an idle prompt now is its own
+    state, spath = sweep_state(watch, w, "nudge")
+    if state.get("spawn") == rules[1]:
+        return False
+    line = spawn_line(herd, w)
+    shape = prompt_shape(pane or "", line)
+    if shape is None:
+        return False
+    put_state(spath, {"spawn": rules[1]})              # before the key: never twice for one record
+    if shape == "typed":
+        ok = herdr("agent", "send-keys", w, "enter")[0] == 0
+    else:
+        ok = herdr("agent", "prompt", w, line)[0] == 0
+    detail(watch, w, "NUDGE %s: %s" % ("enter" if shape == "typed" else "re-send", "ok" if ok else "failed"))
+    coord = os.path.join(herd, "coordinator")
+    if not os.path.islink(coord):
+        if not os.path.isdir(coord):
+            try:
+                os.mkdir(coord, 0o700)
+            except OSError:
+                pass
+        log_reprompt(coord, w, now, "nudged")
+    return True
+
+
 def main_once():
-    fixed = {w for w in os.environ.get("WORKERS", "").split() if NAME_RE.fullmatch(w)}
+    fixed ={w for w in os.environ.get("WORKERS", "").split() if NAME_RE.fullmatch(w)}
     herd = herd_dir()
     watch = os.path.join(herd, ".watch")
     os.makedirs(watch, exist_ok=True)
     now = clock()
+    check_target(herd, watch, now)
     tabs, agents = listing("tab"), listing("agent")
     tab_by = {t.get("label"): t for t in tabs or []}
     agent_by = {a.get("name"): a for a in agents or []}
     names = sorted(fixed | discovered(agents, herd))
+    # a blocked, done or idle pane is read once, here, so the roll call can name a dialog its
+    # runtime's adapter recognizes; approve() and the rest below read the same text rather
+    # than asking herdr twice
+    read = {w: read_pane(w) for w in names if (tab_by.get(w) or {}).get("agent_status") in DIALOG_STATUSES}
+    blocked = {w: pane for w, pane in read.items() if tab_by[w].get("agent_status") == "blocked"}
+    at_dialog = {}
+    for w, pane in read.items():
+        kind = dialog_kind(pane)
+        if kind is not None and kind != LOGOUT_KIND:   # a logged-out pane is the sweep's, below
+            at_dialog[w] = kind
     if tabs is None or agents is None:
         emit("WORKERS: herdr: unreadable")
+        drop_state(os.path.join(watch, "workers"))
     else:
-        emit("WORKERS: " + " ".join("%s=%s" % (w, word(tab_by[w].get("agent_status"))) if w in tab_by else w
+        emit("WORKERS: " + " ".join("dialog %s %s" % (at_dialog[w], w) if w in at_dialog
+                                    else "%s=%s" % (w, word(tab_by[w].get("agent_status"))) if w in tab_by else w
                                     for w in names))
+        # the coordinator's live-worker line (appl-hook.sh SessionStart): herdr's, never
+        # intakes', one `<w>[=<state>]` word per worker; a dialog is `<kind>_dialog` (the
+        # hook reads `[a-z_]{1,20}`), a kind that does not fit plain `dialog`
+        roll = " ".join("%s=%s" % (w, at_dialog[w] + "_dialog" if re.fullmatch(r"[a-z]{1,13}", at_dialog[w])
+                                   else "dialog") if w in at_dialog
+                        else "%s=%s" % (w, word(tab_by[w].get("agent_status"))) if w in tab_by else w
+                        for w in names)
+        put_text(os.path.join(watch, "workers"),
+                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)) + " " + roll + "\n")
+    panes, approved, nudged = {}, set(), set()
     for w in names:
         has_report = check_report(w, herd)
         tab, agent = tab_by.get(w), agent_by.get(w)
-        if (tab or {}).get("agent_status") == "blocked":
-            approve(w, agent, watch)
+        if w in at_dialog:
+            # named, never answered: no verdict, no keys, no prompt, no restart -- a line typed
+            # into a dialog could answer it
+            dialog_stuck(w, at_dialog[w], watch)
+            panes[w] = read[w]
             continue
-        pane = read_pane(w)
+        if tabs is not None:
+            dialog_left(w, watch)
+        if w in read and read[w].strip() and logged_out(read[w]):
+            # nothing is typed into a logged-out pane -- no approval, no CONTINUE, no restart:
+            # the sweep logs it, files its RE-SPAWN and closes it
+            panes[w] = read[w]
+            continue
+        if w in blocked:
+            if approve(w, agent, watch, blocked[w]):
+                approved.add(w)
+            continue
+        pane = panes[w] = read[w] if w in read else read_pane(w)
         stuck(w, pane, watch)
         if tabs is None or agents is None or has_report:
             continue
+        if nudge(w, agent, tab, pane, herd, watch, now):
+            nudged.add(w)                              # the line is on its way: no resume this pass
+            continue
         resume(w, tab, agent, pane, herd, watch, now)
+    if tabs is not None and agents is not None:
+        stalls(names, agent_by, tab_by, herd, watch, now, approved)   # before the sweep: its marker closes this pass
+        sweep(names, agent_by, tab_by, panes, herd, watch, now, nudged)
     intake_watchdog(agents, herd, watch, now)
+    backlog_pull(agents, herd)
     return 0
 
 

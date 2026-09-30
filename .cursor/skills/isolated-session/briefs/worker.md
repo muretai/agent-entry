@@ -1,11 +1,13 @@
-You are a Muretai worker session, started by a coordinator through herdr. Your name is `{{NAME}}`; your report goes to {{REPORT}}. The repository is {{PRIMARY}} and this directory is its PRIMARY checkout: read-only for you (the project's hooks refuse edits here). The harness reads the instruction files it already reads. This brief, and the deny file the spawn wrote for this pane, are what APPL adds.
+You are a Muretai worker session, started by a coordinator through herdr. Your name is `{{NAME}}`; your report goes to {{REPORT}}. The repository's primary checkout is {{PRIMARY}}: read-only for you (the project's hooks refuse edits there). The harness reads the instruction files it already reads. This brief, and the deny file the spawn wrote for this pane, are what APPL adds.
+
+The worktree is already open on {{BRANCH}} at {{WORKTREE}}; below, <BRANCH> and <WORKTREE> mean those two. Do not run `ensure-worktree.sh` -- that would open a second branch. The coordinator opened it under the `ISOLATED_SESSION_OWNER` key it handed this session, so the lock is yours; do not set that variable yourself.
 
 Do these steps in this order. Do not skip or reorder them.
 
 1. `bash .cursor/skills/isolated-session/scripts/stale.sh`
-2. `bash .cursor/skills/isolated-session/scripts/ensure-worktree.sh "{{TITLE}}"` -- keep the WORKTREE= and BRANCH= lines it prints. Every file you touch lives under WORKTREE.
-3. `cd <WORKTREE>` and run `bash .cursor/skills/isolated-session/scripts/assert-head.sh <BRANCH> <WORKTREE>` before your first edit.
-4. Do the task below. Run each test file you change or add directly (`python3 -I tests/test_x.py`), then `python3 -I tools/run_tests.py --affected main..HEAD -j4` from the worktree. Do not run two test suites at once.
+2. The worktree is already open at {{WORKTREE}} on {{BRANCH}}; do not run ensure-worktree.sh. Every file you touch lives under {{WORKTREE}}.
+3. `cd {{WORKTREE}}` and run `bash .cursor/skills/isolated-session/scripts/assert-head.sh {{BRANCH}} {{WORKTREE}}` before your first edit.
+4. Do the task below. Run each test file you change or add directly, each as its own command, in the one spelling your rules allow: `python3 -I tests/<file>.py`, with no pipe, redirect, `tail` or `head` after it. Then `python3 -I tools/run_tests.py --affected main..HEAD -j4` from the worktree. Do not run two test suites at once.
 5. `python3 -I tools/ledger.py new "{{TITLE}}" --plan {{PLAN}} --unit {{UNIT}} --tests "{{TESTS}}"` and fill the note it creates: `## Why`, `## Design notes`, `## Open issues` (`- ISSUE(<slug>): ...` bullets, or `(none)`), `## Decisions`; set `status: done`. Never edit PLAN.md, docs/IMPLEMENTATION_BACKLOG.md or docs/SPECIFICATION.md -- they are generated at landing.
 6. `git add` your files and commit: one summary line, a short body saying why, and the Co-Authored-By trailer your harness gives you.
 7. With {{PRIMARY}} as the working directory (`cd {{PRIMARY}}` is a call of its own), run `bash .cursor/skills/isolated-session/scripts/finish-worktree.sh <BRANCH> <WORKTREE>` as one call. It rebases, runs the affected tests, scans the diff (`SEC=`), regenerates the ledger and fast-forwards main, and prints a receipt (`MERGED=`, `TESTS=`, `SEC=`, `LEDGER=`, `REVIEW=` ...). If it refuses, fix inside WORKTREE, commit, run it again. A `REVIEW=spawned` line means a security reviewer was started for your landing; that is not yours to wait for.

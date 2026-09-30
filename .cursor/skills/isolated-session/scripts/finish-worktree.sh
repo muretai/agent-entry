@@ -18,7 +18,9 @@
 # A landing its tests refused says MERGED=no with TESTS=, TESTS_RED= (the diff's own
 # reds), TESTS_COULD_NOT_RUN= (suites the room refused -- a landing behind a wall), and
 # TESTS_REFUSAL=environment|red: `environment` when only the room refused, `red` when any
-# ordinary red is present. The two lists are disjoint.
+# ordinary red is present. The two lists are disjoint. A file red on BASE too (the runner
+# re-ran it once there) is TESTS_RED_ON_BASE=, counted `<n> red-on-base` on TESTS=, on a
+# landing and on a refusal alike, and never refuses: only TESTS_RED= does.
 #
 # The guards are BASE's, never the branch's. The branch's TESTS run by design; the gate
 # does not: this script re-runs itself from BASE's copy of this skill and of the gate
@@ -1851,6 +1853,20 @@ ledger_tool="$gate_ledger"
 if [[ -f "$ledger_tool" ]]; then
   ledger_err="$(finish_tmp)"
   if ! landing_python "$ledger_tool" --into "$worktree" check --diff "$base" --diff-only 2>"$ledger_err"; then
+    # A check that died with a Traceback judged nothing: BASE's gate is broken (a module
+    # its copy lacks, a bug in the ledger), and the branch is not to blame. Calling that a
+    # generated-file edit sent sessions hunting for an edit they never made
+    # (ISSUE(gate-copy-lacks-the-ledgers-import)). A refusal without one keeps its wording.
+    if grep -q 'Traceback (most recent call last)' "$ledger_err"; then
+      {
+        echo "refusing to land ${branch}: the landing gate is broken -- ${base}'s tools/ledger.py"
+        echo "check crashed before it could judge the branch (this is not a generated-file edit):"
+        cat "$ledger_err"
+        echo "Fix the ledger on ${base} (or the module it failed to import), then run finish again."
+      } >&2
+      rm -f "$ledger_err"
+      exit 1
+    fi
     {
       echo "refusing to land ${branch}: the branch edited a generated file."
       cat "$ledger_err"
@@ -1871,6 +1887,7 @@ runner="$gate_runner"
 tests_line="none (no tools/run_tests.py in this repository)"
 tests_secs=""
 tests_files=""
+tests_on_base=""
 if [[ -f "$runner" ]]; then
   if [[ "${ISOLATED_SESSION_LAND_TESTS:-1}" == "0" ]]; then
     tests_line="skipped-by-operator (ISOLATED_SESSION_LAND_TESTS=0)"
@@ -1957,20 +1974,33 @@ except Exception:
     print("BROKEN\t\t\t")
     sys.exit(0)
 files = d.get("files", [])
+# red on BASE too (the runner re-ran it there once): counted as `red-on-base`, never as
+# `fail`, and it does not refuse -- `fail` counts only the reds the branch caused
+on_base = [x for x in (d.get("red_on_base") or []) if isinstance(x, str)]
 counts = {}
 for r in files:
-    counts[r["status"]] = counts.get(r["status"], 0) + 1
+    k = "red-on-base" if r["file"] in on_base else r["status"]
+    counts[k] = counts.get(k, 0) + 1
 # could-not-run is the verdict of the runner for a file behind a wall: counted on its
 # own, never among the files that ran, and it refuses the landing like a red
-line = ", ".join(f"{counts.get(k, 0)} {k}" for k in ("ok", "skip", "fail", "timeout", "could-not-run")
+line = ", ".join(f"{counts.get(k, 0)} {k}" for k in ("ok", "skip", "fail", "timeout", "could-not-run",
+                                                     "red-on-base")
                  if counts.get(k))
-failed = " ".join(d.get("failed", []))
+# a timeout is not a fail: a file killed at its budget is named with a " (timeout)" suffix,
+# a failed one bare, and both refuse. timed_out is the list from the runner; a runner without it
+# put timeouts on failed, and the per-file status still tells them apart
+status = {r.get("file"): r.get("status") for r in files if isinstance(r, dict)}
+timed_out = [x for x in (d.get("timed_out") or []) if isinstance(x, str)]
+reds = []
+for f in list(d.get("failed", [])) + [x for x in timed_out if x not in d.get("failed", [])]:
+    reds.append(f + " (timeout)" if f in timed_out or status.get(f) == "timeout" else f)
+failed = " ".join(reds)
 unrun = " ".join(d.get("could_not_run", []))
 names = " ".join(r["file"] for r in files)
 # unit separator, not a tab: bash `read` folds runs of IFS whitespace, so an empty
 # `failed` column would shift the columns after it
 print("\x1f".join([f"{line or '0 files'} (of {len(files)}; {d.get('selection', '')})",
-                   str(d.get("wall_s", "")), failed, unrun, names]))
+                   str(d.get("wall_s", "")), failed, unrun, " ".join(on_base), names]))
 with open(tail_path, "w", encoding="utf-8") as fh:
     for r in files:
         if r["status"] in ("fail", "timeout", "could-not-run"):
@@ -1979,7 +2009,7 @@ with open(tail_path, "w", encoding="utf-8") as fh:
                 fh.write("   | " + ln + "\0")
 PY
 )"
-    IFS=$'\x1f' read -r tests_line tests_secs tests_failed tests_unrun tests_files <<< "$summary"
+    IFS=$'\x1f' read -r tests_line tests_secs tests_failed tests_unrun tests_on_base tests_files <<< "$summary"
     while IFS= read -r -d '' tail_rec; do
       [[ -n "$tail_rec" ]] || continue
       if ! tail_esc="$(iso_safe_text "$tail_rec")"; then
@@ -1999,6 +2029,7 @@ PY
       {
         echo "refusing to land ${branch}: ${tests_line}"
         [[ -z "$tests_failed" ]] || echo "red: $(iso_safe_text "$tests_failed")"
+        [[ -z "$tests_on_base" ]] || echo "red on ${base} too (reported, not refusing): $(iso_safe_text "$tests_on_base")"
         if [[ -n "$tests_unrun" ]]; then
           # behind a wall: not a red, and not a pass -- the gate never got to judge these
           echo "could not run (this landing is behind a wall, so these are no verdict on the diff): $(iso_safe_text "$tests_unrun")"
@@ -2021,6 +2052,9 @@ PY
       fi
       if [[ -n "$tests_unrun" ]]; then
         echo "TESTS_COULD_NOT_RUN=$(iso_safe_text "$tests_unrun")"
+      fi
+      if [[ -n "$tests_on_base" ]]; then
+        echo "TESTS_RED_ON_BASE=$(iso_safe_text "$tests_on_base")"
       fi
       # The refusal's class. `environment`: every suite that did not pass is one the room
       # refused (the runner measured a wall AND the suite carried the room's words), so
@@ -2552,6 +2586,7 @@ echo "BASE_FF=${base_ff_line}"
 echo "REBASED=${rebased}"
 echo "LANDING_LOCK=waited ${waited}s"
 echo "TESTS=${tests_line}"
+[[ -n "$tests_on_base" ]] && echo "TESTS_RED_ON_BASE=$(iso_safe_text "$tests_on_base")"
 [[ -n "$tests_secs" ]] && echo "TESTS_SECS=${tests_secs}"
 [[ -n "$tests_files" ]] && echo "TESTS_FILES=$(iso_safe_text "$tests_files")"
 # names are tests/test_x.py: that is how the runner spells a file, and the receipt
@@ -2999,7 +3034,7 @@ elif [[ "$sec_verdict" == "needs-eyes" && "$base_before" != "$base_tip" ]]; then
   # absolute, so the rules herd-spawn.sh writes from it name real paths
   [[ -z "$herd_dir" || "$herd_dir" == /* ]] || herd_dir="$(pwd)/${herd_dir}"
   review_brief="${herd_dir}/briefs/${review_name}.md"
-  # The reviewer opens in a detached checkout of main as it was BEFORE this landing: its
+  # The reviewer opens in a checkout of main as it was BEFORE this landing: its
   # SessionStart hook, its scripts and its settings are the ones main had, not the
   # branch's (a diff that edits session-guard.sh would otherwise run as the reviewer
   # spawns), and no .claude/settings.local.json lives there
@@ -3012,7 +3047,15 @@ elif [[ "$sec_verdict" == "needs-eyes" && "$base_before" != "$base_tip" ]]; then
   template_rel=".claude/skills/security-audit/references/landing-review-brief.md"
   spawner_rel=".cursor/skills/isolated-session/scripts/herd-spawn.sh"
   lib_rel=".cursor/skills/isolated-session/scripts/lib.sh"
-  run_hint="bash ${spawner_rel} ${review_name} ${review_brief} --profile reviewer --cwd ${review_co} --var MAIN=${primary}"
+  # The reviewer's checkout is ON A BRANCH of its own at the pre-landing BASE: the receipt
+  # branch ensure-worktree.sh names for "Audit receipt for landing <slug>", held under the
+  # reviewer's owner key (herd-spawn's default for a walled spawn: the worker's name). A
+  # detached checkout recorded no branch, so the walled reviewer got no gate, and behind the
+  # wall it could not open a worktree of its own to land from
+  # (ISSUE(walled-reviewer-cannot-write-its-receipt)).
+  receipt_task="Audit receipt for landing ${review_slug}"
+  receipt_branch="feat/$(iso_task_slug "$receipt_task" 2>/dev/null || true)"
+  run_hint="bash ${spawner_rel} ${review_name} ${review_brief} --profile reviewer --cwd ${review_co} --var MAIN=${primary} --env ISOLATED_SESSION_OWNER=${review_name}, in a checkout on ${receipt_branch} at ${base_before} (when it is not there: ISOLATED_SESSION_OWNER=${review_name} bash ${spawner_rel%/*}/ensure-worktree.sh --at ${base_before} --into ${review_co} '${receipt_task}'); the reviewer lands its receipt from that checkout with bash ${spawner_rel%/*}/finish-worktree.sh ${receipt_branch} ${review_co}"
   by_hand="run the security-audit skill over ${base_before}..${base_tip} by hand"
   # HERD_DIR is where a prompt for an autonomous session is written: ours, mode 700
   # when this creates it, refused when someone else owns it, and refused when a
@@ -3117,13 +3160,26 @@ PY
               git -C "$primary" show "${base_before}:${w_path}" > "$spawn_dir/walls/${w_base}" 2>/dev/null || rm -f "$spawn_dir/walls/${w_base}"
             done || true
         fi
-        # The reviewer's checkout: detached at the sha main had before this landing,
-        # under a review root that is a real directory of ours -- checked BEFORE the
+        # ... and BASE's claim-worktree.sh and assert-head.sh (each sources lib.sh, already
+        # beside it): the spawner's claim probe runs them behind the wall, and with neither
+        # beside it the claim is unproven and, under require, no reviewer starts. Same base
+        # commit as the spawner; a BASE without them is left to the probe, which says so.
+        # land.sh too: the reviewer is now spawned ON A BRANCH, so herd-spawn records a gate
+        # for it and copies BASE's land.sh into its walls/ directory, which the launcher runs
+        # when the reviewer's finish-worktree.sh asks for its landing (a walled spawn on a
+        # branch with no land.sh beside the spawner is refused).
+        for claim_name in claim-worktree.sh assert-head.sh land.sh; do
+          git -C "$primary" show "${base_before}:${spawner_rel%/*}/${claim_name}" > "$spawn_dir/${claim_name}" 2>/dev/null ||
+            rm -f "$spawn_dir/${claim_name}"
+        done
+        # The reviewer's checkout: at the sha main had before this landing, on its receipt
+        # branch, under a review root that is a real directory of ours -- checked BEFORE the
         # cleanup walks it, so a review root swapped for a symlink to the session
         # worktrees is walked by nothing (-1). Only what THIS script created is ever
         # removed: an entry whose physical parent is the physical review root, that
         # git lists as a worktree, whose git dir carries the marker this script writes,
-        # that is detached, that is a day old or bears this landing's own name, and
+        # that is detached or on the receipt branch that marker names, that is a day old
+        # or bears this landing's own name, and
         # that no live session holds. A bare `false` here once ended a completed
         # landing under set -e with no REVIEW= line: every branch of this chain sets
         # review_line and falls through.
@@ -3142,7 +3198,13 @@ PY
               grep -qFx -e "worktree ${old_co}" -e "worktree ${old_real}" || continue
             old_gd="$(git -C "$old_co" rev-parse --absolute-git-dir 2>/dev/null)" || continue
             [[ -f "${old_gd}/muretai-review-checkout" ]] || continue
-            git -C "$old_co" symbolic-ref -q HEAD >/dev/null 2>&1 && continue
+            # detached (the older shape), or on exactly the receipt branch the marker names;
+            # removing the checkout leaves that branch, and iso_open_at keeps any commit on
+            # it as an archive/ tag before the name is used again
+            if old_head="$(git -C "$old_co" symbolic-ref -q HEAD 2>/dev/null)"; then
+              old_receipt="$(sed -n 's/^receipt_branch=//p' "${old_gd}/muretai-review-checkout" 2>/dev/null | head -1)"
+              [[ -n "$old_receipt" && "$old_head" == "refs/heads/${old_receipt}" ]] || continue
+            fi
             if [[ "$old_co" == "$review_co" ]] || [[ -n "$(find "$old_co" -maxdepth 0 -mtime +1 2>/dev/null)" ]]; then
               old_lock="$(iso_lock_path "$old_co" 2>/dev/null || true)"
               if [[ -n "$old_lock" && -f "$old_lock" ]] && iso_lock_alive "$old_lock"; then
@@ -3155,7 +3217,17 @@ PY
         fi
         review_err="$(finish_tmp)"
         opened=no
-        if [[ "$review_root_ok" == "yes" ]] &&
+        # On the receipt branch at the pre-landing BASE, held under the reviewer's own key
+        # (lib.sh, iso_open_at -- the open `ensure-worktree.sh --at` and the daily engine do).
+        # The gate that lands it is BASE's land.sh; a BASE that predates it has none to land
+        # through, and its reviewer opens detached, as before.
+        [[ -f "$spawn_dir/land.sh" ]] || receipt_branch=""
+        if [[ "$review_root_ok" == "yes" && -n "$receipt_branch" && "$receipt_branch" != "feat/" ]] &&
+           iso_open_at "$primary" "$review_co" "$receipt_branch" "$base_before" "$review_name" "$receipt_task" >/dev/null 2>"$review_err" &&
+           review_gd="$(git -C "$review_co" rev-parse --absolute-git-dir 2>/dev/null)" &&
+           printf 'landing=%s\nbase=%s\ntip=%s\nreceipt_branch=%s\n' "$branch" "$base_before" "$base_tip" "$receipt_branch" > "${review_gd}/muretai-review-checkout" 2>/dev/null; then
+          opened=yes
+        elif [[ "$review_root_ok" == "yes" && -z "$receipt_branch" ]] &&
            git -C "$primary" worktree add --detach "$review_co" "$base_before" >/dev/null 2>"$review_err" &&
            review_gd="$(git -C "$review_co" rev-parse --absolute-git-dir 2>/dev/null)" &&
            printf 'landing=%s\nbase=%s\ntip=%s\n' "$branch" "$base_before" "$base_tip" > "${review_gd}/muretai-review-checkout" 2>/dev/null; then
@@ -3172,7 +3244,9 @@ PY
         # both took their answer from whatever `usercustomize.py` a branch's own test run
         # had planted in the user site directory
         # (ISSUE(security-audit-2026-09-18-daily-2026-09-18-7)).
-        elif spawn_out="$(credless bash "$spawn_dir/herd-spawn.sh" "$review_name" "$review_brief" --cwd "$review_co" --profile reviewer --var "MAIN=${primary}" 2>"$review_err")"; then
+        # The reviewer's own name is the key that holds its receipt branch (herd-spawn's
+        # default for a walled spawn), said explicitly so an unwalled spawn carries it too.
+        elif spawn_out="$(credless bash "$spawn_dir/herd-spawn.sh" "$review_name" "$review_brief" --cwd "$review_co" --profile reviewer --var "MAIN=${primary}" --env "ISOLATED_SESSION_OWNER=${review_name}" 2>"$review_err")"; then
           review_pane="$(printf '%s\n' "$spawn_out" | sed -n 's/.*pane=\([^ ]*\).*/\1/p' | head -1)"
           review_eyes="$(printf '%s\n' "$spawn_out" | sed -n 's/.*harness=\([^ ]*\) model=\([^ ]*\).*/\1\/\2/p' | head -1)"
           review_line="spawned ${review_name} (pane ${review_pane}${review_eyes:+, ${review_eyes}})"

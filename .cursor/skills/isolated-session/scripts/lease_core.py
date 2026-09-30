@@ -5,11 +5,14 @@ Stdlib only, Python 3.9+, and deliberately generic: this module knows nothing ab
 signs a request, which key format a machine keeps, or where a node lives -- a caller hands
 it a backend object that does. It can therefore be lifted into another repository as is.
 
-    backend = none | do | command          ([lease] backend = "..." in a config file)
+    backend = none | do | command | host   ([lease] backend = "..." in a config file)
 
-Only `do` (an HTTPS lease service, one JSON POST per verb) is built. `none` and `command`
-are dispatch-only extension points: selecting either answers "not implemented in this
-build" and makes no request. An unknown backend is a configuration error of its own.
+`do` (an HTTPS lease service, one JSON POST per verb) and `host` (a self-hosted node's
+epoch CAS, one JSON-RPC POST per verb) are built; the caller supplies both backend
+objects, and each maps its node's answer onto the SAME (status, body) shape outcome_of
+reads, so the exit codes below do not depend on the backend. `none` and `command` are
+dispatch-only extension points: selecting either answers "not implemented in this build"
+and makes no request. An unknown backend is a configuration error of its own.
 
 The outcomes, and the exit code each maps to -- a backend returns an OUTCOME, never a code:
 
@@ -43,8 +46,8 @@ EXIT_UNREACHABLE = 3
 EXIT_HELD = 4
 EXIT_REFUSED = 5
 
-BACKENDS = ("none", "do", "command")
-BUILT = ("do",)
+BACKENDS = ("none", "do", "command", "host")
+BUILT = ("do", "host")
 DEFAULT_BACKEND = "do"
 HTTP_TIMEOUT_S = 10.0
 MAX_ANSWER = 64 * 1024

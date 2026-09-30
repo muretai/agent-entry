@@ -5,7 +5,7 @@
 #
 #   herd-spawn.sh <name> <brief-file> [--cwd DIR] [--profile worker|reviewer|coordinator]
 #                 [--env K=V ...] [--var KEY=VALUE ...] [--allow 'Bash(...)' ...]
-#                 [--muretai-agent NAME] [--role solo]
+#                 [--muretai-agent NAME] [--role solo] [--open-worktree TITLE [--repo PRIMARY]]
 #
 #   name        the worker: its herdr tab label and agent name, its own directory
 #               $HERD_DIR/<name>/ (the one directory added to the session) and its
@@ -40,12 +40,39 @@
 #               worker= line, and says on ONE stderr line which steps completed (the
 #               tab and pane, whether the agent started) and that the brief was not
 #               delivered. It removes brief.md only when nothing was typed into the
-#               pane (a tab, start or wait failure, a first-run prompt); when `agent
+#               pane (a tab, start or wait failure); when `agent
 #               prompt` itself failed -- a stall past the deadline, a timeout, a
 #               refusal -- the line may already be in the pane, so brief.md is KEPT and
 #               the message says so: a worker that did get the line finds its brief.
+#               A spawn STOPPED AT A FIRST-RUN PROMPT (folder trust, the renderer, the
+#               auto-mode setup, "Not logged in") keeps brief.md, .roles/<name> and
+#               .repos/<name>, writes $HERD_DIR/.resume/<name> (the pane, tab, cwd,
+#               harness, model, wall and owner key), prints nothing on stdout and ONE
+#               `herd-spawn.sh --resume <name>` on stderr. Two workers found no brief
+#               after an owner answered the trust dialog and re-sent the spawn line.
+#
+#   herd-spawn.sh --resume <name>
+#               finish that spawn once its prompt is answered: same HERD_DIR and herdr,
+#               no brief argument. It types `Read <the same brief.md> and follow it.` into
+#               the agent herdr already has (never a second `agent start`), after the pair
+#               hand-over, prints the one worker= line and removes the resume record; the
+#               three files stay as they are. A pane still on its prompt is exit 1 with
+#               nothing typed; a bad name, no resume record, or a brief.md that is not a
+#               regular file of the caller's (a symlink) is exit 2.
+#               A template that is missing, a directory or unreadable is exit 2 before any
+#               record is written and before a tab.
 #   --cwd DIR   where the tab opens; default: the primary checkout of the repository
 #               this script lives in. A worker opens its own worktree from there.
+#               A WALLED worker's landing gate binds to the branch this directory has
+#               checked out at spawn, so on the primary (the base branch) it records no
+#               gate and says `gate=none (cwd is the primary on <base>)` on stderr and in
+#               wall.log; an IMPLEMENTER brief (implementer.md, by its first line) or a
+#               SOLO worker brief (worker.md, by its first line) walled there is exit 2
+#               before a tab -- pass --cwd <WORKTREE>, or --open-worktree for a solo worker
+#               (ISSUE(solo-workers-spawned-on-the-primary-cannot-land)). A Dispatch ticket
+#               (dispatch-ticket.md) there still starts, with gate=none: dispatch-take.sh
+#               now spawns it in the ticket's worktree, and this is the fallback for an
+#               older dispatch-take (or a by-hand spawn) that did not.
 #               REQUIRED in practice for HERD_SPAWN_HARNESS=codex: a codex session's
 #               writable sandbox root IS this directory, and no session guard runs on
 #               that harness, so a primary checkout here is exit 2 before herdr is asked
@@ -77,21 +104,33 @@
 #               CLAUDE_CODE_DISABLE_AUTO_MEMORY, HERD_WORKER, HERD_BRIEF, HERD_REPORT,
 #               ISOLATED_SESSION_GUARD_TRACE, MURETAI_HERDR_AGENT (which has a flag of
 #               its own, --muretai-agent, with a name rule this door would skip), and
-#               HERD_WALL_INSIDE (the wall's own marker: the plug sets it, a caller never). The
+#               HERD_WALL_INSIDE (the wall's own marker: the plug sets it, a caller never),
+#               and CLAUDE_CODE_OAUTH_TOKEN (THE OAUTH TOKEN, below: only the file is
+#               honored, so a spawn line cannot hand a pane a token by hand). The
 #               caller's entries are appended AFTER the spawn's on `herdr tab create`, so a
 #               duplicate key leaves it to herdr's dedup order which value the tab gets --
 #               neither pinned here nor testable, and the two it would decide are the
 #               interpreter wall and the config home. MURETAI_BINDING_FILE and
-#               ISOLATED_SESSION_OWNER are deliberately NOT on the list: the spawn sets
-#               neither, the first names a binding a node child reads, and the second is
+#               ISOLATED_SESSION_OWNER are deliberately NOT on the list: the spawn never
+#               sets the first, and sets the second only when the caller did not (a walled
+#               worker's default key is its own name -- THE OWNER KEY, in the wall block --
+#               and a caller's entry is then the only one on the tab). The first names a
+#               binding a node child reads, and the second is
 #               how a test-author / implementer pair hands its worktree lock over: every
 #               lock of the cwd's repository owned by that key passes to THIS worker by
 #               name (stderr says which), and the worker's session binds its own process
 #               at its first guarded command -- see the pair hand-over in lib.sh.
+#               A key a LIVE worker holds (one herdr still lists) is refused, naming that
+#               worker, before a tab or a record -- except that hand-over itself: --cwd into
+#               the key's worktree once the holder wrote its report.md (key_guard, below;
+#               the key is recorded in $HERD_DIR/.keys/<name>).
 #               The wall's knobs are the exception the other way: `--env HERD_WALL=off`
 #               (and HERD_WALL_EGRESS, _CPU_SECS, _MEM_MB, _PROCS) set THIS spawn's wall,
 #               exactly as the same variable in the spawn's environment would, and are
 #               never put on the tab.
+#               A coordinator-profile tab always carries DISABLE_AUTOUPDATER=1 (an
+#               in-pane update must not end the long-lived coordinator mid-loop); a
+#               caller's DISABLE_AUTOUPDATER on that profile is exit 2.
 #   --muretai-agent NAME
 #               mark the pane as that Muretai agent's wake target: tab env
 #               MURETAI_HERDR_AGENT=NAME, then herdr pane report-metadata with
@@ -117,8 +156,33 @@
 #               report is judged in: $HERD_DIR/.repos/<name>, `iso_primary_of <cwd>` and a
 #               newline, mode 600 in a herd-level directory of mode 700, Edit-denied like
 #               .roles/, written before the tab exists and removed with the brief when the
-#               spawn fails. appl-hook.sh reads it as `appl-verify.sh --repo`; a cwd with no
+#               spawn fails (kept, with the brief, when it stops at a first-run prompt). appl-hook.sh reads it as `appl-verify.sh --repo`; a cwd with no
 #               repository is refused before herdr is asked anything.
+#   --open-worktree TITLE
+#               open the worker's worktree HERE, before herdr is asked anything, and spawn
+#               in it: `ensure-worktree.sh "TITLE"` runs in the primary of the repository
+#               this script lives in, under the caller's `--env ISOLATED_SESSION_OWNER=<k>`
+#               (required with this flag) and no other ISOLATED_SESSION_* variable, the way
+#               dispatch-take.sh opens a ticket's worktree (293dfea7). Its WORKTREE= becomes
+#               --cwd, and the brief gets WORKTREE, BRANCH and PRIMARY (the primary it was
+#               opened from, not the cwd) and, unless the caller passed one, TITLE. The key
+#               is stable, so a re-run for the same title finds its own lock and resumes the
+#               same worktree; the pair hand-over below then passes that hold to the worker.
+#               It is the coordinator's sanctioned way to open a SOLO worker's worktree: its
+#               seat may not set ISOLATED_SESSION_OWNER itself. With --cwd, or with a --var
+#               WORKTREE/BRANCH/PRIMARY of the caller's, it is exit 2: two answers to one
+#               question. A refused ensure-worktree is exit 2 with its last words, no tab.
+#   --repo PRIMARY
+#               with --open-worktree only (alone it is exit 2): open the worktree in THAT
+#               repository instead of this script's -- for the coordinator seat, which runs
+#               every call from its own checkout and cannot `cd` elsewhere first. PRIMARY is
+#               resolved (relative to the caller's directory, symlinks and a trailing slash
+#               dropped) and must be a repository's primary checkout, not a linked worktree
+#               or a subdirectory, listed in $HOME/.muretai/dispatch/repos (dispatch_listed);
+#               otherwise exit 2 before herdr is asked anything and before any worktree or
+#               branch exists. That repository's OWN ensure-worktree.sh runs, from its
+#               primary; one that has none is exit 2 (this script's copy is never run
+#               against it). The brief's PRIMARY is that repository. --cwd stays refused.
 #
 # Exit 3, one line on stderr, when herdr is not on PATH or its server is not running
 # (HERD_SPAWN_BIN names the binary explicitly; the tests point it at a stub). Exit 2
@@ -247,10 +311,397 @@ here="$(cd "$(dirname "$0")" && pwd)"
 . "$here/lib.sh"
 
 usage() {
-  echo "usage: herd-spawn.sh <name> <brief-file> [--cwd DIR] [--profile worker|reviewer|coordinator] [--env K=V ...] [--var KEY=VALUE ...] [--allow 'Bash(...)' ...] [--muretai-agent NAME] [--role solo]" >&2
+  echo "usage: herd-spawn.sh <name> <brief-file> [--cwd DIR] [--profile worker|reviewer|coordinator] [--env K=V ...] [--var KEY=VALUE ...] [--allow 'Bash(...)' ...] [--muretai-agent NAME] [--role solo] [--open-worktree TITLE]" >&2
   echo "       HERD_SPAWN_HARNESS=codex requires --cwd <worktree>: a codex session's writable sandbox root IS the directory it opens in, and no session guard runs on that harness" >&2
+  echo "       herd-spawn.sh --resume <name>   (a spawn that stopped at a first-run prompt, once the prompt is answered; same HERD_DIR)" >&2
   exit 2
 }
+
+# --- the shared tail ---------------------------------------------------------------------
+# Defined before anything runs, because two paths use them: a spawn, and `--resume <name>`
+# (the same spawn, picked up after the owner answered a first-run prompt in its pane).
+resuming=no
+
+# herdr on PATH (or HERD_SPAWN_BIN) and its server up, else exit 3
+find_herdr() {
+  herdr="${HERD_SPAWN_BIN:-}"
+  if [[ -n "$herdr" ]]; then
+    if [[ ! -x "$herdr" ]]; then
+      echo "herd-spawn: no herdr binary at HERD_SPAWN_BIN=${herdr}; the worker ${name} was not started" >&2
+      exit 3
+    fi
+  else
+    herdr="$(command -v herdr 2>/dev/null || true)"
+    if [[ -z "$herdr" ]]; then
+      echo "herd-spawn: herdr is not on PATH (https://herdr.dev); the worker ${name} was not started" >&2
+      exit 3
+    fi
+  fi
+  if ! "$herdr" status >/dev/null 2>&1; then
+    echo "herd-spawn: 'herdr status' failed -- the herdr server is not running; the worker ${name} was not started" >&2
+    exit 3
+  fi
+}
+
+# A failed start is not always a slow shell: a harness stuck on one of Claude Code's
+# FIRST-RUN prompts (the renderer choice, the auto-mode setup, folder trust, "Not logged
+# in") is already registered, so a retry only earns herdr's agent_name_taken (Mac B,
+# 2026-09-17). The pane is read once and matched on keywords; a match is NAMED from the
+# fixed vocabulary below -- the pane's bytes never reach stderr, they are data another
+# checkout may have written. The keywords are guesses at the real screens
+# (ISSUE(first-run-prompt-texts-are-guesses)).
+first_run_prompt() {
+  local screen
+  screen="$("$herdr" agent read "$name" --source recent-unwrapped --lines 80 2>/dev/null \
+            || "$herdr" agent read "$name" 2>/dev/null || true)"
+  [[ -n "$screen" ]] || return 1
+  printf '%s' "$screen" | python3 -I -c '
+import re, sys
+text = sys.stdin.buffer.read().decode("utf-8", "replace")
+# drop OSC strings (a title) whole, then CSI/other escapes, then the remaining controls
+text = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?", "", text)
+text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b.", "", text)
+text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", " ", text).lower()
+for word, pat in (("login", r"not logged in|please run /login"),
+                  ("trust", r"\btrust\b[^\n]*\b(folder|files|workspace|directory|project)\b"),
+                  ("auto-mode", r"\bauto[- ]mode\b"),
+                  ("renderer", r"\brenderer\b")):
+    if re.search(pat, text):
+        print(word)
+        sys.exit(0)
+sys.exit(1)
+'
+}
+
+# The kind word the harness's own adapter gives the pane's screen (`<adapter> --recognize`,
+# the screen on stdin), or return 1. The adapter is the one place a runtime's dialogs are
+# known; this script learns only the word, and a word that is not [a-z][a-z0-9-]{0,31} is
+# no kind. Recognizing types nothing. The screen is $1 when the caller already read the
+# pane (the stall nudge reads it once), else read here. The adapter is the harness's file
+# beside this script (the spawn's validated harness, or a resume record's): adapter_path,
+# THE seam's one path, computed on each call and never taken from a variable a caller
+# could have set.
+adapter_path() {
+  printf '%s\n' "$here/trust/${harness}.sh"
+}
+dialog_kind() {
+  local screen="${1:-}" kind adapter
+  adapter="$(adapter_path)"
+  [[ -f "$adapter" && ! -L "$adapter" ]] || return 1
+  if [[ -z "$screen" ]]; then
+    screen="$("$herdr" agent read "$name" --source recent-unwrapped --lines 80 2>/dev/null \
+              || "$herdr" agent read "$name" 2>/dev/null || true)"
+  fi
+  [[ -n "$screen" ]] || return 1
+  kind="$(printf '%s' "$screen" | bash "$adapter" --recognize 2>/dev/null)" || return 1
+  [[ "$kind" =~ ^[a-z][a-z0-9-]{0,31}$ ]] || return 1
+  printf '%s\n' "$kind"
+}
+
+# half_fail RC WHAT [keep|resume]: one stderr line naming the failure, the steps that
+# completed (done_steps), and that the brief was NOT delivered; no worker= line.
+#   keep    a failure of `agent prompt` itself (a stall past the deadline, a timeout, a
+#           refusal), where the line may already be in the pane: the ISSUE this exists for
+#           was a worker that received the line after a stall and found brief.md removed
+#           by the spawn's own cleanup.
+#   resume  a spawn stopped at a first-run prompt: nothing was typed, and brief.md, the
+#           .roles and .repos records and the resume record all stay, so the one command
+#           printed here delivers the SAME brief once the owner has answered the prompt.
+#           (It used to remove them, and an owner who answered the prompt and re-sent the
+#           spawn line by hand left a worker with no brief and a report with no record.)
+# Without a mode a spawn removes what it wrote (drop_brief); a --resume never removes
+# anything, and its failure says the resume can be run again.
+half_fail() {
+  local rc="$1" what="$2" keep="${3:-}" tail delivered="the brief was not delivered"
+  if [[ "$keep" == "keep" ]]; then
+    brief_ours=no
+    delivered="the brief was not delivered as far as herdr reports"
+    tail="brief.md is KEPT at ${bfile}: the line may already have been typed into the pane, so a worker that got it finds its brief -- check the pane before re-spawning ${name}"
+  elif [[ "$keep" == "resume" ]]; then
+    brief_ours=no
+    tail="nothing was typed into the pane, so brief.md (${bfile}) and the .roles and .repos records are KEPT; answer the prompt in the pane, then run: bash ${here}/herd-spawn.sh --resume ${name}"
+  elif [[ "$resuming" == "yes" ]]; then
+    tail="nothing was typed into the pane; brief.md, its records and the resume record are kept, so the same resume can be run again"
+  else
+    tail="nothing was typed into a pane, so brief.md is removed"
+  fi
+  echo "herd-spawn: ${what}; ${delivered} to ${name} -- done: ${done_steps}; ${tail}" >&2
+  exit "$rc"
+}
+
+# stall_shape: at the first `agent_prompt_stalled`, the pane is read ONCE and named by one
+# word in nudge_shape (nudge_why says why, in this script's own words):
+#   typed   the last prompt line is exactly prompt_line, typed but not submitted: one Enter
+#   empty   the prompt shows the runtime's placeholder (`Try "..."`): one re-send of prompt_line
+#   stop    a dialog the harness's adapter recognizes (dialog_kind: an Enter would answer it),
+#           a report.md already there, or a worker herdr no longer lists: nothing is typed
+#   none    an unreadable pane or any other screen: the old retry loop, unchanged
+# Nothing read from the pane is ever typed: the only key is Enter, the only text prompt_line.
+# (Four spawns on 2026-09-30 sat at agent_prompt_stalled in one of the two shapes, each a
+# human stop; one worker was swept 20 minutes later without ever getting its brief.)
+stall_shape() {
+  local screen kind
+  nudge_shape=none nudge_why=""
+  screen="$("$herdr" agent read "$name" --source recent-unwrapped --lines 80 2>/dev/null \
+            || "$herdr" agent read "$name" 2>/dev/null || true)"
+  [[ -n "$screen" ]] || return 0
+  if kind="$(dialog_kind "$screen")"; then
+    nudge_shape=stop nudge_why="the pane is at a dialog its adapter names '${kind}', so nothing was typed into it; answer it in the pane"
+    return 0
+  fi
+  if [[ -e "$report" || -L "$report" ]]; then
+    nudge_shape=stop nudge_why="${report} exists already, so the pane was not nudged"
+    return 0
+  fi
+  nudge_shape="$(printf '%s' "$screen" | python3 -I -c '
+import re, sys
+line = sys.argv[1]
+bar, mark = chr(0x2502), chr(0x276F)   # the box side bar and the other prompt mark, kept ASCII here
+text = sys.stdin.buffer.read().decode("utf-8", "replace")
+text = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?", "", text)
+text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b.", "", text)
+last = None
+for row in text.splitlines():
+    m = re.fullmatch(r"\s*" + bar + r"?\s*[>" + mark + r"](?: (.*?))?\s*" + bar + r"?\s*", row)
+    if m:
+        last = (m.group(1) or "").strip()
+if last is not None and last == line:
+    print("typed")
+elif last is not None and re.fullmatch(r"Try \"[^\"]*\"", last):
+    print("empty")
+else:
+    print("none")
+' "$prompt_line" 2>/dev/null)" || nudge_shape=none
+  case "$nudge_shape" in
+    typed|empty) ;;
+    *) nudge_shape=none; return 0 ;;
+  esac
+  # a worker herdr no longer lists is sent nothing; a listing that does not answer is no
+  # proof it is there
+  if ! "$herdr" agent list 2>/dev/null | python3 -I -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin).get("result", {}).get("agents") or []
+except (ValueError, AttributeError):
+    sys.exit(1)
+sys.exit(0 if any(isinstance(r, dict) and r.get("name") == sys.argv[1] for r in rows) else 1)
+' "$name" >/dev/null 2>&1; then
+    nudge_shape=stop nudge_why="herdr no longer lists ${name}, so nothing was typed"
+  fi
+}
+
+# deliver_brief: the agent is in the pane; wait for its input line, hand over the pair's
+# lock, type the one line, and only then print the worker= line. Reads name, herdr, pane,
+# tab_id, cwd, pair_key, prompt_line, report, harness, model and wall_state.
+deliver_brief() {
+  # Start succeeding means the harness process is in the pane, not that its input
+  # line takes text (daily-2026-09-16 typed into a banner; shop-door-hardening-tests
+  # at 23:50 sat unsent). One wait for idle, then prompt with --wait until working
+  # or blocked so the spawn returns when the brief is taken, not when the turn ends.
+  agent_ready_secs="${HERD_SPAWN_AGENT_READY_SECS:-120}"
+  ready_ms=$(( agent_ready_secs * 1000 ))
+  wait_err="$(mktemp "${TMPDIR:-/tmp}/herd-spawn-wait.XXXXXX")"
+  if ! "$herdr" agent wait "$name" --until idle --timeout "$ready_ms" >/dev/null 2>"$wait_err"; then
+    wait_reason="$(tail -1 "$wait_err" 2>/dev/null || true)"
+    rm -f "$wait_err"
+    half_fail 1 "'herdr agent wait' failed for ${name} (pane ${pane}, tab ${tab_id}): ${wait_reason}; the agent started but never reached its input line, and no prompt was typed"
+  fi
+  rm -f "$wait_err"
+
+  # The pair hand-over (ISSUE(pair-worktree-lock-dies-with-the-test-author-session)): a
+  # worker started with `--env ISOLATED_SESSION_OWNER=<key>` takes over every worktree lock
+  # of THIS repository (the cwd's) whose owner is that key -- the test author's -- recorded
+  # as handed to this worker by name; the worker's session binds its own process at its
+  # first guarded command (lib.sh, iso_lock_handover / iso_lock_bind). Here, after the agent
+  # is up and before it is told anything, so it never meets the author's lock, and a spawn
+  # that failed earlier hands nothing to a worker that does not exist. A spawn without the
+  # key, or with a key no lock carries, changes nothing. A walled worker always has a key --
+  # the caller's, or its own name (THE OWNER KEY) -- so the hold on a folder that key
+  # already owns passes to it the same way. A resume hands over here too: the spawn it
+  # picks up stopped before this step.
+  if [[ -n "$pair_key" ]]; then
+    while IFS= read -r handed; do
+      [[ -n "$handed" ]] || continue
+      echo "herd-spawn: the hold on $(iso_safe_text "$handed" || echo '(a worktree)') passes to ${name} (owner key $(iso_safe_text "$pair_key" || echo '?'))" >&2
+    done < <(iso_lock_handover "$cwd" "$pair_key" "$name" 2>/dev/null || true)
+  fi
+
+  # Flags after TEXT (herdr: agent prompt <TARGET> <TEXT> [OPTIONS]). Only
+  # agent_prompt_stalled is retried, two seconds apart, until AGENT_READY_SECS
+  # from the first attempt. Any other failure (agent_blocked, timeout, ...) is not.
+  # The FIRST stall is answered by the nudge (stall_shape, above) when the pane shows one of
+  # its two shapes: one Enter for the typed line, or one re-send of the line at the empty
+  # prompt, then the stall is reported if the agent is still idle -- never looped, and an
+  # Enter that did not submit is not followed by a re-send (a second copy would be appended
+  # to the line still in the prompt). A pane the nudge does not recognize keeps the loop.
+  prompt_err="$(mktemp "${TMPDIR:-/tmp}/herd-spawn-prompt.XXXXXX")"
+  prompted=no
+  nudge_done=no
+  nudge_said=""
+  prompt_deadline=$(( $(date +%s) + agent_ready_secs ))
+  while :; do
+    if "$herdr" agent prompt "$name" "$prompt_line" \
+         --wait --until working --until blocked --timeout "$ready_ms" \
+         >/dev/null 2>"$prompt_err"; then
+      prompted=yes
+      break
+    fi
+    prompt_reason="$(tail -1 "$prompt_err" 2>/dev/null)"
+    if [[ "$prompt_reason" != "agent_prompt_stalled" ]]; then
+      rm -f "$prompt_err"
+      half_fail 1 "'herdr agent prompt' failed for ${name} (pane ${pane}, tab ${tab_id}): ${prompt_reason}; the agent had started" keep
+    fi
+    if [[ "$nudge_done" == "no" ]]; then
+      nudge_done=yes
+      stall_shape
+      case "$nudge_shape" in
+        stop)
+          nudge_said="$nudge_why"
+          break
+          ;;
+        typed)
+          if "$herdr" agent send-keys "$name" enter >/dev/null 2>&1 &&
+             "$herdr" agent wait "$name" --until working --until blocked --timeout "$ready_ms" >/dev/null 2>&1; then
+            prompted=yes
+          else
+            nudge_said="the line sat typed but unsubmitted and one Enter did not submit it"
+          fi
+          break
+          ;;
+        empty)
+          if "$herdr" agent prompt "$name" "$prompt_line" \
+               --wait --until working --until blocked --timeout "$ready_ms" \
+               >/dev/null 2>"$prompt_err"; then
+            prompted=yes
+            break
+          fi
+          prompt_reason="$(tail -1 "$prompt_err" 2>/dev/null)"
+          if [[ "$prompt_reason" != "agent_prompt_stalled" ]]; then
+            rm -f "$prompt_err"
+            half_fail 1 "'herdr agent prompt' failed for ${name} (pane ${pane}, tab ${tab_id}) on its one re-send at the empty prompt: ${prompt_reason}; the agent had started" keep
+          fi
+          nudge_said="the prompt sat empty and one re-send of the line stalled too"
+          break
+          ;;
+      esac
+    fi
+    [[ $(date +%s) -lt $prompt_deadline ]] || break
+    sleep 2
+  done
+  if [[ "$prompted" != "yes" ]]; then
+    prompt_reason="$(tail -1 "$prompt_err" 2>/dev/null || true)"
+    rm -f "$prompt_err"
+    if [[ -n "$nudge_said" ]]; then
+      half_fail 1 "'herdr agent prompt' stalled for ${name} (pane ${pane}, tab ${tab_id}): ${nudge_said}; the agent had started" keep
+    fi
+    half_fail 1 "'herdr agent prompt' kept stalling for ${name} (pane ${pane}, tab ${tab_id}) past ${agent_ready_secs}s: ${prompt_reason}; the agent had started" keep
+  fi
+  rm -f "$prompt_err"
+  brief_ours=no          # the worker has been told to read it: it stays
+  # The honest half, said out loud where the person spawning the worker reads it: on codex
+  # the allow/deny lists this script computed are recorded, not applied. A file nobody opens
+  # would let the claude wall be assumed for a session that does not have it. The second line
+  # is the OTHER half of the same truth, and it was missing while the header claimed the
+  # opposite: no session guard runs here either, so the worktree named by --cwd is the whole
+  # of this session's blast radius.
+  if [[ "$harness" == "codex" ]]; then
+    echo "codex: the allow/deny lists are not enforced on this harness; the wall is the sandbox (workspace-write) and approval (on-request)"
+    echo "codex: and no session guard runs on it -- the isolated-session hook is registered for claude, cursor and grok only, and codex-cli reads neither .claude/settings.json nor .cursor/hooks.json; the worktree this worker opened in is the whole of its blast radius"
+  fi
+  # the harness and the model are on the line, so a landing's REVIEW= and its note can say
+  # which eyes read the diff; and whether the worker is walled, with the network said
+  # plainly (wall v1 leaves it open), so nobody reads "walled" as "offline"
+  echo "worker=${name} pane=${pane} tab=${tab_id} report=${report} harness=${harness} model=${model:-default} wall=${wall_state} egress=open"
+}
+
+# --- --resume <name>: a spawn that stopped at a first-run prompt, picked up -------------
+# The spawn it picks up wrote brief.md, the .roles and .repos records, opened the tab and
+# started the agent, which then sat on a first-run prompt; it wrote $HERD_DIR/.resume/<name>
+# (the pane, the tab, the cwd, the harness, the model, the wall and the owner key) and
+# printed this command. Same environment (HERD_DIR, the herdr on PATH), no brief argument:
+# the brief is the brief.md that spawn rendered, never a new one. Nothing is written but
+# the resume record's removal after the line is typed; the three files are left as they are.
+#   * a name that is not a worker name is exit 2 before herdr is asked anything;
+#   * no resume record (never spawned, or already delivered) is exit 2, nothing invented;
+#   * a brief.md that is not a regular file of the caller's (a symlink planted after the
+#     stop) is exit 2: the line would tell the worker to read whatever it points at;
+#   * a pane still on a first-run prompt is exit 1 and nothing is typed (a line typed
+#     into a dialog could answer it);
+#   * only a delivered line prints worker=.
+if [[ "${1:-}" == "--resume" ]]; then
+  resuming=yes
+  if [[ $# -ne 2 ]]; then
+    echo "usage: herd-spawn.sh --resume <name>   (a spawn that stopped at a first-run prompt; same HERD_DIR as that spawn)" >&2
+    exit 2
+  fi
+  name="$2"
+  case "$name" in
+    ''|*[!a-z0-9_-]*|[!a-z]*)
+      echo "herd-spawn: --resume takes a worker name, [a-z][a-z0-9_-]* (herdr's agent-name rule); nothing was resumed" >&2
+      exit 2
+      ;;
+  esac
+  if [[ ${#name} -gt 32 ]]; then
+    echo "herd-spawn: --resume takes a worker name of at most 32 characters (herdr's agent-name rule); nothing was resumed" >&2
+    exit 2
+  fi
+  herd_dir="$(iso_herd_dir)" || {
+    echo "herd-spawn: neither HERD_DIR nor HOME is set, so there is no herd directory; nothing was resumed for ${name}" >&2
+    exit 2
+  }
+  [[ "$herd_dir" == /* ]] || herd_dir="$(pwd)/${herd_dir}"
+  resume_rec="$herd_dir/.resume/${name}"
+  bfile="$herd_dir/${name}/brief.md"
+  report="$herd_dir/${name}/report.md"
+  repo_record="$herd_dir/.repos/${name}"
+  if [[ ! -d "$herd_dir" || ! -O "$herd_dir" ]] || ! iso_private_path "$herd_dir" >/dev/null ||
+     [[ -L "$herd_dir/.resume" || -L "$herd_dir/${name}" || -L "$herd_dir/.repos" ]]; then
+    echo "herd-spawn: ${herd_dir} (HERD_DIR) is missing, not ${USER:-the caller}'s own, writable by others, or holds a symlink where ${name}'s records live; nothing was resumed for ${name}" >&2
+    exit 2
+  fi
+  if [[ -L "$resume_rec" || ! -f "$resume_rec" || ! -O "$resume_rec" ]]; then
+    echo "herd-spawn: nothing to resume for ${name}: no spawn of that name stopped at a first-run prompt under ${herd_dir} (no resume record, or it was delivered already); spawn it with its brief instead" >&2
+    exit 2
+  fi
+  if [[ -L "$bfile" || ! -f "$bfile" || ! -O "$bfile" ]]; then
+    echo "herd-spawn: ${bfile} is missing, a symlink or not a regular file of $(id -un)'s; the resumed line would tell ${name} to read it, so it is never followed; spawn ${name} again with its brief; nothing was resumed" >&2
+    exit 2
+  fi
+  if [[ -L "$repo_record" || ! -f "$repo_record" ]]; then
+    echo "herd-spawn: ${repo_record} is missing or a symlink, so ${name}'s report could never be verified; spawn ${name} again with its brief; nothing was resumed" >&2
+    exit 2
+  fi
+  pane="" tab_id="" cwd="" harness="" model="" wall_state="" pair_key=""
+  while IFS= read -r rline || [[ -n "$rline" ]]; do
+    case "$rline" in
+      pane=*) pane="${rline#pane=}" ;;
+      tab=*) tab_id="${rline#tab=}" ;;
+      cwd=*) cwd="${rline#cwd=}" ;;
+      harness=*) harness="${rline#harness=}" ;;
+      model=*) model="${rline#model=}" ;;
+      wall=*) wall_state="${rline#wall=}" ;;
+      pair_key=*) pair_key="${rline#pair_key=}" ;;
+    esac
+  done < "$resume_rec"
+  case "$harness" in
+    claude|cursor|codex) ;;
+    *) harness="" ;;
+  esac
+  if [[ -z "$pane" || -z "$tab_id" || -z "$harness" || -z "$wall_state" || ! -d "$cwd" ]]; then
+    echo "herd-spawn: the resume record ${resume_rec} is incomplete (pane, tab, harness, wall or cwd); spawn ${name} again with its brief; nothing was resumed" >&2
+    exit 2
+  fi
+  find_herdr
+  prompt_line="Read ${bfile} and follow it. Your report goes to ${report}."
+  done_steps="brief.md kept (${bfile}), tab kept (pane ${pane}, tab ${tab_id}), resume started"
+  if stuck_on="$(first_run_prompt)"; then
+    echo "herd-spawn: ${name} is still on Claude Code's first-run prompt (${stuck_on}) in pane ${pane}, tab ${tab_id}; nothing was typed into it; answer it in the pane and run this resume again -- brief.md and its records are kept" >&2
+    exit 1
+  fi
+  deliver_brief
+  rm -f "$resume_rec"
+  exit 0
+fi
 
 name="${1:-}"
 brief="${2:-}"
@@ -272,6 +723,12 @@ if [[ ! -f "$brief" ]]; then
   echo "herd-spawn: no brief at ${brief}" >&2
   exit 2
 fi
+# ... and one this spawn can read: an unreadable template used to reach the render below and
+# end there in a Python traceback, after herdr had been asked for its status
+if [[ ! -r "$brief" ]]; then
+  echo "herd-spawn: the brief ${brief} is not readable; the worker ${name} was not started" >&2
+  exit 2
+fi
 
 cwd=""
 profile="worker"
@@ -280,9 +737,16 @@ vars=()
 extra_allow=()
 muretai_agent=""
 role=""
+cwd_given=no
+open_title=""
+open_given=no
+open_repo=""
+repo_given=no
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --cwd) [[ $# -ge 2 ]] || usage; cwd="$2"; shift 2 ;;
+    --cwd) [[ $# -ge 2 ]] || usage; cwd="$2"; cwd_given=yes; shift 2 ;;
+    --open-worktree) [[ $# -ge 2 ]] || usage; open_title="$2"; open_given=yes; shift 2 ;;
+    --repo) [[ $# -ge 2 ]] || usage; open_repo="$2"; repo_given=yes; shift 2 ;;
     --profile) [[ $# -ge 2 ]] || usage; profile="$2"; shift 2 ;;
     # A key the SPAWN sets on the tab itself is refused here, before herdr is asked
     # anything and before a single directory is made. `tab_env` is assembled spawn-first
@@ -295,7 +759,7 @@ while [[ $# -gt 0 ]]; do
     --env)
       [[ $# -ge 2 ]] || usage
       case "${2%%=*}" in
-        CODEX_HOME|CURSOR_CONFIG_DIR|PYTHONNOUSERSITE|CLAUDE_CODE_DISABLE_AUTO_MEMORY|HERD_WORKER|HERD_BRIEF|HERD_REPORT|ISOLATED_SESSION_GUARD_TRACE|MURETAI_HERDR_AGENT|HERD_WALL_INSIDE)
+        CODEX_HOME|CURSOR_CONFIG_DIR|PYTHONNOUSERSITE|CLAUDE_CODE_DISABLE_AUTO_MEMORY|HERD_WORKER|HERD_BRIEF|HERD_REPORT|ISOLATED_SESSION_GUARD_TRACE|MURETAI_HERDR_AGENT|HERD_WALL_INSIDE|CLAUDE_CODE_OAUTH_TOKEN)
           echo "herd-spawn: --env ${2%%=*}=... is refused: the spawn sets that key on the tab itself and the caller's entries are appended after its own, so which value the tab got would be herdr's dedup order to decide; the worker ${name} was not started" >&2
           exit 2
           ;;
@@ -343,11 +807,131 @@ case "$profile" in
   worker|reviewer|coordinator) ;;
   *) echo "herd-spawn: --profile is worker, reviewer or coordinator (got '${profile}'); the worker ${name} was not started" >&2; exit 2 ;;
 esac
+# A coordinator pane carries DISABLE_AUTOUPDATER=1 (set on the tab below), so a caller's
+# `--env DISABLE_AUTOUPDATER=...` is refused for that profile rather than left to herdr's
+# dedup order: a silent override would hide the mistake. Judged after the loop because
+# --profile may follow --env on the line.
+if [[ "$profile" == "coordinator" ]]; then
+  for kv in ${envs[@]+"${envs[@]}"}; do
+    if [[ "${kv%%=*}" == "DISABLE_AUTOUPDATER" ]]; then
+      echo "herd-spawn: --env DISABLE_AUTOUPDATER=... is refused for the coordinator profile: the spawn sets DISABLE_AUTOUPDATER=1 on that tab itself, so an in-pane update cannot end the coordinator mid-loop; the worker ${name} was not started" >&2
+      exit 2
+    fi
+  done
+fi
 # a solo worker lands its own work, which is what the worker profile is for; a reviewer or
 # a coordinator declared solo would be verified as a landing it never makes
 if [[ -n "$role" && "$profile" != "worker" ]]; then
   echo "herd-spawn: --role solo goes with the worker profile only (got '${profile}'); the worker ${name} was not started" >&2
   exit 2
+fi
+# --open-worktree: judged here, before herdr is asked anything and before the worktree is
+# opened (which happens where the tab's directory is resolved, below). It opens a worker's
+# OWN worktree, so it goes with the worker profile; it needs the caller's stable key, or a
+# re-run could not find its own lock; and it is the only answer to "where", so a --cwd or a
+# caller's WORKTREE/BRANCH/PRIMARY beside it is refused rather than silently outvoted.
+open_key=""
+if [[ "$open_given" == "yes" ]]; then
+  if [[ -z "$open_title" ]]; then
+    echo "herd-spawn: --open-worktree needs a title (the task, as ensure-worktree.sh takes it); the worker ${name} was not started" >&2
+    exit 2
+  fi
+  if [[ "$profile" != "worker" ]]; then
+    echo "herd-spawn: --open-worktree goes with the worker profile only (got '${profile}'); the worker ${name} was not started" >&2
+    exit 2
+  fi
+  if [[ "$cwd_given" == "yes" ]]; then
+    echo "herd-spawn: --open-worktree and --cwd both say where the worker opens; pass one; the worker ${name} was not started" >&2
+    exit 2
+  fi
+  for kv in ${vars[@]+"${vars[@]}"}; do
+    case "${kv%%=*}" in
+      WORKTREE|BRANCH|PRIMARY)
+        echo "herd-spawn: --var ${kv%%=*}=... is refused with --open-worktree: the spawn fills it from the worktree it opens; the worker ${name} was not started" >&2
+        exit 2
+        ;;
+    esac
+  done
+  for kv in ${envs[@]+"${envs[@]}"}; do
+    if [[ "${kv%%=*}" == "ISOLATED_SESSION_OWNER" ]]; then
+      open_key="${kv#*=}"
+    fi
+  done
+  if [[ -z "$open_key" ]]; then
+    echo "herd-spawn: --open-worktree needs --env ISOLATED_SESSION_OWNER=<harness>:<worker>: the worktree is opened under that key and handed to the worker by it, and a re-run finds its own lock only under the same key; the worker ${name} was not started" >&2
+    exit 2
+  fi
+fi
+
+# 0 when the repository $1 (a primary checkout) is itself a path listed in the operator's
+# $HOME/.muretai/dispatch/repos, dispatch-init.sh's `<name>=<absolute path>` lines. Read the
+# way the other dispatch readers read it (finish-worktree.sh): a regular file and not a
+# symlink, blank and `#` lines skipped. Stricter here, because the answer is a trust
+# decision: the listed path must BE the repository (both resolved), never a directory
+# holding it (a parent, HOME, `/`) or a sibling sharing its prefix; a line carrying `*` is
+# skipped whole; a relative path counts for nothing. HOME only -- DISPATCH_DIR is not
+# read, so no variable can point the check at a list the operator did not write.
+# Defined here, before herdr is asked anything, because --repo is judged against it; the
+# trust seam below asks it again.
+dispatch_listed() {
+  local want="$1" repos line pth got
+  [[ -n "${HOME:-}" && "$want" == /* ]] || return 1
+  repos="${HOME}/.muretai/dispatch/repos"
+  [[ -f "$repos" && ! -L "$repos" && -O "$repos" ]] || return 1
+  want="$(cd "$want" 2>/dev/null && pwd -P)" || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      ''|\#*|*'*'*) continue ;;
+    esac
+    [[ "$line" == *=* ]] || continue
+    pth="${line#*=}"
+    case "$pth" in
+      "~/"*) pth="${HOME}/${pth#\~/}" ;;
+    esac
+    [[ "$pth" == /* && -d "$pth" ]] || continue
+    got="$(cd "$pth" 2>/dev/null && pwd -P)" || continue
+    if [[ "$got" == "$want" ]]; then
+      return 0
+    fi
+  done < "$repos"
+  return 1
+}
+
+# --repo <primary>: which repository --open-worktree opens the worktree in, for a caller
+# (the coordinator seat) that cannot `cd` there first. Judged here, before herdr is asked
+# anything and before any worktree or branch exists. It goes with --open-worktree only.
+# The value is resolved to a canonical absolute path (a relative one from the caller's
+# directory; symlinks and a trailing slash fall away) and must be a repository's PRIMARY
+# checkout -- its top level, not a linked worktree or a subdirectory -- listed in the
+# operator's $HOME/.muretai/dispatch/repos (dispatch_listed). Anything else is refused the
+# same way as an unlisted path. The worktree is opened by THAT repository's own
+# ensure-worktree.sh, never this one's run against it; a repository without one is refused.
+open_repo_primary=""
+if [[ "$repo_given" == "yes" ]]; then
+  if [[ "$open_given" != "yes" ]]; then
+    echo "herd-spawn: --repo goes with --open-worktree only (it names the repository the worktree opens in); the worker ${name} was not started" >&2
+    exit 2
+  fi
+  repo_real=""
+  if [[ -n "$open_repo" && -d "$open_repo" ]]; then
+    repo_real="$(cd "$open_repo" 2>/dev/null && pwd -P)" || repo_real=""
+  fi
+  repo_top=""
+  if [[ -n "$repo_real" ]]; then
+    repo_top="$(iso_primary_of "$repo_real" 2>/dev/null)" || repo_top=""
+    [[ -z "$repo_top" ]] || repo_top="$(cd "$repo_top" 2>/dev/null && pwd -P)" || repo_top=""
+  fi
+  if [[ -z "$repo_real" || "$repo_top" != "$repo_real" || ! -d "$repo_real/.git" ]] \
+     || ! dispatch_listed "$repo_real"; then
+    echo "herd-spawn: --repo $(iso_safe_text "$open_repo" || echo '?') is not a primary checkout listed in the dispatch repos (\$HOME/.muretai/dispatch/repos); the worker ${name} was not started" >&2
+    exit 2
+  fi
+  repo_ensure="$repo_real/.cursor/skills/isolated-session/scripts/ensure-worktree.sh"
+  if [[ ! -f "$repo_ensure" || -L "$repo_ensure" ]]; then
+    echo "herd-spawn: --repo ${repo_real} has no ensure-worktree.sh of its own (${repo_ensure}); this script's copy is never run against another repository; the worker ${name} was not started" >&2
+    exit 2
+  fi
+  open_repo_primary="$repo_real"
 fi
 
 # --- the permission mode: one of four words, checked before herdr is asked anything ----
@@ -527,9 +1111,33 @@ wall_bound() {
 wall_bound HERD_WALL_CPU_SECS 7200 wall_cpu
 wall_bound HERD_WALL_MEM_MB 8192 wall_mem
 wall_bound HERD_WALL_PROCS 512 wall_procs
+#   probe seconds each of the two wall probes (the wall probe, the claim probe) may take
+#         before it is killed and the spawn refused by name. Both waited with no limit, so a
+#         probe that stalled behind the wall stalled the spawn with it. Checked here, before
+#         any probe starts; like the other bounds it has no unbounded spelling.
+wall_bound HERD_WALL_PROBE_SECS 120 wall_probe_secs
 # dropped from this process like the other knobs, so a spawn a worker starts decides its
 # own wall from the defaults again
-unset HERD_WALL HERD_WALL_EGRESS HERD_WALL_CPU_SECS HERD_WALL_MEM_MB HERD_WALL_PROCS
+unset HERD_WALL HERD_WALL_EGRESS HERD_WALL_CPU_SECS HERD_WALL_MEM_MB HERD_WALL_PROCS HERD_WALL_PROBE_SECS
+
+# --- THE OAUTH TOKEN: the owner's long-lived login for the pane -------------------------
+# Every pane refreshing the one shared ~/.claude login knocked the others out at each
+# rotation (a refresh token is single-use). When $HOME/.muretai/herd/oauth-token passes
+# iso_herd_oauth_token (a regular 0600-style file of the caller's, not a symlink), a claude
+# pane gets it as CLAUDE_CODE_OAUTH_TOKEN on `herdr tab create` and never touches that file.
+# Anything else is an absent file, silently: today's spawn, on the shared login. The FILE
+# is the only source -- a CLAUDE_CODE_OAUTH_TOKEN this process inherited is dropped here, so
+# no caller smuggles one past the mode and symlink check, and nothing this spawn runs
+# inherits it. The value lives in this shell variable only: it is written to no file (not
+# permissions.json, the brief, the wall, the resume record) and printed on no line. The
+# channel is herdr's --env argv on `tab create` (the daemon builds the tab from that list
+# alone), so the value is in the process table while that one call runs:
+# ISSUE(herd-oauth-token-rides-tab-create-argv). Cursor and codex do not read it and get none.
+oauth_token=""
+if [[ "$harness" == "claude" ]]; then
+  oauth_token="$(iso_herd_oauth_token 2>/dev/null)" || oauth_token=""
+fi
+unset CLAUDE_CODE_OAUTH_TOKEN
 
 # --- the deny list ------------------------------------------------------------------------
 # What the shell may NOT do even when an allow rule would allow it: a deny rule is
@@ -577,16 +1185,21 @@ deny=(
   # through to the auto-mode classifier: exactly the wave-through this list exists to stop
   # (ISSUE(security-audit-2026-09-18-daily-2026-09-18-16)). The shape is what matters: any
   # `-c`, any `-m`, any bare `-` argument, whatever flags stand between. `-c` and `-m`
-  # consume the rest of a cluster, so a cluster carrying one ENDS in `c` or `m` (`-Ic`,
-  # `-IBm`) -- that is what the `-*c` / `-*m` rules read. `python3 -I <path>`, the form the
-  # briefs instruct, carries no `c `/`m ` and none of these touch it (pinned both ways by
-  # test_herd_spawn.test_deny_by_shape). `Bash(python:*)` already covers every `python `.
+  # consume the rest of a cluster. `Bash(python:*)` already covers every `python `.
+  # The shape rules read the interpreter's FLAGS only -- the words between `python3` and the
+  # script path -- never a script's arguments. The first spelling of them (`python3 -*c *`,
+  # `python3 * -m`, ...) put a `*` before the `c`, and a `*` spans spaces: it ran past the
+  # script into its arguments, so `python3 -I tools/sec_lint.py --diff <sha>..<sha>` was
+  # DENIED whenever a sha ended in `c` or `m`, and a reviewer's receipt depended on the hex
+  # of its range (the landing 46815a9..c3691b0). So every literal below stops inside the
+  # flag words and each `*` only follows it: the one flag spelling a session is allowed is
+  # `python3 -I <path>`, and the rules deny every OTHER start -- a second flag word after
+  # `-I`, a cluster that continues `-I`, any other dash option, a long option, a doubled
+  # space. Letter by letter, in the loop after this list (`-c'code'` and `-mmod`, with no
+  # space, are the `c` and `m` of it). Pinned both ways by test_herd_spawn.test_deny_by_shape
+  # and tests/test_reviewer_receipt_perms.py.
   "Bash(python3 -m:*)"
-  "Bash(python3 * -c)" "Bash(python3 * -c *)"
-  "Bash(python3 * -m)" "Bash(python3 * -m *)"
-  "Bash(python3 * -)" "Bash(python3 * - *)"
-  "Bash(python3 -*c)" "Bash(python3 -*c *)"
-  "Bash(python3 -*m)" "Bash(python3 -*m *)"
+  "Bash(python3 -I -*)" "Bash(python3 --*)" "Bash(python3  *)" "Bash(python3 -I  *)"
   "Bash(perl:*)" "Bash(ruby:*)" "Bash(node:*)" "Bash(php:*)"
   "Bash(bash -*)" "Bash(sh -*)" "Bash(zsh -*)"
   "Bash(cat:*)" "Bash(head:*)" "Bash(tail:*)" "Bash(grep:*)" "Bash(wc:*)"
@@ -595,6 +1208,21 @@ deny=(
   "Bash(less:*)" "Bash(more:*)"
   "Bash(curl:*)" "Bash(wget:*)" "Bash(ssh:*)" "Bash(scp:*)"
 )
+# the flag words, letter by letter (see the shape rules above): `-I` continued by a letter
+# is a cluster (`-Ic`, `-IBm`), and a first flag that is not `-I` is any other option
+for py_flag in a b c d e f g h i j k l m n o p q r s t u v w x y z \
+               A B C D E F G H I J K L M N O P Q R S T U V W X Y Z; do
+  deny+=("Bash(python3 -I${py_flag}*)")
+  [[ "$py_flag" == "I" ]] || deny+=("Bash(python3 -${py_flag}*)")
+done
+unset py_flag
+# A test run is ONE command, `python3 -I tests/<file>.py`, never redirected (A2 of intake
+# 20260929T223514Z): a pipe splits the line and its `tail`/`head` half is denied above, but
+# `> out.txt` stays inside the one subcommand, so it needs a rule of its own. The `*` only
+# follows the literal `tests/` and guards no `c` or `m` (the shape rule above). A `..` would
+# walk the every-profile `tests/*.py` allow out of tests/, so it is refused the same way.
+# After the static list, so a profile's deny still begins with it byte for byte.
+deny+=("Bash(python3 -I tests/*>*)" "Bash(python3 tests/*>*)" "Bash(python3 -I tests/*..*)")
 # The coordinator starts panes only through this script (which writes their rules), so
 # the raw verb that would start an agent with any flags it likes is denied to it.
 if [[ "$profile" == "coordinator" ]]; then
@@ -672,10 +1300,175 @@ for rule in rules:
 PY
 fi
 
+# --- one live worker per owner key -------------------------------------------------------
+# The key is a pair's identity: ensure-worktree.sh gives its worktree `lock: mine` to any
+# session holding it, so a second worker started under a key a LIVE worker holds writes on
+# that worker's branch beside it (appl-home-tests2 beside appl-home-tests, 2026-09-29).
+# key_guard KEY DIR HANDOVER refuses such a spawn (exit 2, one line naming the live worker)
+# before a tab, a record or the lock is touched. The workers holding KEY are those whose
+# $HERD_DIR/.keys/<w> record says KEY (written by their own spawn) and the owner_worker of
+# every lock of DIR's repository owned by KEY (a hand-over names it); this worker's own
+# name is not one of them (herdr refuses a live name by itself). Only those herdr still
+# lists -- `agent list` by name or `tab list` by label -- are live, so nothing is asked of
+# herdr when no worker holds the key. A listing herdr does not answer is a refusal too:
+# herdr not answering is not "the tab is gone".
+# The one spawn under a live key that goes ahead is the pair hand-over (HANDOVER=yes): DIR
+# is the worktree whose lock is owned by KEY, and every live holder has written a regular,
+# non-empty $HERD_DIR/<holder>/report.md. The coordinator spawns the implementer that way
+# and closes the author after; a second implementer while the first is live and unreported
+# is refused like any duplicate.
+key_guard() {
+  local key="$1" dir="$2" handover="$3" hd f w k line wt lk ow cands="" live="" missing="" listed lock_owner
+  hd="$(iso_herd_dir)" || return 0
+  [[ "$hd" == /* ]] || hd="$(pwd)/${hd}"
+  if [[ -d "$hd/.keys" && ! -L "$hd/.keys" ]]; then
+    for f in "$hd/.keys"/*; do
+      [[ -f "$f" && ! -L "$f" ]] || continue
+      w="${f##*/}"
+      case "$w" in *[!a-z0-9_-]*|[!a-z]*) continue ;; esac
+      [[ "$w" != "$name" ]] || continue
+      k=""
+      IFS= read -r k < "$f" || true
+      [[ "$k" == "$key" ]] || continue
+      case " $cands " in *" $w "*) ;; *) cands="${cands:+$cands }$w" ;; esac
+    done
+  fi
+  while IFS= read -r line; do
+    case "$line" in worktree\ *) wt="${line#worktree }" ;; *) continue ;; esac
+    lk="$(iso_lock_path "$wt" 2>/dev/null)" || continue
+    [[ -f "$lk" && ! -L "$lk" ]] || continue
+    [[ "$(iso_lock_get "$lk" owner)" == "$key" ]] || continue
+    ow="$(iso_lock_get "$lk" owner_worker)"
+    case "$ow" in ''|*[!a-z0-9_-]*|[!a-z]*) continue ;; esac
+    [[ "$ow" != "$name" ]] || continue
+    case " $cands " in *" $ow "*) ;; *) cands="${cands:+$cands }$ow" ;; esac
+  done < <(git -C "$dir" worktree list --porcelain 2>/dev/null || true)
+  [[ -n "$cands" ]] || return 0
+  [[ -n "${herdr:-}" ]] || find_herdr
+  if ! listed="$(python3 -I - "$herdr" <<'PY'
+import json, subprocess, sys
+names = set()
+for kind, field in (("agent", "name"), ("tab", "label")):
+    try:
+        p = subprocess.run([sys.argv[1], kind, "list"], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        print("'herdr %s list' did not run (%s)" % (kind, type(e).__name__)); sys.exit(1)
+    if p.returncode != 0:
+        print("'herdr %s list' exited %d" % (kind, p.returncode)); sys.exit(1)
+    try:
+        rows = json.loads(p.stdout.decode("utf-8", "replace")).get("result", {}).get(kind + "s")
+    except (ValueError, AttributeError):
+        rows = None
+    if not isinstance(rows, list):
+        print("'herdr %s list' printed no %ss" % (kind, kind)); sys.exit(1)
+    for r in rows:
+        if isinstance(r, dict) and isinstance(r.get(field), str):
+            names.add(r[field])
+print("\n".join(sorted(names)))
+PY
+)"; then
+    echo "herd-spawn: the owner key $(iso_safe_text "$key" || echo '?') is held by ${cands// /, }, and herdr's listing did not answer (${listed:-no reason}), so whether that worker is still live cannot be told; refusing rather than start a second worker under a live key; the worker ${name} was not started" >&2
+    exit 2
+  fi
+  for w in $cands; do
+    case $'\n'"$listed"$'\n' in
+      *$'\n'"$w"$'\n'*) live="${live:+$live }$w" ;;
+    esac
+  done
+  [[ -n "$live" ]] || return 0
+  if [[ "$handover" == "yes" ]]; then
+    lk="$(iso_lock_path "$dir" 2>/dev/null || true)"
+    lock_owner=""
+    [[ -z "$lk" || ! -f "$lk" || -L "$lk" ]] || lock_owner="$(iso_lock_get "$lk" owner)"
+    if [[ "$lock_owner" == "$key" ]]; then
+      for w in $live; do
+        f="$hd/${w}/report.md"
+        [[ ! -L "$f" && -f "$f" && -s "$f" ]] || missing="${missing:+$missing }$w"
+      done
+      [[ -n "$missing" ]] || return 0
+      echo "herd-spawn: the owner key $(iso_safe_text "$key" || echo '?') is held by the live worker ${missing// /, }, which has written no report.md yet; the pair hand-over into ${dir} waits for that report; the worker ${name} was not started" >&2
+      exit 2
+    fi
+  fi
+  echo "herd-spawn: the owner key $(iso_safe_text "$key" || echo '?') is held by the live worker ${live// /, } (herdr still lists it); a second worker under a live key would share its worktree -- only the pair hand-over (--cwd <the key's worktree>, after the holder's report.md) may, or wait until that tab is closed; the worker ${name} was not started" >&2
+  exit 2
+}
+caller_key=""
+for kv in ${envs[@]+"${envs[@]}"}; do
+  if [[ "${kv%%=*}" == "ISOLATED_SESSION_OWNER" ]]; then
+    caller_key="${kv#*=}"
+  fi
+done
+
 # --- where the tab opens ---------------------------------------------------------------
 # Resolved BEFORE herdr is asked anything, because for codex the answer is itself a
 # refusal (below) and a refused spawn must leave nothing anywhere -- not a tab, not a
 # recorded call, not a directory.
+#
+# --open-worktree opens the worker's worktree first and makes it the cwd (the header says
+# why). ensure-worktree.sh runs in a subshell holding the caller's key and no other
+# ISOLATED_SESSION_* variable (an override in the coordinator's environment must not reach
+# the open), with HERD_WORKER set to THIS worker's name (not the caller's), from the primary
+# of the repository this script lives in -- dispatch-take.sh's open_worktree, plus the
+# worker name a re-run needs after the hand-over. Only its WORKTREE= and BRANCH= lines are read;
+# the title reaches it as one argument and is never evaluated.
+# With --repo (judged above) the primary is that repository's and so is the script: its own
+# ensure-worktree.sh, from its own primary.
+if [[ "$open_given" == "yes" ]]; then
+  if [[ -n "$open_repo_primary" ]]; then
+    open_primary="$open_repo_primary"
+    open_ensure="$repo_ensure"
+  else
+    open_primary="$(iso_primary_of "$here")" || {
+      echo "herd-spawn: --open-worktree: this script is not inside a git checkout; the worker ${name} was not started" >&2
+      exit 2
+    }
+    open_ensure="$here/ensure-worktree.sh"
+  fi
+  # a function, called in a subshell: bash 3.2 cannot parse a `case` written inside $( )
+  open_run() {
+    local v
+    for v in $(compgen -e); do
+      case "$v" in
+        ISOLATED_SESSION_*|HERD_WORKER) unset "$v" ;;
+      esac
+    done
+    export ISOLATED_SESSION_OWNER="$open_key"
+    # ... as THIS worker: once a spawn has handed the hold over, the lock names the worker
+    # (owner_worker=<name>) and is `mine` only for a session whose HERD_WORKER is that
+    # name (lib.sh iso_lock_state) -- which is what lets a re-run resume, and keeps another
+    # worker started under the same key out
+    export HERD_WORKER="$name"
+    cd "$open_primary" || return 2
+    bash "$open_ensure" "$open_title" </dev/null 2>&1
+  }
+  open_out=""
+  open_rc=0
+  open_out="$(open_run)" || open_rc=$?
+  open_wt=""
+  open_branch=""
+  while IFS= read -r open_line; do
+    case "$open_line" in
+      WORKTREE=*) [[ -n "$open_wt" ]] || open_wt="${open_line#WORKTREE=}" ;;
+      BRANCH=*) [[ -n "$open_branch" ]] || open_branch="${open_line#BRANCH=}" ;;
+    esac
+  done <<< "$open_out"
+  if [[ "$open_rc" -ne 0 || -z "$open_wt" || -z "$open_branch" || ! -d "$open_wt" ]]; then
+    echo "herd-spawn: --open-worktree could not open the worker's worktree (ensure-worktree exit ${open_rc}): $(printf '%s' "$open_out" | tail -3 | tr '\n' ' '); the worker ${name} was not started" >&2
+    exit 2
+  fi
+  cwd="$open_wt"
+  vars=("WORKTREE=${open_wt}" "BRANCH=${open_branch}" "PRIMARY=${open_primary}" ${vars[@]+"${vars[@]}"})
+  open_has_title=no
+  for kv in ${vars[@]+"${vars[@]}"}; do
+    if [[ "${kv%%=*}" == "TITLE" ]]; then
+      open_has_title=yes
+    fi
+  done
+  [[ "$open_has_title" == "yes" ]] || vars+=("TITLE=${open_title}")
+  echo "herd-spawn: opened ${open_wt} on ${open_branch} for ${name} (owner key $(iso_safe_text "$open_key" || echo '?'))" >&2
+fi
 if [[ -z "$cwd" ]]; then
   cwd="$(iso_primary_of "$here")" || {
     echo "herd-spawn: this script is not inside a git checkout; pass --cwd DIR" >&2
@@ -714,23 +1507,7 @@ spawn_repo="$(iso_primary_of "$cwd" 2>/dev/null)" && [[ "$spawn_repo" == /* ]] |
 }
 
 # --- herdr: on PATH (or HERD_SPAWN_BIN) and its server up, else exit 3 ---------------
-herdr="${HERD_SPAWN_BIN:-}"
-if [[ -n "$herdr" ]]; then
-  if [[ ! -x "$herdr" ]]; then
-    echo "herd-spawn: no herdr binary at HERD_SPAWN_BIN=${herdr}; the worker ${name} was not started" >&2
-    exit 3
-  fi
-else
-  herdr="$(command -v herdr 2>/dev/null || true)"
-  if [[ -z "$herdr" ]]; then
-    echo "herd-spawn: herdr is not on PATH (https://herdr.dev); the worker ${name} was not started" >&2
-    exit 3
-  fi
-fi
-if ! "$herdr" status >/dev/null 2>&1; then
-  echo "herd-spawn: 'herdr status' failed -- the herdr server is not running; the worker ${name} was not started" >&2
-  exit 3
-fi
+find_herdr
 
 # --- HERD_DIR: ours, or nothing is written there ----------------------------------------
 # Created mode 700 when absent. An existing directory someone else owns (a shared host's
@@ -762,6 +1539,16 @@ if ! open_dir="$(iso_private_path "$cwd")"; then
   echo "herd-spawn: ${open_dir}, at or above the cwd ${cwd}, is writable by others; a CLAUDE.md there would reach the worker; the worker ${name} was not started" >&2
   exit 2
 fi
+# the key a live worker holds is not handed to a second one. With --open-worktree this is
+# judged after the open: ensure-worktree.sh already refuses a lock handed to another worker
+# by name, and says so; an open is never the pair hand-over.
+if [[ -n "$caller_key" ]]; then
+  if [[ "$open_given" == "yes" ]]; then
+    key_guard "$caller_key" "$cwd" no
+  else
+    key_guard "$caller_key" "$cwd" yes
+  fi
+fi
 # A directory under it is ours or nothing is written into it: a real directory (a
 # symlink planted at $HERD_DIR/<name> by an earlier, prompt-injected session would carry
 # the next reviewer's rules file wherever it points), created mode 700 when absent and
@@ -784,10 +1571,12 @@ own_dir() {
 own_dir "$herd_dir/briefs"
 own_dir "$herd_dir/.roles"
 own_dir "$herd_dir/.repos"
+own_dir "$herd_dir/.keys"
 own_dir "$herd_dir/${name}"
 role_marker="$herd_dir/${name}/role"
 role_record="$herd_dir/.roles/${name}"
 repo_record="$herd_dir/.repos/${name}"
+key_record="$herd_dir/.keys/${name}"
 report="$herd_dir/${name}/report.md"
 rendered="$herd_dir/briefs/${name}.md"
 perms="$herd_dir/${name}/permissions.json"
@@ -1023,6 +1812,27 @@ fi
 # plug, its templates and run.py -- where the walled worker cannot write (walls/ is on no
 # allow-write line). The script this block lives in may run from a worktree the worker can
 # edit, or from the landing's temporary copy that is deleted after the spawn.
+#
+# THE OWNER KEY (ISSUE(walled-worker-cannot-claim-a-worktree)). Behind wall v1 `ps` cannot
+# run (/bin/ps is setuid, and a Seatbelt-walled process cannot exec it), so the process walk
+# that names a keyless session's owner has no answer there, and iso_owner_pid refuses. A
+# walled (or inherited-wall) worker is therefore ALWAYS given a stable key on its tab:
+# the caller's `--env ISOLATED_SESSION_OWNER=<k>` when there is one -- and then that entry
+# alone, never a second beside it, which would leave the value to herdr's dedup order --
+# else the worker's own name. Every lock of the repository that key already owns is handed
+# over below, exactly as the pair hand-over does. And the probe proves the claim works:
+# behind the same wall, before any tab exists, claim-worktree.sh and assert-head.sh run
+# under that key against a THROWAWAY repository in the worker's own directory (removed
+# afterwards); a wall under which they fail is a finding like a leak.
+owner_key=""
+owner_key_from_caller=no
+for kv in ${envs[@]+"${envs[@]}"}; do
+  if [[ "${kv%%=*}" == "ISOLATED_SESSION_OWNER" ]]; then
+    owner_key="${kv#*=}"
+    owner_key_from_caller=yes
+  fi
+done
+[[ "$owner_key_from_caller" == "yes" ]] || owner_key="$name"
 wall_scope=walled
 bounded=yes
 if [[ "$profile" == "coordinator" ]]; then
@@ -1693,6 +2503,88 @@ else:
         if os.path.lexists(os.path.join(wd, t)):
             os.unlink(os.path.join(wd, t))
 PY
+# The claim probe (THE OWNER KEY above). Runs through the plug, under the worker's profile,
+# the scripts a worker runs to hold its folder -- claim-worktree.sh, then assert-head.sh from
+# another shell, as each Bash call of a session is -- with the key the tab will carry, in a
+# throwaway repository and linked worktree made behind the wall inside $HERD_DIR/<name>/
+# (the one place under HERD_DIR the profile lets the worker write, never TMPDIR and never
+# the worker's repository), removed whatever the outcome. The scripts are this script's own
+# siblings, the version that just wrote the profile: the landing's reviewer spawn and
+# tools/security_daily.sh extract both from BASE beside their temporary copy of this script.
+# Failing that, the cwd checkout's copy -- the one the worker itself will run -- is used.
+# No copy of either is a finding, not a skip.
+# Silent and 0 when the claim holds; else one clause on stdout and 1. No variable skips it.
+#
+# probe_bounded SECS CMD...: run CMD in a session of its own and wait at most SECS seconds;
+# at the bound its whole process group is killed (the stalled plug and whatever it started)
+# and this returns 124. macOS has no timeout(1), so the bound is a few lines of python3 -I.
+probe_bounded() {
+  python3 -I -c '
+import os, signal, subprocess, sys
+secs = int(sys.argv[1])
+p = subprocess.Popen(sys.argv[2:], start_new_session=True)
+try:
+    rc = p.wait(timeout=secs)
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    p.wait()
+    sys.exit(124)
+sys.exit(128 - rc if rc < 0 else rc)
+' "$@"
+}
+wall_claim_probe() {
+  local sd="" cand wt_root cdir crc cout step
+  wt_root="$(iso_worktree_of "$cwd" 2>/dev/null || true)"
+  for cand in "$here" "${wt_root:-/nonexistent}/.cursor/skills/isolated-session/scripts"; do
+    if [[ -f "$cand/claim-worktree.sh" && -f "$cand/assert-head.sh" && -f "$cand/lib.sh" ]]; then
+      sd="$cand"
+      break
+    fi
+  done
+  if [[ -z "$sd" ]]; then
+    echo "no claim-worktree.sh and assert-head.sh were found to prove the worktree claim behind the wall, so the worker's lock is unproven"
+    return 1
+  fi
+  if ! cdir="$(mktemp -d "$herd_dir/${name}/.claim-probe.XXXXXX" 2>/dev/null)"; then
+    echo "could not create the claim probe's throwaway directory in ${herd_dir}/${name}, so the worker's lock is unproven"
+    return 1
+  fi
+  crc=0
+  cout="$( cd "$cdir" && probe_bounded "$wall_probe_secs" /bin/bash "$wall_dir/plug.sh" exec "$wall_dir/profile" -- /bin/bash -c '
+    d="$1"; sd="$2"
+    unset HERD_WORKER ISOLATED_SESSION_TAKEOVER ISOLATED_SESSION_FORCE ISOLATED_SESSION_RESUME ISOLATED_SESSION_CROSS
+    export ISOLATED_SESSION_OWNER="$3" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+    export GIT_AUTHOR_NAME=herd-probe GIT_AUTHOR_EMAIL=herd-probe@example.invalid
+    export GIT_COMMITTER_NAME=herd-probe GIT_COMMITTER_EMAIL=herd-probe@example.invalid
+    git init -q "$d/repo" >/dev/null 2>&1 &&
+      git -C "$d/repo" commit -q --allow-empty -m probe >/dev/null 2>&1 &&
+      git -C "$d/repo" worktree add -q -b herd/claim-probe "$d/wt" >/dev/null 2>&1 || { echo step=setup; exit 1; }
+    /bin/bash "$sd/claim-worktree.sh" "$d/wt" >/dev/null 2>&1 || { echo step=claim; exit 1; }
+    /bin/bash "$sd/assert-head.sh" herd/claim-probe "$d/wt" >/dev/null 2>&1 || { echo step=assert-head; exit 1; }
+    echo step=done
+  ' herd-claim-probe "$cdir" "$sd" "$owner_key" 2>/dev/null )" || crc=$?
+  rm -rf "$cdir"
+  step="$(printf '%s\n' "$cout" | sed -n 's/^step=//p' | tail -1)"
+  if [[ "$crc" == "0" && "$step" == "done" ]]; then
+    return 0
+  fi
+  if [[ "$crc" == "124" ]]; then
+    echo "the claim probe timed out behind the wall (killed after ${wall_probe_secs}s, HERD_WALL_PROBE_SECS), so the worker's worktree claim and lock are unproven"
+    return 1
+  fi
+  case "$step" in
+    claim|assert-head)
+      echo "behind the wall the worktree claim does not hold (${step}.sh failed in a throwaway repository under the worker's key), so the worker could not keep its lock" ;;
+    setup)
+      echo "behind the wall the claim probe could not even make its throwaway repository (git failed), so the worker's worktree claim and lock are unproven" ;;
+    *)
+      echo "the claim probe did not run to the end behind the wall (exit ${crc}), so the worker's worktree claim and lock are unproven" ;;
+  esac
+  return 1
+}
 wall_state=unwalled
 wall_why=""
 if [[ "$wall_scope" != "walled" ]]; then
@@ -1755,7 +2647,7 @@ else
                 write:intake "$herd_dir/coordinator/intake")
     [[ -z "${HOME:-}" ]] || probe_args+=(write:suite "$HOME/.cache/muretai-tests")
     probe_rc=0
-    ( cd "$probe_dir" && /bin/bash "$wall_dir/plug.sh" exec "$wall_dir/profile" -- \
+    ( cd "$probe_dir" && probe_bounded "$wall_probe_secs" /bin/bash "$wall_dir/plug.sh" exec "$wall_dir/profile" -- \
         "$wall_py" -I "$wall_dir/run.py" probe "${probe_args[@]}" \
     ) >"$probe_dir/out" 2>/dev/null || probe_rc=$?
     leaks=""
@@ -1780,12 +2672,16 @@ else
       esac
     done < "$probe_dir/out"
     rm -rf "$probe_dir"
-    if [[ -n "$leaks" ]]; then
+    if [[ "$probe_rc" == "124" ]]; then
+      finding="the wall probe timed out behind the wall (killed after ${wall_probe_secs}s, HERD_WALL_PROBE_SECS), so the wall is unproven"
+    elif [[ -n "$leaks" ]]; then
       finding="the wall probe could still read ${leaks} behind the wall, so the wall does not hold"
     elif [[ "$probe_done" != "yes" || "$probe_rc" != "0" ]]; then
       finding="the wall probe did not run to the end (exit ${probe_rc}), so the wall is unproven"
     elif [[ -n "$jobs_denied" ]]; then
       finding="the wall stands, but behind it the worker could not ${jobs_denied}"
+    elif ! finding="$(wall_claim_probe)"; then
+      :
     else
       finding=""
       wall_state=walled
@@ -1799,6 +2695,46 @@ else
       wall_why="why=probe"
     fi
   fi
+fi
+# A walled worker whose cwd is the PRIMARY gets NO gate. The launcher's gate is the branch
+# the cwd has checked out at spawn, and finish-worktree.sh hands a landing to it only when
+# the branch and worktree it lands ARE the gate's -- a gate on the base branch in the
+# primary matches no landing a worker ever makes (it opens its own worktree from there), so
+# it would only look like a gate. "The primary" is judged the way the landing judges it:
+# the recorded branch is the base ref, which a subdirectory of the primary is too. Said on
+# stderr and in wall.log, so a spawn that can never land through the gate is visible.
+wall_base="main"
+if [[ -n "$wall_common" ]] &&
+   ! git --git-dir "$wall_common" rev-parse --verify --quiet refs/heads/main >/dev/null 2>&1 &&
+   git --git-dir "$wall_common" rev-parse --verify --quiet refs/heads/master >/dev/null 2>&1; then
+  wall_base="master"
+fi
+gate_none=""
+if [[ "$wall_state" == "walled" && -n "$wall_common" && "$wall_branch" == "$wall_base" ]]; then
+  gate_none="gate=none (cwd is the primary on ${wall_base})"
+  # ... and an IMPLEMENTER there is not started at all: it is the worker that lands, and
+  # its landing could never be handed to the launcher, so it would fall to the lease step
+  # inside the wall and wait for a person. Judged by the brief's first line, the way
+  # appl-role-of.sh reads a role. The IMPLEMENTER and SOLO WORKER templates (a solo worker
+  # lands its own work too: ISSUE(solo-workers-spawned-on-the-primary-cannot-land); its
+  # spawner opens the worktree first, --open-worktree). Not the ticket: dispatch-take.sh now opens
+  # the ticket's worktree and spawns there, but a Dispatch ticket spawned on the primary (an
+  # older dispatch-take, a by-hand spawn) still starts here with gate=none (coordinator
+  # ruling 20260927T014613Z; test_gate_cwd.py c4).
+  # A test author on the primary opens its own worktree and never lands, so it starts.
+  brief_first=""
+  IFS= read -r brief_first < "$brief" || true
+  case "$brief_first" in
+    "You are a Muretai implementer session"*)
+      echo "herd-spawn: a walled implementer on the primary checkout could never land: its landing gate binds to the branch its cwd has checked out at spawn (${wall_base} here), and finish-worktree.sh hands the launcher only that branch in that worktree; pass --cwd <WORKTREE> (the pair's worktree, from the test author's report); the worker ${name} was not started" >&2
+      exit 2
+      ;;
+    "You are a Muretai worker session"*)
+      echo "herd-spawn: a walled solo worker on the primary checkout could never land: its landing gate binds to the branch its cwd has checked out at spawn (${wall_base} here), and finish-worktree.sh hands the launcher only that branch in that worktree; open its worktree first -- --open-worktree \"<TITLE>\" with its --env ISOLATED_SESSION_OWNER key, or pass --cwd <WORKTREE> with --var WORKTREE= and --var BRANCH=; the worker ${name} was not started" >&2
+      exit 2
+      ;;
+  esac
+  echo "herd-spawn: ${gate_none}: the worker ${name} has no landing gate; a landing it makes runs where it runs" >&2
 fi
 # Step 2: the record, and the launcher. wall.log is this spawn's own (rewritten, like the
 # profile); run.py appends to it -- the start, and any kill -- from outside the wall.
@@ -1816,6 +2752,7 @@ HS_WALL_DIR="$wall_dir" HS_NAME="$name" HS_AGENT_CMD="$agent_cmd" HS_PY="$wall_p
   HS_COMMON="$wall_common" HS_GITDIR="$wall_gitdir" HS_LAND="$here/land.sh" \
   HS_RECORD="spawn worker=${name} profile=${profile} harness=${harness} mode=${wall_mode} wall=${wall_state} egress=open ${bounds_said}${wall_why:+ ${wall_why}}" \
   HS_WALLED="$wall_state" HS_BOUNDED="$bounded" HS_CPU="$wall_cpu" HS_MEM="$wall_mem" HS_PROCS="$wall_procs" \
+  HS_GATE_NONE="$gate_none" HS_PROFILE="$profile" \
   python3 -I - <<'PY' || exit 2
 import json, os, shlex, subprocess, time
 wd = os.environ["HS_WALL_DIR"]
@@ -1830,7 +2767,11 @@ def write(rel, text, mode=0o600):
         f.write(text)
 
 
-write("wall.log", time.strftime("%Y-%m-%dT%H:%M:%S%z") + " " + os.environ["HS_RECORD"] + "\n")
+stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+logged = stamp + " " + os.environ["HS_RECORD"] + "\n"
+if os.environ.get("HS_GATE_NONE"):
+    logged += stamp + " " + os.environ["HS_GATE_NONE"] + "\n"
+write("wall.log", logged)
 shim = os.path.join("bin", os.environ["HS_AGENT_CMD"])
 if os.environ["HS_BOUNDED"] != "yes":
     for rel in ("run.json", shim):
@@ -1856,6 +2797,15 @@ else:
             ["git", "--git-dir", common, "rev-parse", "--verify", "--quiet",
              "refs/heads/" + base_ref + "^{commit}"],
             capture_output=True, text=True).stdout.strip()
+    # A REVIEWER's checkout is opened at the BASE it reviews from, on a receipt branch of its
+    # own, while main already carries the landings it reads (both spawn sites). Its base is
+    # that checkout's HEAD now, at spawn: land.sh runs BASE's gate out of it and tests the
+    # receipt range from it, and the landed tip would name commits the reviewer never branched
+    # from. A worker's base stays main at spawn.
+    if os.environ.get("HS_PROFILE") == "reviewer" and branch and gitdir:
+        base_sha = subprocess.run(
+            ["git", "--git-dir", gitdir, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+            capture_output=True, text=True).stdout.strip()
     record = None
     if branch and common:
         record = {"common_dir": os.path.realpath(common),
@@ -1868,7 +2818,8 @@ else:
     if src and os.path.isfile(src) and not os.path.islink(src):
         write("land.sh", open(src, encoding="utf-8").read(), 0o700)
     gate = None
-    if os.environ["HS_WALLED"] == "walled" and branch and record:
+    # no gate on the base branch: a cwd in the primary (see gate_none in the shell above)
+    if os.environ["HS_WALLED"] == "walled" and branch and record and branch != base_ref:
         gate = {"channel": os.path.join(os.environ["HS_HERD"], os.environ["HS_NAME"]),
                 "primary": record["primary"], "worktree": record["worktree"], "branch": branch,
                 "lander": os.path.join(wd, "land.sh")}
@@ -1889,8 +2840,10 @@ else:
                                                        os.path.join(wd, "run.json"), "--")) + ' "$@"\n', 0o700)
 PY
 # Only a spawn that GETS a landing needs land.sh: the same test run.json's `gate` uses (walled,
-# on a branch, in a repository). A reviewer in a detached checkout has no branch to land, so
+# on a branch, in a repository). A spawn in a detached checkout has no branch to land, so
 # nothing would ever run the lander; refusing it for a missing one refused the daily review.
+# Both reviewer spawn sites now open the reviewer ON its receipt branch, so a walled reviewer
+# gets the gate, and needs land.sh, like a worker.
 if [[ "$wall_state" == "walled" && -n "$wall_branch" && -n "$wall_common" && ! -f "$wall_dir/land.sh" ]]; then
   echo "herd-spawn: no land.sh beside this script; a walled worker has no landing to run; the worker ${name} was not started" >&2
   exit 2
@@ -1912,7 +2865,13 @@ python3 -I - "$brief_abs" "$rendered" "$bfile" "NAME=${name}" "PRIMARY=${cwd}" "
   ${vars[@]+"${vars[@]}"} <<'PY' || exit $?
 import os, re, stat, sys
 src, dst, bfile = sys.argv[1], sys.argv[2], sys.argv[3]
-text = open(src, encoding="utf-8").read()
+try:
+    with open(src, encoding="utf-8") as f:
+        text = f.read()
+except (OSError, UnicodeDecodeError) as e:
+    print("herd-spawn: the brief " + src + " could not be read (" + (getattr(e, "strerror", None) or type(e).__name__)
+          + "); the worker " + os.path.basename(os.path.dirname(bfile)) + " was not started", file=sys.stderr)
+    sys.exit(2)
 values = {}
 for kv in sys.argv[4:]:
     key, _, value = kv.partition("=")
@@ -1973,34 +2932,25 @@ with os.fdopen(fd, "w", encoding="utf-8") as f:
 PY
 # brief.md is this spawn's own from here: a failure below where nothing was typed into the
 # pane removes it (a refusal above never reaches this line, and leaves the file that was
-# there alone). A failure of `agent prompt` itself keeps it: see half_fail.
+# there alone). A failure of `agent prompt` itself, and a stop at a first-run prompt, keep
+# it: see half_fail.
 brief_ours=yes
 # What a failure below has already done, for the one line it prints: the coordinator
 # must never read a half-spawn as a success, and "which half" is what it acts on.
 done_steps="brief.md written (${bfile})"
-# half_fail RC WHAT [keep]: one stderr line naming the failure, the steps that
-# completed, and that the brief was NOT delivered; no worker= line. `keep` is for a
-# failure of `agent prompt` itself (a stall past the deadline, a timeout, a refusal),
-# where the line may already be in the pane: the ISSUE this exists for was a worker that
-# received the line after a stall and found brief.md removed by the spawn's own cleanup.
-half_fail() {
-  local rc="$1" what="$2" keep="${3:-}" tail delivered="the brief was not delivered"
-  if [[ "$keep" == "keep" ]]; then
-    brief_ours=no
-    delivered="the brief was not delivered as far as herdr reports"
-    tail="brief.md is KEPT at ${bfile}: the line may already have been typed into the pane, so a worker that got it finds its brief -- check the pane before re-spawning ${name}"
-  else
-    tail="nothing was typed into a pane, so brief.md is removed"
-  fi
-  echo "herd-spawn: ${what}; ${delivered} to ${name} -- done: ${done_steps}; ${tail}" >&2
-  exit "$rc"
-}
+# A resume record an earlier spawn of this name left names a pane this spawn is replacing:
+# it goes, so a --resume can only ever pick up the spawn that wrote the brief.md above.
+resume_dir="$herd_dir/.resume"
+resume_rec="$resume_dir/${name}"
+if [[ -d "$resume_dir" && ! -L "$resume_dir" ]]; then
+  rm -f "$resume_rec"
+fi
 drop_brief() {
   if [[ "${brief_ours:-no}" == "yes" ]]; then
     rm -f "$bfile"
     # a solo role belongs to a worker that was started; a failed spawn declares nothing,
     # and records no repository for a report that will never come
-    rm -f "$role_marker" "$role_record" "$repo_record"
+    rm -f "$role_marker" "$role_record" "$repo_record" "$key_record"
     # ... and the codex config home this spawn wrote into. Left standing, the config.toml
     # and the login symlink ARE the non-empty home the check above refuses, so a spawn that
     # failed after them would refuse its own retry; and a link to the owner's auth.json in a
@@ -2064,6 +3014,30 @@ with os.fdopen(fd, "w", encoding="utf-8") as f:
     f.write(repo + "\n")
 PY
 
+# --- the owner key this worker holds -----------------------------------------------------
+# $HERD_DIR/.keys/<name>: the caller's --env ISOLATED_SESSION_OWNER and a newline, made the
+# way the .repos record is, removed with the brief when the spawn fails. key_guard reads it
+# to name the live worker a later spawn under the same key would duplicate. A spawn without
+# a caller key removes one an earlier spawn of the name left.
+if [[ -n "$caller_key" ]]; then
+  python3 -I - "$key_record" "$caller_key" <<'PY' || exit 2
+import os, sys
+path, key = sys.argv[1], sys.argv[2]
+if os.path.lexists(path):
+    os.unlink(path)
+try:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+except OSError as e:
+    print("herd-spawn: could not create the owner-key record exclusively at " + path + ": " + e.strerror
+          + "; the worker was not started", file=sys.stderr)
+    sys.exit(2)
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    f.write(key + "\n")
+PY
+else
+  rm -f "$key_record"
+fi
+
 # --- the tab, the agent, the prompt ------------------------------------------------------
 # Auto memory is OFF for a herd session: it is keyed by the repository, shared across
 # worktrees, and written by every session -- one prompt-injected session's "secrev-*:
@@ -2090,6 +3064,18 @@ tab_env=(--env ISOLATED_SESSION_GUARD_TRACE=1 --env CLAUDE_CODE_DISABLE_AUTO_MEM
 if [[ "$harness" == "cursor" ]]; then
   tab_env+=(--env "CURSOR_CONFIG_DIR=${cursor_home}")
 fi
+# The coordinator is the one pane that runs for days. Claude Code's in-pane auto-update
+# ended it mid-loop twice (2026-09-24, 2026-09-26: `Update installed - Restart to update`
+# beside `Not logged in`), after which it swallowed every intake until the owner found it.
+# With the updater off, the update happens when the owner restarts the pane on purpose
+# (restart-coordinator-pane.sh). A caller override was refused above.
+if [[ "$profile" == "coordinator" ]]; then
+  tab_env+=(--env DISABLE_AUTOUPDATER=1)
+fi
+# THE OAUTH TOKEN (above): the pane's own login, so it never refreshes the shared one
+if [[ -n "$oauth_token" ]]; then
+  tab_env+=(--env "CLAUDE_CODE_OAUTH_TOKEN=${oauth_token}")
+fi
 if [[ "$harness" == "codex" ]]; then
   # the config home the spawn owns, so the file we wrote is the file codex obeys; no path
   # under the user's own ~/.codex is handed to the tab at all
@@ -2103,6 +3089,12 @@ fi
 for kv in ${envs[@]+"${envs[@]}"}; do
   tab_env+=(--env "$kv")
 done
+# A walled worker's stable owner key (THE OWNER KEY, in the wall block): the caller's entry
+# went on above and is the only one; without it, the worker's name. An unwalled worker keeps
+# the process walk, which works where `ps` does.
+if [[ "$wall_state" == "walled" || "$wall_state" == "inherited" ]] && [[ "$owner_key_from_caller" != "yes" ]]; then
+  tab_env+=(--env "ISOLATED_SESSION_OWNER=${owner_key}")
+fi
 # Wake-target mark: the pane env is what a node child / L0 hook can see. The
 # token is the first non-DID mark herdrwake._select recognises. Never a DID.
 if [[ -n "$muretai_agent" ]]; then
@@ -2131,7 +3123,8 @@ if [[ "$profile" == "coordinator" ]]; then
   # Exactly this list, nothing shared with the others: spawn (both spellings, the second
   # through the primary of the repository this script lives in), drive panes, read the
   # node inbox, dm, read the coordinator directory, write only its intake/ and briefs/.
-  # No git, no echo, no tools/tests: a coordinator that needs more briefs a worker.
+  # No git, no echo, no tools/: a coordinator that needs more briefs a worker. Its one
+  # tests rule is the shared `python3 -I tests/*.py`, added after this block for every seat.
   spawner_rel=".cursor/skills/isolated-session/scripts/herd-spawn.sh"
   coord_dir="${herd_dir%/}/coordinator"
   allow=("Bash(bash ${spawner_rel}:*)")
@@ -2142,7 +3135,8 @@ if [[ "$profile" == "coordinator" ]]; then
     "Bash(herdr agent prompt:*)" "Bash(herdr agent read:*)" "Bash(herdr agent wait:*)"
     "Bash(herdr agent list:*)" "Bash(herdr agent send-keys:*)"
     "Bash(herdr tab list:*)" "Bash(herdr tab close:*)"
-    "Bash(python3 operator_cli.py --as * inbox*)" "Bash(python3 operator_cli.py --as * dm *)"
+    "Bash(muretai op --as * inbox)" "Bash(muretai op --as * inbox --json)"
+    "Bash(muretai op --as * dm *)"
     "Read(//${coord_dir#/}/**)"
     "Edit(//${coord_dir#/}/intake/**)" "Edit(//${coord_dir#/}/briefs/**)"
   )
@@ -2159,8 +3153,15 @@ if [[ "$profile" == "coordinator" ]]; then
   done
   allow+=("Agent(appl-brief-writer)" "Agent(appl-report-reader)" "Agent(appl-prompt-triage)")
 else
+# The reviewer's ONE write through a tool is its receipt, so its audit_scope.py rules name
+# that verb (`write-receipt`) and no other: a `write-baseline --out docs/BACKLOG.md` or any
+# verb added later is a prompt for it, never a run. Other profiles keep the whole tool.
+audit_verb=""
+if [[ "$profile" == "reviewer" ]]; then
+  audit_verb=" write-receipt"
+fi
 allow=(
-  "Bash(python3 tools/audit_scope.py:*)"
+  "Bash(python3 tools/audit_scope.py${audit_verb}:*)"
   "Bash(python3 tools/ledger.py:*)"
   "Bash(python3 tools/sec_lint.py:*)"
   "Bash(python3 tools/affected_tests.py:*)"
@@ -2186,11 +3187,11 @@ if [[ "$profile" == "worker" ]]; then
   allow+=("Bash(python3 -I tools/run_tests.py:*)" "Bash(python3 -I tests/test_*)")
   # Dispatch finish verbs the ticket brief names: coord deliver, a Room dm
   # (deliverable, /remember, or failed), and stance full via dispatch-capacity.
-  # A bare operator_cli.py prefix would let a ticket drive wake set/test.
-  allow+=("Bash(python3 operator_cli.py --as * coord * deliver *)")
-  allow+=("Bash(python3 operator_cli.py --as * dm *)")
-  allow+=("Bash(python3 -I operator_cli.py --as * coord * deliver *)")
-  allow+=("Bash(python3 -I operator_cli.py --as * dm *)")
+  # A bare `muretai op` prefix would let a ticket drive wake set/test. Both go through the
+  # front door, never an interpreter: an interpreter-spelled rule sits in the family the
+  # deny list refuses by shape, so a dm whose text held ` - `, `-m` or `-c` was shadowed.
+  allow+=("Bash(muretai op --as * coord * deliver *)")
+  allow+=("Bash(muretai op --as * dm *)")
   allow+=("Bash(bash .cursor/skills/isolated-session/scripts/dispatch-capacity.sh:*)")
 fi
 # The SAME commands in the isolated spelling. The tab above carries PYTHONNOUSERSITE=1 and
@@ -2203,7 +3204,7 @@ fi
 # `python3 -Ic`, `python3 -I -` and `python3 -I -m ...` are refused, while `python3 -I
 # <path>` -- what each rule here names -- is not.
 allow+=(
-  "Bash(python3 -I tools/audit_scope.py:*)"
+  "Bash(python3 -I tools/audit_scope.py${audit_verb}:*)"
   "Bash(python3 -I tools/ledger.py:*)"
   "Bash(python3 -I tools/sec_lint.py:*)"
   "Bash(python3 -I tools/affected_tests.py:*)"
@@ -2233,6 +3234,11 @@ allow+=(
   "Bash(git merge-base:*)" "Bash(git rev-list:*)"
 )
 fi
+# The one test-run spelling every brief names, `python3 -I tests/<file>.py`, for EVERY profile
+# (A1 of intake 20260929T223514Z): a brief that tells a session to run a test file its rules
+# do not allow stops it at a prompt on its own instructions. One file, no arguments: the `*`
+# ends at `.py`, and a redirect or a pipe half is refused by the deny list whatever this says.
+allow+=("Bash(python3 -I tests/*.py)")
 # the brief's own --allow rules (judged above), after the profile's
 allow+=(${extra_allow[@]+"${extra_allow[@]}"})
 # `git ls-files` reads tracked content only (never keys/, which is not tracked).
@@ -2307,9 +3313,69 @@ for a in anc:
     for f in ("CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md", ".claude/rules/**"):
         excludes.append(os.path.join(a, f))
         extra_deny.append(abs_rule(os.path.join(a, f)))
+# THE REVIEWER'S OWN CHECKOUT. Since the reviewer gate, a reviewer runs in its own linked
+# worktree at $HERD_DIR/review/<name>, on its own receipt branch, and lands its note and
+# receipt from there -- which the blanket `review/**` deny made impossible, so the operator
+# wrote the note by hand. A deny beats any allow, so the carve-out cannot be an allow under
+# that deny: for a reviewer whose cwd is such a checkout the herd's `review/**` is replaced
+# by one deny per OTHER entry of review/ (the other reviewers' checkouts), the checkout
+# itself gets one deny per top-level entry except notes/ and .security/, and .security/ one
+# per entry except audit-receipts/ -- entries as they exist AT SPAWN (literal names, no
+# `[!..]` classes: a class spelling this repository has not measured Claude Code honour is
+# not a wall to lean on). Then exactly two allows: <co>/notes/** and
+# <co>/.security/audit-receipts/**. A path the checkout gains after the spawn matches no
+# rule and stops at a prompt, never a write. Either allowed directory that is a symlink (or
+# a .security/ that is one) is denied instead of allowed, and every rule is written for the
+# checkout as spelled AND as resolved, since a path is judged in both forms. The primary is
+# never a reviewer's review checkout (a linked worktree has a .git FILE), and the worker and
+# coordinator profiles take none of this.
+review_co = ""
+review_root = os.path.join(herd, "review")
+if (os.environ.get("HS_PROFILE") == "reviewer"
+        and os.path.isfile(os.path.join(cwd, ".git"))
+        and os.path.realpath(cwd) != os.path.realpath(os.environ.get("HS_PRIMARY") or "/")
+        and os.path.realpath(os.path.dirname(cwd)) == os.path.realpath(review_root)):
+    review_co = cwd
+review_allow = []
+if review_co:
+    own = os.path.basename(review_co)
+    roots = []
+    for r in (review_root, os.path.realpath(review_root)):
+        if r not in roots:
+            roots.append(r)
+    for entry in sorted(os.listdir(review_root)):
+        if entry != own:
+            for r in roots:
+                extra_deny.append(abs_rule(os.path.join(r, entry)))
+                extra_deny.append(abs_rule(os.path.join(r, entry, "**")))
+    sec = os.path.join(review_co, ".security")
+    carve = {"notes": os.path.join(review_co, "notes"),
+             ".security/audit-receipts": os.path.join(sec, "audit-receipts")}
+    denied_rel = [e for e in os.listdir(review_co) if e not in ("notes", ".security")]
+    if os.path.islink(sec) or (os.path.lexists(sec) and not os.path.isdir(sec)):
+        denied_rel.append(".security")
+    elif os.path.isdir(sec):
+        denied_rel += [".security/" + e for e in os.listdir(sec) if e != "audit-receipts"]
+    for rel, p in sorted(carve.items()):
+        if os.path.islink(p) or os.path.islink(os.path.dirname(p)):
+            denied_rel.append(rel)
+        else:
+            review_allow.append(rel)
+    bases = []
+    for b in (review_co, os.path.realpath(review_co)):
+        if b not in bases:
+            bases.append(b)
+    for rel in sorted(denied_rel):
+        for b in bases:
+            extra_deny.append(abs_rule(os.path.join(b, rel)))
+            extra_deny.append(abs_rule(os.path.join(b, rel, "**")))
+    review_allow = [abs_rule(os.path.join(b, rel, "**")) for rel in review_allow for b in bases]
 # .repos/ holds the repository each worker's report is judged in: a worker that could
-# rewrite its own record would choose where its claim is checked again
-for d in ("review/**", "briefs/**", ".roles/**", ".repos/**", "CLAUDE.md", "CLAUDE.local.md", ".claude/**"):
+# rewrite its own record would choose where its claim is checked again; .resume/ holds the
+# pane a --resume types into, and the key it hands the pair's lock to
+for d in ("review/**", "briefs/**", ".roles/**", ".repos/**", ".resume/**", "CLAUDE.md", "CLAUDE.local.md", ".claude/**"):
+    if d == "review/**" and review_co:
+        continue
     extra_deny.append(abs_rule(os.path.join(herd, d)))
 if home:
     extra_deny.append(abs_rule(os.path.join(home, ".claude/**")))
@@ -2329,7 +3395,7 @@ except OSError as e:
     print("herd-spawn: could not create the rules file exclusively at " + path + ": " + e.strerror
           + "; the worker was not started", file=sys.stderr)
     sys.exit(2)
-settings = {"permissions": {"allow": rest[:n], "deny": rest[n:] + extra_deny},
+settings = {"permissions": {"allow": rest[:n] + review_allow, "deny": rest[n:] + extra_deny},
             "autoMemoryEnabled": False,
             "claudeMdExcludes": excludes}
 if os.environ.get("HS_PROFILE") == "coordinator":
@@ -2460,36 +3526,23 @@ PY
 # failure is retried: an attempt that ran into herdr's own readiness timeout has
 # already typed the command, and the deadline has long passed by then.
 # HERD_SPAWN_AGENT_READY_SECS (below) is a different wait: after start succeeds.
-# A failed start is not always a slow shell: a harness stuck on one of Claude Code's
-# FIRST-RUN prompts (the renderer choice, the auto-mode setup, folder trust, "Not logged
-# in") is already registered, so a retry only earns herdr's agent_name_taken (Mac B,
-# 2026-09-17). After a failure that is not the slow shell, the pane is read once and matched on keywords; a match
-# is NAMED from the fixed vocabulary below -- the pane's bytes never reach stderr, they
-# are data another checkout may have written -- and the spawn stops without a second
-# start. The tab stays open: the owner answers the prompt in it. The keywords are guesses
-# at the real screens (ISSUE(first-run-prompt-texts-are-guesses)).
-first_run_prompt() {
-  local screen
-  screen="$("$herdr" agent read "$name" --source recent-unwrapped --lines 80 2>/dev/null \
-            || "$herdr" agent read "$name" 2>/dev/null || true)"
-  [[ -n "$screen" ]] || return 1
-  printf '%s' "$screen" | python3 -I -c '
-import re, sys
-text = sys.stdin.buffer.read().decode("utf-8", "replace")
-# drop OSC strings (a title) whole, then CSI/other escapes, then the remaining controls
-text = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?", "", text)
-text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b.", "", text)
-text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", " ", text).lower()
-for word, pat in (("login", r"not logged in|please run /login"),
-                  ("trust", r"\btrust\b[^\n]*\b(folder|files|workspace|directory|project)\b"),
-                  ("auto-mode", r"\bauto[- ]mode\b"),
-                  ("renderer", r"\brenderer\b")):
-    if re.search(pat, text):
-        print(word)
-        sys.exit(0)
-sys.exit(1)
-'
-}
+# A failed start is not always a slow shell: after a failure that is not the slow shell,
+# the pane is read once (first_run_prompt, at the top) and a first-run prompt stops the
+# spawn without a second start. The tab stays open: the owner answers the prompt in it,
+# then runs the one `--resume` command the stop prints.
+# The key a pair hand-over passes the lock by (deliver_brief), decided here so a stop at a
+# first-run prompt can record it for the resume, which hands over in its place.
+pair_key=""
+if [[ "$owner_key_from_caller" == "yes" ]] ||
+   [[ "$wall_state" == "walled" || "$wall_state" == "inherited" ]]; then
+  pair_key="$owner_key"
+fi
+# (dispatch_listed, the trust seam's list check, is defined above, where --repo is judged;
+# dialog_kind, the adapter's recognizer, in the shared tail at the top, because the stall
+# nudge in deliver_brief asks it too, on the --resume path as well.)
+# trust_adapter is THE seam's one path (adapter_path), chosen by the harness: recognizing and
+# answering go through the same file.
+trust_adapter="$(adapter_path)"
 start_err="$(mktemp "${TMPDIR:-/tmp}/herd-spawn-start.XXXXXX")"
 started=no
 stuck_on=""
@@ -2510,15 +3563,101 @@ while :; do
   [[ $(date +%s) -lt $deadline ]] || break
   sleep 2
 done
+# THE TRUST SEAM (P1, owner principle 20260928T125026Z: APPL does not depend on one agent
+# runtime). A pane stopped at the runtime's folder-trust question is answered ONLY when the
+# spawn's repository -- its primary, so a linked worktree of a listed primary counts -- is a
+# path the operator listed in $HOME/.muretai/dispatch/repos (dispatch_listed, above), and
+# then only by the harness's own adapter, the file named after the harness in the trust
+# directory beside this script. That adapter is the one place a runtime's dialog is known;
+# this script knows no runtime's trust record or file, and no flag or variable reaches the
+# check. A harness with no adapter there, an adapter that finds some other screen (exit 1),
+# or an unlisted repository: the spawn stops and names the question exactly as before.
+# The same seam answers every OTHER dialog the adapter recognizes (`--recognize` gives its
+# kind word, e.g. auto mode's teach dialog): same gate, same adapter, same stop. It is asked
+# only for a screen first_run_prompt did not already call `trust` (and never for "Not logged
+# in"), so a trust stop still makes exactly one adapter call, and only when listed.
+dialog=""
+if [[ "$stuck_on" == "trust" ]]; then
+  dialog="trust"
+elif [[ -n "$stuck_on" && "$stuck_on" != "login" ]]; then
+  dialog="$(dialog_kind)" || dialog=""
+fi
+trust_answered=no
+if [[ -n "$dialog" ]] && dispatch_listed "$spawn_repo"; then
+  if [[ -f "$trust_adapter" && ! -L "$trust_adapter" ]] &&
+     bash "$trust_adapter" "$herdr" "$name" "$pane" </dev/null >/dev/null 2>&1; then
+    if [[ "$dialog" == "trust" ]]; then
+      echo "herd-spawn: ${name}'s folder-trust question was answered once (the repository is listed in the dispatch repos)" >&2
+    else
+      echo "herd-spawn: ${name}'s ${dialog} dialog was answered once (the repository is listed in the dispatch repos)" >&2
+    fi
+    trust_answered=yes
+    stuck_on=""
+    started=yes
+    # The answer is not proof the pane moved on (another first-run prompt may follow, or the
+    # key may not have landed). The agent must reach its input line; if it does not, this is
+    # a spawn stopped at a first-run prompt like any other -- the P0 stop below keeps brief.md
+    # and prints the one --resume -- and nothing more is typed.
+    trust_wait_secs="${HERD_SPAWN_AGENT_READY_SECS:-120}"
+    if ! "$herdr" agent wait "$name" --until idle --timeout "$(( trust_wait_secs * 1000 ))" >/dev/null 2>&1; then
+      stuck_on="$(first_run_prompt)" || stuck_on="$dialog"
+      trust_answered=unsettled
+      started=no
+    fi
+  else
+    trust_answered=failed
+  fi
+fi
 if [[ -n "$stuck_on" ]]; then
   rm -f "$start_err"
+  # a dialog other than trust is named by the adapter's kind word, never by its text
+  [[ "$dialog" == "trust" || -z "$dialog" ]] || stuck_on="dialog"
   case "$stuck_on" in
     login)     what="\"Not logged in\"; run 'claude auth login' (once per machine)" ;;
-    trust)     what="the folder-trust question; answer it in the pane" ;;
+    dialog)
+      if [[ "$trust_answered" == "unsettled" ]]; then
+        what="the dialog its adapter names '${dialog}', answered once (the repository is listed in the dispatch repos), but the agent never reached its input line; answer what the pane shows"
+      elif [[ "$trust_answered" == "failed" ]]; then
+        what="the dialog its adapter names '${dialog}' (the repository is listed in the dispatch repos, but the adapter did not answer it: its selection or screen was not the one it answers); answer it in the pane"
+      else
+        what="the dialog its adapter names '${dialog}', not answered because the repository is not listed in the dispatch repos (~/.muretai/dispatch/repos); answer it in the pane"
+      fi
+      ;;
+    trust)
+      if [[ "$trust_answered" == "unsettled" ]]; then
+        what="the folder-trust question, answered once (the repository is listed in the dispatch repos), but the agent never reached its input line; answer what the pane shows"
+      elif [[ "$trust_answered" == "failed" ]]; then
+        what="the folder-trust question (the repository is listed in the dispatch repos, but the ${harness} harness has no trust adapter or its screen was not the dialog it answers); answer it in the pane"
+      else
+        what="the folder-trust question, not answered because the repository is not listed in the dispatch repos (~/.muretai/dispatch/repos); answer it in the pane"
+      fi
+      ;;
     auto-mode) what="the auto-mode setup prompt; answer it in the pane" ;;
     *)         what="the renderer choice; answer it in the pane" ;;
   esac
-  half_fail 1 "${name} is stuck on Claude Code's first-run prompt: ${what}. The tab is left open (pane ${pane}, tab ${tab_id}); close it afterwards and spawn ${name} again. Not retried: the agent is already registered, and it did not start"
+  stuck_said="${name} is stuck on Claude Code's first-run prompt: ${what}. The tab is left open (pane ${pane}, tab ${tab_id}). Not retried: the agent is already registered, and it did not start"
+  # The resume record: what `--resume` needs to finish THIS spawn and nothing it could take
+  # from a caller -- the pane and tab herdr gave it, the cwd, the harness, the model, the
+  # wall and the owner key. In the herd-level .resume/ (mode 700, Edit-denied to every
+  # session like .roles/ and .repos/), unlinked by exact path and created O_EXCL mode 600.
+  # A value with a line break could forge a key, so it is refused, and so is the resume.
+  own_dir "$resume_dir"
+  if python3 -I - "$resume_rec" "pane=${pane}" "tab=${tab_id}" "cwd=${cwd}" "harness=${harness}" \
+       "model=${model}" "wall=${wall_state}" "pair_key=${pair_key}" <<'PY'
+import os, sys
+path, lines = sys.argv[1], sys.argv[2:]
+if any(("\n" in l or "\r" in l or "\x00" in l) for l in lines):
+    sys.exit(1)
+if os.path.lexists(path):
+    os.unlink(path)
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    f.write("\n".join(lines) + "\n")
+PY
+  then
+    half_fail 1 "$stuck_said" resume
+  fi
+  half_fail 1 "${stuck_said}; its resume record could not be written, so close the tab and spawn ${name} again"
 fi
 if [[ "$started" != "yes" ]]; then
   start_reason="$(tail -1 "$start_err" 2>/dev/null || true)"
@@ -2528,78 +3667,5 @@ fi
 rm -f "$start_err"
 done_steps="${done_steps}, agent started in pane ${pane}"
 
-# Start succeeding means the harness process is in the pane, not that its input
-# line takes text (daily-2026-09-16 typed into a banner; shop-door-hardening-tests
-# at 23:50 sat unsent). One wait for idle, then prompt with --wait until working
-# or blocked so the spawn returns when the brief is taken, not when the turn ends.
-agent_ready_secs="${HERD_SPAWN_AGENT_READY_SECS:-120}"
-ready_ms=$(( agent_ready_secs * 1000 ))
-wait_err="$(mktemp "${TMPDIR:-/tmp}/herd-spawn-wait.XXXXXX")"
-if ! "$herdr" agent wait "$name" --until idle --timeout "$ready_ms" >/dev/null 2>"$wait_err"; then
-  wait_reason="$(tail -1 "$wait_err" 2>/dev/null || true)"
-  rm -f "$wait_err"
-  half_fail 1 "'herdr agent wait' failed for ${name} (pane ${pane}, tab ${tab_id}): ${wait_reason}; the agent started but never reached its input line, and no prompt was typed"
-fi
-rm -f "$wait_err"
-
-# The pair hand-over (ISSUE(pair-worktree-lock-dies-with-the-test-author-session)): a worker
-# started with `--env ISOLATED_SESSION_OWNER=<key>` takes over every worktree lock of THIS
-# repository (the cwd's) whose owner is that key -- the test author's -- recorded as handed
-# to this worker by name; the worker's session binds its own process at its first guarded
-# command (lib.sh, iso_lock_handover / iso_lock_bind). Here, after the agent is up and
-# before it is told anything, so it never meets the author's lock, and a spawn that failed
-# earlier hands nothing to a worker that does not exist. A spawn without the key, or with a
-# key no lock carries, changes nothing.
-pair_key=""
-for kv in ${envs[@]+"${envs[@]}"}; do
-  if [[ "${kv%%=*}" == "ISOLATED_SESSION_OWNER" ]]; then pair_key="${kv#*=}"; fi
-done
-if [[ -n "$pair_key" ]]; then
-  while IFS= read -r handed; do
-    [[ -n "$handed" ]] || continue
-    echo "herd-spawn: the hold on $(iso_safe_text "$handed" || echo '(a worktree)') passes to ${name} (owner key $(iso_safe_text "$pair_key" || echo '?'))" >&2
-  done < <(iso_lock_handover "$cwd" "$pair_key" "$name" 2>/dev/null || true)
-fi
-
-# Flags after TEXT (herdr: agent prompt <TARGET> <TEXT> [OPTIONS]). Only
-# agent_prompt_stalled is retried, two seconds apart, until AGENT_READY_SECS
-# from the first attempt. Any other failure (agent_blocked, timeout, ...) is not.
-prompt_err="$(mktemp "${TMPDIR:-/tmp}/herd-spawn-prompt.XXXXXX")"
-prompted=no
-prompt_deadline=$(( $(date +%s) + agent_ready_secs ))
-while :; do
-  if "$herdr" agent prompt "$name" "$prompt_line" \
-       --wait --until working --until blocked --timeout "$ready_ms" \
-       >/dev/null 2>"$prompt_err"; then
-    prompted=yes
-    break
-  fi
-  prompt_reason="$(tail -1 "$prompt_err" 2>/dev/null)"
-  if [[ "$prompt_reason" != "agent_prompt_stalled" ]]; then
-    rm -f "$prompt_err"
-    half_fail 1 "'herdr agent prompt' failed for ${name} (pane ${pane}, tab ${tab_id}): ${prompt_reason}; the agent had started" keep
-  fi
-  [[ $(date +%s) -lt $prompt_deadline ]] || break
-  sleep 2
-done
-if [[ "$prompted" != "yes" ]]; then
-  prompt_reason="$(tail -1 "$prompt_err" 2>/dev/null || true)"
-  rm -f "$prompt_err"
-  half_fail 1 "'herdr agent prompt' kept stalling for ${name} (pane ${pane}, tab ${tab_id}) past ${agent_ready_secs}s: ${prompt_reason}; the agent had started" keep
-fi
-rm -f "$prompt_err"
-brief_ours=no          # the worker has been told to read it: it stays
-# The honest half, said out loud where the person spawning the worker reads it: on codex
-# the allow/deny lists this script computed are recorded, not applied. A file nobody opens
-# would let the claude wall be assumed for a session that does not have it. The second line
-# is the OTHER half of the same truth, and it was missing while the header claimed the
-# opposite: no session guard runs here either, so the worktree named by --cwd is the whole
-# of this session's blast radius.
-if [[ "$harness" == "codex" ]]; then
-  echo "codex: the allow/deny lists are not enforced on this harness; the wall is the sandbox (workspace-write) and approval (on-request)"
-  echo "codex: and no session guard runs on it -- the isolated-session hook is registered for claude, cursor and grok only, and codex-cli reads neither .claude/settings.json nor .cursor/hooks.json; the worktree this worker opened in is the whole of its blast radius"
-fi
-# the harness and the model are on the line, so a landing's REVIEW= and its note can say
-# which eyes read the diff; and whether the worker is walled, with the network said
-# plainly (wall v1 leaves it open), so nobody reads "walled" as "offline"
-echo "worker=${name} pane=${pane} tab=${tab_id} report=${report} harness=${harness} model=${model:-default} wall=${wall_state} egress=open"
+# the wait, the pair hand-over, the one line, and only then the worker= line (at the top)
+deliver_brief

@@ -1,0 +1,84 @@
+# appl-phrases.tsv -- the one phrase table of the invocable APPL skill (UTF-8).
+#
+# appl-phrase.py reads it; the entry points (.claude/skills/appl/SKILL.md,
+# .cursor/rules/appl.mdc) carry no copy of it. One row per line, fields separated by ONE
+# tab; a line starting with `#` and a blank line are skipped. ASCII phrases match without
+# regard to case, and only as whole words.
+#
+#   intake  prefix|suffix  <phrase>             A1: file an APPL intake now (appl-add.sh)
+#   inbox   prefix|suffix  <phrase>             A2: put it in the backlog inbox (appl-backlog-add.sh)
+#   inbox   around  <before>  <after>           A2 with words on both sides ("add XX to the backlog")
+#   priority  P0|P1|P3  <word>                  A3: --priority (none of them: P2)
+#   after   before|follows  <word>              A4: --after; the target is the token before the
+#                                               word (before) or the text after it up to a comma (follows)
+#   note    <word>                              A5: --note; the target is the next token
+#   ruling  <word>                              A5: --needs-ruling
+#   solo    <word>                              A6: --solo
+#   msg     <key>  en|ja  <text>                what the parser says; {name} {prio} {path} {a} {b}
+#
+# Every word stays in the requirement text: only the trigger phrase is removed (A8, C3).
+
+intake	suffix	を APPL して
+intake	suffix	を APPLして
+intake	suffix	をAPPLして
+intake	suffix	を APPL してください
+intake	prefix	APPL this:
+intake	prefix	APPL this
+intake	prefix	use APPL for
+
+inbox	suffix	をバックログに積んで
+inbox	suffix	をバックログに積んでおいて
+inbox	suffix	を積んで
+inbox	suffix	を積んでおいて
+inbox	around	add	to the backlog
+inbox	suffix	to the backlog
+inbox	prefix	queue
+inbox	prefix	later:
+inbox	prefix	idea:
+inbox	prefix	idea
+inbox	prefix	アイディア:
+inbox	prefix	アイディア：
+inbox	prefix	アイディア
+
+priority	P0	最優先
+priority	P0	P0
+priority	P0	top priority
+priority	P1	優先度高く
+priority	P1	高優先
+priority	P1	P1
+priority	P1	high priority
+priority	P3	後回し
+priority	P3	低優先
+priority	P3	P3
+priority	P3	low priority
+
+after	before	の後で
+after	follows	after
+
+note	ノート:
+note	ノート：
+note	note:
+
+ruling	相談
+ruling	裁定が要る
+ruling	needs a ruling
+
+solo	記録だけ
+solo	records only
+
+msg	filed-intake	en	APPL: filed an intake for {name} -> {path}
+msg	filed-intake	ja	APPL: {name} のインテークを登録しました -> {path}
+msg	filed-inbox	en	APPL: queued to the {name} backlog inbox at {prio} -> {path}
+msg	filed-inbox	ja	APPL: {name} のバックログ inbox に {prio} で積みました -> {path}
+msg	ask-both	en	That says both an APPL intake now and the backlog inbox -- which one did you mean?
+msg	ask-both	ja	今すぐ APPL するのとバックログに積むのが両方入っています。どちらにしますか？
+msg	ask-priorities	en	Which priority did you mean, {a} or {b}?
+msg	ask-priorities	ja	優先度は {a} と {b} のどちらですか？
+msg	ask-intake-modifiers	en	An intake filed now takes no priority, after, note or ruling -- queue it to the backlog inbox instead?
+msg	ask-intake-modifiers	ja	今すぐの APPL には優先度・順序・ノート・裁定の指定を付けられません。代わりにバックログに積みますか？
+msg	ask-no-trigger	en	File this as an APPL intake now, or queue it to the backlog inbox?
+msg	ask-no-trigger	ja	今すぐ APPL しますか、それともバックログに積みますか？
+msg	ask-empty-target	en	The {a} word names nothing -- what should it point at?
+msg	ask-empty-target	ja	「{a}」の対象がありません。何を指しますか？
+msg	ask-two-targets	en	The {a} word names two things, {b} -- which one?
+msg	ask-two-targets	ja	「{a}」の対象が二つあります（{b}）。どちらですか？

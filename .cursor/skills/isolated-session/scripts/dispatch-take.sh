@@ -13,8 +13,9 @@
 # `quarantine approve <id>` a person runs; stdout says ACCEPT=policy or
 # ACCEPT=person), checks the local stance is open, checks the
 # Room /mem carries no taken-by line for that contextId, writes the /remember
-# line, and spawns a worker through herd-spawn.sh (worker profile) in the
-# resolved repo. Ticket fields reach the brief as fenced DATA through --var;
+# line, and spawns a worker through herd-spawn.sh (worker profile) IN the ticket's
+# worktree of the resolved repo, which it opens first with ensure-worktree.sh under
+# the owner key `dispatch:<worker>` and hands to the worker. Ticket fields reach the brief as fenced DATA through --var;
 # they are never a shell argument to anything else. This script never calls
 # `herdr agent prompt`.
 #
@@ -484,13 +485,51 @@ if not room:
         % dispatch_dir)
 
 
-# -- herdr preflight (exit 3, print the by-hand command, do not take) ------------
+# -- the ticket's worktree, opened HERE, before any spawn -------------------------
+# The worker is spawned IN its worktree, never on the primary: herd-spawn binds a
+# walled worker's landing gate to the branch its cwd has checked out at spawn, so a
+# worker spawned on the primary (gate=none) could never land through the launcher
+# (ISSUE(dispatch-take-spawns-on-the-primary-so-a-ticket-worker-cannot-land-through-the-gate)).
+# ensure-worktree.sh derives the branch from the ticket title (feat/<iso_task_slug>),
+# exactly as the worker running it would have. It runs under ONE owner key per ticket,
+# derived from the contextId and never a pid, so a re-take after a stopped one (herdr
+# down) finds its own lock `mine` and resumes the same worktree; the spawn hands the key
+# to the worker (--env), and herd-spawn's pair hand-over passes the hold to it by name.
+# Opened after every refusal that is not herdr's (not mine, taken, unknown repo), so a
+# refused take opens nothing.
 worker = "dt-" + re.sub(r"[^a-z0-9]", "", context.lower())[:20]
 if not re.match(r"^[a-z]", worker):
     worker = "d" + worker[1:]
+owner_key = "dispatch:" + worker
+title = ticket.get("title") or context
+
+
+def open_worktree() -> tuple[str, str]:
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("ISOLATED_SESSION_") and k != "HERD_WORKER"}
+    env["ISOLATED_SESSION_OWNER"] = owner_key
+    r = subprocess.run(["bash", str(here / "ensure-worktree.sh"), title], cwd=resolved,
+                       env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if r.returncode != 0:
+        die(2, "could not open the ticket's worktree in %s (ensure-worktree exit %s): %s"
+            % (resolved, r.returncode, (r.stderr or r.stdout).strip()[-400:]))
+    got = {}
+    for line in r.stdout.splitlines():
+        k, eq, v = line.partition("=")
+        if eq and k in ("WORKTREE", "BRANCH") and k not in got:
+            got[k] = v.strip()
+    if not got.get("WORKTREE") or not got.get("BRANCH") or not os.path.isdir(got["WORKTREE"]):
+        die(2, "ensure-worktree named no usable WORKTREE/BRANCH: %s" % r.stdout.strip()[-300:])
+    return got["WORKTREE"], got["BRANCH"]
+
+
+worktree, branch = open_worktree()
+
+
+# -- herdr preflight (exit 3, print the by-hand command, do not take) ------------
 brief_rel = ".cursor/skills/isolated-session/briefs/dispatch-ticket.md"
 vars_kv = [
-    ("TITLE", ticket.get("title") or context),
+    ("TITLE", title),
     ("TASK", ticket.get("task") or ""),
     ("REPO", repo_name),
     ("BRANCH_HINT", ticket.get("branchHint") or ""),
@@ -499,12 +538,16 @@ vars_kv = [
     ("DID", me),
     ("ROOM", room),
     ("PEER", peer),
+    ("WORKTREE", worktree),
+    ("BRANCH", branch),
+    ("REPO_PRIMARY", resolved),
 ]
 
 
 def spawn_argv() -> list[str]:
     cmd = ["bash", str(spawn_sh), worker, str(brief_tpl),
-           "--cwd", resolved, "--profile", "worker"]
+           "--cwd", worktree, "--profile", "worker",
+           "--env", "ISOLATED_SESSION_OWNER=" + owner_key]
     for k, v in vars_kv:
         cmd.extend(["--var", "%s=%s" % (k, v)])
     return cmd
@@ -512,7 +555,8 @@ def spawn_argv() -> list[str]:
 
 def by_hand() -> str:
     cmd = ["bash", ".cursor/skills/isolated-session/scripts/herd-spawn.sh",
-           worker, brief_rel, "--cwd", resolved, "--profile", "worker"]
+           worker, brief_rel, "--cwd", worktree, "--profile", "worker",
+           "--env", "ISOLATED_SESSION_OWNER=" + owner_key]
     for k, v in vars_kv:
         cmd.extend(["--var", "%s=%s" % (k, v)])
     return " ".join(shlex_quote(p) for p in cmd)

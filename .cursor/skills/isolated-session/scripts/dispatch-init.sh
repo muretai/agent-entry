@@ -3,6 +3,7 @@
 # which repository.
 #
 #   dispatch-init.sh --as <agent> --repo <name>=<absolute path> [--node <absolute path>]
+#                    [--lease <identity name>] [--lease-endpoint <url>]
 #
 # Writes $DISPATCH_DIR (default ~/.muretai/dispatch):
 #   agent   `name=<agent>`         -- the line finish-worktree.sh reads for `take --as`
@@ -12,6 +13,9 @@
 #   node    `node=<path>`          -- the node whose operator_cli.py and keys/ the lease
 #                                     and dispatch-take.sh run through (the M1 defect:
 #                                     they used to run this checkout's copy)
+#           `lease=<name>`         -- --lease: the node's dedicated, unbound identity the
+#                                     landing lease signs with
+#           `endpoint=<url>`       -- --lease-endpoint: the lease service
 # All mode 600. Without --node an existing node line is kept; with none, node= is
 # written as $HOME/muretai-node only if that passes the same checks as --node, and
 # otherwise no node line is written and stderr says to pass --node (agent and repos
@@ -36,7 +40,19 @@
 #     control character (a newline in a real directory name would otherwise write a
 #     second `repos` line);
 #   * an `agent` or `repos` that is a symlink or not a regular file -- the readers
-#     ignore a symlinked file, and a write through one would land wherever it points.
+#     ignore a symlinked file, and a write through one would land wherever it points;
+#   * a --lease name a take would refuse: not an identity name, the agent itself (--as),
+#     no plain key in the node's keys/, or bound to a principal (an unreadable bindings
+#     directory fails closed). landing-lease.py `check-lease` applies the take's own
+#     check_lease, against --node or else the existing node= line;
+#   * a --lease-endpoint lease_core.check_url refuses (https://, or http:// to loopback
+#     only), or one carrying a control character (landing-lease.py `check-endpoint`).
+# Without --lease / --lease-endpoint an existing lease= / endpoint= line is kept; with
+# one, that line is replaced where it stands, else appended.
+#
+# Why --lease exists: landing-lease.py refused a node file with no lease= line and told
+# the operator to run this script, which could not write one -- the line had to be typed
+# in by hand (Mac B, 2026-09-24).
 # Each file is written to a temporary file in the same directory and renamed over the
 # old one, so a reader never sees half a file and the result is mode 600 even when the
 # old file was wider.
@@ -46,7 +62,7 @@ umask 077
 here="$(cd "$(dirname "$0")" && pwd)"
 
 usage() {
-  echo "usage: dispatch-init.sh --as <agent> --repo <name>=<absolute path> [--node <absolute path>]" >&2
+  echo "usage: dispatch-init.sh --as <agent> --repo <name>=<absolute path> [--node <absolute path>] [--lease <identity name>] [--lease-endpoint <url>]" >&2
   exit 2
 }
 
@@ -67,11 +83,17 @@ repo_spec=""
 repo_set="no"
 node_arg=""
 node_set="no"
+lease_name=""
+lease_set="no"
+endpoint_url=""
+endpoint_set="no"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --as) [[ $# -ge 2 ]] || usage; as_name="$2"; as_set="yes"; shift 2 ;;
     --repo) [[ $# -ge 2 ]] || usage; repo_spec="$2"; repo_set="yes"; shift 2 ;;
     --node) [[ $# -ge 2 ]] || usage; node_arg="$2"; node_set="yes"; shift 2 ;;
+    --lease) [[ $# -ge 2 ]] || usage; lease_name="$2"; lease_set="yes"; shift 2 ;;
+    --lease-endpoint) [[ $# -ge 2 ]] || usage; endpoint_url="$2"; endpoint_set="yes"; shift 2 ;;
     -h|--help) usage ;;
     *) echo "dispatch-init: unknown argument: $(show "$1")" >&2; usage ;;
   esac
@@ -157,6 +179,22 @@ else
   fi
 fi
 
+# lease / endpoint: the checks a take applies, run before anything is written. The lease
+# identity is judged against the node about to be written, else the existing node= line
+# (check-lease resolves that itself, and refuses when there is none).
+if [[ "$lease_set" == "yes" ]]; then
+  if ! python3 -I "$here/landing-lease.py" check-lease "$lease_name" "$as_name" "$node_value" \
+      --as-prefix dispatch-init >/dev/null; then
+    exit 1
+  fi
+fi
+if [[ "$endpoint_set" == "yes" ]]; then
+  if ! python3 -I "$here/landing-lease.py" check-endpoint "$endpoint_url" \
+      --as-prefix dispatch-init >/dev/null; then
+    exit 1
+  fi
+fi
+
 # --- write -----------------------------------------------------------------------
 mkdir -p "$dispatch_dir"
 
@@ -205,18 +243,49 @@ written="no"
   fi
 } > "$tmp_repos"
 
-# node: `node=` replaced (or added first); every other line kept
-if [[ -n "$node_value" ]]; then
+# node: `node=` replaced (or added first); `lease=` and `endpoint=`, when given, replaced
+# where they stand (a duplicate dropped), else appended; every other line kept
+if [[ -n "$node_value" || "$lease_set" == "yes" || "$endpoint_set" == "yes" ]]; then
   tmp_node="$(mktemp "${dispatch_dir}/.node.XXXXXX")"
+  lease_written="no"
+  endpoint_written="no"
   {
-    printf 'node=%s\n' "$node_value"
+    if [[ -n "$node_value" ]]; then
+      printf 'node=%s\n' "$node_value"
+    fi
     if [[ -f "$node_file" ]]; then
       while IFS= read -r line || [[ -n "$line" ]]; do
         case "$line" in
-          node=*) ;;
+          node=*)
+            if [[ -z "$node_value" ]]; then
+              printf '%s\n' "$line"
+            fi
+            ;;
+          lease=*)
+            if [[ "$lease_set" != "yes" ]]; then
+              printf '%s\n' "$line"
+            elif [[ "$lease_written" == "no" ]]; then
+              printf 'lease=%s\n' "$lease_name"
+              lease_written="yes"
+            fi
+            ;;
+          endpoint=*)
+            if [[ "$endpoint_set" != "yes" ]]; then
+              printf '%s\n' "$line"
+            elif [[ "$endpoint_written" == "no" ]]; then
+              printf 'endpoint=%s\n' "$endpoint_url"
+              endpoint_written="yes"
+            fi
+            ;;
           *) printf '%s\n' "$line" ;;
         esac
       done < "$node_file"
+    fi
+    if [[ "$lease_set" == "yes" && "$lease_written" == "no" ]]; then
+      printf 'lease=%s\n' "$lease_name"
+    fi
+    if [[ "$endpoint_set" == "yes" && "$endpoint_written" == "no" ]]; then
+      printf 'endpoint=%s\n' "$endpoint_url"
     fi
   } > "$tmp_node"
 fi
@@ -236,5 +305,11 @@ echo "AGENT=${as_name}"
 echo "REPO=${repo_name}=${repo_path}"
 if [[ -n "$node_value" ]]; then
   echo "NODE=${node_value}"
+fi
+if [[ "$lease_set" == "yes" ]]; then
+  echo "LEASE=${lease_name}"
+fi
+if [[ "$endpoint_set" == "yes" ]]; then
+  echo "ENDPOINT=${endpoint_url}"
 fi
 echo "DISPATCH_DIR=${dispatch_dir}"
