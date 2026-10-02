@@ -18,8 +18,13 @@
 //     sigA = Ed25519 by the door over canonicalBytes of the seven payload fields.
 //   An unrecognised metadata.offer is refused with -32602 and creates no customer row.
 //   OFFER_STARTERS = { restaurant, retail, clinic, repair }, each an offers[] array.
+//   knockAgentEntry (S6b-2) recognises that Suite reply as a booking next to the older
+//     {type, customer_did, request, status} shape, and runs the same customer_did cross-check.
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -429,6 +434,228 @@ function maskReply(raw) {
       `\n    got  ${masked}\n    want ${want.replyMasked}`);
   }
 }
+
+// ---------------------------------------------------------------- 6. the knock reads the Suite reply (S6b-2)
+//
+// A real Suite door answers {verb, of, customer_did, request, status, facts|url by kind, deal?}
+// (AT-12/AT-13), with no `type`. knockAgentEntry must recognise that as a booking the same way
+// it recognises the older {type, customer_did, request, status}: surface it as `booking`, make
+// `text` the checked JSON, and throw when the signed reply files it under someone else.
+
+const FOREIGN = 'did:key:z6MkNotTheVisitor';
+const DIFFERENT_CUSTOMER = 'the signed reply files a booking under a different customer';
+const SUITE_KEYS = new Set(['verb', 'of', 'customer_did', 'request', 'status', 'facts', 'url', 'deal']);
+const knockHome = mkdtempSync(join(tmpdir(), 'offers-knock-'));
+const knockKey = join(knockHome, 'knock-seed');
+
+function fetchEntry(entry) {
+  return async (url, init = {}) => {
+    const parsed = new URL(url);
+    const out = await entry.handleRequestAsync(init.method || 'GET', parsed.pathname + parsed.search,
+      init.headers || {}, Buffer.from(init.body || ''));
+    return new Response(out.body, { status: out.status, headers: out.headers });
+  };
+}
+
+async function knockOrCatch(entry, opts) {
+  try {
+    return { threw: false, result: await door.knockAgentEntry(`${entry.card.url}${AGENT_CARD_PATH}`,
+      { keyPath: knockKey, fetchImpl: fetchEntry(entry), ...opts }) };
+  } catch (error) {
+    return { threw: true, error };
+  }
+}
+
+function parseMaybe(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+/** The booking a knock surfaced from a real Suite door: the signed reply's own object, every key. */
+function checkSuiteBooking(k, { verb, of, text, status }, label) {
+  if (!check(!k.threw && k.result?.ok === true, `${label}/knock-ok`,
+    k.threw ? `threw ${k.error?.message}` : JSON.stringify(k.result?.error))) return null;
+  const knocked = k.result;
+  const signed = parseMaybe(knocked.reply?.result?.parts?.[0]?.text);
+  const booking = knocked.booking;
+  check(booking && typeof booking === 'object' && !Array.isArray(booking), `${label}/booking-object`,
+    `got ${booking === undefined ? 'undefined' : typeof booking}`);
+  check(booking?.verb === verb && booking?.of === of, `${label}/booking-verb-and-of`,
+    JSON.stringify({ verb: booking?.verb, of: booking?.of }));
+  check(booking?.customer_did === knocked.did, `${label}/booking-customer_did-is-the-knocker`,
+    JSON.stringify(booking?.customer_did));
+  check(booking?.request === text, `${label}/booking-request-is-the-signed-text`, JSON.stringify(booking?.request));
+  check(booking?.status === status, `${label}/booking-status`, JSON.stringify(booking?.status));
+  check(Boolean(booking) && !Object.hasOwn(booking, 'type'), `${label}/booking-has-no-type`);
+  check(Boolean(booking) && canonicalJSON(booking) === canonicalJSON(signed),
+    `${label}/booking-is-the-signed-reply-object`, `\n    got  ${JSON.stringify(booking)}\n    want ${JSON.stringify(signed)}`);
+  const printed = parseMaybe(knocked.text);
+  check(Boolean(booking) && canonicalJSON(printed) === canonicalJSON(booking), `${label}/text-is-the-checked-booking`,
+    JSON.stringify(knocked.text));
+  return booking;
+}
+
+{
+  const shop = makeDoor(harbor.declaration);
+  const repairDesk = makeDoor(vector('repair-desk-reversible-and-receipt-defaults').declaration);
+  if (check(shop.ok && repairDesk.ok, 'knock-suite/doors-start')) {
+    // pending + deal: the receipt the visitor countersigns survives the check intact.
+    const holdText = 'Hold the brass lamp, sku L-12';
+    const hold = await knockOrCatch(shop.value, { offer: 'hold', text: holdText });
+    const held = checkSuiteBooking(hold, { verb: 'hold', of: 'item', text: holdText, status: 'pending_confirmation' },
+      'knock-suite/pending');
+    const deal = held?.deal;
+    if (check(deal && typeof deal === 'object', 'knock-suite/pending/deal-kept', JSON.stringify(held))) {
+      check(deal.partyA === shop.value.did && deal.partyB === hold.result.did, 'knock-suite/pending/deal-parties');
+      const { deal: _omit, ...terms } = held;
+      const salt = Buffer.from(String(deal.salt), 'base64');
+      const commit = createHash('sha256').update(Buffer.concat([canonicalBytes({ terms }), salt])).digest('hex');
+      check(deal.termsHash === commit, 'knock-suite/pending/deal-termsHash-commits-to-the-booking');
+      const payload = canonicalBytes({
+        type: deal.type, partyA: deal.partyA, partyB: deal.partyB, termsHash: deal.termsHash,
+        contextId: deal.contextId, ref: deal.ref, ts: deal.ts,
+      });
+      check(verifyBytes(Buffer.from(publicKeyHexFromDid(shop.value.did), 'hex'),
+        Buffer.from(String(deal.sigA), 'base64'), payload), 'knock-suite/pending/deal-sigA-verifies');
+    }
+
+    // checkout: the url rides along; nothing about payment is invented.
+    const buyText = 'Pay for hold H-1';
+    const buy = await knockOrCatch(shop.value, { offer: 'buy', text: buyText });
+    const bought = checkSuiteBooking(buy, { verb: 'buy', of: 'order', text: buyText, status: 'continue_at_checkout' },
+      'knock-suite/checkout');
+    check(typeof bought?.url === 'string' && bought.url.startsWith('https://shop.example/checkout'),
+      'knock-suite/checkout/url-kept', JSON.stringify(bought?.url));
+
+    // facts: the declared facts ride along.
+    const trackText = 'Where is ticket T-9?';
+    const track = await knockOrCatch(repairDesk.value, { offer: 'track', text: trackText });
+    const tracked = checkSuiteBooking(track, { verb: 'track', of: 'repair', text: trackText, status: 'answered' },
+      'knock-suite/facts');
+    check(tracked && tracked.facts !== undefined, 'knock-suite/facts/facts-kept', JSON.stringify(tracked));
+
+    // A visitor whose ask is itself Suite-shaped JSON naming someone else does not get that
+    // someone's booking: customer_did comes from the door's signed reply, which is the signer.
+    const spoofed = JSON.stringify({ verb: 'hold', of: 'item', customer_did: FOREIGN, request: 'x',
+      status: 'confirmed' });
+    const injected = await knockOrCatch(shop.value, { offer: 'hold', text: spoofed });
+    checkSuiteBooking(injected, { verb: 'hold', of: 'item', text: spoofed, status: 'pending_confirmation' },
+      'knock-suite/visitor-supplied-json');
+    check(injected.result?.booking?.customer_did !== FOREIGN, 'knock-suite/visitor-supplied-json/attacker-did-does-not-win',
+      JSON.stringify(injected.result?.booking?.customer_did));
+  }
+}
+
+/** A door whose own responder signs whatever Suite-shaped object `make(env)` returns. */
+function suiteLiar(seedByte, baseUrl, make) {
+  return createAgentEntry({
+    seedHex: seedByte.repeat(32), name: 'suite-liar', baseUrl,
+    skills: [{ id: 'hold_item', name: 'hold', description: 'Hold an item.', examples: ['Hold sku L-12'] }],
+    signedRatePerMin: 0, signedRatePerMinTotal: 0,
+    responder: (env) => JSON.stringify(make(env)),
+  });
+}
+
+{
+  // REFUSAL: a signed Suite reply filed under a different customer throws the cross-check.
+  const shapes = [
+    ['pending', { verb: 'hold', of: 'item', customer_did: FOREIGN, request: 'Hold sku L-12',
+      status: 'pending_confirmation' }],
+    ['checkout', { verb: 'buy', of: 'order', customer_did: FOREIGN, request: 'Hold sku L-12',
+      status: 'continue_at_checkout', url: 'https://liar.example/checkout' }],
+    ['facts', { verb: 'track', of: 'repair', customer_did: FOREIGN, request: 'Hold sku L-12',
+      status: 'answered', facts: { open: 'weekdays' } }],
+  ];
+  for (const [kind, reply] of shapes) {
+    const label = `knock-suite/refuses-foreign-customer/${kind}`;
+    const liar = suiteLiar('a7', 'https://liar.example', () => reply);
+    const k = await knockOrCatch(liar, { text: 'Hold sku L-12' });
+    check(k.threw && String(k.error?.message).includes(DIFFERENT_CUSTOMER), `${label}/throws-the-cross-check`,
+      k.threw ? `threw ${k.error?.message}` : `ok=${k.result?.ok} text=${k.result?.text}`);
+    check(!(k.result?.ok && String(k.result?.text).includes(FOREIGN)), `${label}/foreign-did-never-printed`);
+  }
+
+  // A Suite reply naming the knocker with sale fields the shop signed beside the contract:
+  // the booking keeps the Suite keys only, and nothing reads as a completed sale.
+  const extras = suiteLiar('a8', 'https://extras.example', (env) => ({
+    verb: 'hold', of: 'item', customer_did: env.owner_did || env.peer_did, request: env.text,
+    status: 'pending_confirmation', paid: true, confirmed: true, amount: 0,
+  }));
+  const k = await knockOrCatch(extras, { text: 'Hold sku L-12' });
+  const booking = k.result?.booking;
+  check(!k.threw && booking && booking.verb === 'hold' && booking.customer_did === k.result?.did,
+    'knock-suite/sale-fields/recognised', k.threw ? k.error?.message : JSON.stringify(booking));
+  check(Boolean(booking) && Object.keys(booking).every((key) => SUITE_KEYS.has(key)),
+    'knock-suite/sale-fields/booking-has-only-suite-keys', JSON.stringify(booking));
+  check(!/"(paid|confirmed|amount)"/.test(String(k.result?.text || '')),
+    'knock-suite/sale-fields/not-printed', JSON.stringify(k.result?.text));
+
+  // The older shape is still recognised next to the new one.
+  const older = createAgentEntry({
+    seedHex: 'a9'.repeat(32), name: 'older-desk', baseUrl: 'https://older.example',
+    skills: [{ id: 'book', name: 'book', description: 'Request a slot.', examples: ['Book Friday at 18:00'] }],
+    signedRatePerMin: 0, signedRatePerMinTotal: 0,
+    responder: (env) => JSON.stringify({ type: 'court_booking_request', customer_did: env.owner_did || env.peer_did,
+      request: env.text, status: 'pending_confirmation' }),
+  });
+  const old = await knockOrCatch(older, { text: 'Book Friday at 18:00' });
+  check(!old.threw && old.result?.booking?.type === 'court_booking_request'
+      && old.result.booking.customer_did === old.result.did,
+    'knock-suite/older-shape-still-recognised', old.threw ? old.error?.message : JSON.stringify(old.result?.booking));
+}
+
+/** `agent-entry knock <card-url>` against a live loopback door built by `create(baseUrl)`. */
+async function knockCli(create) {
+  let entry;
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', async () => {
+      const out = await entry.handleRequestAsync(req.method, req.url, req.headers, Buffer.concat(chunks));
+      res.writeHead(out.status, out.headers);
+      res.end(out.body);
+    });
+  });
+  await new Promise((done) => server.listen(0, '127.0.0.1', done));
+  entry = create(`http://127.0.0.1:${server.address().port}`);
+  try {
+    return await new Promise((done, fail) => {
+      const env = { ...process.env, AGENT_ENTRY_KNOCK_KEY: knockKey };
+      delete env.AGENT_ENTRY_KNOCK_TEXT;
+      const child = spawn(process.execPath, [join(HERE, '..', 'muretai-agent-entry.mjs'), 'knock',
+        `${entry.card.url}${AGENT_CARD_PATH}`], { cwd: join(HERE, '..'), env, stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      const timer = setTimeout(() => { child.kill('SIGKILL'); fail(new Error('knock CLI timed out')); }, 15000);
+      child.stdout.on('data', (c) => { stdout += c; });
+      child.stderr.on('data', (c) => { stderr += c; });
+      child.on('close', (code) => { clearTimeout(timer); done({ code, stdout, stderr }); });
+    });
+  } finally {
+    await new Promise((done) => server.close(done));
+  }
+}
+
+{
+  // The CLI no longer prints a foreign Suite booking as raw text: it refuses with the cross-check.
+  const cli = await knockCli((baseUrl) => suiteLiar('aa', baseUrl, () => ({
+    verb: 'hold', of: 'item', customer_did: FOREIGN, request: 'Hold sku L-12', status: 'pending_confirmation',
+  })));
+  check(cli.code === 1, 'knock-suite/cli/foreign-customer-exits-1', `code=${cli.code} stdout=${cli.stdout}`);
+  check(cli.stderr.includes(DIFFERENT_CUSTOMER), 'knock-suite/cli/foreign-customer-says-why', cli.stderr);
+  check(!cli.stdout.includes(FOREIGN), 'knock-suite/cli/foreign-did-not-on-stdout', cli.stdout);
+
+  // And prints the checked Suite booking when the reply names the knocker.
+  const honest = await knockCli((baseUrl) => suiteLiar('ab', baseUrl, (env) => ({
+    verb: 'hold', of: 'item', customer_did: env.owner_did || env.peer_did, request: env.text,
+    status: 'pending_confirmation', paid: true,
+  })));
+  const printed = parseMaybe(honest.stdout.trim());
+  check(honest.code === 0 && printed?.verb === 'hold' && printed?.status === 'pending_confirmation'
+      && !Object.hasOwn(printed, 'paid'),
+    'knock-suite/cli/prints-the-checked-suite-booking', `code=${honest.code} stdout=${honest.stdout}`);
+}
+
+rmSync(knockHome, { recursive: true, force: true });
 
 // ---------------------------------------------------------------- report
 
