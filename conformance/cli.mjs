@@ -45,6 +45,8 @@
 //   fileSink(path)                        -> observer that appends the counts log (no DID, no text).
 //   gaSink({ measurementId, apiSecret })  -> observer posting GA4 Measurement Protocol events with
 //                 engagement_time_msec, session_id and typed dimensions only.
+//   knock <card-url> [--offer <id or verb>]  (S6b-1) and knockAgentEntry(url, { offer }) -> the knock
+//                 carries metadata.offer after sig; without it the POST body is byte for byte today's.
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { connect } from 'node:net';
@@ -1037,7 +1039,220 @@ await section('gaSink', async () => {
   }
 });
 
-// ---------------------------------------------------------------- 9. the bin still knows `knock`, misuse is 2
+// ---------------------------------------------------------------- 9. knock --offer (S6b-1)
+//
+// WRITTEN BEFORE THE IMPLEMENTATION (test-first, split 1 of 2 of parent intake 20261002T130610Z).
+// `knockAgentEntry(cardUrl, { offer })` and `agent-entry knock <card-url> --offer <id or verb>`
+// put `metadata.offer` beside from/to/timestamp/sig, after `sig`, the way doctor's in-process
+// knock already does (AT-11, AT-24). The selection is not signed (section 4): the sig covers the
+// same six fields with or without it. Without --offer the POST body is byte for byte today's.
+// A value that is not an id or a verb by AT-1's spelling (^[a-z][a-z0-9_]*$, a string) is
+// refused before anything is sent; a well-formed value the door does not answer is sent, and
+// the door's -32602 comes back as a refusal.
+
+const KNOCK_SEED = 'f4'.repeat(32);
+const OFFER_SPELLING = /^[a-z][a-z0-9_]*$/;
+const MALFORMED_OFFERS = ['Hold', 'HOLD_ITEM', 'hold item', 'hold-item', '1hold', '_hold', '', 'hold ', ' hold',
+  'hold_item\n', 'did:key:z6MkNotAnOffer', 'holdé'];
+const NON_STRING_OFFERS = [42, true, {}, ['hold']];
+const { verifyEnvelope } = door;
+
+function knockKeyFile(seed = KNOCK_SEED) {
+  const keyPath = join(tmp('ae-cli-knock-key-'), 'knock-seed');
+  writeFileSync(keyPath, `${seed}\n`, { mode: 0o600 });
+  return keyPath;
+}
+
+/** An in-process fetch onto one door: never a socket. Records every POST body as sent. */
+function doorFetch(entry, posts) {
+  return async (url, init = {}) => {
+    const parsed = new URL(String(url));
+    const method = init.method || 'GET';
+    const body = Buffer.from(init.body || '');
+    if (method === 'POST') posts.push(body.toString('utf8'));
+    const out = await entry.handleRequestAsync(method, parsed.pathname + parsed.search, init.headers || {}, body,
+      { remoteAddress: '127.0.0.1' });
+    return new Response(out.body, { status: out.status, headers: out.headers });
+  };
+}
+
+/**
+ * The pre-change wire, rebuilt from the values one captured POST carries: the exact object
+ * literal and JSON.stringify call knockAgentEntry used before S6b-1, with `offer` appended after
+ * `sig` only when one was given (doctor's offerKnock order). Any reorder, extra field or
+ * whitespace change in what was sent makes the bytes differ.
+ */
+function expectedKnockBytes(raw, offer = undefined) {
+  const m = JSON.parse(raw).params.message;
+  const md = m.metadata;
+  const metadata = { from: md.from, to: md.to, timestamp: md.timestamp, sig: md.sig };
+  if (offer !== undefined) metadata.offer = offer;
+  return JSON.stringify({ jsonrpc: '2.0', id: m.messageId, method: 'message/send', params: { message: {
+    kind: 'message', role: 'user', messageId: m.messageId, contextId: null, parts: [{ kind: 'text', text: m.parts[0].text }],
+    metadata } } });
+}
+
+/** Byte identity plus the values themselves: signed by the knock key to the door, fresh, unsigned offer. */
+function checkKnockWire(label, raw, { doorDid, text, offer = undefined }) {
+  let m = null;
+  try { m = JSON.parse(raw).params.message; } catch { /* below */ }
+  if (!check(m !== null, `${label}/post-is-a-message-send`, raw.slice(0, 200))) return;
+  let want = null;
+  try { want = expectedKnockBytes(raw, offer); } catch (e) { want = `unbuildable: ${e.message}`; }
+  check(raw === want, `${label}/wire-bytes-exact`, `sent ${JSON.stringify(raw.slice(0, 400))} want ${JSON.stringify(String(want).slice(0, 400))}`);
+  const md = m.metadata || {};
+  const keys = offer === undefined ? ['from', 'to', 'timestamp', 'sig'] : ['from', 'to', 'timestamp', 'sig', 'offer'];
+  check(JSON.stringify(Object.keys(md)) === JSON.stringify(keys), `${label}/metadata-keys-${keys.join('-')}`, JSON.stringify(Object.keys(md)));
+  if (offer === undefined) check(!Object.hasOwn(md, 'offer'), `${label}/no-offer-field-when-not-given`);
+  else check(md.offer === offer, `${label}/metadata-offer-is-the-value-given`, JSON.stringify(md.offer));
+  check(md.from === didFromSeedHex(KNOCK_SEED) && md.to === doorDid, `${label}/from-the-knock-key-to-the-door`,
+    JSON.stringify({ from: md.from, to: md.to }));
+  check(m.parts?.[0]?.text === text, `${label}/text-is-the-ask`, JSON.stringify(m.parts?.[0]?.text));
+  check(/^[0-9a-f]{32}$/.test(m.messageId || '') && JSON.parse(raw).id === m.messageId, `${label}/message-id-shape`);
+  check(Number.isSafeInteger(md.timestamp) && Math.abs(md.timestamp - Date.now() / 1000) < 120, `${label}/timestamp-fresh`);
+  let verified = false;
+  try {
+    verified = Boolean(verifyEnvelope({ from: md.from, to: md.to, messageId: m.messageId, contextId: null,
+      timestamp: md.timestamp, text: m.parts[0].text, sig: md.sig }, { recipientDid: doorDid, signerDid: md.from }));
+  } catch { /* false */ }
+  check(verified, `${label}/sig-covers-the-six-fields-and-not-the-offer`);
+}
+
+const replyOf = (text) => { try { return JSON.parse(text); } catch { return null; } };
+
+await section('knock-offer-library', async () => {
+  const knock = need('knockAgentEntry');
+  if (typeof knock !== 'function') return;
+  const origin = 'https://shop.example';
+  const entry = liveDoor(doctorDeclaration(origin));
+  const cardUrl = `${origin}/.well-known/agent-card.json`;
+  const keyPath = knockKeyFile();
+  const posts = [];
+  const fetchImpl = doorFetch(entry, posts);
+  const run = async (opts) => {
+    posts.length = 0;
+    try { return { result: await knock(cardUrl, { keyPath, text: MARKER, fetchImpl, ...opts }), error: null }; } catch (error) {
+      return { result: null, error };
+    }
+  };
+
+  // Baseline: no offer, and an explicit `offer: undefined`, send today's bytes exactly.
+  for (const [tag, opts] of [['no-offer', {}], ['offer-undefined', { offer: undefined }]]) {
+    const label = `knock-offer/library-${tag}`;
+    const { result, error } = await run(opts);
+    check(error === null && result?.ok === true, `${label}/answered`, error?.message || JSON.stringify(result?.error));
+    if (check(posts.length === 1, `${label}/one-post`, String(posts.length))) {
+      checkKnockWire(label, posts[0], { doorDid: entry.did, text: MARKER });
+    }
+  }
+
+  // An offer id and a registry verb: carried as metadata.offer, and the door answers that offer.
+  for (const offer of ['hold_item', 'hold', 'find_hours']) {
+    const label = `knock-offer/library-${offer}`;
+    const { result, error } = await run({ offer });
+    check(error === null && result?.ok === true, `${label}/answered`, error?.message || JSON.stringify(result?.error));
+    if (check(posts.length === 1, `${label}/one-post`, String(posts.length))) {
+      checkKnockWire(label, posts[0], { doorDid: entry.did, text: MARKER, offer });
+    }
+    const reply = replyOf(result?.text);
+    const want = offer === 'find_hours' ? ['find', 'hours'] : ['hold', 'item'];
+    check(reply?.verb === want[0] && reply?.of === want[1], `${label}/door-answered-that-offer`, String(result?.text).slice(0, 200));
+  }
+
+  // Well-formed but not answered at this door: sent as given, and the door's -32602 comes back as ok:false.
+  for (const offer of ['teleport_now', 'track_order', 'hold_']) {
+    const label = `knock-offer/library-unanswered-${offer}`;
+    const { result, error } = await run({ offer });
+    check(error === null && result?.ok === false && result?.error?.code === -32602, `${label}/door-refusal-returned`,
+      error?.message || JSON.stringify(result?.error));
+    if (check(posts.length === 1, `${label}/one-post`, String(posts.length))) {
+      checkKnockWire(label, posts[0], { doorDid: entry.did, text: MARKER, offer });
+    }
+  }
+
+  // Malformed: refused before anything is sent, never quietly dropped and sent without it.
+  for (const offer of [...MALFORMED_OFFERS, ...NON_STRING_OFFERS]) {
+    const label = `knock-offer/library-malformed-${JSON.stringify(offer)}`;
+    if (typeof offer === 'string' && OFFER_SPELLING.test(offer)) { check(false, `${label}/fixture-is-malformed`); continue; }
+    const { result, error } = await run({ offer });
+    check(error !== null || (result && result.ok !== true), `${label}/refused`, JSON.stringify(result));
+    check(error === null || error instanceof Error, `${label}/refusal-is-an-error`, String(error));
+    check(posts.length === 0, `${label}/nothing-sent`, JSON.stringify(posts.map((p) => JSON.parse(p).params?.message?.metadata)));
+  }
+});
+
+await section('knock-offer-bin', async () => {
+  const fx = await startFixtureServer();
+  try {
+    const entry = liveDoor(doctorDeclaration(fx.origin));
+    fx.state.handler = (...a) => entry.handleRequestAsync(...a);
+    const cardUrl = `${fx.origin}/.well-known/agent-card.json`;
+    const keyPath = knockKeyFile();
+    const env = { AGENT_ENTRY_KNOCK_KEY: keyPath, AGENT_ENTRY_KNOCK_TEXT: MARKER };
+    const knockCli = async (args) => {
+      fx.state.posts = [];
+      const run = await runCli(['knock', ...args], { env });
+      return { run, posts: [...fx.state.posts] };
+    };
+
+    // Baseline: the bin without --offer sends today's bytes exactly.
+    {
+      const label = 'knock-offer/bin-no-offer';
+      const { run, posts } = await knockCli([cardUrl]);
+      guardClean(label, run, { onlyPort: fx.port });
+      check(run.code === 0, `${label}/exit-0`, `exit ${run.code}: ${run.stderr.slice(0, 300)}`);
+      if (check(posts.length === 1, `${label}/one-post`, String(posts.length))) {
+        checkKnockWire(label, posts[0], { doorDid: entry.did, text: MARKER });
+      }
+    }
+
+    // --offer <id> and --offer <verb>, end to end.
+    for (const offer of ['hold_item', 'hold']) {
+      const label = `knock-offer/bin-${offer}`;
+      const { run, posts } = await knockCli([cardUrl, '--offer', offer]);
+      guardClean(label, run, { onlyPort: fx.port });
+      check(run.code === 0, `${label}/exit-0`, `exit ${run.code}: ${run.stderr.slice(0, 300)}`);
+      if (check(posts.length === 1, `${label}/one-post`, String(posts.length))) {
+        checkKnockWire(label, posts[0], { doorDid: entry.did, text: MARKER, offer });
+      }
+      const reply = replyOf(run.stdout.trim());
+      check(reply?.verb === 'hold' && reply?.of === 'item', `${label}/prints-the-door-answer-to-that-offer`, run.stdout.slice(0, 200));
+    }
+
+    // Well-formed, not answered here: sent, refused by the door, exit 1 naming -32602.
+    {
+      const label = 'knock-offer/bin-unanswered';
+      const { run, posts } = await knockCli([cardUrl, '--offer', 'teleport_now']);
+      guardClean(label, run, { onlyPort: fx.port });
+      check(run.code === 1 && /Refused \(-32602\)/.test(run.stderr), `${label}/exit-1-door-refusal`,
+        `exit ${run.code}: ${run.stderr.slice(0, 300)}`);
+      if (check(posts.length === 1, `${label}/one-post`, String(posts.length))) {
+        checkKnockWire(label, posts[0], { doorDid: entry.did, text: MARKER, offer: 'teleport_now' });
+      }
+    }
+
+    // Malformed or missing values: misuse, exit 2, and no knock reaches the door.
+    for (const offer of MALFORMED_OFFERS) {
+      const label = `knock-offer/bin-malformed-${JSON.stringify(offer)}`;
+      const { run, posts } = await knockCli([cardUrl, '--offer', offer]);
+      guardClean(label, run, { onlyPort: fx.port });
+      check(run.code === 2, `${label}/exit-2`, `exit ${run.code}: ${run.stderr.slice(0, 200)}`);
+      check(posts.length === 0, `${label}/nothing-sent`, String(posts.length));
+      check(run.stdout === '', `${label}/prints-nothing-on-stdout`, run.stdout.slice(0, 200));
+    }
+    for (const [tag, args] of [['flag-without-value', [cardUrl, '--offer']], ['no-card-url', ['--offer', 'hold_item']],
+      ['unknown-flag', [cardUrl, '--frobnicate', 'x']]]) {
+      const label = `knock-offer/bin-${tag}`;
+      const { run, posts } = await knockCli(args);
+      check(run.code === 2, `${label}/exit-2`, `exit ${run.code}: ${run.stderr.slice(0, 200)}`);
+      check(posts.length === 0, `${label}/nothing-sent`, String(posts.length));
+    }
+  } finally {
+    fx.server.close();
+  }
+});
+
+// ---------------------------------------------------------------- 10. the bin still knows `knock`, misuse is 2
 
 await section('bin', async () => {
   const unknown = await runCli(['frobnicate']);
