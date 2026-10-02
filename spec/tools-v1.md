@@ -37,12 +37,14 @@ where the seam allows them).
 **AT-1. Grammar.** A declaration is a JSON object with exactly these keys: `v` (the number
 `1`), `entry`, `offers`, and optionally `facts`.
 
-- `entry` is `{name, baseUrl, domains?, prefer?, catalog?}`:
+- `entry` is `{name, baseUrl, domains?, prefer?, catalog?, counts?}`:
   - `name` is a non-empty string;
   - `baseUrl` is the URL visitors dial, under the rules of v1;
   - `domains` is a list of bare domain names;
   - `prefer` is an `agentEntry.prefer` list (v1 AE-30);
-  - `catalog` is a boolean.
+  - `catalog` is a boolean;
+  - `counts` is an absolute `https` URL with a host. Plain `http`, any other scheme, a
+    relative or protocol-relative reference, and a non-string are refused as `entry.counts`.
 - `offers` is a non-empty list of offers. Each offer is
   `{verb, of, about, input, effect?, ask?, then?, page?, door?}`.
 - `verb` and `of` match `^[a-z][a-z0-9_]*$`. The offer's id is `verb + "_" + of`. Two offers

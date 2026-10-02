@@ -3204,7 +3204,7 @@ const OFFER_SPELLING = /^[a-z][a-z0-9_]*$/;
 const INPUT_FIELD = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CALL_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 const DECLARATION_KEYS = ['v', 'entry', 'offers', 'facts'];
-const ENTRY_KEYS = ['name', 'baseUrl', 'domains', 'prefer', 'catalog'];
+const ENTRY_KEYS = ['name', 'baseUrl', 'domains', 'prefer', 'catalog', 'counts'];
 const OFFER_KEYS = ['verb', 'of', 'about', 'input', 'effect', 'ask', 'then', 'page', 'door'];
 
 /** Where the contract, its signature and the collector live, under the entry's mount. */
@@ -3258,6 +3258,18 @@ function sameOriginPath(value, field) {
   if (typeof value !== 'string' || !/^\/(?![/\\])[\x21-\x7e]*$/.test(value) || value.includes('\\')) {
     refuseDeclaration(field, 'must be a same-origin path: it starts with "/", not "//", and is printable ASCII');
   }
+  return value;
+}
+
+/** `entry.counts`: an absolute https URL with a host. The raw prefix is checked before
+ *  `new URL()`, because the URL parser repairs `https:///counts` into host `counts` and would
+ *  accept what the operator never wrote. */
+function countsUrl(value) {
+  const rule = 'must be an absolute https URL, e.g. "https://example.com/.well-known/agent-counts.json"';
+  if (typeof value !== 'string' || !/^https:\/\/[^/\\?#]/i.test(value)) refuseDeclaration('entry.counts', rule);
+  let url;
+  try { url = new URL(value); } catch { refuseDeclaration('entry.counts', rule); }
+  if (url.protocol !== 'https:' || !url.hostname) refuseDeclaration('entry.counts', rule);
   return value;
 }
 
@@ -3408,7 +3420,7 @@ function readDeclaration(declaration) {
   if (declaration.v !== 1) refuseDeclaration('v', 'must be 1');
 
   const entry = declaration.entry;
-  if (!isPlainObject(entry)) refuseDeclaration('entry', 'must be an object: {name, baseUrl, domains?, prefer?, catalog?}');
+  if (!isPlainObject(entry)) refuseDeclaration('entry', 'must be an object: {name, baseUrl, domains?, prefer?, catalog?, counts?}');
   onlyKeys(entry, ENTRY_KEYS, 'entry');
   const name = declaredString(entry.name, 'entry.name');
   if (typeof entry.baseUrl !== 'string') refuseDeclaration('entry.baseUrl', 'must be the URL visitors dial');
@@ -3438,6 +3450,7 @@ function readDeclaration(declaration) {
     refuseDeclaration('entry.prefer', `is not a valid order of ways in (${e.message})`);
   }
   if (entry.catalog !== undefined && typeof entry.catalog !== 'boolean') refuseDeclaration('entry.catalog', 'must be true or false');
+  if (entry.counts !== undefined) countsUrl(entry.counts);
 
   let facts;
   if (declaration.facts !== undefined) {
