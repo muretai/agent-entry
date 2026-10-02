@@ -5643,13 +5643,21 @@ function checkedBookingReceipt(replyText, visitorDid) {
  * When the verified reply carries a booking, `text` is the checked
  * `{type, customer_did, request, status}` JSON — not the shop's raw signed body.
  * `reply` remains the verified signed wire (`reply.result.parts[0].text`).
+ * `offer` (an offer id or a registry verb, AT-11) rides as `metadata.offer` after `sig`, as
+ * doctor's knock sends it; it is not signed (tools spec section 4). A value that is not AT-1's
+ * spelling is refused before anything is fetched; whether the door answers it is the door's to
+ * say. Without `offer` the POST is byte for byte what it was before S6b-1.
  */
 export async function knockAgentEntry(cardUrl, {
   keyPath = process.env.AGENT_ENTRY_KNOCK_KEY
     || resolve(homedir(), '.config', 'muretai-agent-entry', 'knock-seed'),
   text,
+  offer,
   fetchImpl = globalThis.fetch,
 } = {}) {
+  if (offer !== undefined && !(typeof offer === 'string' && OFFER_SPELLING.test(offer))) {
+    throw new TypeError('knock: offer must be an offer id or a verb (^[a-z][a-z0-9_]*$)');
+  }
   if (typeof fetchImpl !== 'function') throw new TypeError('knock: fetch is unavailable');
   const location = cardBaseFromUrl(cardUrl);
   const get = async (url) => {
@@ -5708,6 +5716,7 @@ export async function knockAgentEntry(cardUrl, {
           to: card.did,
           timestamp,
           sig: signEnvelope(seedHex, fields),
+          ...(offer !== undefined ? { offer } : {}),
         },
       },
     },
@@ -5764,12 +5773,20 @@ export async function knockAgentEntry(cardUrl, {
 }
 
 async function knockMain(argv) {
-  if (argv.length !== 2 || argv[0] !== 'knock') {
-    console.error('usage: node muretai-agent-entry.mjs knock <card-url>');
+  let cardUrl;
+  let offer;
+  let misuse = argv[0] !== 'knock';
+  for (let i = 1; i < argv.length && !misuse; i += 1) {
+    if (argv[i] === '--offer' && offer === undefined && i + 1 < argv.length) offer = argv[++i];
+    else if (!argv[i].startsWith('-') && cardUrl === undefined) cardUrl = argv[i];
+    else misuse = true;
+  }
+  if (misuse || cardUrl === undefined || (offer !== undefined && !OFFER_SPELLING.test(offer))) {
+    console.error('usage: node muretai-agent-entry.mjs knock <card-url> [--offer <id or verb>]');
     return 2;
   }
   try {
-    const result = await knockAgentEntry(argv[1]);
+    const result = await knockAgentEntry(cardUrl, { offer });
     if (result.ok) {
       console.log(result.text);
       return 0;
