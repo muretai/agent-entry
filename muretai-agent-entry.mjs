@@ -3450,7 +3450,7 @@ function readDeclaration(declaration) {
     refuseDeclaration('entry.prefer', `is not a valid order of ways in (${e.message})`);
   }
   if (entry.catalog !== undefined && typeof entry.catalog !== 'boolean') refuseDeclaration('entry.catalog', 'must be true or false');
-  if (entry.counts !== undefined) countsUrl(entry.counts);
+  const counts = entry.counts === undefined ? null : countsUrl(entry.counts);
 
   let facts;
   if (declaration.facts !== undefined) {
@@ -3473,7 +3473,7 @@ function readDeclaration(declaration) {
     ids.add(compiled.id);
     offers.push(compiled);
   });
-  return { name, origin, origins, prefer, offers, facts };
+  return { name, origin, origins, prefer, offers, facts, counts };
 }
 
 /** Returns the declaration unchanged, or throws a TypeError naming the field (AT-2). */
@@ -3888,6 +3888,7 @@ export function createAgentEntry({
       byId,
       byVerb,
       offerIds: new Set(contract.offers.map((o) => o.id)),
+      counts: read.counts,
     };
   } else if (toolsHistory !== null && toolsHistory !== undefined) {
     throw new TypeError('createAgentEntry: toolsHistory needs the declaration it precedes');
@@ -5128,14 +5129,30 @@ export function createAgentEntry({
     while (collectorSessions.size > COLLECTOR_MAX_SESSIONS) {
       collectorSessions.delete(collectorSessions.keys().next().value);
     }
-    for (const e of beacon.events.slice(0, take)) {
+    const kept = beacon.events.slice(0, take);
+    for (const e of kept) {
       observe({ stage: 'page', event: e.name, offer: e.offer ?? null, engine: e.engine ?? null,
         ms: e.ms ?? null, identified: 0, verified: false, ua_family: family,
         client_class: clientClass(family, 'page'),
         peer_did: null, owner_did: null, wba_did: null, text: null,
         ip_vendor: seen.ip_vendor, country: seen.country, signature_agent: null });
     }
+    if (tools.counts !== null && kept.length > 0) postCounts(beacon.session, kept);
     return { status: 204, headers: { 'Content-Length': '0', ...CORS_HEADERS }, body: Buffer.alloc(0) };
+  }
+
+  /** S6a-2: the counted events also go to `entry.counts`, the AT-14 body and nothing else — no
+   *  DID, no text, no visitor header, `Origin` the shop's own. Best-effort as gaSink is: one
+   *  attempt, never awaited, every failure swallowed, so the 204 and every signed reply are
+   *  the same bytes whether the sink is up, slow, hung or down. */
+  function postCounts(sessionId, events) {
+    try {
+      const body = JSON.stringify({ session: sessionId, events });
+      Promise.resolve()
+        .then(() => globalThis.fetch(tools.counts, { method: 'POST',
+          headers: { 'content-type': 'application/json', origin: doorOrigin }, body }))
+        .then(undefined, () => {});
+    } catch { /* the hosted count never changes what the door does */ }
   }
 
   /** What `Allow:` may truthfully say about THIS path, or null when the entry does not own
