@@ -496,6 +496,82 @@ if (callable(compileDeclaration)) {
   refusesHistory('not-an-array', clone(c1));
 }
 
+// ---------------------------------------------------------------- 9. entry.counts (S6a-1)
+
+// Split 1 of 4 of intake 20261002T130609Z: `counts` joins ENTRY_KEYS as an optional field whose
+// value is an absolute https URL. Optional like `domains`, `prefer` and `catalog`: a declaration
+// without it is unchanged. Refused by name (`entry.counts`) when malformed, plain http, or
+// without the https scheme. The vectors carry the cases; these checks pin that they are there,
+// so dropping a vector is a failure here, not a silent loss of coverage.
+
+if (callable(validateDeclaration) && callable(compileDeclaration)) {
+  const base = () => clone(VECTORS.accepted.find((a) => a.name === 'minimal-door-only-offer').declaration);
+  const withCounts = (counts) => { const d = base(); d.entry.counts = counts; return d; };
+
+  for (const name of ['entry-counts-absolute-https-url', 'entry-counts-absolute-https-url-with-port-and-query']) {
+    check(VECTORS.accepted.some((a) => a.name === name), `counts/vector-accepted/${name}-present`);
+  }
+  for (const name of ['entry-counts-malformed-url', 'entry-counts-not-a-url', 'entry-counts-plain-http',
+    'entry-counts-missing-scheme', 'entry-counts-protocol-relative',
+    'entry-counts-same-origin-path-is-not-absolute', 'entry-counts-javascript-scheme',
+    'entry-counts-not-a-string']) {
+    const hit = VECTORS.refusals.find((r) => r.name === name);
+    check(hit && hit.field === 'entry.counts', `counts/vector-refused/${name}-present-naming-entry.counts`);
+  }
+
+  const good = 'https://refuse.example/.well-known/agent-counts.json';
+  const v = attempt(() => validateDeclaration(withCounts(good)));
+  check(v.ok, 'counts/https-url-validates', v.ok ? '' : v.error?.message);
+  const c = attempt(() => compileDeclaration(withCounts(good)));
+  check(c.ok, 'counts/https-url-compiles', c.ok ? '' : c.error?.message);
+  const started = attempt(() => createAgentEntry({
+    seedHex: SEED, name: 'counts', baseUrl: 'https://refuse.example', declaration: withCounts(good),
+  }));
+  check(started.ok, 'counts/door-starts-with-an-https-counts', started.ok ? '' : started.error?.message);
+  const upper = attempt(() => validateDeclaration(withCounts('HTTPS://refuse.example/counts')));
+  check(upper.ok, 'counts/scheme-is-case-insensitive-https', upper.ok ? '' : upper.error?.message);
+
+  // Optional, the same rule as the other optional entry fields: absence is not a refusal.
+  const absent = attempt(() => validateDeclaration(base()));
+  check(absent.ok, 'counts/absent-is-accepted', absent.ok ? '' : absent.error?.message);
+
+  for (const [label, bad] of [
+    ['malformed', 'https://counts example/agent counts'],
+    ['not-a-url', 'counts dot example'],
+    ['empty-string', ''],
+    ['plain-http', 'http://refuse.example/.well-known/agent-counts.json'],
+    ['plain-http-uppercase', 'HTTP://refuse.example/counts'],
+    ['missing-scheme', 'refuse.example/.well-known/agent-counts.json'],
+    ['protocol-relative', '//refuse.example/.well-known/agent-counts.json'],
+    ['relative-path', '/.well-known/agent-counts.json'],
+    ['other-scheme-ftp', 'ftp://refuse.example/counts'],
+    ['javascript', 'javascript:alert(1)'],
+    ['data', 'data:text/plain,0'],
+    ['https-without-host', 'https:///counts'],
+    ['not-a-string', 42],
+    ['an-object', { url: good }],
+  ]) {
+    const r = attempt(() => validateDeclaration(withCounts(bad)));
+    check(!r.ok, `counts/refused/${label}/validate-throws`);
+    if (!r.ok) {
+      check(r.error instanceof Error && String(r.error.message).includes('entry.counts'),
+        `counts/refused/${label}/message-names-entry.counts`, String(r.error?.message));
+    }
+    check(!attempt(() => compileDeclaration(withCounts(bad))).ok, `counts/refused/${label}/compile-throws`);
+    check(!attempt(() => createAgentEntry({
+      seedHex: SEED, name: 'counts', baseUrl: 'https://refuse.example', declaration: withCounts(bad),
+    })).ok, `counts/refused/${label}/door-refuses-to-start`);
+  }
+
+  // Adding `counts` does not open ENTRY_KEYS to near spellings: unknown keys stay refused.
+  for (const stray of ['count', 'Counts', 'countsUrl']) {
+    const d = base(); d.entry[stray] = good;
+    const r = attempt(() => validateDeclaration(d));
+    check(!r.ok && String(r.error?.message).includes('entry'), `counts/stray-key-${stray}-still-refused`,
+      r.ok ? 'accepted' : String(r.error?.message));
+  }
+}
+
 // ---------------------------------------------------------------- report
 
 if (failures.length) {

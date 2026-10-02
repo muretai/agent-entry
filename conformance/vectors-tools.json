@@ -1763,6 +1763,54 @@
           }
         ]
       }
+    },
+    {
+      "name": "entry-counts-absolute-https-url",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example",
+          "counts": "https://refuse.example/.well-known/agent-counts.json"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "entry-counts-absolute-https-url-with-port-and-query",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example",
+          "counts": "https://refuse.example:8443/counts?site=refuse"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
     }
   ],
   "refusals": [
@@ -2979,6 +3027,206 @@
         "facts": {
           "hours": 9
         }
+      }
+    },
+    {
+      "name": "entry-counts-malformed-url",
+      "field": "entry.counts",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example",
+          "counts": "https://counts example/agent counts"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "entry-counts-not-a-url",
+      "field": "entry.counts",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example",
+          "counts": "counts dot example"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "entry-counts-plain-http",
+      "field": "entry.counts",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example",
+          "counts": "http://refuse.example/.well-known/agent-counts.json"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "entry-counts-missing-scheme",
+      "field": "entry.counts",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example",
+          "counts": "refuse.example/.well-known/agent-counts.json"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "entry-counts-protocol-relative",
+      "field": "entry.counts",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example",
+          "counts": "//refuse.example/.well-known/agent-counts.json"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "entry-counts-same-origin-path-is-not-absolute",
+      "field": "entry.counts",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example",
+          "counts": "/.well-known/agent-counts.json"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "entry-counts-javascript-scheme",
+      "field": "entry.counts",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example",
+          "counts": "javascript:alert(1)"
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "entry-counts-not-a-string",
+      "field": "entry.counts",
+      "declaration": {
+        "v": 1,
+        "entry": {
+          "name": "Refusal Desk",
+          "baseUrl": "https://refuse.example",
+          "counts": 42
+        },
+        "offers": [
+          {
+            "verb": "find",
+            "of": "things",
+            "about": "Find things.",
+            "input": {
+              "q": "string"
+            },
+            "door": {
+              "reply": "catalog"
+            }
+          }
+        ]
       }
     }
   ]
