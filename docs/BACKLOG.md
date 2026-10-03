@@ -52,7 +52,6 @@ follow-up -> the owner reads who came and who came back. Its proof is conformanc
 until every member lands. Chains in flight: Woo 001756Z -> 001757Z -> {001757Z-2, 001758Z, 001758Z-2} -> 001759Z;
 S6a 215207Z (landed) -> 215208Z (impl) -> 215208Z-2 -> 215209Z; S6b 215209Z-2 (landed) -> 215210Z (tests).)
 - P0 FRAME TEST the one test that walks the thin line: conformance/frame.mjs, test author only, red at every step a member makes green (init from a fixture Woo store, door up, claim file served, knock find/ask/hold, decide approve, counts shows who and first_contact); not wired into npm test until green. [20261003T131708Z] [skeleton]
-- P1 S6b the knock speaks the verbs: S6b-2, checkedBookingReceipt recognises the Suite's default reply shape next to the older one (tests in flight); S6b-1 (`--offer` on the knock) landed 9e58808. Tail id. [20261002T215210Z] [skeleton]
 
 ## Next (queued, in order)
 
@@ -112,6 +111,7 @@ S6a 215207Z (landed) -> 215208Z (impl) -> 215208Z-2 -> 215209Z; S6b 215209Z-2 (l
 - S6b-1 the knock gains `--offer` and sends metadata.offer (chain of S6b) [20261002T215209Z-2] d463ef2..9e58808
 - S6a-1 `counts` joins the accepted entry keys (chain of S6a) [20261002T215207Z] f1b4020..4a6617b
 - isolated-session: re-vendor APPL v0.1.1 (da7c693) [20260930T020158Z] 1bc9b04
+- P1 S6b the knock speaks the verbs: S6b-2, checkedBookingReceipt recognises the Suite's default reply shape next to the older one (tests in flight); S6b-1 (`--offer` on the knock) landed 9e58808. Tail id. [20261002T215210Z] [skeleton]
 
 ## Done v1.13.1 (2026-09-28)
 
