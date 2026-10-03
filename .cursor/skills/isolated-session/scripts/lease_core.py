@@ -7,12 +7,16 @@ it a backend object that does. It can therefore be lifted into another repositor
 
     backend = none | do | command | host   ([lease] backend = "..." in a config file)
 
-`do` (an HTTPS lease service, one JSON POST per verb) and `host` (a self-hosted node's
-epoch CAS, one JSON-RPC POST per verb) are built; the caller supplies both backend
-objects, and each maps its node's answer onto the SAME (status, body) shape outcome_of
-reads, so the exit codes below do not depend on the backend. `none` and `command` are
-dispatch-only extension points: selecting either answers "not implemented in this build"
-and makes no request. An unknown backend is a configuration error of its own.
+`none` returns ok and sends nothing: the caller's own landing lock is the only exclusion.
+`command` runs the `command` value from the [lease] section as argv (`shlex.split`, never
+a shell): the verb is the next argument, and renew and release append the epoch as a
+decimal string. Its process status is one of the exit codes below (any other code is a
+refusal); stdout and stderr past MAX_ANSWER are truncated. `do` (an HTTPS lease service,
+one JSON POST per verb) and `host` (a self-hosted node's epoch CAS, one JSON-RPC POST per
+verb) map their node's answer onto the SAME (status, body) shape outcome_of reads, so
+those two exit codes do not depend on which of them ran. An unknown backend is a
+configuration error of its own. A name this build does not implement answers
+"not implemented in this build" and makes no request.
 
 The outcomes, and the exit code each maps to -- a backend returns an OUTCOME, never a code:
 
@@ -34,7 +38,9 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import socket
+import subprocess
 import sys
 import urllib.parse
 from pathlib import Path
@@ -47,8 +53,8 @@ EXIT_HELD = 4
 EXIT_REFUSED = 5
 
 BACKENDS = ("none", "do", "command", "host")
-BUILT = ("do", "host")
-DEFAULT_BACKEND = "do"
+BUILT = ("none", "do", "command", "host")
+DEFAULT_BACKEND = "none"
 HTTP_TIMEOUT_S = 10.0
 MAX_ANSWER = 64 * 1024
 
@@ -79,7 +85,10 @@ class Outcome:
 def read_config(path: Optional[Path]) -> Dict[str, str]:
     """The [lease] section of a small TOML file: `key = "value"` (or a bare word) lines.
     A missing file is an empty configuration; an unreadable one is a ConfigError."""
-    if path is None or not path.exists():
+    if path is None:
+        return {}
+    path = Path(path)
+    if not path.exists():
         return {}
     if path.is_symlink() or not path.is_file():
         raise ConfigError("the lease configuration %s is not a regular file" % path)
@@ -252,12 +261,86 @@ def outcome_of(verb: str, status: int, body, raw: str, me: str) -> Outcome:
 
 class Backend:
     """What the core needs from a backend. `me` names the holder; `send(verb)` performs one
-    request and returns (status, body, raw) or raises Unreachable / ConfigError."""
+    request and returns (status, body, raw) or raises Unreachable / ConfigError.
+
+    A backend that is not an HTTP JSON grant implements `outcome(verb)` instead and is
+    not retried: `none` sends nothing, and `command` must not run the operator's program
+    twice."""
 
     me = ""
 
     def send(self, verb: str):  # pragma: no cover - interface
         raise NotImplementedError
+
+
+def _answer_fields(text: str) -> Dict[str, str]:
+    """key=value lines from a command's stdout. A truncated tail is still one line."""
+    fields: Dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key:
+            fields[key] = value.strip()
+    return fields
+
+
+class NoneBackend(Backend):
+    """Ok, and nothing is sent. The caller's landing lock is the only exclusion."""
+
+    def outcome(self, verb: str) -> Outcome:
+        return Outcome("ok")
+
+
+class CommandBackend(Backend):
+    """Run `command` as argv from shlex.split, never through a shell.
+
+    The verb is the next argument. renew and release append the epoch as a decimal
+    string. Exit codes: 0 ok (stdout key=value), 4 held (held-by=, until=), 5 refused
+    (stderr reason), 3 unreachable, 2 config error, any other code refused. Stdout and
+    stderr past MAX_ANSWER are truncated."""
+
+    def __init__(self, command: str, epoch: Optional[int]):
+        self._command = command
+        self._epoch = epoch
+
+    def outcome(self, verb: str) -> Outcome:
+        try:
+            argv = shlex.split(self._command)
+        except ValueError as e:
+            raise ConfigError("backend = command: the command value is not argv (%s)" % e)
+        if not argv:
+            raise ConfigError(
+                "backend = command needs a command key in the [lease] section "
+                "(command is missing or empty)")
+        argv.append(verb)
+        if verb in ("renew", "release"):
+            argv.append("" if self._epoch is None else str(self._epoch))
+        try:
+            proc = subprocess.run(argv, shell=False, capture_output=True,
+                                  stdin=subprocess.DEVNULL, timeout=HTTP_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            return Outcome("unreachable", reason="the lease backend at command is unreachable: "
+                           "timed out after %.0fs" % HTTP_TIMEOUT_S)
+        except OSError as e:
+            return Outcome("unreachable", reason="the lease backend at command is unreachable: %s"
+                           % (getattr(e, "strerror", None) or e))
+        out = proc.stdout[:MAX_ANSWER].decode("utf-8", "replace")
+        err = " ".join(proc.stderr[:MAX_ANSWER].decode("utf-8", "replace").split())
+        code = proc.returncode
+        if code == EXIT_OK:
+            return Outcome("ok", _answer_fields(out))
+        if code == EXIT_HELD:
+            fields = _answer_fields(out)
+            return Outcome("held", {"held-by": fields.get("held-by", ""),
+                                    "until": fields.get("until", "")})
+        if code == EXIT_UNREACHABLE:
+            return Outcome("unreachable", reason="the lease backend at command is unreachable: %s"
+                           % (err or "exit 3"))
+        if code == EXIT_CONFIG:
+            raise ConfigError(err or "command reported a configuration error")
+        return Outcome("refused", reason=err or "exit %s" % code)
 
 
 def run(verb: str, backend: Backend) -> Outcome:
@@ -310,7 +393,8 @@ def dispatch(prog: str, verb: str, cfg: Dict[str, str],
             raise ConfigError("the lease backend %r is not implemented in this build "
                               "(built: %s)" % (name, ", ".join(BUILT)))
         backend = builders[name](cfg)
-        outcome = run(verb, backend)
+        direct = getattr(backend, "outcome", None)
+        outcome = direct(verb) if callable(direct) else run(verb, backend)
     except ConfigError as e:
         outcome = Outcome("config", reason=str(e))
     return emit(prog, outcome)

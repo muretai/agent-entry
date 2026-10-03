@@ -3,10 +3,13 @@
 # Must be run only when the user's task is actually done. Never pushes BASE.
 #
 # The landing is the one serial section of parallel work, so it is short and it is
-# ordered: take the landing lock (one landing at a time per primary) -> fast-forward
+# ordered: run the tests the diff owes ONCE, before any lock, into a bound receipt (the
+# test step below reuses it while it is still current) -> take the landing lock (one
+# landing at a time per primary) -> fast-forward
 # local BASE from origin/BASE, so the landing descends from what the other primary
 # published (diverged: refuse) -> bring the branch onto that BASE (rebase; merge when
-# the branch is already on origin) ->
+# another checkout holds the branch -- origin, the publisher bundle, another remote or
+# another worktree, SHARED= on the receipt; a holder that cannot be read refuses) ->
 # refuse a branch that edited a generated file -> run the tests the diff owes
 # (tools/run_tests.py --affected) -> scan the diff (tools/sec_lint.py: a refusal stops
 # the landing like a red test; needs-eyes lands and owes a reviewer) -> regenerate the
@@ -104,8 +107,10 @@ landing_python() {
 # The directory is still the operator's: a poisoned importable module planted there
 # is still imported by later landings. ISSUE(the-lent-backend-is-the-operators)
 # closes only with a pinned copy of the backend that belongs to the landing.
+# `-B`: the runner it starts is the gate copy's, and that runner imports its siblings out
+# of the copy; a __pycache__ written there would be loaded by the next start from it.
 branch_tests_python() {
-  credless PYTHONNOUSERSITE=1 MURETAI_TEST_BACKEND_PATH="${branch_tests_backend_path-}" python3 -I "$@"
+  credless PYTHONNOUSERSITE=1 MURETAI_TEST_BACKEND_PATH="${branch_tests_backend_path-}" python3 -I -B "$@"
 }
 
 # The files whose change is judged by eyes whatever the lint said: they decide what a
@@ -1249,6 +1254,229 @@ if git -C "$worktree" remote get-url origin >/dev/null 2>&1; then
   fi
 fi
 
+# --- the pre-run: the tests the diff owes, once, OUTSIDE the landing lock -------
+# The lock makes the fast-forward and the receipt exclusive; the test run does not need
+# it, and holding it through the slowest landing's test phase queued every other landing
+# behind that phase (IB:12734). So the affected tests run here, before the lock, into a
+# BOUND receipt (tools/run_tests.py: head, BASE, selection, worktree), and the test step
+# under the lock takes it only while it is still current (see there); after a rebase or a
+# moved BASE the files run again. A red pre-run
+# hands nothing on -- the lock holder judges it afresh. The launcher's receipt (land.sh ran
+# the same pre-run before starting this) is used in place of our own, and only one that
+# lives in the spawn's walls directory with a green `tests.json` beside it: any other path,
+# including one a worker set, is ignored. The variables are cleared before anything this
+# landing starts, so a test cannot hand them on.
+tests_from_wall=no
+prerun_receipt=""        # the receipt the test step may --reuse
+prerun_tmp=""            # ... when it is our own file, removed after that step
+prerun_head=""           # HEAD and BASE our own pre-run saw ("" for the launcher's)
+prerun_base=""
+rec_path="${ISO_FINISH_TESTS_RECEIPT:-}"
+walls_path="${ISO_FINISH_WALLS_DIR:-}"
+unset ISO_FINISH_TESTS_RECEIPT ISO_FINISH_WALLS_DIR
+if [[ -f "$gate_runner" && "${ISOLATED_SESSION_LAND_TESTS:-1}" != "0" ]]; then
+  # --- the children's wall, and the one thing it costs -------------------------------
+  # Where the CHILDREN would look for the operator's own packages. Asked ONCE, of an
+  # isolated python, so nothing this process reads comes from a PYTHON* variable -- and
+  # `-I` does not stop `site.getusersitepackages()` from honouring PYTHONUSERBASE, which
+  # it reads from os.environ at call time, so the answer is the directory the children
+  # would really have used. A python that cannot answer leaves the path empty, and the
+  # children then run walled and without it: closed, and slow, never open.
+  tests_usersite="$(credless python3 -I -c 'import site; print(site.getusersitepackages() or "")' 2>/dev/null || true)"
+  branch_tests_backend_path=""
+  if [[ -n "$tests_usersite" && -d "$tests_usersite" ]]; then
+    branch_tests_backend_path="${tests_usersite}"
+  fi
+  if [[ -n "$rec_path" && -n "$walls_path" ]]; then
+    rec_rc="$(landing_python - "$rec_path" "$walls_path" <<'PY'
+import json, os, sys
+rec, walls = sys.argv[1], sys.argv[2]
+
+def real(p):
+    return os.path.realpath(p)
+
+try:
+    if os.path.islink(rec) or os.path.islink(walls):
+        raise OSError("link")
+    rec_r, walls_r = real(rec), real(walls)
+    if not os.path.isdir(walls_r) or not os.path.isfile(rec_r) or os.path.dirname(rec_r) != walls_r:
+        raise OSError("place")
+    rc_path = os.path.join(walls, "tests.json")
+    if os.path.islink(rc_path):
+        raise OSError("link")
+    rc_r = real(rc_path)
+    if os.path.dirname(rc_r) != walls_r or not os.path.isfile(rc_r):
+        raise OSError("rc")
+    rc = json.load(open(rc_r)).get("rc")
+    if type(rc) is not int or rc != 0:
+        raise OSError("rc")
+    sys.stdout.write(rec_r + "\n")
+except (OSError, ValueError, AttributeError):
+    sys.stdout.write("no\n")
+PY
+)" || rec_rc="no"
+    if [[ -n "$rec_rc" && "$rec_rc" != "no" ]]; then
+      prerun_receipt="$rec_rc"
+      tests_from_wall=yes
+    fi
+  fi
+  if [[ -z "$prerun_receipt" ]]; then
+    prerun_tmp="$(finish_tmp)"
+    prerun_err="$(finish_tmp)"
+    prerun_head="$(git -C "$worktree" rev-parse HEAD 2>/dev/null || true)"
+    prerun_base="$(git -C "$worktree" rev-parse "${base}^{commit}" 2>/dev/null || true)"
+    echo "running the affected tests of ${branch} before taking the landing lock" >&2
+    set +e
+    ( cd "$worktree" && branch_tests_python "$gate_runner" --root "$worktree" --affected "${base}..HEAD" --gate --json -j "${ISOLATED_SESSION_LAND_JOBS:-4}" ) > "$prerun_tmp" 2>"$prerun_err"
+    prerun_rc=$?
+    set -e
+    rm -f "$prerun_err"
+    if [[ "$prerun_rc" == "0" && -n "$prerun_head" && -n "$prerun_base" ]]; then
+      prerun_receipt="$prerun_tmp"
+    else
+      # red, or not bound to a HEAD and BASE this shell saw: the lock holder runs them
+      rm -f "$prerun_tmp"
+      prerun_tmp=""
+    fi
+  fi
+fi
+
+# --- is the branch shared? asked before the lock, answered by every holder --------------
+# A branch another checkout holds is MERGED onto BASE below, never rebased: a rebase
+# rewrites commits somebody else already has. The question used to be one live
+# `git ls-remote origin`, and on this machine origin cannot be reached at all, so the
+# answer was always "no" and a branch shared by bundle or by a second clone was rewritten
+# (IB:12735). Now every holder is asked:
+#   origin     origin carries refs/heads/<branch> (origin fetched this landing), or
+#   bundle     the publisher bundle carries refs/remotes/origin/<branch> (origin was read
+#              from it: an unreachable origin whose bundle was read is an answer, not a doubt);
+#   <remote>   any other configured remote carries refs/heads/<branch>;
+#   worktree   another worktree of this repository has <branch> checked out.
+# A holder that cannot be read, or two copies that have diverged, is a refusal by name:
+# neither a rebase nor a merge is chosen on a guess. It runs before the landing lock, the
+# lease and the fast-forward of BASE, so a refusal leaves everything where it was. Only
+# asked when the branch will have to be brought onto BASE at all; SHARED= on the receipt
+# says what it found.
+
+# Every OTHER worktree (not the session's) that has <branch> checked out, one per line.
+# Run from $1, any checkout of the repository that still exists.
+branch_checked_out_elsewhere() {  # $1 a checkout to ask from
+  local want="refs/heads/${branch}" wt="" line="" self_p=""
+  self_p="$(cd "$worktree" 2>/dev/null && pwd -P || true)"
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *) wt="${line#worktree }" ;;
+      branch\ *)
+        if [[ "${line#branch }" == "$want" && "$wt" != "$worktree" &&
+              ( -z "$self_p" || "$(cd "$wt" 2>/dev/null && pwd -P || true)" != "$self_p" ) ]]; then
+          printf '%s\n' "$wt"
+        fi
+        ;;
+    esac
+  done < <(git -C "$1" worktree list --porcelain 2>/dev/null || true)
+}
+
+shared_refuse() {  # $1 why (names the source)
+  {
+    echo "refusing to land ${branch}: $1"
+    echo "A branch that may be shared is neither rebased (that rewrites commits another"
+    echo "checkout holds) nor merged on a guess. Nothing moved (${base}, ${branch} and"
+    echo "${worktree} are as they were), and no landing lock was taken."
+  } >&2
+  if [[ -n "${prerun_tmp:-}" ]]; then
+    rm -f "$prerun_tmp"
+  fi
+  exit 1
+}
+
+# The tip remote $1 holds for <branch>: prints it and returns 0; 2 when the remote does
+# not carry the branch; 1 when the remote could not be read.
+shared_ls_remote() {  # $1 remote
+  local out="" rc=0 sha="" name=""
+  out="$(GIT_TERMINAL_PROMPT=0 git -C "$worktree" ls-remote --exit-code "$1" "refs/heads/${branch}" 2>/dev/null)" || rc=$?
+  if [[ "$rc" == "2" ]]; then
+    return 2
+  fi
+  [[ "$rc" == "0" ]] || return 1
+  while IFS=$'\t' read -r sha name; do
+    if [[ "$name" == "refs/heads/${branch}" ]]; then
+      printf '%s\n' "$sha"
+      return 0
+    fi
+  done <<< "$out"
+  return 2
+}
+
+shared_line="not asked (${branch} already descends from ${base})"
+sb_need="no"
+if ! git -C "$worktree" merge-base --is-ancestor "$base" "$branch"; then
+  sb_need="yes"
+elif [[ "$origin_read" == "yes" ]] &&
+     git -C "$worktree" rev-parse --verify --quiet "refs/remotes/origin/${base}" >/dev/null &&
+     ! git -C "$worktree" merge-base --is-ancestor "refs/remotes/origin/${base}" "$branch"; then
+  sb_need="yes"
+fi
+if [[ "$sb_need" == "yes" ]]; then
+  sb_tip="$(git -C "$worktree" rev-parse "refs/heads/${branch}")"
+  sb_signals=""
+  sb_copies=""        # "<source> <sha>" per line: every copy another holder has
+  sb_rc=0
+  sb_sha=""
+  if [[ "$origin_read" == "yes" && "$ISO_ORIGIN_VIEW_SOURCE" == "bundle" ]]; then
+    sb_bundle="${ISO_PUBLISHER_STATE}/origin/$(iso_publisher_name "$worktree" || true).bundle"
+    sb_heads="$(git -C "$worktree" bundle list-heads "$sb_bundle" 2>/dev/null)" ||
+      shared_refuse "the publisher bundle $(iso_safe_text "$sb_bundle") (origin's view) could not be listed, so whether origin holds a copy of ${branch} -- whether it is shared -- is unknown."
+    while IFS=' ' read -r sb_sha sb_name; do
+      if [[ "$sb_name" == "refs/remotes/origin/${branch}" ]]; then
+        sb_signals="${sb_signals:+${sb_signals},}bundle"
+        sb_copies="${sb_copies}bundle ${sb_sha}"$'\n'
+        break
+      fi
+    done <<< "$sb_heads"
+  elif [[ "$origin_read" == "yes" ]]; then
+    sb_rc=0
+    sb_sha="$(shared_ls_remote origin)" || sb_rc=$?
+    if [[ "$sb_rc" == "0" ]]; then
+      sb_signals="${sb_signals:+${sb_signals},}origin"
+      sb_copies="${sb_copies}origin ${sb_sha}"$'\n'
+    elif [[ "$sb_rc" != "2" ]]; then
+      shared_refuse "origin could not be read (git ls-remote failed), so whether it holds a copy of ${branch} -- whether it is shared -- is unknown."
+    fi
+  fi
+  while IFS= read -r sb_remote; do
+    [[ -n "$sb_remote" && "$sb_remote" != "origin" ]] || continue
+    sb_show="$(iso_safe_text "$sb_remote")"
+    sb_rc=0
+    sb_sha="$(shared_ls_remote "$sb_remote")" || sb_rc=$?
+    if [[ "$sb_rc" == "0" ]]; then
+      sb_signals="${sb_signals:+${sb_signals},}${sb_show}"
+      sb_copies="${sb_copies}${sb_show} ${sb_sha}"$'\n'
+    elif [[ "$sb_rc" != "2" ]]; then
+      shared_refuse "the remote ${sb_show} could not be read (git ls-remote failed), so whether it holds a copy of ${branch} -- whether it is shared -- is unknown. Fix or remove that remote, then run finish again."
+    fi
+  done < <(git -C "$worktree" remote 2>/dev/null || true)
+  if [[ -n "$(branch_checked_out_elsewhere "$worktree")" ]]; then
+    sb_signals="${sb_signals:+${sb_signals},}worktree"
+  fi
+  # Every copy must be one history with the session's tip and with every other copy: an
+  # ancestor or a descendant. A copy whose commit this checkout does not even have holds
+  # work the session never saw, and no integration here is right for both.
+  sb_all="session ${sb_tip}"$'\n'"${sb_copies}"
+  while IFS=' ' read -r sb_a sb_ca; do
+    [[ -n "$sb_a" ]] || continue
+    while IFS=' ' read -r sb_b sb_cb; do
+      [[ -n "$sb_b" && "$sb_a" != "$sb_b" && "$sb_ca" != "$sb_cb" ]] || continue
+      if ! git -C "$worktree" cat-file -e "${sb_cb}^{commit}" 2>/dev/null ||
+         ! git -C "$worktree" cat-file -e "${sb_ca}^{commit}" 2>/dev/null ||
+         { ! git -C "$worktree" merge-base --is-ancestor "$sb_ca" "$sb_cb" &&
+           ! git -C "$worktree" merge-base --is-ancestor "$sb_cb" "$sb_ca"; }; then
+        shared_refuse "the branch is shared and its copies have diverged: ${sb_b} holds ${branch} at ${sb_cb:0:7} and ${sb_a} at ${sb_ca:0:7}, and neither contains the other (or this checkout does not have that commit). Reconcile the copies first."
+      fi
+    done <<< "$sb_all"
+  done <<< "$sb_all"
+  shared_line="${sb_signals:-no}"
+fi
+
 # --- the landing lock: one landing at a time per primary ----------------------
 # Where the lock is, asked ONCE and kept in a variable, so releasing it later is a bare
 # `rm` with nothing in front of it. The release used to ask `iso_land_lock_release`,
@@ -1283,6 +1511,7 @@ while :; do
           echo "  $(iso_land_lock_describe "$primary")"
           echo "Waited ${waited}s (ISOLATED_SESSION_LAND_WAIT). Run finish again when it is done."
         } >&2
+        [[ -z "$prerun_tmp" ]] || rm -f "$prerun_tmp"
         exit 1
       fi
       if (( waited % 30 == 0 )); then
@@ -1336,6 +1565,7 @@ lease_as=""
 lease_repo=""
 lease_room=""
 lease_epoch=""
+gate_scratch=""
 cleanup() {
   # The lease first, while this landing still holds the local lock, then the lock
   # by name: one `rm` on a path this shell already had, before anything that forks
@@ -1355,6 +1585,10 @@ cleanup() {
     holding_land="no"
     [[ -n "$land_lock" ]] && rm -f "$land_lock" 2>/dev/null
   fi
+  if [[ -n "$prerun_tmp" ]]; then
+    rm -f "$prerun_tmp" 2>/dev/null
+    prerun_tmp=""
+  fi
   if [[ -n "$tmp_merge" ]]; then
     git -C "$primary" worktree remove --force "$tmp_merge" >/dev/null 2>&1 || true
     tmp_merge=""
@@ -1367,6 +1601,10 @@ cleanup() {
     git -C "$tmp_publish" rebase --abort >/dev/null 2>&1 || true
     git -C "$primary" worktree remove --force "$tmp_publish" >/dev/null 2>&1 || true
     tmp_publish=""
+  fi
+  if [[ -n "$gate_scratch" ]]; then
+    rm -rf "$gate_scratch" 2>/dev/null || true
+    gate_scratch=""
   fi
   return 0
 }
@@ -1774,18 +2012,15 @@ fi
 
 # --- bring the branch onto the current base -----------------------------------
 # A local session branch is rebased, so the tree the tests see is byte-identical to
-# the fast-forwarded BASE and BASE stays linear. A branch that is already on origin
-# (a second laptop's) is merged, never rewritten. A conflict confined to the generated
+# the fast-forwarded BASE and BASE stays linear. A branch another checkout holds
+# (shared_line, asked before the lock above: origin, the bundle, another remote, another
+# worktree) is merged, never rewritten; a shared_line that is anything but "no" merges.
+# A conflict confined to the generated
 # files is resolved by taking BASE's copy -- the ledger is rebuilt below anyway; any
 # other conflict stops the landing with the steps to resolve it.
 rebased="no-op"
 if ! git -C "$worktree" merge-base --is-ancestor "$base" "$branch"; then
-  on_origin=0
-  if git -C "$worktree" remote get-url origin >/dev/null 2>&1 &&
-     git -C "$worktree" ls-remote --exit-code origin "refs/heads/${branch}" >/dev/null 2>&1; then
-    on_origin=1
-  fi
-  if [[ "$on_origin" == "1" || "${ISOLATED_SESSION_LAND_MERGE:-0}" == "1" ]]; then
+  if [[ "$shared_line" != "no" || "${ISOLATED_SESSION_LAND_MERGE:-0}" == "1" ]]; then
     if ! git -C "$worktree" merge --no-edit "$base" >/dev/null 2>&1; then
       git -C "$worktree" merge --abort >/dev/null 2>&1 || true
       {
@@ -1893,73 +2128,128 @@ if [[ -f "$runner" ]]; then
     tests_line="skipped-by-operator (ISOLATED_SESSION_LAND_TESTS=0)"
     echo "NOTE: ISOLATED_SESSION_LAND_TESTS=0 -- landing ${branch} without running its tests" >&2
   else
-    # --- the children's wall, and the one thing it costs -------------------------------
-    # Where the CHILDREN would look for the operator's own packages. Asked ONCE, of an
-    # isolated python, so nothing this process reads comes from a PYTHON* variable -- and
-    # `-I` does not stop `site.getusersitepackages()` from honouring PYTHONUSERBASE, which
-    # it reads from os.environ at call time, so the answer is the directory the children
-    # would really have used. A python that cannot answer leaves the path empty, and the
-    # children then run walled and without it: closed, and slow, never open.
-    tests_usersite="$(credless python3 -I -c 'import site; print(site.getusersitepackages() or "")' 2>/dev/null || true)"
-    branch_tests_backend_path=""
-    if [[ -n "$tests_usersite" && -d "$tests_usersite" ]]; then
-      branch_tests_backend_path="${tests_usersite}"
-    fi
-
     tests_err="$(finish_tmp)"
     tests_tail="$(finish_tmp)"
-    # A receipt the launcher already took, and only one that lives in the spawn's walls
-    # directory: any other path, including one a worker set, runs the tests. The variables
-    # are cleared before anything this landing starts, so a test cannot hand them on.
-    tests_from_wall=no
-    rec_path="${ISO_FINISH_TESTS_RECEIPT:-}"
-    walls_path="${ISO_FINISH_WALLS_DIR:-}"
-    unset ISO_FINISH_TESTS_RECEIPT ISO_FINISH_WALLS_DIR
-    if [[ -n "$rec_path" && -n "$walls_path" ]]; then
-      rec_rc="$(python3 -I - "$rec_path" "$walls_path" <<'PY'
-import json, os, sys
-rec, walls = sys.argv[1], sys.argv[2]
+    report="$(finish_tmp)"
+    # The pre-run (above, outside the lock) stands only while it is current. Our own is
+    # one THIS shell ran and saw exit 0: when HEAD and BASE are the shas it saw and the
+    # worktree is still clean, it is the verdict and nothing runs again. The launcher's
+    # receipt is bound to nothing this shell saw, so it goes through the runner's own
+    # --reuse check (head, BASE, selection, worktree), which runs the files when it is
+    # not current.
+    #
+    # BASE moving under the pre-run is the common case (records commits and other landings
+    # land every few minutes), so a moved BASE is judged rather than always paid for
+    # (ISSUE(prerun-dies-on-every-records-commit)). The pre-run still stands when every
+    # commit between the BASE it saw and this BASE is RECORDS-ONLY for this branch: the
+    # range selects no test (BASE's affected_tests over it is empty -- a path in no unit owes
+    # the full suite, so it never counts), it touches none of the branch's own paths, and
+    # the tree now under test is the pre-run's tree with exactly the range's paths taken
+    # from BASE, and the range deletes nothing (a deletion, or the old side of a rename,
+    # is invisible to the selection -- changed_files reads the current tree -- yet a test
+    # the branch adds may import the path it took away). Otherwise the files run again
+    # over prerun_base..HEAD for SELECTION: the branch's selection and the range's
+    # together, never only the branch's. The reds of that run are judged on the CURRENT
+    # BASE (the runner's --judge-base), the one the branch lands onto: a test red on the
+    # BASE the pre-run saw, fixed since and broken again by the branch is the branch's
+    # red, not red on BASE (review secrev-pin-pre-run-reuse-ac-64e9, finding 1).
+    reuse_receipt=""
+    judge_base=""
+    tests_from_prerun=no
+    tests_range="${base}..HEAD"
+    prerun_moved_line=""
+    cur_head="$(git -C "$worktree" rev-parse HEAD 2>/dev/null || true)"
+    cur_base="$(git -C "$worktree" rev-parse "${base}^{commit}" 2>/dev/null || true)"
+    if [[ -n "$prerun_receipt" && -z "$prerun_head" ]]; then
+      reuse_receipt="$prerun_receipt"
+    elif [[ -n "$prerun_base" && -n "$cur_base" && "$cur_base" != "$prerun_base" ]] &&
+         git -C "$worktree" merge-base --is-ancestor "$prerun_base" "$cur_base" 2>/dev/null; then
+      tests_range="${prerun_base}..HEAD"
+      # the re-run selects over the BASE the pre-run saw and judges on this one; a BASE
+      # runner that predates --judge-base (a consumer's older vendored copy) judges on the
+      # range's start as before
+      if grep -q -- '--judge-base' "$runner" 2>/dev/null; then
+        judge_base="$cur_base"
+      fi
+      if [[ -n "$prerun_receipt" && -n "$cur_head" &&
+            -z "$(git -C "$worktree" status --porcelain 2>/dev/null)" ]]; then
+        prerun_moved="$( cd "$worktree" && landing_python - "${gate_dir}/tools" "$prerun_base" "$prerun_head" "$cur_base" "$cur_head" <<'PY' 2>/dev/null || true
+import subprocess, sys
+tools, pre_base, pre_head, cur_base, cur_head = sys.argv[1:6]
+GIT = ["git", "-c", "core.quotepath=false"]
 
-def real(p):
-    return os.path.realpath(p)
+
+def names(a, b, *more):
+    out = subprocess.run(GIT + ["diff", "--name-only", "-z", "--no-renames"] + list(more) + [a, b],
+                         capture_output=True, check=True).stdout.decode("utf-8", "surrogateescape")
+    return {p for p in out.split("\0") if p}
+
 
 try:
-    if os.path.islink(rec) or os.path.islink(walls):
-        raise OSError("link")
-    rec_r, walls_r = real(rec), real(walls)
-    if not os.path.isdir(walls_r) or not os.path.isfile(rec_r) or os.path.dirname(rec_r) != walls_r:
-        raise OSError("place")
-    rc_path = os.path.join(walls, "tests.json")
-    if os.path.islink(rc_path):
-        raise OSError("link")
-    rc_r = real(rc_path)
-    if os.path.dirname(rc_r) != walls_r or not os.path.isfile(rc_r):
-        raise OSError("rc")
-    rc = json.load(open(rc_r)).get("rc")
-    if type(rc) is not int:
-        raise OSError("rc")
-    sys.stdout.write(rec_r + "\n" + str(rc) + "\n")
-except OSError:
-    sys.stdout.write("no\n")
+    rng = names(pre_base, cur_base)
+    ours = names(pre_base, pre_head) | names(cur_base, cur_head)
+    # the tree under test is the one the pre-run saw, with only the paths of the range changed
+    if rng & ours or not names(pre_head, cur_head) <= rng:
+        raise SystemExit(0)
+    # a range that deletes a path (--no-renames: the old side of a rename is a deletion) is
+    # never records-only: the selection below cannot see a deletion, and a test the branch
+    # adds may import what the range took away (secrev-pin-pre-run-reuse-ac-64e9, finding 2)
+    if names(pre_base, cur_base, "--diff-filter=D"):
+        raise SystemExit(0)
+    sys.path.insert(0, tools)
+    from affected_tests import Graph, load_units, select
+    from pathlib import Path
+    root = Path(".").resolve()
+    tests, _why, full = select(Graph(root, load_units(root / "tools" / "units.json")), sorted(rng))
+    if tests or full:
+        raise SystemExit(0)
+    n = subprocess.run(GIT + ["rev-list", "--count", pre_base + ".." + cur_base],
+                       capture_output=True, text=True, check=True).stdout.strip()
+    print(int(n))
+except SystemExit:
+    raise
+except Exception:
+    pass
 PY
 )"
-      if [[ "$rec_rc" != "no" && "$rec_rc" != $'no\n' ]]; then
-        report="${rec_rc%%$'\n'*}"
-        rc="${rec_rc#*$'\n'}"
-        rc="${rc%%$'\n'*}"
-        tests_from_wall=yes
-        : > "$tests_err"
+        case "$prerun_moved" in
+          ''|*[!0-9]*) ;;
+          *)
+            tests_from_prerun=yes
+            if [[ "$prerun_moved" == "1" ]]; then
+              prerun_moved_line="yes (base moved by 1 records-only commit)"
+            else
+              prerun_moved_line="yes (base moved by ${prerun_moved} records-only commits)"
+            fi
+            ;;
+        esac
       fi
+    elif [[ -n "$prerun_receipt" && "$cur_head" == "$prerun_head" && "$cur_base" == "$prerun_base" &&
+            -z "$(git -C "$worktree" status --porcelain 2>/dev/null)" ]]; then
+      tests_from_prerun=yes
     fi
-    if [[ "$tests_from_wall" != "yes" ]]; then
-      report="$(finish_tmp)"
+    if [[ "$tests_from_prerun" == "yes" ]]; then
+      rm -f "$report"
+      report="$prerun_tmp"
+      prerun_tmp=""
+      rc=0
+      if [[ -n "$prerun_moved_line" ]]; then
+        echo "the affected tests ran before the landing lock; ${base} moved since only by records-only commits, so not running them again" >&2
+      else
+        echo "the affected tests ran before the landing lock on this very HEAD and ${base}; not running them again" >&2
+      fi
+    else
       # the branch's tests, with no push credential in reach (credless, above), the harness
       # isolated, and the CHILDREN walled but still able to reach the operator's optional
       # backend through PYTHONPATH (branch_tests_python)
       set +e
-      ( cd "$worktree" && branch_tests_python "$runner" --root "$worktree" --affected "${base}..HEAD" --gate --json -j "${ISOLATED_SESSION_LAND_JOBS:-4}" ) > "$report" 2>"$tests_err"
+      ( cd "$worktree" && branch_tests_python "$runner" --root "$worktree" --affected "$tests_range" --gate --json -j "${ISOLATED_SESSION_LAND_JOBS:-4}" ${judge_base:+--judge-base "$judge_base"} ${reuse_receipt:+--reuse "$reuse_receipt"} ) > "$report" 2>"$tests_err"
       rc=$?
       set -e
+    fi
+    if [[ -n "$prerun_tmp" ]]; then
+      rm -f "$prerun_tmp"
+      prerun_tmp=""
     fi
     # The tail of a failing file is the BRANCH's own output, so it is a name-the-diff-chose
     # sink like any other: it goes to a file as NUL-separated records and is escaped here,
@@ -2087,10 +2377,11 @@ fi
 # a human review, which is spawned after the merge below; `clean` owes nothing.
 #
 # The lint that runs is BASE's, not the branch's: `git show BASE:tools/sec_lint.py`
-# (and its audit_scope.py plus the generator siblings the rebuild runs) into an
-# untracked scratch directory INSIDE the worktree -- the tool takes its
+# (and its audit_scope.py plus the generator siblings the rebuild runs) into this
+# landing's gate-scratch directory (gate_scratch_ensure below), OUTSIDE the worktree
+# the worker can write; it runs with the worktree as cwd -- the tool takes its
 # repository from git rev-parse --show-toplevel of cwd, so from there `--diff`
-# sees the branch -- and the directory is gone before anything asks `git status`.
+# sees the branch.
 # A branch that replaces the lint with one that answers `clean` is still scanned
 # by the copy main had, and its replacement is a gate file (below), so it is
 # needs-eyes on top. A BASE without the tool says SEC=none; the branch's copy is
@@ -2185,10 +2476,28 @@ PY
   )
 }
 
+# BASE's lint and invariant copies are built under this landing's gate-scratch directory
+# (lib.sh's iso_gate_scratch_dir: mode 700, under a root every wall denies), never in the
+# worktree: the wall lets the worker write its worktree, and a poller it left behind could
+# swap BASE's sec_lint.py or plant its bytecode there while this landing runs it, forging
+# SEC= and INV= as the operator (review secrev-the-gate-copy-takes-0f58). The copies keep
+# their .sec-base- / .inv-base- names inside it. A root that is a symlink, or anything else
+# iso_gate_scratch_dir refuses, refuses the landing; nothing falls back into the worktree.
+# Called in this shell, never in a `$( )`: it sets gate_scratch, which cleanup() removes.
+gate_scratch_ensure() {
+  [[ -z "$gate_scratch" ]] || return 0
+  if ! gate_scratch="$(iso_gate_scratch_dir "land-$(date +%s)-$$")" || [[ -z "$gate_scratch" ]]; then
+    gate_scratch=""
+    echo "error: refusing to land ${branch}: no private gate-scratch directory for BASE's gate copies (see above); nothing was built in the worktree" >&2
+    return 1
+  fi
+}
+
 sec_line="none (base has no tools/sec_lint.py)"
 sec_verdict="none"
 sec_scanned_line=""
 sec_files=""
+sec_findings=""
 sec_gate=""
 gate_files=""
 # a branch that removes the scan or the receipt tool would turn this gate off for every
@@ -2202,7 +2511,8 @@ for keep in tools/sec_lint.py tools/audit_scope.py; do
   fi
 done
 if git -C "$worktree" cat-file -e "${base}:tools/sec_lint.py" 2>/dev/null; then
-  sec_base="$(mktemp -d "${worktree}/.sec-base-XXXXXX")"
+  gate_scratch_ensure || exit 1
+  sec_base="$(mktemp -d "${gate_scratch}/.sec-base-XXXXXX")"
   mkdir -p "$sec_base/tools" "$sec_base/company/ops"
   git -C "$worktree" show "${base}:tools/sec_lint.py" > "$sec_base/tools/sec_lint.py"
   for extra in tools/audit_scope.py tools/ledger.py tools/backlog_build.py \
@@ -2371,7 +2681,8 @@ fi
 # refusal, the same shape as SEC=none. refused stops the landing before the merge.
 inv_line="none"
 if git -C "$worktree" cat-file -e "${base}:tools/invariants.py" 2>/dev/null; then
-  inv_base="$(mktemp -d "${worktree}/.inv-base-XXXXXX")"
+  gate_scratch_ensure || exit 1
+  inv_base="$(mktemp -d "${gate_scratch}/.inv-base-XXXXXX")"
   mkdir -p "$inv_base/tools"
   git -C "$worktree" show "${base}:tools/invariants.py" > "$inv_base/tools/invariants.py"
   if git -C "$worktree" cat-file -e "${base}:tools/sec_lint.py" 2>/dev/null; then
@@ -2557,7 +2868,14 @@ else
   git worktree remove "$worktree"
 fi
 if git merge-base --is-ancestor "$branch" "$base"; then
-  git branch -D "$branch"
+  # another worktree with the branch checked out (a shared branch) keeps it: git will not
+  # delete a branch a checkout is on, and that checkout is somebody's work
+  sb_kept="$(branch_checked_out_elsewhere "$primary")"
+  if [[ -n "$sb_kept" ]]; then
+    echo "note: ${branch} is merged into ${base} and kept: it is checked out in $(iso_safe_text "$sb_kept"); delete it once that checkout is done" >&2
+  else
+    git branch -D "$branch"
+  fi
 else
   echo "refusing to delete ${branch}: not merged into ${base}" >&2
   exit 1
@@ -2584,8 +2902,10 @@ echo "MERGE_KIND=${merge_kind}"
 echo "BASE_FF=${base_ff_line}"
 [[ -n "$base_rebase_line" ]] && echo "BASE_REBASE=${base_rebase_line}"
 echo "REBASED=${rebased}"
+echo "SHARED=${shared_line}"
 echo "LANDING_LOCK=waited ${waited}s"
 echo "TESTS=${tests_line}"
+[[ -n "${prerun_moved_line:-}" ]] && echo "TESTS_FROM_PRERUN=${prerun_moved_line}"
 [[ -n "$tests_on_base" ]] && echo "TESTS_RED_ON_BASE=$(iso_safe_text "$tests_on_base")"
 [[ -n "$tests_secs" ]] && echo "TESTS_SECS=${tests_secs}"
 [[ -n "$tests_files" ]] && echo "TESTS_FILES=$(iso_safe_text "$tests_files")"
@@ -3044,7 +3364,7 @@ elif [[ "$sec_verdict" == "needs-eyes" && "$base_before" != "$base_tip" ]]; then
   # worktree either (-1)
   review_root="${herd_dir}/review"
   review_co="${review_root}/${review_name}"
-  template_rel=".claude/skills/security-audit/references/landing-review-brief.md"
+  template_rel=".cursor/skills/isolated-session/briefs/reviewer.md"
   spawner_rel=".cursor/skills/isolated-session/scripts/herd-spawn.sh"
   lib_rel=".cursor/skills/isolated-session/scripts/lib.sh"
   # The reviewer's checkout is ON A BRANCH of its own at the pre-landing BASE: the receipt
@@ -3084,9 +3404,14 @@ elif [[ "$sec_verdict" == "needs-eyes" && "$base_before" != "$base_tip" ]]; then
     # One pass over the placeholders with a dict, never sequential replaces (a value
     # is never re-scanned for a later key). FILES and BRANCH are data the diff chose:
     # rendered as backticked paths with any backtick, brace pair or newline removed.
+    # LINT_FINDINGS is the lint's findings this landing already computed for the range
+    # (sec_findings: one iso_safe_text-escaped record per line, in the scan's order), so the
+    # reviewer never runs the lint itself; each stays one line, and a brace pair in it is
+    # folded so herd-spawn.sh's re-render can neither fill it nor refuse on it.
     if landing_python - "$review_tpl" "$review_brief" "NAME=${review_name}" "BASE=${base_before}" \
          "TIP=${base_tip}" "BRANCH=${branch}" "SLUG=${review_slug}" "FILES=${sec_files}" \
-         "PRIMARY=${review_co}" "MAIN=${primary}" "BASE_FROM=the pre-landing base" <<'PY'
+         "PRIMARY=${review_co}" "MAIN=${primary}" "BASE_FROM=the pre-landing base" \
+         "LINT_FINDINGS=${sec_findings}" <<'PY'
 import os, re, sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src, encoding="utf-8").read()
@@ -3112,6 +3437,19 @@ paths = [as_data(p) for p in values.get("FILES", "").split() if p]
 values["FILES"] = ", ".join("`" + p + "`" for p in paths) or "(none)"
 values["BRANCH"] = as_data(values.get("BRANCH", ""))
 values["BASE_FROM"] = as_data(values.get("BASE_FROM", ""))
+
+
+def as_finding(s):
+    # verbatim but for what could break the section or refill a placeholder: no line
+    # break survives, and no brace pair either
+    s = s.replace("\r", " ").replace("\x85", " ").replace(chr(0x2028), " ").replace(chr(0x2029), " ")
+    while "{{" in s or "}}" in s:
+        s = s.replace("{{", "{").replace("}}", "}")
+    return s
+
+
+found = [as_finding(ln) for ln in values.get("LINT_FINDINGS", "").split("\n") if ln.strip()]
+values["LINT_FINDINGS"] = "\n".join(found) or "`none`"
 
 
 def fill(m):

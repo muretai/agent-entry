@@ -868,9 +868,9 @@ def plant_spawner(primary: Path) -> None:
 def plant_review_gear(primary: Path) -> None:
     """The fake lint, a one-line reviewer brief, and the spawner -- committed on main."""
     (primary / "tools" / "sec_lint.py").write_text(FAKE_SEC_LINT)
-    refs = primary / ".claude" / "skills" / "security-audit" / "references"
+    refs = primary / ".cursor" / "skills" / "isolated-session" / "briefs"
     refs.mkdir(parents=True, exist_ok=True)
-    (refs / "landing-review-brief.md").write_text(
+    (refs / "reviewer.md").write_text(
         "Reviewer {{NAME}} for {{BRANCH}} ({{SLUG}}): git diff {{BASE}}..{{TIP}} -- files {{FILES}}"
         " -- in {{PRIMARY}}, report {{REPORT}}\n")
     plant_spawner(primary)
@@ -1395,7 +1395,7 @@ def test_review_checkouts_are_named_placed_and_cleaned(tmp: Path) -> None:
     git("commit", "-m", "back to a reviewer per landing", cwd=primary)
 
     print("  (4) a gate file deleted, renamed away or re-typed is a gate change; removing the lint is refused")
-    template = ".claude/skills/security-audit/references/landing-review-brief.md"
+    template = ".cursor/skills/isolated-session/briefs/reviewer.md"
 
     def delete_template(wt: Path) -> None:
         git("rm", "-q", template, cwd=wt)
@@ -4906,12 +4906,12 @@ def test_every_renderer_fills_the_published_brief(tmp: Path) -> None:
     its own, which is exactly what would let the two drift apart unseen. This case reads
     the published one.
     """
-    gone = _consumer_lacks(".claude/skills/security-audit/references/landing-review-brief.md",
+    gone = _consumer_lacks(".cursor/skills/isolated-session/briefs/reviewer.md",
                            "tools/security_daily.sh")
-    if ".claude/skills/security-audit/references/landing-review-brief.md" in gone:
+    if ".cursor/skills/isolated-session/briefs/reviewer.md" in gone:
         return
-    tpl = (REPO / ".claude" / "skills" / "security-audit" / "references"
-           / "landing-review-brief.md")
+    tpl = (REPO / ".cursor" / "skills" / "isolated-session" / "briefs"
+           / "reviewer.md")
     ok(tpl.is_file(), "the published reviewer brief is at " + str(tpl.relative_to(REPO)))
     keys = set(re.findall(r"\{\{([A-Z][A-Z0-9_]*)\}\}", tpl.read_text()))
     ok(keys, "and it carries placeholders at all: " + repr(sorted(keys)))

@@ -29,3 +29,5 @@ When asked to APPL something, or to put it in the backlog, do exactly this and n
 If the parser is not in this repository, say so and stop: the repository has not vendored APPL (`vendor.sh pull --ref <tag>`). Do not substitute your own implementation.
 
 If the person later asks "did APPL take it?", read the filed file's `status:` line; do not start work.
+
+To vendor APPL into another repository, that repository is joined with `appl join <path>`. The runbook is docs/APPL_JOIN.md.

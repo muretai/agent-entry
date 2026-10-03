@@ -33,6 +33,115 @@ iso_herd_dir() {
   fi
 }
 
+# The gate-scratch root: where a landing builds BASE's lint and invariant copies.
+# $MURETAI_GATE_SCRATCH_DIR (the fixture seam), else $HOME/.cache/muretai-herd/gate-scratch,
+# beside the gate slots. Every wall denies it read and write (herd-spawn.sh): the copies used
+# to live in the worker's worktree, which the wall lets the worker write, so a poller the
+# worker left behind could swap BASE's sec_lint.py or plant its bytecode while the launcher
+# landed, and forge SEC= and INV= as the operator (review secrev-the-gate-copy-takes-0f58).
+# With HOME unset or empty, the home is this uid's own passwd entry (a landing run with no
+# HOME still gates its diff; it never builds the copies in the worktree instead). Prints
+# nothing and returns 1 when no absolute home can be found either.
+iso_gate_scratch_root() {
+  local h
+  if [[ -n "${MURETAI_GATE_SCRATCH_DIR:-}" ]]; then
+    printf '%s\n' "$MURETAI_GATE_SCRATCH_DIR"
+    return 0
+  fi
+  h="${HOME:-}"
+  if [[ -z "$h" ]]; then
+    h="$(python3 -I -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null)" || h=""
+  fi
+  case "$h" in
+    /?*) printf '%s\n' "${h%/}/.cache/muretai-herd/gate-scratch" ;;
+    *) return 1 ;;
+  esac
+}
+
+# iso_gate_scratch_dir <landing>: make (or reuse) <root>/<landing>, a real directory of this
+# uid, mode 700, under a root of this uid with no group or world bit, and print its path.
+# The landing is one plain name ([A-Za-z0-9._-], never `.` or `..`), so it cannot step out
+# of the root. Nothing is followed: the root and the landing directory are lstat'd and
+# opened with O_NOFOLLOW, and a symlink, a file or a directory of another uid at either
+# place is refused -- one line on stderr, nothing on stdout, return 1 -- and left as it is.
+iso_gate_scratch_dir() {  # $1 landing
+  local root
+  case "${1:-}" in
+    ''|.|..|*[!A-Za-z0-9._-]*)
+      echo "iso_gate_scratch_dir: refusing: the landing name '$(iso_safe_text "${1:-}" 2>/dev/null)' is not one plain name" >&2
+      return 1
+      ;;
+  esac
+  root="$(iso_gate_scratch_root)" || {
+    echo "iso_gate_scratch_dir: refusing: MURETAI_GATE_SCRATCH_DIR is unset and no home directory is known (HOME, or this user's passwd entry)" >&2
+    return 1
+  }
+  python3 -I - "$root" "$1" <<'PY'
+import os, stat, sys
+
+root, name = sys.argv[1], sys.argv[2]
+me = os.getuid()
+DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def refuse(why):
+    sys.stderr.write("iso_gate_scratch_dir: refusing: %s\n" % why)
+    sys.exit(1)
+
+
+def private(fd, what):
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != me:
+        refuse("%s is not a directory of this user" % what)
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.fchmod(fd, 0o700)
+
+
+if not os.path.isabs(root):
+    refuse("the gate-scratch root %r is not an absolute path" % root)
+parent = os.path.dirname(root.rstrip("/")) or "/"
+try:
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+except OSError as e:
+    refuse("could not make %s: %s" % (parent, e.strerror))
+try:
+    os.mkdir(root, 0o700)
+except FileExistsError:
+    pass
+except OSError as e:
+    refuse("could not make the gate-scratch root %s: %s" % (root, e.strerror))
+st = os.lstat(root)
+if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+    refuse("the gate-scratch root %s is not a real directory (a symlink is not followed)" % root)
+try:
+    rfd = os.open(root, DIR)
+except OSError as e:
+    refuse("could not open the gate-scratch root %s: %s" % (root, e.strerror))
+try:
+    private(rfd, "the gate-scratch root " + root)
+    try:
+        os.mkdir(name, 0o700, dir_fd=rfd)
+    except FileExistsError:
+        pass
+    except OSError as e:
+        refuse("could not make %s/%s: %s" % (root, name, e.strerror))
+    st = os.lstat(name, dir_fd=rfd)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        refuse("%s/%s is not a real directory (a symlink is not followed)" % (root, name))
+    try:
+        lfd = os.open(name, DIR, dir_fd=rfd)
+    except OSError as e:
+        refuse("could not open %s/%s: %s" % (root, name, e.strerror))
+    try:
+        private(lfd, "%s/%s" % (root, name))
+    finally:
+        os.close(lfd)
+finally:
+    os.close(rfd)
+print(root.rstrip("/") + "/" + name)
+PY
+}
+
 # 0 when every directory at or above $1 (symlinks resolved; a directory that does not
 # exist yet is skipped) is owned by this user or root and writable by nobody else;
 # else 1 with the first offending directory on stdout.
@@ -60,9 +169,10 @@ PY
 # owner to $HOME/.muretai/herd/oauth-token, one line). Every pane refreshing the one shared
 # ~/.claude login knocked the others out at each rotation (a refresh token is single-use);
 # a pane given CLAUDE_CODE_OAUTH_TOKEN never touches that file. On stdout, the token with
-# its trailing newline stripped, and 0 -- only when the path is a REGULAR file (not a
-# symlink) of this user's whose mode has no group or world bit, holding one line of
-# printable, space-free ASCII. Anything else prints nothing and returns 1, exactly like an
+# its trailing newline and any surrounding spaces or tabs stripped, and 0 -- only when the
+# path is a REGULAR file (not a symlink) of this user's whose mode has no group or world
+# bit, holding one line of printable, space-free ASCII (the stripping is of that one line:
+# a second line, even an empty one, still refuses). Anything else prints nothing and returns 1, exactly like an
 # absent file: the caller falls back to the shared login and never says why, so no
 # message can carry the value. The value is never written to a file by this function.
 iso_herd_oauth_token() {
@@ -87,6 +197,7 @@ if data.endswith(b"\n"):
     data = data[:-1]
 if data.endswith(b"\r"):
     data = data[:-1]
+data = data.strip(b" \t")
 if not data or any(b < 0x21 or b > 0x7e for b in data):
     sys.exit(1)
 sys.stdout.write(data.decode("ascii"))

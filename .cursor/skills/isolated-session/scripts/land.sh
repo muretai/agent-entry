@@ -19,7 +19,9 @@
 # nested sandbox-exec: every suite that builds a wall was booked FAIL for the room. The
 # pid that ran them, and whether a nested sandbox-exec worked from it, go to wall.log.
 set -euo pipefail
-exec python3 -I - "$@" <<'PY'
+# -B: this python imports BASE's tools/gate_slots.py out of the gate copy, and a copy that
+# gained a __pycache__ would hand bytecode to every later import of it
+exec python3 -I -B - "$@" <<'PY'
 import json, os, shutil, site, subprocess, sys, time
 
 SKILL = os.path.join(".cursor", "skills", "isolated-session", "scripts")
@@ -173,6 +175,44 @@ def tests_env(env):
     return out
 
 
+def slot_dir_refusal(dest):
+    """Why the gate's slot directory refuses this landing, or "" when it does not.
+
+    The one definition of that directory is tools/gate_slots.py, loaded BY PATH from the
+    gate's copy of BASE (never the worktree's), so this program spells no path of its own.
+    tools/ is never put on this interpreter's sys.path: with it there, a tools/typing.py or
+    tools/ast.py BASE carried would answer the module's own `from typing import ...` and run
+    here, as the operator, outside every wall (W4b, review secrev-land-sh-refuses-a-ba-389a
+    finding 1). A gate_slots this interpreter already holds FROM THAT SAME FILE is asked as
+    it is -- one resolver for the gate and this pre-check (tests/test_nested_gate_slot.py),
+    never a second copy with its own idea of the directory. A BASE that predates the module
+    has no slot directory to check: its runner does not use one. Self-contained on purpose
+    (os and sys only): the test above lifts this function out of land.sh and runs it alone."""
+    tools = os.path.join(dest, "tools")
+    mod = os.path.join(tools, "gate_slots.py")
+    if not os.path.isfile(mod) or os.path.islink(mod):
+        return ""
+    gate_slots = sys.modules.get("gate_slots")
+    if gate_slots is None or os.path.realpath(getattr(gate_slots, "__file__", "") or "") != os.path.realpath(mod):
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("_land_gate_slots", mod)
+            if spec is None or spec.loader is None:
+                raise ImportError("no loader for " + mod)
+            gate_slots = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = gate_slots            # a private name: nothing imports it by accident
+            spec.loader.exec_module(gate_slots)
+        except Exception as e:  # noqa: BLE001 -- a gate module that will not load is a refusal
+            return "the gate's tools/gate_slots.py could not be loaded by path: %s" % e
+    try:
+        gate_slots.ensure_slot_dir()
+    except gate_slots.SlotDirRefused as e:
+        return "the gate's slot directory is refused before any test runs: %s" % e
+    except OSError as e:
+        return "the gate's slot directory %s could not be made: %s" % (gate_slots.slot_dir(), e)
+    return ""
+
+
 def fail(runjson, reason, extra=""):
     if extra:
         sys.stdout.write(extra if extra.endswith("\n") else extra + "\n")
@@ -248,13 +288,14 @@ GATE_ENTRIES = ("tools/ledger.py", "tools/sec_lint.py", "tools/invariants.py",
 GATE_CLOSURE = ("company/ops/backlog_to_core.py",)
 
 
-def imported_names(path):
+def imported_names(path, source=None):
     """The top-level names a Python file imports absolutely, anywhere in it. A file that does
     not parse imports nothing here: the gate program that runs it will crash, and
-    finish-worktree.sh calls that crash a broken gate."""
+    finish-worktree.sh calls that crash a broken gate. `source`, when given, is the file's
+    bytes read from BASE's tree rather than from disk."""
     import ast
     try:
-        tree = ast.parse(open(path, "rb").read(), path)
+        tree = ast.parse(open(path, "rb").read() if source is None else source, path)
     except (OSError, SyntaxError, ValueError):
         return set()
     names = set()
@@ -293,9 +334,146 @@ def closure(dest):
     return needed
 
 
-def extract(common, base_sha, wall):
-    """BASE's scripts and tools, from the commit the spawn recorded, into walls/<name>/base.
-    The worker cannot write that directory, so it cannot swap the runner.
+def stdlib_names():
+    """The top-level names of THIS interpreter's standard library: the one the gate runner
+    (`sys.executable -I -B <copy>/tools/run_tests.py`) starts with <copy>/tools first on its
+    sys.path, so a tools/<name>.py for any of these answers the runner's own `import <name>`.
+    sys.stdlib_module_names exists from 3.10 only; the floor is 3.9, so the set is built from
+    what is always there -- sys.builtin_module_names plus the stdlib directories' listing
+    (stdlib, platstdlib, lib-dynload: a .py, a package directory or an extension file each
+    name a module) -- and sys.stdlib_module_names is added where it exists."""
+    import sysconfig
+    names = set(getattr(sys, "stdlib_module_names", ()))
+    names.update(sys.builtin_module_names)
+    paths = sysconfig.get_paths()
+    dirs = []
+    for key in ("stdlib", "platstdlib"):
+        d = paths.get(key)
+        if d:
+            dirs.extend((d, os.path.join(d, "lib-dynload")))
+    for d in dirs:
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        for entry in entries:
+            stem = entry.split(".")[0]
+            if not stem.isidentifier():
+                continue
+            if entry.endswith((".py", ".so", ".pyd")) or os.path.isdir(os.path.join(d, entry)):
+                names.add(stem)
+    return names
+
+
+def code_shadow(parts, stems, std):
+    """The stem a tools/ entry (its path split below tools/) would answer an import for, or
+    "" when the entry is harmless. Only CODE shadows count: a .py file named for a standard
+    library module, a package directory tools/<stem>/ holding a .py (or an extension file, or
+    a __pycache__ entry) anywhere under it, an extension file tools/<stem>*.so / .pyd, an
+    entry tools/__pycache__/<stem>.*, or a bare extensionless tools/<stem>. A data file
+    (tools/json/schema.json) or a directory with no code under it (tools/affected_tests/README.md)
+    answers no import and is never a shadow, whatever its name."""
+    first = parts[0]
+    if len(parts) > 1:
+        if first == "__pycache__":
+            stem = parts[1].split(".")[0]
+            return stem if len(parts) == 2 and (stem in stems or stem in std) else ""
+        last = parts[-1]
+        holds_code = last.endswith((".py", ".so", ".pyd")) or "__pycache__" in parts[1:]
+        return first if holds_code and (first in stems or first in std) else ""
+    stem = first.split(".")[0]
+    if first.endswith(".py"):
+        return stem if stem in std else ""
+    if first == stem or first.endswith((".so", ".pyd")):
+        return stem if (stem in stems or stem in std) else ""
+    return ""
+
+
+def shadow_refusal(common, gate_sha, whose="BASE", skip=()):
+    """Why `whose` tree (BASE, or the branch's tip) refuses this landing because its tools/
+    shadows a module the gate imports, or "".
+
+    Run before extract(), on the tree itself, so nothing is written on a refusal. A gate
+    module's stem is every GATE_ENTRIES stem, every module the closure walk reaches from them
+    (the same walk closure() makes, read blob by blob from the tree), and every name those
+    files import; to those come the standard library's top-level names (stdlib_names()),
+    since the runner starts with the copy's tools/ first on its sys.path and a
+    tools/typing.py there would answer `from typing import ...` in gate_slots.py, in the
+    runner and in the launcher's own load of the module. Which shapes shadow is code_shadow()'s
+    rule: code only, never a data file or a directory without .py (finding 2 of the review of
+    389a23e refused tools/json/schema.json). `skip` names the paths the branch deletes: a BASE
+    shadow the branch removes is not held against the branch, which is the one landing that
+    can take it out. The landing stops and names the entry rather than stepping around it."""
+    listing = {}
+    for root in ("tools/",) + tuple(p for p in GATE_CLOSURE if not p.startswith("tools/")):
+        r = subprocess.run(["git", "--git-dir", common, "ls-tree", "-r", "-z", "--full-tree",
+                            gate_sha, "--", root], capture_output=True)
+        if r.returncode != 0:
+            return "%s's tree could not be listed at %s" % (whose, root)
+        for raw in r.stdout.split(b"\0"):
+            head, _, rawpath = raw.partition(b"\t")
+            fields = head.split()
+            if len(fields) == 3:
+                listing[rawpath.decode("utf-8", "replace")] = fields[0].decode()
+
+    def source(rel):
+        if listing.get(rel) not in ("100644", "100755"):
+            return None
+        r = subprocess.run(["git", "--git-dir", common, "cat-file", "blob",
+                            "%s:%s" % (gate_sha, rel)], capture_output=True)
+        return r.stdout if r.returncode == 0 else None
+
+    by_name = {os.path.splitext(os.path.basename(p))[0]: p for p in GATE_CLOSURE}
+    stems = {os.path.splitext(os.path.basename(p))[0] for p in GATE_ENTRIES}
+    queue = [p for p in GATE_ENTRIES if p in listing]
+    seen = set(queue)
+    while queue:
+        rel = queue.pop(0)
+        text = source(rel)
+        if text is None:
+            continue
+        for name in sorted(imported_names(rel, text)):
+            stems.add(name)
+            nxt = by_name.get(name) or "tools/" + name + ".py"
+            if nxt not in seen and nxt in listing:
+                seen.add(nxt)
+                queue.append(nxt)
+    std = stdlib_names()
+    skip = set(skip)
+    for path in sorted(listing):
+        if not path.startswith("tools/") or path in skip:
+            continue
+        parts = path[len("tools/"):].split("/")
+        stem = code_shadow(parts, stems, std)
+        if not stem:
+            continue
+        entry = "tools/%s/" % parts[0] if len(parts) > 1 and parts[0] != "__pycache__" else path
+        shadow_of = ("the standard-library module %s" % stem if stem in std
+                     else "the gate module tools/%s.py" % stem)
+        return ("%s's %s shadows %s; the landing refuses before the gate copy is made"
+                % (whose, entry, shadow_of))
+    return ""
+
+
+def deleted_by_branch(common, base_sha, tip):
+    """The tools/ paths the branch takes out: present at the fork point (the merge base of
+    BASE and the branch's tip) and absent at the tip. A path BASE added after the fork is not
+    the branch's deletion -- the merge would keep it -- so it is not in this set."""
+    fork = git(common, "merge-base", base_sha, tip).stdout.strip() or base_sha
+    r = subprocess.run(["git", "--git-dir", common, "diff", "--name-only", "--diff-filter=D",
+                        "-z", fork, tip, "--", "tools/"], capture_output=True)
+    if r.returncode != 0:
+        return set()
+    return {p.decode("utf-8", "replace") for p in r.stdout.split(b"\0") if p}
+
+
+def extract(common, gate_sha, wall, skip=()):
+    """BASE's scripts and tools, from gate_sha -- BASE's tip as the landing starts, never the
+    commit the spawn recorded, so a worker spawned before a gate change lands under the gate
+    BASE holds now -- into walls/<name>/base. The worker cannot write that directory, so it
+    cannot swap the runner. `skip` names the tools/ paths the branch deletes (see
+    deleted_by_branch()): a shadow among them is left out of the copy, as the merge leaves it
+    out of BASE; any other deleted path is copied as usual, so the branch cannot thin the gate.
 
     Returns (dest, "") or ("", why). Read blob by blob -- `ls-tree -r -z`, then `git show`
     per entry -- the way finish-worktree.sh extracts BASE's walls/, never `git archive`:
@@ -305,7 +483,16 @@ def extract(common, base_sha, wall):
     it reads the worker-writable worktree. Only regular blobs (100644/100755, the exec bit
     kept) are written; a symlink, a gitlink or anything else under these paths is refused
     by name -- neither followed nor silently skipped. Each name below the prefix obeys the
-    walls/ basename rule, and a name that breaks it is refused the same way."""
+    walls/ basename rule, and a name that breaks it is refused the same way.
+
+    The order under tools/: first, a code entry that shadows a module the gate imports is
+    REFUSED by name -- a .py or a package named for a standard-library module (tools/typing.py
+    would answer gate_slots.py's `from typing import` in the runner), an extension file, a
+    __pycache__ entry or a package on a gate module's stem (code_shadow() is the rule; main()
+    runs shadow_refusal() on BASE and on the branch's tip before this, so the refusal is
+    normally theirs and nothing is written). Then, of what is left, only .py files are written:
+    every other blob (notes, units.json, a pyc on a stem no gate program imports) is skipped
+    and never refuses the landing."""
     dest = os.path.join(wall, "base")
     if os.path.lexists(dest):
         if os.path.islink(dest):
@@ -321,7 +508,7 @@ def extract(common, base_sha, wall):
         """One regular blob of BASE into dest, exec bit kept; never through a link."""
         target = os.path.join(dest, *path.split("/"))
         os.makedirs(os.path.dirname(target), 0o700, exist_ok=True)
-        blob = subprocess.run(["git", "--git-dir", common, "show", "%s:%s" % (base_sha, path)],
+        blob = subprocess.run(["git", "--git-dir", common, "show", "%s:%s" % (gate_sha, path)],
                               capture_output=True)
         if blob.returncode != 0:
             return False
@@ -339,13 +526,16 @@ def extract(common, base_sha, wall):
     # them (ISSUE(land-sh-demands-a-runner-a-vendored-repo-does-not-have)).
     roots = (SKILL.replace(os.sep, "/"), "tools")
     skill = subprocess.run(["git", "--git-dir", common, "ls-tree", "-z", "--full-tree",
-                            base_sha, "--", roots[0] + "/"], capture_output=True)
+                            gate_sha, "--", roots[0] + "/"], capture_output=True)
     if skill.returncode != 0 or not skill.stdout:
-        return bail("BASE's skill scripts are not in the recorded commit")
+        return bail("BASE's skill scripts are not in BASE's tip")
     tree = subprocess.run(["git", "--git-dir", common, "ls-tree", "-r", "-z", "--full-tree",
-                           base_sha, "--"] + [r + "/" for r in roots], capture_output=True)
+                           gate_sha, "--"] + [r + "/" for r in roots], capture_output=True)
     if tree.returncode != 0:
         return bail("BASE's tree could not be listed")
+    gate_stems = {os.path.splitext(os.path.basename(p))[0] for p in GATE_ENTRIES}
+    std = stdlib_names()
+    skip = set(skip)
     for raw in tree.stdout.split(b"\0"):
         if not raw:
             continue
@@ -361,6 +551,20 @@ def extract(common, base_sha, wall):
         parts = path[len(root) + 1:].split("/") if root else []
         if not parts or any(not p or p.startswith(".") or not set(p) <= SAFE_NAME for p in parts):
             return bail("BASE's %s is not a name land.sh extracts" % path)
+        if root == "tools":
+            stem = code_shadow(parts, gate_stems, std)
+            if stem and path in skip:
+                # a shadow the branch deletes: out of the copy, as the merge takes it out of BASE
+                continue
+            if stem:
+                entry = "tools/%s/" % parts[0] if len(parts) > 1 and parts[0] != "__pycache__" else path
+                return bail("BASE's %s shadows %s; the gate copy is not made" % (
+                    entry, "the standard-library module %s" % stem if stem in std
+                    else "the gate module tools/%s.py" % stem))
+            if not path.endswith(".py"):
+                # under tools/ only .py files: any other blob (a pyc or extension file on a stem
+                # no gate program imports, notes, units.json) is never copied and never refuses
+                continue
         if not put(path, mode):
             return bail("BASE's %s could not be read" % path)
     # Every closure path outside tools/ is decided per file at BASE as well, whether or not a
@@ -368,7 +572,7 @@ def extract(common, base_sha, wall):
     # symlink, a gitlink) is refused by name -- never followed, never read as absent.
     for path in GATE_CLOSURE:
         rec = subprocess.run(["git", "--git-dir", common, "ls-tree", "-z", "--full-tree",
-                              base_sha, "--", path], capture_output=True)
+                              gate_sha, "--", path], capture_output=True)
         if rec.returncode != 0:
             return bail("BASE's tree could not be listed at %s" % path)
         head, _, rawpath = rec.stdout.rstrip(b"\0").partition(b"\t")
@@ -391,10 +595,10 @@ def extract(common, base_sha, wall):
         for path in todo:
             done.add(path)
             rec = subprocess.run(["git", "--git-dir", common, "ls-tree", "-z", "--full-tree",
-                                  base_sha, "--", path], capture_output=True)
+                                  gate_sha, "--", path], capture_output=True)
             head, _, rawpath = rec.stdout.rstrip(b"\0").partition(b"\t")
             if rec.returncode != 0 or rawpath.decode("utf-8", "replace") != path:
-                return bail("BASE's gate imports %s, and the recorded commit does not carry it"
+                return bail("BASE's gate imports %s, and BASE's tip does not carry it"
                             % path)
             fields = head.split()
             if (len(fields) != 3 or fields[1] != b"blob"
@@ -471,7 +675,21 @@ def main(argv):
     if not any(line.startswith("+") for line in cherry.stdout.splitlines()):
         return fail(runjson, "nothing of the worker's own work would land: every recorded commit "
                              "is already equivalent on " + base_ref)
-    dest, why = extract(common, base_sha, wall)
+    # The gate copy is BASE as this landing starts, not the recorded base: a worker spawned
+    # before a gate change lands under the gate BASE holds now. base_sha still bounds the
+    # ancestor check, the cherry checks and the affected range. A BASE that shadows a gate
+    # module (or a stdlib name the gate imports) is refused first, by name, so nothing of it
+    # is extracted -- except for the shadows this branch deletes, which the merge takes out.
+    # The branch's tip is checked the same way, so the landing that INTRODUCES a shadow is
+    # the one refused, not every landing after it.
+    deleted = deleted_by_branch(common, base_before, tip)
+    shadowed = shadow_refusal(common, base_before, "BASE", deleted)
+    if shadowed:
+        return fail(runjson, shadowed)
+    shadowed = shadow_refusal(common, tip, "the branch's tip")
+    if shadowed:
+        return fail(runjson, shadowed)
+    dest, why = extract(common, base_before, wall, deleted)
     if why:
         return fail(runjson, why)
     if not dest:
@@ -487,6 +705,9 @@ def main(argv):
     # TESTS=none, exactly as an operator's landing does. The worktree's runner never runs.
     runner = os.path.join(dest, "tools", "run_tests.py")
     runner_path = ""
+    refused = slot_dir_refusal(dest)
+    if refused:
+        return fail(runjson, refused)
     if os.path.isfile(runner) and not os.path.islink(runner):
         probe = nest_probe()
         where = ("outside every wall" if probe in ("ok", "n/a")
@@ -495,7 +716,7 @@ def main(argv):
                   "%s; nested sandbox-exec from here: %s"
             % (branch, os.getpid(), os.getppid(), where, probe))
         proc = subprocess.run(
-            [sys.executable, "-I", runner, "--root", worktree, "--affected", base_sha + ".." + tip,
+            [sys.executable, "-I", "-B", runner, "--root", worktree, "--affected", base_sha + ".." + tip,
              "--gate", "--json", "-j", env.get("ISOLATED_SESSION_LAND_JOBS") or "4"],
             cwd=worktree, env=tests_env(env), stdin=subprocess.DEVNULL, capture_output=True,
             text=True, errors="replace")
