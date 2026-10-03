@@ -62,6 +62,10 @@
 //   init --from woocommerce <store-url>  (Woo chain item 5) also writes one door-bound `hold` offer answered
 //                 `pending` with a receipt; the door's hold reply is pending_confirmation until the owner's
 //                 confirmReceipt(seedHex, replyText) returns the follow-on that reads confirmed (section 11e).
+//   doctor --from woocommerce [--json]  (Woo chain item 6) in the project `init --from woocommerce` wrote:
+//                 knocks each door-bound offer of agent-entry.json at the door its entry.baseUrl names, and
+//                 only there; one row per offer, id `offer.<offer id>`, PASS or FAIL, every offer checked
+//                 even after one fails; never confirms a hold, never echoes a secret (section 11f).
 //   publish --claim <32 lowercase hex>  (FRAME Claim-2) records the code in agent-entry.json, prints
 //                 `_muretai-catalog.<host> TXT muretai-catalog-claim=<code>`, and the door serves
 //                 GET /.well-known/muretai-catalog-claim.txt: 200 text/plain `muretai-catalog-claim=<code>`
@@ -2506,6 +2510,257 @@ await section('woo-hold', async () => {
     check(c.reply?.deal?.partyB === c.from && !Object.hasOwn(c.reply?.deal || {}, 'status'),
       `${label}/refused/receipt-not-forged-from-the-request`, JSON.stringify(c.reply?.deal).slice(0, 300));
   } finally { await store.close(); }
+});
+
+// ---------------------------------------------------------------- 11f. doctor --from woocommerce: knock every door-bound offer
+//
+// WRITTEN BEFORE THE IMPLEMENTATION (test-first, skeleton item 6 of 6 of the Woo declaration
+// generator chain, Woo-6; parent intake 20261002T235854Z: public Store API only, bounded, robots.txt
+// respected, own vocabulary AT-1, deterministic compile, no payment verb). The implementer may not
+// edit this section. Woo-1..5's pins above stand as they are and are not repeated here.
+//
+// `agent-entry doctor --from woocommerce [--json]`, run in the project `init --from woocommerce`
+// wrote, reads its agent-entry.json and knocks each door-bound offer (ask, find, hold) at the door
+// the declaration's own entry.baseUrl names -- that origin and no other: never the store the
+// declaration was generated from, never a host named in the facts or the snapshot. It reports one
+// row per door-bound offer, `{ id: "offer.<offer id>", level: "PASS" | "FAIL", label, detail }` in
+// --json's `rows` (text mode: one PASS/FAIL line naming the offer id). A knock that fails -- the door
+// answers an error, drops the connection, answers something malformed, or is not there at all -- is a
+// FAIL for that offer by its id, and the remaining offers are still knocked and reported. Exit 0 when
+// every offer passes, 1 when any fails.
+// Refusals: the hold knock never confirms (no "confirmed" follow-on leaves the doctor, no second
+// message reaches the door, nothing is written) and nothing completes a purchase (no request to the
+// store, no payment verb at the door). No output -- above all a failure's -- carries the owner seed,
+// the knock key, or the store credentials, even when the door's own error text does.
+
+const WOO6_SEED = '9c'.repeat(32);
+const WOO6_CK = `ck_${'4f'.repeat(20)}`;
+const WOO6_CS = `cs_${'7a'.repeat(20)}`;
+const WOO6_LEAK = `door failed: AGENT_ENTRY_SEED_HEX=${WOO6_SEED} consumer_key=${WOO6_CK} consumer_secret=${WOO6_CS}`;
+const WOO6_MODES = ['error', 'malformed', 'drop'];
+
+/** A door on 127.0.0.1 in front of `state.entry`; `state.mode[offerId]` makes that offer's knock fail. */
+function wooDoctorDoor() {
+  return new Promise((resolveStart) => {
+    const state = { entry: null, ids: [], mode: {}, posts: [], requests: [], events: [] };
+    const sockets = new Set();
+    const offerOf = (raw) => {
+      try {
+        const m = JSON.parse(raw).params.message;
+        const text = String(m.parts?.[0]?.text ?? '');
+        const meta = m.metadata?.offer;
+        const [verb, of] = text.split(/\s+/);
+        return { id: JSON.parse(raw).id ?? null, text, signed: Boolean(m.metadata?.sig && m.metadata?.from),
+          offer: state.ids.includes(meta) ? meta : `${verb}_${of}` };
+      } catch { return { id: null, text: raw.slice(0, 200), signed: false, offer: null }; }
+    };
+    const server = createServer((req, res) => {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', async () => {
+        const body = Buffer.concat(chunks);
+        state.requests.push({ method: req.method, url: req.url, host: req.headers.host });
+        const knock = req.method === 'POST' ? offerOf(body.toString('utf8')) : null;
+        if (knock) state.posts.push(knock);
+        const mode = knock ? state.mode[knock.offer] : undefined;
+        if (mode === 'drop') { req.socket.destroy(); return; }
+        if (mode === 'error') {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: knock.id, error: { code: -32603, message: WOO6_LEAK } }));
+          return;
+        }
+        if (mode === 'malformed') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(`{"jsonrpc":"2.0","id":${JSON.stringify(knock.id)},"result":{"parts":[{"kind":"text","text":"${WOO6_LEAK}`);
+          return;
+        }
+        try {
+          const out = await state.entry.handleRequestAsync(req.method, req.url, req.headers, body, { remoteAddress: req.socket.remoteAddress });
+          res.writeHead(out.status, out.headers || {});
+          res.end(out.body || '');
+        } catch {
+          res.writeHead(500);
+          res.end('door threw');
+        }
+      });
+    });
+    server.on('connection', (s) => { sockets.add(s); s.on('close', () => sockets.delete(s)); });
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      resolveStart({ port, origin: `http://127.0.0.1:${port}`, state,
+        close: () => new Promise((r) => { for (const s of sockets) s.destroy(); server.close(() => r()); }) });
+    });
+  });
+}
+
+await section('woo-doctor', async () => {
+  const decoy = await startStore((req, res) => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('decoy'); }, { tls: false });
+  let store = null;
+  store = await startStore(wooStore((req, res) => {
+    const bytes = Buffer.from(onOrigin(WOO_PAGE.toString('utf8'), store.origin));
+    res.writeHead(200, { ...WOO_JSON, 'x-wp-total': '3', 'x-wp-totalpages': '1', 'content-length': String(bytes.length) });
+    res.end(bytes);
+  }));
+  const door = await wooDoctorDoor();
+  try {
+    // Setup: the project as init --from woocommerce writes it, with a facts line naming another host.
+    const label = 'woo-doctor';
+    const { file } = factsFileWith({ contact: `Write to us at ${decoy.origin}/contact` });
+    const dir = makeRepo('vite');
+    const init = await runCli(['init', '--from', 'woocommerce', store.origin, '--facts', file, '--json'], { cwd: dir, env: WOO_ENV });
+    if (!check(init.code === 0, `${label}/setup-init-from-woocommerce`, `exit ${init.code}; stderr ${init.stderr.slice(0, 400)}`)) return;
+    // The owner's seed and the store's credentials sit in the project, git-ignored: the doctor's temptation.
+    writeFileSync(join(dir, '.env'), `AGENT_ENTRY_SEED_HEX=${WOO6_SEED}\nWOO_CONSUMER_KEY=${WOO6_CK}\nWOO_CONSUMER_SECRET=${WOO6_CS}\n`);
+    const generated = readJson(join(dir, 'agent-entry.json'));
+    let compiled = null;
+    try { compiled = compileDeclaration(clone(generated)); } catch (error) { check(false, `${label}/setup-declaration-compiles`, String(error?.message || error)); return; }
+    const doorBound = compiled.offers.filter((o) => o.door);
+    const ids = doorBound.map((o) => o.id);
+    if (!check(sorted(doorBound.map((o) => o.verb)) === sorted(['ask', 'find', 'hold']), `${label}/setup-ask-find-hold-door-bound`,
+      JSON.stringify(doorBound.map((o) => [o.id, o.verb])))) return;
+
+    // The declaration's own origin is the running door; the store stays up, named in the snapshot.
+    const declaration = clone(generated);
+    declaration.entry.baseUrl = door.origin;
+    writeFileSync(join(dir, 'agent-entry.json'), `${JSON.stringify(declaration, null, 2)}\n`);
+    door.state.ids = ids;
+    door.state.entry = createAgentEntry({ seedHex: WOO6_SEED, name: declaration.entry.name, baseUrl: door.origin, declaration,
+      catalogFile: join(dir, SNAPSHOT_FILE), signedRatePerMin: 0, signedRatePerMinTotal: 0,
+      observer: (e) => { door.state.events.push(e); } });
+    const storeHitsBefore = store.hits.length;
+    const secrets = () => {
+      const out = [WOO6_SEED, WOO6_CK, WOO6_CS];
+      const knockKey = readText(join(HOME, 'knock-seed'));
+      if (knockKey && knockKey.trim().length >= 16) out.push(knockKey.trim());
+      return out;
+    };
+
+    /** One doctor run: rows, the door's knocks, and every shared refusal pinned. */
+    async function doctor(tag, { json = true, port = door.port } = {}) {
+      const tl = `${label}/${tag}`;
+      door.state.posts = [];
+      const before = treeState(dir);
+      const run = await runCli(['doctor', '--from', 'woocommerce', ...(json ? ['--json'] : [])],
+        { cwd: dir, env: { AGENT_ENTRY_SEED_HEX: WOO6_SEED } });
+      guardClean(tl, run, { onlyPort: port });
+      const rows = json ? (parseJsonOut(tl, run)?.rows || []) : [];
+      const knocks = door.state.posts.slice();
+      // Refusal: only the declaration's door is knocked -- never the store, never a host in the facts.
+      check(store.hits.length === storeHitsBefore, `${tl}/refused/never-asks-the-woo-store`, JSON.stringify(store.hits.slice(storeHitsBefore)));
+      check(decoy.hits.length === 0, `${tl}/refused/never-asks-a-host-named-elsewhere`, JSON.stringify(decoy.hits));
+      check(run.guard.filter((r) => r.kind === 'connect').every((r) => r.port === port && isLocalHost(r.host)),
+        `${tl}/refused/connects-only-to-the-declared-door`, JSON.stringify(run.guard.filter((r) => r.kind === 'connect').slice(0, 3)));
+      check(door.state.requests.every((r) => r.host === `127.0.0.1:${door.port}`), `${tl}/refused/every-door-request-names-the-door-host`);
+      // Refusal: nothing is confirmed, nothing is bought, nothing is written.
+      const said = `${run.stdout}\n${run.stderr}`;
+      check(!/\bconfirmed\b/i.test(said), `${tl}/refused/no-confirmation-in-the-output`, said.slice(0, 400));
+      check(!knocks.some((k) => /\bconfirm(ed)?\b/i.test(k.text) || PAYMENT_VERBS.includes(k.text.split(/\s+/)[0])),
+        `${tl}/refused/no-confirmation-or-payment-knock`, JSON.stringify(knocks.map((k) => k.text)));
+      check(knocks.filter((k) => k.offer === ids.find((id) => id.startsWith('hold'))).length <= 1, `${tl}/refused/hold-knocked-at-most-once`,
+        JSON.stringify(knocks.map((k) => k.offer)));
+      check(stateDiff(before, treeState(dir)).length === 0, `${tl}/refused/writes-nothing-in-the-project`,
+        JSON.stringify(stateDiff(before, treeState(dir))));
+      // Refusal: no secret in the output, failure or not.
+      for (const [i, s] of secrets().entries()) check(!said.includes(s), `${tl}/refused/never-echoes-secret-${i}`);
+      return { run, rows, knocks, said };
+    }
+    const rowsOf = (rows, id) => rows.filter((r) => r.id === `offer.${id}`);
+    const levelOf = (rows, id) => { const rs = rowsOf(rows, id); return rs.length === 1 ? rs[0].level : `${rs.length} rows`; };
+
+    // (1) Functional: every offer knocked at the door, each a PASS by its offer id.
+    {
+      const tl = `${label}/clean`;
+      const { run, rows, knocks } = await doctor('clean');
+      check(run.code === 0, `${tl}/exit-0`, `exit ${run.code}; stderr ${run.stderr.slice(0, 300)}`);
+      for (const id of ids) {
+        check(levelOf(rows, id) === 'PASS', `${tl}/${id}-one-pass-row`, JSON.stringify(rowsOf(rows, id)));
+        check(knocks.filter((k) => k.offer === id).length === 1, `${tl}/${id}-knocked-once-at-the-door`, JSON.stringify(knocks.map((k) => k.offer)));
+      }
+      check(knocks.length === ids.length && knocks.every((k) => k.signed), `${tl}/one-signed-knock-per-offer-and-no-other-post`,
+        JSON.stringify(knocks.map((k) => [k.offer, k.signed])));
+      const holdId = ids.find((id) => id.startsWith('hold'));
+      check(!/\bconfirmed\b/i.test(rowText(rowsOf(rows, holdId)[0] || { id: '', label: '', detail: 'confirmed' })),
+        `${tl}/refused/hold-row-does-not-say-confirmed`, JSON.stringify(rowsOf(rows, holdId)));
+      check(!door.state.events.some((e) => e.reply === 'checkout') && door.state.events.filter((e) => e.offer === holdId).every((e) => e.reply === 'pending'),
+        `${tl}/refused/the-door-answered-the-hold-pending-and-no-checkout`, JSON.stringify(door.state.events.map((e) => [e.offer, e.reply])));
+
+      const text = await doctor('clean-text', { json: false });
+      check(text.run.code === 0, `${tl}-text/exit-0`, `exit ${text.run.code}`);
+      const lines = text.run.stdout.split('\n');
+      for (const id of ids) {
+        check(lines.some((l) => /^\s*PASS\b/.test(l) && l.includes(id)), `${tl}-text/${id}-on-a-pass-line`, text.run.stdout.slice(0, 600));
+      }
+    }
+
+    // (2) Refusal: a pending receipt the fixture holds stays pending through a doctor run.
+    {
+      const tl = `${label}/pending-receipt`;
+      door.state.events = [];
+      const k = await knockHold(door.state.entry, 'hold item {"id":101}');
+      check(k.reply?.status === 'pending_confirmation', `${tl}/setup-fixture-hold-pending`, String(k.replyText).slice(0, 300));
+      const { run, said } = await doctor('pending-receipt');
+      check(run.code === 0, `${tl}/exit-0`, `exit ${run.code}`);
+      check(!said.includes(k.messageId) && !said.includes(String(k.reply?.deal?.termsHash ?? '\0')),
+        `${tl}/refused/the-fixture-receipt-never-handled`, said.slice(0, 300));
+      check(!door.state.events.some((e) => e.reply === 'checkout' || /confirm/i.test(String(e.status ?? ''))),
+        `${tl}/refused/no-confirmation-or-purchase-reached-the-door`, JSON.stringify(door.state.events.map((e) => [e.offer, e.reply])));
+      check(k.reply?.status === 'pending_confirmation' && !Object.hasOwn(k.reply || {}, 'confirmed'), `${tl}/refused/receipt-still-pending`);
+    }
+
+    // (3) Functional + refusal: each way a knock fails, on each offer in turn -> FAIL for that offer by
+    // its id, the others still knocked and PASS, no secret echoed from the failing door.
+    for (const mode of WOO6_MODES) {
+      for (const failing of ids) {
+        const tl = `${label}/${mode}-${failing}`;
+        door.state.mode = { [failing]: mode };
+        const { run, rows, knocks, said } = await doctor(`${mode}-${failing}`);
+        door.state.mode = {};
+        check(run.code === 1, `${tl}/exit-1`, `exit ${run.code}`);
+        check(levelOf(rows, failing) === 'FAIL', `${tl}/fail-row-names-the-offer`, JSON.stringify(rows.filter((r) => r.level !== 'PASS')));
+        for (const id of ids.filter((x) => x !== failing)) {
+          check(knocks.some((kk) => kk.offer === id), `${tl}/${id}-still-knocked`, JSON.stringify(knocks.map((kk) => kk.offer)));
+          check(levelOf(rows, id) === 'PASS', `${tl}/${id}-still-passes`, JSON.stringify(rowsOf(rows, id)));
+        }
+        if (mode === 'error') {
+          check(!said.includes('consumer_secret') && !said.includes('AGENT_ENTRY_SEED_HEX='), `${tl}/refused/door-error-text-not-echoed-raw`,
+            said.slice(0, 400));
+        }
+      }
+    }
+
+    // (4) Every offer failing, each its own way, in one run: three FAIL rows, text mode too.
+    {
+      const tl = `${label}/all-fail`;
+      door.state.mode = Object.fromEntries(ids.map((id, i) => [id, WOO6_MODES[i % WOO6_MODES.length]]));
+      const { run, rows, knocks } = await doctor('all-fail');
+      check(run.code === 1, `${tl}/exit-1`, `exit ${run.code}`);
+      for (const id of ids) {
+        check(levelOf(rows, id) === 'FAIL', `${tl}/${id}-fail-row`, JSON.stringify(rowsOf(rows, id)));
+        check(knocks.some((kk) => kk.offer === id), `${tl}/${id}-knocked`, JSON.stringify(knocks.map((kk) => kk.offer)));
+      }
+      const text = await doctor('all-fail-text', { json: false });
+      check(text.run.code === 1, `${tl}-text/exit-1`, `exit ${text.run.code}`);
+      for (const id of ids) {
+        check(text.run.stdout.split('\n').some((l) => /^\s*FAIL\b/.test(l) && l.includes(id)), `${tl}-text/${id}-on-a-fail-line`,
+          text.run.stdout.slice(0, 600));
+      }
+      door.state.mode = {};
+    }
+
+    // (5) The declared door is not there at all: every offer is a FAIL by its id, not one row and a stop.
+    {
+      const tl = `${label}/unreachable`;
+      const gone = await wooDoctorDoor();
+      const { port, origin } = gone;
+      await gone.close();
+      writeFileSync(join(dir, 'agent-entry.json'), `${JSON.stringify({ ...declaration, entry: { ...declaration.entry, baseUrl: origin } }, null, 2)}\n`);
+      const { run, rows } = await doctor('unreachable', { port });
+      check(run.code === 1 && run.signal === null, `${tl}/exit-1`, `exit ${run.code} ${run.signal}`);
+      for (const id of ids) check(levelOf(rows, id) === 'FAIL', `${tl}/${id}-fail-row`, JSON.stringify(rows.slice(0, 6)));
+      check(door.state.posts.length === 0, `${tl}/refused/the-other-door-never-knocked`, JSON.stringify(door.state.posts.map((p) => p.offer)));
+      writeFileSync(join(dir, 'agent-entry.json'), `${JSON.stringify(declaration, null, 2)}\n`);
+    }
+  } finally { await door.close(); await store.close(); await decoy.close(); }
 });
 
 // ---------------------------------------------------------------- 12. publish --claim: the Catalog's proof file
