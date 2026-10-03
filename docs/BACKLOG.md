@@ -49,6 +49,7 @@ Ideas that are not yet lines here go to the inbox with `.cursor/skills/isolated-
 P0 Woo = chain 20261003T001756Z -> 001757Z -> 001757Z-2 / 001758Z / 001758Z-2 -> 001759Z (parent record 20261002T235854Z, blocked
 on the split-check defect, APPL inbox 20261002T214813Z). S6a = 215207Z (landed) -> 215208Z (impl) -> 215208Z-2 -> 215209Z.
 S6b = 215209Z-2 (landed) -> 215210Z (tests).)
+- P1 S6b the knock speaks the verbs: S6b-2, checkedBookingReceipt recognises the Suite's default reply shape next to the older one so the customer_did cross-check runs on a real Suite door's answer (tests in flight); S6b-1 (`--offer` on the knock) landed 9e58808. Tail id. [20261002T215210Z] [skeleton]
 
 ## Next (queued, in order)
 
@@ -62,7 +63,6 @@ S6b = 215209Z-2 (landed) -> 215210Z (tests).)
 ### 1. Agent Entry Suite S6 (the follow-ups of 1.13.0, after trunk S5 94b76839)
 
 - P1 S6a entry.counts hosted counts URL: the chain S6a-2 (door posts the AT-14 body to the counts URL, impl) -> S6a-3 (page runtime posts the same body) -> S6a-4 (README, CHANGELOG, docs.mjs needle); S6a-1 (`counts` accepted) landed 4a6617b. This line carries the chain's TAIL id, so the pull moves it to Done only when the whole chain has landed. [20261002T215209Z] [skeleton]
-- P1 S6b the knock speaks the verbs: S6b-2, checkedBookingReceipt recognises the Suite's default reply shape next to the older one so the customer_did cross-check runs on a real Suite door's answer (tests in flight); S6b-1 (`--offer` on the knock) landed 9e58808. Tail id. [20261002T215210Z] [skeleton]
 - P2 S6c the visitor skill compares terms with the errand: spec/skill-distill.md and the distilled skill (scripts/distill) carry the owner ruling of 2026-09-26 (the person's errand is the mandate; the journey step is "compare the shop's terms with the errand", never "decide whether to ask"; return only on divergent terms, missing information or a verb beyond the errand; no "Ask first?" column), and the conformance pin on the distilled text follows. [none] [after P1 S6b the knock speaks the verbs]
 
 ### 2. Conformance and the gate
