@@ -2,16 +2,17 @@
 // Smoke-test the four one-file trade recipes. The signed POST path stays in-process.
 // The documented visiting-runtime command (`node muretai-agent-entry.mjs knock <card-url>`)
 // binds a loopback port because that is the path a stranger actually runs.
-import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  AGENT_CARD_PATH, AGENT_ENTRY_REL, createAgentEntry, didFromSeedHex, knockAgentEntry,
-  signEnvelope, verifyEnvelope,
+  AGENT_CARD_PATH, AGENT_CARD_PATH_LEGACY, AGENT_CARD_SIG_PATH, AGENT_ENTRY_REL,
+  createAgentEntry, didFromSeedHex, knockAgentEntry, signEnvelope, validateDeclaration,
+  verifyCardEnvelope, verifyEnvelope,
 } from '../muretai-agent-entry.mjs';
 import { createCourtBookingDoor } from '../examples/court-booking.mjs';
 import { createClinicBookingDoor } from '../examples/clinic-booking.mjs';
@@ -707,6 +708,278 @@ for (const recipe of [
     rmSync(session.dir, { recursive: true, force: true });
   }
 }
+
+// ---------------------------------------------------------------- WooCommerce one-file plugin
+//
+// FRAME Claim-1, skeleton item 1 of 4 (parent intake 20261003T131709Z): the one-file plugin
+// examples/woocommerce-agent-entry.php installs like restaurant-wordpress.php, mints its seed at
+// activation (and never re-mints one that exists), and serves the agent card and its signature
+// byte for byte what the Node door serves for the same declaration. agent-tools.json, ask and hold
+// are the chain's later items and are not pinned here.
+//
+// The contract the plugin runs under (fixtures/woo-plugin/wp-shim.php is the WordPress it gets):
+//   - the declaration is the WordPress option `muretai_agent_entry_declaration`, whose value is
+//     the agent-entry.json text; the door's name and baseUrl are its entry.name and entry.baseUrl;
+//   - the seed lives in an option the plugin chooses, as 32 raw bytes, 64 hex or base64;
+//   - the Node door it must equal is createAgentEntry({seedHex, name, baseUrl, declaration}).
+// The run needs `php` (AGENT_ENTRY_PHP overrides the binary) with sodium; without it the run is
+// skipped BY NAME and the suite does not fail. The static checks run either way.
+
+const WOO_PLUGIN = join(HERE, '..', 'examples', 'woocommerce-agent-entry.php');
+const WOO_SHIM = join(HERE, 'fixtures', 'woo-plugin', 'wp-shim.php');
+const WOO_DECLARATION_OPTION = 'muretai_agent_entry_declaration';
+const WOO_RUN = 'woocommerce-plugin/php-S';
+const skipped = [];
+
+function findPhp(bin) {
+  const out = spawnSync(bin, ['-r', 'echo extension_loaded("sodium") ? "sodium" : "no-sodium";'],
+    { encoding: 'utf8', timeout: 15000 });
+  if (out.error || out.status !== 0) return null;
+  return { bin, sodium: out.stdout.trim() === 'sodium' };
+}
+
+function wooDeclaration(baseUrl) {
+  return {
+    v: 1,
+    entry: { name: 'Harbor Lamp', baseUrl },
+    facts: JSON.parse(readFileSync(join(HERE, 'fixtures', 'frame', 'facts.json'), 'utf8')),
+    offers: [{
+      verb: 'ask', of: 'shop', about: 'Ask the shop about hours, shipping, returns, payment and pickup.',
+      input: { text: 'string' }, door: { reply: 'facts' },
+    }],
+  };
+}
+
+const phpString = (text) => `s:${Buffer.byteLength(text, 'utf8')}:"${text}";`;
+
+function readShimState(path) {
+  const state = JSON.parse(readFileSync(path, 'utf8'));
+  return { options: state.options || {}, transients: state.transients || {} };
+}
+
+/** Every string inside a PHP serialize()d value, as bytes. */
+function serializedStrings(buf) {
+  const text = buf.toString('latin1');
+  const out = [];
+  for (const m of text.matchAll(/s:(\d+):"/g)) {
+    const start = m.index + m[0].length;
+    out.push(Buffer.from(text.slice(start, start + Number(m[1])), 'latin1'));
+  }
+  return out;
+}
+
+/** Every 32-byte seed an option could hold (raw, hex or base64), as lowercase hex. */
+function seedCandidates(state) {
+  const seeds = new Set();
+  for (const value of Object.values(state.options)) {
+    for (const raw of serializedStrings(Buffer.from(String(value), 'base64'))) {
+      if (raw.length === 32) seeds.add(raw.toString('hex'));
+      const s = raw.toString('utf8').trim();
+      if (/^[0-9a-f]{64}$/i.test(s)) seeds.add(s.toLowerCase());
+      const b = Buffer.from(s, 'base64');
+      if (b.length === 32 && b.toString('base64') === s) seeds.add(b.toString('hex'));
+    }
+  }
+  return [...seeds];
+}
+
+function freePort() {
+  return new Promise((resolvePort, reject) => {
+    const probe = createServer();
+    probe.on('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolvePort(port));
+    });
+  });
+}
+
+async function getBytes(url) {
+  const res = await fetch(url, { headers: { accept: 'application/json' } });
+  return { status: res.status, headers: res.headers, body: Buffer.from(await res.arrayBuffer()) };
+}
+
+async function startPhpServer(php, port, env) {
+  const child = spawn(php.bin, ['-S', `127.0.0.1:${port}`, WOO_SHIM], {
+    cwd: dirname(WOO_SHIM), env, stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+  const end = Date.now() + 15000;
+  while (Date.now() < end) {
+    try {
+      await fetch(`http://127.0.0.1:${port}/`);
+      return { child, stderr: () => stderr };
+    } catch {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+  child.kill('SIGKILL');
+  throw new Error(`php -S did not start: ${stderr.slice(0, 400)}`);
+}
+
+function activate(php, env) {
+  return spawnSync(php.bin, [WOO_SHIM, 'activate'], { env, encoding: 'utf8', timeout: 30000 });
+}
+
+/** What the Node door serves at `path` for the same declaration and seed, at epoch `ts`. */
+async function nodeDoorBytes(seedHex, declaration, path, ts) {
+  const realNow = Date.now;
+  if (ts !== undefined) Date.now = () => ts * 1000;
+  try {
+    const entry = createAgentEntry({
+      seedHex, name: declaration.entry.name, baseUrl: declaration.entry.baseUrl, declaration,
+    });
+    const out = await entry.handleRequestAsync('GET', path, { accept: 'application/json' }, Buffer.alloc(0));
+    return Buffer.from(out.body);
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+{
+  const exists = existsSync(WOO_PLUGIN);
+  check(exists, 'woocommerce-plugin/one-file-install-exists', WOO_PLUGIN);
+  const php = exists ? readFileSync(WOO_PLUGIN, 'utf8') : '';
+  check(/Plugin Name:/.test(php) && /WooCommerce/i.test(php),
+    'woocommerce-plugin/wordpress-plugin-header-names-woocommerce');
+  check(php.includes("defined('ABSPATH')"), 'woocommerce-plugin/refuses-to-run-outside-wordpress');
+  check(php.includes('register_activation_hook('), 'woocommerce-plugin/mints-at-activation-hook');
+  check(php.includes('sodium_crypto_sign_detached') && php.includes('sodium_crypto_sign_seed_keypair'),
+    'woocommerce-plugin/signs-with-sodium');
+  check(exists && !/\b(?:require|include)(?:_once)?\b[^;]*(?:__DIR__|__FILE__|plugin_dir_path)/.test(php),
+    'woocommerce-plugin/one-file-no-sibling-includes');
+  check(exists && !php.includes('http://127.0.0.1') && !/\b(?:shell_exec|proc_open|passthru|popen)\s*\(/.test(php),
+    'woocommerce-plugin/no-hidden-sidecar');
+}
+
+check(findPhp('/nonexistent/agent-entry-no-php') === null,
+  'woocommerce-plugin/php-absent-is-detected-for-a-named-skip');
+
+{
+  const php = existsSync(WOO_PLUGIN) ? findPhp(process.env.AGENT_ENTRY_PHP || 'php') : null;
+  if (!existsSync(WOO_PLUGIN)) {
+    check(false, `${WOO_RUN}/plugin-file-missing`, 'examples/woocommerce-agent-entry.php does not exist');
+  } else if (!php) {
+    skipped.push(`${WOO_RUN} — php not found`);
+  } else if (!php.sodium) {
+    skipped.push(`${WOO_RUN} — php has no sodium extension`);
+  } else {
+    const dir = mkdtempSync(join(tmpdir(), 'agent-entry-woo-plugin-'));
+    const port = await freePort();
+    const origin = `http://127.0.0.1:${port}`;
+    const declaration = wooDeclaration(origin);
+    let fixtureOk = true;
+    try { validateDeclaration(declaration); } catch (error) {
+      fixtureOk = false;
+      check(false, `${WOO_RUN}/fixture-declaration-validates`, String(error?.message));
+    }
+    const statePath = join(dir, 'state.json');
+    const declarationText = JSON.stringify(declaration);
+    const freshState = () => JSON.stringify({
+      options: { [WOO_DECLARATION_OPTION]: Buffer.from(phpString(declarationText), 'utf8').toString('base64') },
+      transients: {},
+    });
+    writeFileSync(statePath, freshState());
+    const env = {
+      ...process.env, MAE_SHIM_PLUGIN: WOO_PLUGIN, MAE_SHIM_STATE: statePath, MAE_SHIM_HOME: origin,
+    };
+    let server = null;
+    try {
+      server = fixtureOk ? await startPhpServer(php, port, env) : null;
+      if (server) {
+        // Refusal: installed, not yet activated -- no seed, so no card and no signature.
+        const optionsBefore = readShimState(statePath).options;
+        for (const path of [AGENT_CARD_PATH, AGENT_CARD_PATH_LEGACY, AGENT_CARD_SIG_PATH]) {
+          const res = await getBytes(`${origin}${path}`);
+          const text = res.body.toString('utf8');
+          let parsed = null;
+          try { parsed = JSON.parse(text); } catch { /* not JSON: fine */ }
+          check(res.status !== 200, `${WOO_RUN}/before-activation/${path}/is-refused`,
+            `HTTP ${res.status} ${text.slice(0, 200)}`);
+          check(!text.includes('did:key:') && !(parsed && typeof parsed === 'object'
+              && ('sig' in parsed || 'card' in parsed || 'did' in parsed)),
+            `${WOO_RUN}/before-activation/${path}/serves-no-card-and-no-signature`, text.slice(0, 200));
+        }
+        const optionsAfter = readShimState(statePath).options;
+        check(JSON.stringify(optionsAfter) === JSON.stringify(optionsBefore),
+          `${WOO_RUN}/before-activation/a-request-mints-no-seed`,
+          `options ${JSON.stringify(Object.keys(optionsBefore))} -> ${JSON.stringify(Object.keys(optionsAfter))}`);
+
+        // Fresh activation mints and persists a seed.
+        const first = activate(php, env);
+        check(first.status === 0, `${WOO_RUN}/fresh-activation/exits-0`,
+          `status=${first.status} stderr=${String(first.stderr).slice(0, 300)}`);
+        const minted = readShimState(statePath);
+        check(seedCandidates(minted).length > 0, `${WOO_RUN}/fresh-activation/persists-a-seed`,
+          JSON.stringify(Object.keys(minted.options)));
+
+        const card = await getBytes(`${origin}${AGENT_CARD_PATH}`);
+        const legacy = await getBytes(`${origin}${AGENT_CARD_PATH_LEGACY}`);
+        const sig = await getBytes(`${origin}${AGENT_CARD_SIG_PATH}`);
+        check(card.status === 200 && sig.status === 200, `${WOO_RUN}/after-activation/card-and-signature-served`,
+          `card HTTP ${card.status}, sig HTTP ${sig.status}`);
+        check(/^application\/json\b/.test(String(card.headers.get('content-type')))
+            && /^application\/json\b/.test(String(sig.headers.get('content-type'))),
+          `${WOO_RUN}/after-activation/served-as-json`);
+        const cardJson = parseMaybe(card.body.toString('utf8'));
+        const sigJson = parseMaybe(sig.body.toString('utf8'));
+        const did = cardJson?.did;
+        const seedHex = seedCandidates(minted).find((s) => didFromSeedHex(s) === did) || null;
+        check(Boolean(seedHex), `${WOO_RUN}/after-activation/card-did-is-the-minted-seed`, String(did));
+        check(Boolean(did) && verifyCardEnvelope(sigJson, did) !== null,
+          `${WOO_RUN}/after-activation/signature-verifies-against-the-card-did`, sig.body.toString('utf8').slice(0, 200));
+        if (seedHex) {
+          const seedB64 = Buffer.from(seedHex, 'hex').toString('base64');
+          const served = `${card.body}${legacy.body}${sig.body}`;
+          check(!served.includes(seedHex) && !served.includes(seedB64),
+            `${WOO_RUN}/after-activation/the-seed-is-never-served`);
+
+          // Byte-identical to the Node door for the same declaration and seed.
+          const nodeCard = await nodeDoorBytes(seedHex, declaration, AGENT_CARD_PATH);
+          check(card.body.equals(nodeCard), `${WOO_RUN}/card-is-byte-identical-to-the-node-door`,
+            `php ${card.body.toString('utf8').slice(0, 300)} | node ${nodeCard.toString('utf8').slice(0, 300)}`);
+          check(legacy.status === 200 && legacy.body.equals(nodeCard),
+            `${WOO_RUN}/legacy-card-path-is-byte-identical-to-the-node-door`, `HTTP ${legacy.status}`);
+          const ts = sigJson?.ts;
+          check(Number.isSafeInteger(ts), `${WOO_RUN}/signature-ts-is-an-integer-epoch`, JSON.stringify(ts));
+          if (Number.isSafeInteger(ts)) {
+            const nodeSig = await nodeDoorBytes(seedHex, declaration, AGENT_CARD_SIG_PATH, ts);
+            check(sig.body.equals(nodeSig), `${WOO_RUN}/signature-is-byte-identical-to-the-node-door`,
+              `php ${sig.body.toString('utf8').slice(0, 300)} | node ${nodeSig.toString('utf8').slice(0, 300)}`);
+          }
+        }
+
+        // Already activated: a later activation keeps the seed it has.
+        const second = activate(php, env);
+        check(second.status === 0, `${WOO_RUN}/re-activation/exits-0`,
+          `status=${second.status} stderr=${String(second.stderr).slice(0, 300)}`);
+        const kept = readShimState(statePath);
+        check(JSON.stringify(seedCandidates(kept).sort()) === JSON.stringify(seedCandidates(minted).sort()),
+          `${WOO_RUN}/re-activation/does-not-re-mint-the-seed`);
+        const cardAgain = await getBytes(`${origin}${AGENT_CARD_PATH}`);
+        check(cardAgain.status === 200 && cardAgain.body.equals(card.body),
+          `${WOO_RUN}/re-activation/serves-the-same-card`, `HTTP ${cardAgain.status}`);
+
+        // A second install mints its own seed, not a constant.
+        const otherState = join(dir, 'state-other.json');
+        writeFileSync(otherState, freshState());
+        const other = activate(php, { ...env, MAE_SHIM_STATE: otherState });
+        const otherSeeds = seedCandidates(readShimState(otherState));
+        check(other.status === 0 && otherSeeds.length > 0 && Boolean(seedHex) && !otherSeeds.includes(seedHex),
+          `${WOO_RUN}/another-install-mints-another-seed`,
+          `status=${other.status} seeds=${otherSeeds.length}`);
+      }
+    } catch (error) {
+      check(false, `${WOO_RUN}/ran`, String(error?.stack || error));
+    } finally {
+      if (server) server.child.kill('SIGKILL');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+}
+
+for (const name of skipped) console.log(`SKIP ${name}`);
 
 if (failures.length) {
   console.error(`FAILED — ${failures.length} recipe check(s):`);
