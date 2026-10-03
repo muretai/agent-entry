@@ -71,6 +71,10 @@
 //                 GET /.well-known/muretai-catalog-claim.txt: 200 text/plain `muretai-catalog-claim=<code>`
 //                 (no trailing newline), 404 without a code, GET in OPTIONS' Allow once claimed. Any
 //                 other code is refused naming 32/hex, and nothing is written.
+//   publish --claim <code> --address <text> --contact-name <text> [--contact-email <text>] [--contact-phone <text>]
+//                 (claim-lookup chain item 1) shows the entered values, asks the claimant to confirm on stdin,
+//                 and only on yes writes them as entered into agent-entry.json `facts` with `facts_source`
+//                 naming each "claimant"; no network at all (section 13).
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, createPrivateKey, X509Certificate } from 'node:crypto';
 import { createServer } from 'node:http';
@@ -2928,6 +2932,323 @@ await section('publish-claim', async () => {
 
   const help = await runCli(['publish', '--help']);
   check(help.code === 0 && help.stdout.includes('--claim'), 'publish-claim/publish-help-names---claim', `exit ${help.code}`);
+});
+
+// ---------------------------------------------------------------- 13. publish --claim: address and human contact, confirmed
+//
+// WRITTEN BEFORE THE IMPLEMENTATION (test-first, skeleton item 1 of 5 of the claim-lookup chain,
+// intake 20261003T225243Z, parent intake 20261003T214139Z). The implementer may not edit this section.
+// This item adds STORAGE and the CONFIRMATION GATE only: no fetch, no normalisation, no geocoding,
+// no contact-page read (chain items 2-5). The facts keys are Woo-2's (1b0efb0), consumed as landed:
+// address, human_contact_name, human_contact_email, human_contact_phone.
+//
+// `publish --claim <code> --address <text> --contact-name <text> [--contact-email <text>]
+// [--contact-phone <text>]`, for a project `init --from woocommerce` wrote (a fixture Woo store) and
+// for a plain site's agent-entry.json alike:
+//   1. The human contact is checked first: a name (company or person), non-blank, AND at least one
+//      of email or phone, non-blank. Otherwise refused, exit 1, and the refusal names what is
+//      missing: human_contact_name for a missing name; human_contact_email and human_contact_phone
+//      for a contact with neither (the two refusals are not one generic message). Nothing written,
+//      and the claimant is never asked to confirm a refused contact.
+//   2. The entered values are SHOWN (stdout or stderr), escaped: a control character or a newline in
+//      a value is shown as its JSON escape (the value's JSON.stringify form, quotes aside), never raw.
+//   3. The claimant is asked to confirm, one line on stdin: `yes` (or `y`) confirms. Anything else,
+//      or stdin ending, declines: exit 1 and nothing written. Until the answer, the entered values
+//      are held pending, in memory: the project tree (agent-entry.json and the published files
+//      included) is byte for byte as before.
+//   4. On yes: agent-entry.json `facts` holds each entered value AS ENTERED (the same string: no
+//      trim, no case fold, no normalisation), as a JSON string; the declaration's other facts are
+//      unchanged; and `facts_source` (a top-level object beside `facts`, since a fact itself is a
+//      string by AT-1) maps each entered key to "claimant". No other facts key is invented. The
+//      claim code is recorded and the facts reach the published contract as today's publish does.
+// Entered values are data, never code: no shell, no eval; a `$(...)`, backticks or markup in a
+// value is stored as those characters and runs nothing. The whole flow dials NOTHING: every child
+// here also preloads fixtures/cli/no-dial.mjs (no socket, fetch, DNS or UDP, not even loopback),
+// and the fixture Woo store, still listening, is asked nothing.
+
+const NO_DIAL = join(FIX, 'no-dial.mjs');
+const CLAIMANT_KEYS = ['address', 'human_contact_name', 'human_contact_email', 'human_contact_phone'];
+const CLAIMANT_FLAGS = { address: '--address', human_contact_name: '--contact-name', human_contact_email: '--contact-email',
+  human_contact_phone: '--contact-phone' };
+const SHELLS = /(^|\/)(sh|bash|zsh|dash|ksh|cmd(\.exe)?|powershell(\.exe)?)$/i;
+const PAUSE_MS = 400;
+
+const claimantArgs = (entered) => Object.entries(entered).flatMap(([k, v]) => [CLAIMANT_FLAGS[k], v]);
+/** A value as the claimant must see it: its JSON escape, quotes aside (a plain value is itself). */
+const shownForm = (v) => JSON.stringify(v).slice(1, -1);
+const showsAll = (out, entered) => Object.values(entered).every((v) => out.includes(shownForm(v)));
+const pause = (ms) => new Promise((r) => { setTimeout(r, ms); });
+
+/** The bin with both guards preloaded and stdin held open: the caller reads what it shows, then answers. */
+function startClaimSession(args, { cwd, env = {}, timeout = 45000 } = {}) {
+  const log = join(tmp('ae-cli-guard-'), 'guard.jsonl');
+  const dialLog = join(tmp('ae-cli-nodial-'), 'no-dial.jsonl');
+  const child = spawn(process.execPath,
+    ['--import', pathToFileURL(GUARD).href, '--import', pathToFileURL(NO_DIAL).href, BIN, ...args], {
+      cwd, env: { ...baseEnv(HOME), ...env, AE_CLI_GUARD_LOG: log, AE_NO_DIAL_LOG: dialLog },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  let stdout = '';
+  let stderr = '';
+  let timedOut = false;
+  let ended = false;
+  const waiters = [];
+  const poke = () => {
+    for (const w of [...waiters]) if (w.test(stdout + stderr)) { waiters.splice(waiters.indexOf(w), 1); w.resolve(true); }
+  };
+  const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeout);
+  child.stdout.on('data', (c) => { stdout += c.toString('utf8'); poke(); });
+  child.stderr.on('data', (c) => { stderr += c.toString('utf8'); poke(); });
+  child.stdin.on('error', () => { /* the child stopped reading */ });
+  const rows = (p) => {
+    try { return readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; }
+  };
+  const closed = new Promise((resolveRun) => {
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      ended = true;
+      for (const w of waiters.splice(0)) w.resolve(false);
+      resolveRun({ code, signal, stdout, stderr, guard: rows(log), dial: rows(dialLog), timedOut });
+    });
+  });
+  return {
+    output: () => stdout + stderr,
+    waitFor(test, ms = 20000) {
+      return new Promise((resolveWait) => {
+        if (test(stdout + stderr)) { resolveWait(true); return; }
+        if (ended) { resolveWait(false); return; }
+        const w = { test, resolve: resolveWait };
+        waiters.push(w);
+        setTimeout(() => { const i = waiters.indexOf(w); if (i !== -1) { waiters.splice(i, 1); resolveWait(false); } }, ms);
+      });
+    },
+    answer(text) { child.stdin.end(text); },
+    closed,
+  };
+}
+
+/** Nothing dialled (not even loopback), nothing run through a shell, no entered value on a child's command line. */
+function claimStayedHome(label, run, entered = {}) {
+  check(run.guard.some((r) => r.kind === 'loaded'), `${label}/loopback-guard-loaded`);
+  check(run.dial.some((r) => r.kind === 'loaded'), `${label}/no-dial-guard-loaded`, 'fixtures/cli/no-dial.mjs did not load');
+  const dialled = run.dial.filter((r) => r.kind !== 'loaded');
+  check(dialled.length === 0, `${label}/no-network-request-of-any-kind`, JSON.stringify(dialled.slice(0, 3)));
+  const nets = run.guard.filter((r) => r.kind === 'connect' || r.kind === 'fetch');
+  check(nets.length === 0, `${label}/no-connect-no-fetch`, JSON.stringify(nets.slice(0, 3)));
+  const spawns = run.guard.filter((r) => r.kind === 'spawn');
+  check(!spawns.some((r) => SHELLS.test(r.command)), `${label}/no-shell-spawned`, JSON.stringify(spawns.slice(0, 3)));
+  const values = Object.values(entered).filter((v) => v.trim() !== '');
+  check(!spawns.some((r) => values.some((v) => `${r.command} ${r.args.join(' ')}`.includes(v))),
+    `${label}/no-entered-value-on-a-child-command-line`, JSON.stringify(spawns.slice(0, 3)));
+  check(!run.timedOut, `${label}/finished`, 'timed out');
+}
+
+/** A plain site: the Vite fixture with a declaration that has no facts, published once. */
+async function plainClaimProject() {
+  const dir = makePublishProject(DECL_V1);
+  const pub = await runCli(['publish'], { cwd: dir });
+  check(pub.code === 0, 'claim-contact/setup-plain-publish', `exit ${pub.code}: ${pub.stderr.slice(0, 300)}`);
+  return dir;
+}
+
+/** A Woo project: `init --from woocommerce` against the fixture store with Woo-2's facts file, then published once. */
+async function wooClaimProject(store) {
+  const dir = makeRepo('vite');
+  const init = await runCli(['init', '--from', 'woocommerce', store.origin, '--facts', WOO_FACTS_FILE], { cwd: dir, env: WOO_ENV });
+  check(init.code === 0, 'claim-contact/setup-woo-init', `exit ${init.code}: ${init.stderr.slice(0, 300)}`);
+  writeFileSync(join(dir, '.env'), `AGENT_ENTRY_SEED_HEX=${PUBLISH_SEED}\n`);
+  const pub = await runCli(['publish'], { cwd: dir });
+  check(pub.code === 0, 'claim-contact/setup-woo-publish', `exit ${pub.code}: ${pub.stderr.slice(0, 300)}`);
+  return dir;
+}
+
+const readDecl = (dir) => { try { return JSON.parse(readFileSync(join(dir, 'agent-entry.json'), 'utf8')); } catch { return null; } };
+
+/** One confirmed claim: shown, pending (nothing written), then yes; every storage pin checked. */
+async function claimConfirmed(label, dir, entered, { store = null, home = null } = {}) {
+  const beforeTree = treeState(dir);
+  const beforeDecl = readDecl(dir);
+  const priorFacts = { ...(beforeDecl?.facts ?? {}) };
+  const hitsBefore = store ? store.hits.length : 0;
+  const homeBefore = home ? treeState(home) : null;
+  const session = startClaimSession(['publish', '--claim', CLAIM_CODE, ...claimantArgs(entered)], {
+    cwd: dir, env: home ? { HOME: home } : {} });
+
+  const shown = await session.waitFor((out) => showsAll(out, entered));
+  check(shown, `${label}/shows-the-entered-values-before-asking`, JSON.stringify(session.output().slice(0, 600)));
+  await pause(PAUSE_MS);
+  const pending = stateDiff(beforeTree, treeState(dir));
+  check(pending.length === 0, `${label}/nothing-written-before-confirmation`, JSON.stringify(pending.slice(0, 10)));
+  const midFacts = readDecl(dir)?.facts ?? {};
+  check(!Object.entries(entered).some(([k, v]) => midFacts[k] === v && priorFacts[k] !== v),
+    `${label}/facts-read-before-confirmation-do-not-show-the-entered-values`, JSON.stringify(midFacts).slice(0, 400));
+
+  session.answer('yes\n');
+  const run = await session.closed;
+  claimStayedHome(label, run, entered);
+  if (store) check(store.hits.length === hitsBefore, `${label}/the-store-is-asked-nothing`, JSON.stringify(store.hits.slice(hitsBefore)));
+  if (!check(run.code === 0, `${label}/exit-0-after-yes`, `exit ${run.code}; stdout ${run.stdout.slice(0, 300)}; stderr ${run.stderr.slice(0, 400)}`)) {
+    return null;
+  }
+  const decl = readDecl(dir);
+  if (!check(decl !== null, `${label}/agent-entry.json-is-json`)) return null;
+  try { validateDeclaration(decl); passed += 1; } catch (e) { check(false, `${label}/declaration-validates`, e.message); }
+  const facts = decl.facts ?? {};
+  const source = decl.facts_source ?? null;
+  for (const [k, v] of Object.entries(entered)) {
+    check(typeof facts[k] === 'string' && facts[k] === v, `${label}/facts.${k}-stored-as-entered`,
+      `${JSON.stringify(facts[k])} vs entered ${JSON.stringify(v)}`);
+    check(source !== null && typeof source === 'object' && source[k] === 'claimant', `${label}/facts_source.${k}-is-claimant`,
+      JSON.stringify(source));
+  }
+  check(Object.keys(facts).every((k) => CLAIMANT_KEYS.includes(k) || Object.hasOwn(priorFacts, k)),
+    `${label}/no-facts-key-invented`, JSON.stringify(Object.keys(facts)));
+  check(source === null || Object.keys(source).every((k) => CLAIMANT_KEYS.includes(k)), `${label}/facts_source-names-only-the-claimant-keys`,
+    JSON.stringify(source));
+  for (const [k, v] of Object.entries(priorFacts)) {
+    if (CLAIMANT_KEYS.includes(k)) continue;
+    check(facts[k] === v, `${label}/other-fact-${k}-unchanged`, `${JSON.stringify(facts[k])} vs ${JSON.stringify(v)}`);
+  }
+  check(decl.entry?.claim === CLAIM_CODE, `${label}/claim-code-recorded`, JSON.stringify(decl.entry));
+  // The entered strings reach the contract and the published file as JSON strings, byte for byte.
+  try {
+    const contract = compileDeclaration(clone(decl), { version: 1 });
+    check(Object.entries(entered).every(([k, v]) => contract.facts?.[k] === v), `${label}/contract-facts-carry-the-entered-strings`,
+      JSON.stringify(contract.facts).slice(0, 400));
+  } catch (e) { check(false, `${label}/declaration-compiles`, e.message); }
+  const published = readText(join(WELL_KNOWN(dir), 'agent-tools.json'));
+  let publishedFacts = null;
+  try { publishedFacts = JSON.parse(published).facts; } catch { /* checked below */ }
+  check(publishedFacts !== null && Object.entries(entered).every(([k, v]) => publishedFacts?.[k] === v),
+    `${label}/published-agent-tools.json-carries-the-entered-strings`, String(published).slice(0, 400));
+  if (homeBefore) {
+    const homeDiff = stateDiff(homeBefore, treeState(home)).filter((p) => /pwned/i.test(p));
+    check(homeDiff.length === 0, `${label}/nothing-ran-in-home`, JSON.stringify(homeDiff));
+  }
+  return { run, decl };
+}
+
+/** One declined or refused claim: nonzero (1), nothing written anywhere in the project, nothing dialled. */
+async function claimNotWritten(label, dir, entered, { answer = 'yes\n', waitShown = false, store = null } = {}) {
+  const beforeTree = treeState(dir);
+  const hitsBefore = store ? store.hits.length : 0;
+  const session = startClaimSession(['publish', '--claim', CLAIM_CODE, ...claimantArgs(entered)], { cwd: dir });
+  if (waitShown) {
+    const shown = await session.waitFor((out) => showsAll(out, entered));
+    check(shown, `${label}/shows-the-entered-values-before-asking`, JSON.stringify(session.output().slice(0, 600)));
+  }
+  session.answer(answer);
+  const run = await session.closed;
+  claimStayedHome(label, run, entered);
+  if (store) check(store.hits.length === hitsBefore, `${label}/the-store-is-asked-nothing`, JSON.stringify(store.hits.slice(hitsBefore)));
+  check(run.code === 1, `${label}/exit-1`, `exit ${run.code}; stdout ${run.stdout.slice(0, 300)}; stderr ${run.stderr.slice(0, 300)}`);
+  const diff = stateDiff(beforeTree, treeState(dir));
+  check(diff.length === 0, `${label}/writes-nothing`, JSON.stringify(diff.slice(0, 10)));
+  check(!run.stdout.includes('_muretai-catalog.'), `${label}/prints-no-dns-line`, run.stdout.slice(0, 200));
+  return run;
+}
+
+await section('claim-contact', async () => {
+  const ADDRESS = 'Unit 4,  12 Quay Street, Harbor Town  HT1 2AB';           // two double spaces: kept, never normalised
+  const NAME = 'Harbor Lamp Ltd.';
+  const EMAIL = 'Claims@Harbor-Lamp.example';                               // mixed case: kept, never folded
+  const PHONE = '+44 (0)20 7946-0001';
+
+  // ---- functional: a fixture Woo store (the project `init --from woocommerce` wrote).
+  const store = await startStore(wooStore(wooPage));
+  try {
+    for (const [tag, entered] of [
+      ['name-and-email', { address: ADDRESS, human_contact_name: NAME, human_contact_email: EMAIL }],
+      ['name-and-phone', { address: ADDRESS, human_contact_name: 'Ada Quay', human_contact_phone: PHONE }],
+    ]) {
+      const dir = await wooClaimProject(store);
+      await claimConfirmed(`claim-contact/woo/${tag}`, dir, entered, { store });
+    }
+
+    // Woo refusals and a Woo decline: the store, still listening, is asked nothing.
+    {
+      const dir = await wooClaimProject(store);
+      const run = await claimNotWritten('claim-contact/woo/refused-no-name', dir,
+        { address: ADDRESS, human_contact_email: EMAIL }, { store });
+      check(run.stderr.includes('human_contact_name'), 'claim-contact/woo/refused-no-name/names-human_contact_name',
+        JSON.stringify(run.stderr.slice(0, 400)));
+      await claimNotWritten('claim-contact/woo/declined', dir,
+        { address: ADDRESS, human_contact_name: NAME, human_contact_email: EMAIL }, { answer: 'no\n', waitShown: true, store });
+    }
+  } finally { await store.close(); }
+
+  // ---- functional: a plain site (no Woo adapter, no facts before the claim).
+  for (const [tag, entered] of [
+    ['name-and-email', { address: ADDRESS, human_contact_name: NAME, human_contact_email: EMAIL }],
+    ['name-and-phone', { address: ADDRESS, human_contact_name: 'Ada Quay', human_contact_phone: PHONE }],
+    ['name-email-and-phone', { address: 'Kaiserstraße 7, 60311 Frankfurt am Main', human_contact_name: NAME,
+      human_contact_email: EMAIL, human_contact_phone: PHONE }],
+  ]) {
+    const dir = await plainClaimProject();
+    await claimConfirmed(`claim-contact/plain/${tag}`, dir, entered);
+  }
+
+  // ---- data, never code: shell, script and markup in the entered values are stored as characters.
+  {
+    const label = 'claim-contact/plain/entered-values-are-data';
+    const dir = await plainClaimProject();
+    const home = tmp('ae-cli-claim-home-');
+    writeFileSync(join(home, '.gitconfig-empty'), '');
+    const entered = {
+      address: '12 Quay St.\nINJECTED-LINE \u001b[2J$(touch PWNED-ADDR) `touch PWNED-TICK` <script>alert(1)</script> "; process.exit(7); //',
+      human_contact_name: 'Ada <img src=x onerror=alert(1)> & Co; touch PWNED-NAME',
+      human_contact_email: "ada@harbor-lamp.example'; require('child_process').execSync('touch PWNED-EVAL'); '",
+      human_contact_phone: '+44 20 7946 0000 && touch PWNED-PHONE | ${HOME}',
+    };
+    const out = await claimConfirmed(label, dir, entered, { home });
+    const pwned = [...walk(dir), ...walk(home)].filter((p) => /pwned/i.test(p));
+    check(pwned.length === 0, `${label}/nothing-in-a-value-ran`, JSON.stringify(pwned));
+    if (out) {
+      const said = `${out.run.stdout}${out.run.stderr}`;
+      check(!said.includes('\u001b'), `${label}/control-character-never-shown-raw`, JSON.stringify(said.slice(0, 400)));
+      check(!said.split(/\r?\n/).some((l) => l.trimStart().startsWith('INJECTED-LINE')), `${label}/newline-in-a-value-never-starts-a-line`,
+        JSON.stringify(said.slice(0, 400)));
+      check(said.includes(shownForm(entered.address)), `${label}/address-shown-json-escaped`, JSON.stringify(said.slice(0, 400)));
+    }
+  }
+
+  // ---- the gate: declining, or stdin ending, writes nothing.
+  {
+    const entered = { address: ADDRESS, human_contact_name: NAME, human_contact_email: EMAIL };
+    for (const [tag, answer] of [['no', 'no\n'], ['empty-line', '\n'], ['not-a-yes', 'yess\n'], ['stdin-ends', '']]) {
+      const dir = await plainClaimProject();
+      await claimNotWritten(`claim-contact/plain/declined-${tag}`, dir, entered, { answer, waitShown: answer !== '' });
+    }
+  }
+
+  // ---- refusals: the human contact, each named by what is missing, before any confirmation.
+  const refusals = {};
+  for (const [tag, entered, names] of [
+    ['no-name-email-given', { address: ADDRESS, human_contact_email: EMAIL }, ['human_contact_name']],
+    ['no-name-phone-given', { address: ADDRESS, human_contact_phone: PHONE }, ['human_contact_name']],
+    ['no-name-both-given', { address: ADDRESS, human_contact_email: EMAIL, human_contact_phone: PHONE }, ['human_contact_name']],
+    ['blank-name', { address: ADDRESS, human_contact_name: '   ', human_contact_email: EMAIL }, ['human_contact_name']],
+    ['neither-email-nor-phone', { address: ADDRESS, human_contact_name: NAME }, ['human_contact_email', 'human_contact_phone']],
+    ['blank-email-and-phone', { address: ADDRESS, human_contact_name: NAME, human_contact_email: '', human_contact_phone: ' ' },
+      ['human_contact_email', 'human_contact_phone']],
+    ['no-contact-at-all', { address: ADDRESS }, ['human_contact_name', 'human_contact_email', 'human_contact_phone']],
+  ]) {
+    const label = `claim-contact/plain/refused-${tag}`;
+    const dir = await plainClaimProject();
+    // A `yes` already waiting on stdin must not carry a refused contact through.
+    const run = await claimNotWritten(label, dir, entered, { answer: 'yes\n' });
+    for (const name of names) {
+      check(run.stderr.includes(name), `${label}/refusal-names-${name}`, JSON.stringify(run.stderr.slice(0, 400)));
+    }
+    refusals[tag] = run.stderr;
+  }
+  check(typeof refusals['no-name-email-given'] === 'string' && refusals['no-name-email-given'] !== refusals['neither-email-nor-phone'],
+    'claim-contact/refusals/missing-name-and-missing-email-and-phone-are-told-apart',
+    JSON.stringify([refusals['no-name-email-given'], refusals['neither-email-nor-phone']].map((s) => String(s).slice(0, 200))));
+
+  const help = await runCli(['publish', '--help']);
+  check(help.code === 0 && ['--address', '--contact-name', '--contact-email', '--contact-phone'].every((f) => help.stdout.includes(f)),
+    'claim-contact/publish-help-names-the-claimant-flags', `exit ${help.code}`);
 });
 
 // ---------------------------------------------------------------- the runner itself never dialled out
