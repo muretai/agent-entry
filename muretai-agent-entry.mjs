@@ -7529,20 +7529,47 @@ async function doctorMain(argv) {
 
 // ------------------------------------------ counts
 
+const LOG_ROW_KEYS = new Set(['t', ...SINK_FIELDS]);
+const isVendor = (v) => typeof v === 'string' && VENDOR_INDEX.has(v);
+
+/** A row fileSink could have written: a JSON object of `t` plus SINK_FIELDS keys, with no
+ *  string value that starts with `did:`. Anything else is dropped before it is counted. */
+const isSinkRow = (e) => isPlainObject(e)
+  && Object.keys(e).every((k) => LOG_ROW_KEYS.has(k) && !(typeof e[k] === 'string' && e[k].startsWith('did:')));
+
 /** The counts (AT-25) from fileSink lines and a createFileStore file. Keyed by offer id; the
- *  only thing read from the store is how many accounts wrote twice or more. */
-function tallyCounts(lines, accounts) {
+ *  only thing read from the store is how many accounts wrote twice or more. `coverage` says
+ *  which stretch of the log was read and how many rows the allowlist dropped; `who` sorts door
+ *  knocks into the signed / declared / network tiers (independent: one knock counts in every
+ *  tier it carries evidence for), and a knock in no tier into stealth-agent or none. Keys come
+ *  only from VENDORS and AI_AGENT_FAMILIES, never from a log value. */
+function tallyCounts(lines, accounts, storePresent) {
   const offers = new Map();
   const referrals = new Map();
   const byStage = new Map();
   const byClass = new Map();
+  const signed = new Map();
+  const declared = new Map();
+  const network = new Map();
+  let stealth = 0;
+  let none = 0;
+  let dropped = 0;
+  let from = null;
+  let to = null;
+  let last = null;
   const bump = (map, key) => map.set(key, (map.get(key) || 0) + 1);
   const row = (id) => {
     if (!offers.has(id)) offers.set(id, { page_asked: 0, door_asked: 0, completed: 0, receipts: 0 });
     return offers.get(id);
   };
   for (const e of lines) {
-    if (!isPlainObject(e)) continue;
+    if (!isSinkRow(e)) { dropped += 1; continue; }
+    // Only a `t` a Date can hold moves the range: toISOString throws past ±8.64e15 ms.
+    if (typeof e.t === 'number' && Math.abs(e.t) <= 8.64e12) {
+      if (from === null || e.t < from) from = e.t;
+      if (to === null || e.t > to) to = e.t;
+      last = e.t;
+    }
     const offer = typeof e.offer === 'string' && SINK_TOKEN.test(e.offer) ? e.offer : null;
     if (e.stage === 'page') {
       if (e.event === 'referral' && typeof e.engine === 'string' && REFERRAL_ENGINES.includes(e.engine)) bump(referrals, e.engine);
@@ -7553,6 +7580,14 @@ function tallyCounts(lines, accounts) {
     if (!DOOR_STAGES.has(e.stage)) continue;
     bump(byStage, e.stage);
     bump(byClass, typeof e.client_class === 'string' && CLIENT_CLASSES.has(e.client_class) ? e.client_class : 'unknown');
+    let tiers = 0;
+    if (isVendor(e.signature_agent)) { bump(signed, e.signature_agent); tiers += 1; }
+    if (typeof e.ua_family === 'string' && AI_AGENT_FAMILIES.has(e.ua_family)) { bump(declared, e.ua_family); tiers += 1; }
+    if (isVendor(e.ip_vendor)) { bump(network, e.ip_vendor); tiers += 1; }
+    if (tiers === 0) {
+      if (e.client_class === 'stealth-agent') stealth += 1;
+      else none += 1;
+    }
     if (offer && e.stage !== 'refused_post') {
       const r = row(offer);
       r.door_asked += 1;
@@ -7562,8 +7597,14 @@ function tallyCounts(lines, accounts) {
     }
   }
   const returning = accounts.filter((a) => Array.isArray(a) && isPlainObject(a[1]) && Number(a[1].messages) >= 2).length;
-  return { offers: Object.fromEntries(offers), referrals: Object.fromEntries(referrals), returning_customers: returning,
-    knocks: { by_stage: Object.fromEntries(byStage), by_class: Object.fromEntries(byClass) } };
+  const when = (t) => (t === null ? null : new Date(t * 1000).toISOString());
+  return {
+    coverage: { from: when(from), to: when(to), last_event: when(last), store_present: storePresent, rows_dropped: dropped },
+    offers: Object.fromEntries(offers), referrals: Object.fromEntries(referrals), returning_customers: returning,
+    knocks: { by_stage: Object.fromEntries(byStage), by_class: Object.fromEntries(byClass) },
+    who: { signed: Object.fromEntries(signed), declared: Object.fromEntries(declared), network: Object.fromEntries(network),
+      'stealth-agent': stealth, none },
+  };
 }
 
 function readCounts(logPath, storePath) {
@@ -7576,7 +7617,7 @@ function readCounts(logPath, storePath) {
     if (!existsSync(storePath)) throw new CliRefusal(`no store at ${storePath}: pass the file createFileStore(path) writes`);
     try { accounts = readJsonFile(storePath).accounts || []; } catch (e) { throw new CliRefusal(`the store is not readable: ${shortError(e)}`); }
   }
-  return tallyCounts(lines, Array.isArray(accounts) ? accounts : []);
+  return tallyCounts(lines, Array.isArray(accounts) ? accounts : [], storePath !== null);
 }
 
 function countsText(c) {
