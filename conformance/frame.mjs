@@ -19,6 +19,8 @@
 //        the facts file as `facts` (FACT_KEYS below), and an offer of verb `ask` answered at the door by
 //        `facts`. It reads only the store's public Store API (and robots.txt). Refusals: a store
 //        that is not https (Woo-1, landed 49930bf) and an incomplete facts file write nothing.
+//   1b Woo-3 (on 20261003T001757Z)   that same init reads BOTH pages of the shop's two-page Store API
+//        (page 1, then ?page=2, each once) and never a page past x-wp-totalpages.
 //   2 the door (Suite S1, landed) started from that declaration serves the card and its signature,
 //        /.well-known/agent-tools.json and /.well-known/agent-tools.sig.json, all verifying.
 //   3 Claim-2 (20261003T131709Z-2)   `publish --claim <32 lowercase hex>` records the code in the
@@ -243,6 +245,7 @@ const state = {
   project: null,          // the shop's project directory (init / publish / decide run here)
   dataDir: null,          // the fileSink log and the file store
   declaration: null,      // what step 1 left in agent-entry.json (or the stand-in)
+  initHits: null,         // what step 1's init asked the shop, in order
   receiptFile: null,      // step 4's hold reply, for decide
   hold: null,             // step 4's parsed hold reply
   customer: null,         // the customer's own door (step 5)
@@ -374,6 +377,7 @@ after(async () => {
 test('frame 1 [Woo-2 20261003T001757Z]: init --from woocommerce <store> --facts <file> writes agent-entry.json with an ask offer', async () => {
   const before1 = state.hits.length;
   const run = await runCli(['init', '--from', 'woocommerce', state.shop.origin, '--facts', FACTS_FILE], { cwd: state.project });
+  state.initHits = state.hits.slice(before1);
   assertStayedHome(run, 'init --from woocommerce');
   assert.equal(run.code, 0, `init --from woocommerce must succeed on a reachable https Store API: ${said(run)}`);
   const path = join(state.project, 'agent-entry.json');
@@ -394,6 +398,15 @@ test('frame 1 [Woo-2 20261003T001757Z]: init --from woocommerce <store> --facts 
   assert.deepEqual(asked.filter((p) => p !== WOO_PRODUCTS && p !== '/robots.txt'), [],
     'init reads the public Store API (and robots.txt) only');
   assert.ok(!`${run.stdout}${run.stderr}`.includes(shopSeed()), 'the seed is never printed');
+});
+
+test('frame 1b [Woo-3 on 20261003T001757Z]: init reads both pages of the two-page Store API, each once, and no more', () => {
+  assert.ok(state.initHits, 'step 1 never ran init');
+  const pages = state.initHits
+    .map((h) => new URL(h.url, 'https://x.invalid'))
+    .filter((u) => u.pathname.replace(/\/$/, '') === WOO_PRODUCTS)
+    .map((u) => Number(u.searchParams.get('page') ?? '1'));
+  assert.deepEqual(pages, [1, 2], `init reads page 1 then page 2 of a store reporting x-wp-totalpages ${PAGES.length}: ${JSON.stringify(pages)}`);
 });
 
 test('frame 1 refusals [Woo-1 landed 49930bf, Woo-2]: a non-https store and an incomplete facts file write nothing', async () => {

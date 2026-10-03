@@ -55,6 +55,10 @@
 //                 Store API page, writes agent-entry.json with one `ask` offer answered from the facts
 //                 (file, or prompted one per line); a facts file without the human contact
 //                 (human_contact_name + human_contact_email|phone) is refused by name before any request.
+//   init --from woocommerce <store-url> [--max-pages <n>] [--max-bytes <n>]  (Woo chain item 3) walks the
+//                 Store API pages 1..n in order, each asked once, never past x-wp-totalpages, never off
+//                 the store's host; --json -> { ..., products: <count over every page read>, pages: <n>,
+//                 stopped: null | "page-bound" | "byte-bound" }: a bound that ends the walk is named.
 //   publish --claim <32 lowercase hex>  (FRAME Claim-2) records the code in agent-entry.json, prints
 //                 `_muretai-catalog.<host> TXT muretai-catalog-claim=<code>`, and the door serves
 //                 GET /.well-known/muretai-catalog-claim.txt: 200 text/plain `muretai-catalog-claim=<code>`
@@ -1823,6 +1827,331 @@ await section('woo-ask', async () => {
 
   const help = await runCli(['init', '--help']);
   check(help.code === 0 && help.stdout.includes('--facts'), 'woo-ask/init-help-names---facts', `exit ${help.code}`);
+});
+
+// ---------------------------------------------------------------- 11c. init --from woocommerce: paging within bounds
+//
+// WRITTEN BEFORE THE IMPLEMENTATION (test-first, skeleton item 3 of 6 of the Woo declaration
+// generator chain, Woo-3; parent intake 20261003T001757Z: public Store API only, bounded, robots.txt
+// respected; owner answer 20261003T214138Z: both pages of a two-page store are read). The
+// implementer may not edit this section. Woo-2's pins above (robots.txt first, a disallow honoured,
+// one page on a one-page store) stand as they are and are not repeated here; Woo-1's refusals are
+// untouched.
+//
+// `init --from woocommerce <store>` walks the public Store API products path page by page: page 1
+// (with or without ?page=1), then ?page=2, ... in order, each page asked ONCE, and stops at the
+// first of:
+//   the store's last page    x-wp-totalpages on the answers. A page past it is never asked, even
+//                            when the page bound would allow it and the store would answer it.
+//   the page bound           --max-pages <n> (a positive integer); its default is named in README.md
+//                            on a line carrying `--max-pages`, the word `default` and the number.
+//   the byte bound           --max-bytes <n> (a positive integer): the most body bytes read over
+//                            every page together; its default is named in README.md the same way
+//                            (`--max-bytes`, `default`, the number). The walk never reads past it: once
+//                            the pages read add up to the bound, no further page is asked. A FIRST
+//                            page past it is Woo-1's too-large refusal, unchanged.
+// A walk that a bound ends says so by name: --json carries `stopped: "page-bound"` or
+// `stopped: "byte-bound"` (null when the store's last page was read), and the text output names
+// "page bound" / "byte bound". Never a silent truncation. --json also carries `pages` (the pages read)
+// and `products` (the products over every page read).
+// Refusals and bounds:
+//   another host     every request goes to the host robots.txt was read from: a redirect to another
+//                    host is refused (exit 1, nothing written) and not followed; a Link: rel="next"
+//                    naming another host is never asked.
+//   no retry storm   a page that fails (5xx, 429/503 with Retry-After: 0, a reset mid-body, a stall)
+//                    is asked once; no later page is asked after it, and the outcome names it.
+//   misuse           --max-pages / --max-bytes that are not positive integers, or given without
+//                    --from woocommerce, are misuse (exit 2, the flag named), before any request.
+// The stores are recorded fixtures served on 127.0.0.1: the frame's two-page Store API
+// (fixtures/frame/store-api-products-page-{1,2}.json) and fixtures/cli/woo/products-page.json's three
+// products served one per page. Never a live store.
+
+const FRAME_FIX = join(HERE, 'fixtures', 'frame');
+const TWO_PAGES = [readFileSync(join(FRAME_FIX, 'store-api-products-page-1.json')),
+  readFileSync(join(FRAME_FIX, 'store-api-products-page-2.json'))];
+const TWO_PAGE_PRODUCTS = TWO_PAGES.reduce((n, b) => n + JSON.parse(b.toString('utf8')).length, 0);
+const ONE_PER_PAGE = JSON.parse(WOO_PAGE.toString('utf8')).map((p) => Buffer.from(JSON.stringify([p])));
+const BOUND_NAME = { 'page-bound': /page[- ]bound/i, 'byte-bound': /byte[- ]bound/i };
+
+/** The page number a products request asked for (no ?page= is page 1). */
+const pageOf = (h) => Number(new URL(h.url, 'https://x.invalid').searchParams.get('page') ?? '1');
+const pagesAsked = (hits) => productsHits(hits).map(pageOf);
+const range = (n) => Array.from({ length: n }, (_, i) => i + 1);
+
+/** A paged Store API: `pages` are bodies, x-wp-totalpages says `totalPages`, and every page up to
+ *  `serve` (default: all of them, even past totalPages) is answered. `onPage` may take a request over. */
+function pagedProducts(pages, { totalPages = pages.length, serve = pages.length, body = (n) => pages[n - 1], onPage = null, extra = {} } = {}) {
+  return (req, res) => {
+    const n = Number(new URL(req.url, 'https://x.invalid').searchParams.get('page') ?? '1');
+    if (onPage && onPage(n, req, res)) return;
+    const headers = { ...WOO_JSON, 'x-wp-total': String(serve), 'x-wp-totalpages': String(totalPages), ...extra };
+    if (!Number.isInteger(n) || n < 1 || n > serve) {
+      res.writeHead(400, headers);
+      res.end(JSON.stringify({ code: 'rest_invalid_param', message: 'Invalid parameter(s): page', data: { status: 400 } }));
+      return;
+    }
+    const bytes = body(n);
+    res.writeHead(200, { ...headers, 'content-length': String(bytes.length) });
+    res.end(bytes);
+  };
+}
+
+/** The integer README.md names as `flag`'s default, from the line carrying the flag and `default`. */
+function readmeDefault(flag) {
+  const line = readFileSync(join(ROOT, 'README.md'), 'utf8').split('\n').find((l) => l.includes(flag) && /default/i.test(l));
+  const m = line ? line.split(flag).join(' ').replace(/(\d),(?=\d{3}\b)/g, '$1').match(/\b(\d+)\b/) : null;
+  return m ? Number(m[1]) : null;
+}
+
+await section('woo-pages', async () => {
+  /** One init against `store` with the shared facts file; nothing about the outcome checked yet. */
+  async function initWalk(label, store, { extra = [], json = true, timeout = 60000 } = {}) {
+    const dir = makeRepo('vite');
+    const home = tmp('ae-cli-woo-home-');
+    const before = { tree: treeState(dir), home: treeState(home), hits: store.hits.length };
+    const args = ['init', '--from', 'woocommerce', store.origin, '--facts', WOO_FACTS_FILE, ...(json ? ['--json'] : []), ...extra];
+    const run = await runCli(args, { cwd: dir, env: { ...WOO_ENV, HOME: home }, timeout });
+    guardClean(label, run, { onlyPort: store.port });
+    const hits = store.hits.slice(before.hits);
+    const unwritten = () => {
+      const tree = stateDiff(before.tree, treeState(dir));
+      check(tree.length === 0, `${label}/writes-nothing-in-the-project`, JSON.stringify(tree.slice(0, 10)));
+      const homeDiff = stateDiff(before.home, treeState(home));
+      check(homeDiff.length === 0, `${label}/writes-nothing-in-home`, JSON.stringify(homeDiff.slice(0, 10)));
+      check(!existsSync(join(dir, 'agent-entry.json')), `${label}/no-agent-entry.json`);
+    };
+    return { run, dir, hits, pages: pagesAsked(hits), unwritten };
+  }
+
+  /** A walk that must succeed: exit 0, a valid declaration, robots.txt first, the pages in order. */
+  async function walked(label, store, { pages, products = null, stopped, extra = [], atMostOnce = [] }) {
+    const w = await initWalk(label, store, { extra });
+    if (!check(w.run.code === 0, `${label}/exit-0`, `exit ${w.run.code}; stdout ${w.run.stdout.slice(0, 300)}; stderr ${w.run.stderr.slice(0, 400)}`)) return w;
+    const path = join(w.dir, 'agent-entry.json');
+    if (check(existsSync(path), `${label}/wrote-agent-entry.json`)) {
+      let ok = true;
+      try { validateDeclaration(readJson(path)); } catch (error) { ok = false; check(false, `${label}/declaration-validates`, String(error?.message || error)); }
+      if (ok) check(true, `${label}/declaration-validates`);
+    }
+    const robotsAt = w.hits.findIndex((h) => pathOf(h) === '/robots.txt');
+    const productsAt = w.hits.findIndex((h) => pathOf(h) === WOO_PRODUCTS);
+    check(robotsAt !== -1 && robotsAt < productsAt, `${label}/robots.txt-still-read-first`, JSON.stringify(w.hits));
+    check(productsHits(w.hits).every((h) => h.method === 'GET'), `${label}/pages-are-GETs`, JSON.stringify(w.hits));
+    // `pages` are the pages that must be asked, once each and in order; `atMostOnce` may follow them.
+    const head = w.pages.slice(0, pages.length);
+    const tail = w.pages.slice(pages.length);
+    check(JSON.stringify(head) === JSON.stringify(pages) && tail.every((p) => atMostOnce.includes(p))
+      && new Set(tail).size === tail.length, `${label}/asks-pages-${pages.join('-')}-in-order-once-each`, JSON.stringify(w.pages));
+    const out = parseJsonOut(label, w.run);
+    if (out) {
+      check(out.stopped === stopped, `${label}/stopped-${stopped ?? 'null'}`, JSON.stringify(out));
+      if (atMostOnce.length === 0) check(out.pages === pages.length, `${label}/json-pages-${pages.length}`, JSON.stringify(out));
+      if (products !== null) check(out.products === products, `${label}/json-products-${products}`, JSON.stringify(out));
+    }
+    return w;
+  }
+
+  // (0) The bounds are documented: README names each default, init --help names each flag.
+  const defaultPages = readmeDefault('--max-pages');
+  check(Number.isInteger(defaultPages) && defaultPages >= 2, 'woo-pages/readme-names-the---max-pages-default',
+    `read ${defaultPages}; a README line with \`--max-pages\`, \`default\` and the number (at least 2: the frame's store has two pages)`);
+  const defaultBytes = readmeDefault('--max-bytes');
+  check(Number.isInteger(defaultBytes) && defaultBytes > 0, 'woo-pages/readme-names-the---max-bytes-default',
+    `read ${defaultBytes}; a README line with \`--max-bytes\`, \`default\` and the number`);
+  const help = await runCli(['init', '--help']);
+  check(help.code === 0 && help.stdout.includes('--max-pages') && help.stdout.includes('--max-bytes'),
+    'woo-pages/init-help-names---max-pages-and---max-bytes', `exit ${help.code}`);
+
+  // (1) The recorded two-page store: both pages read, the products of both counted.
+  {
+    const store = await startStore(wooStore(pagedProducts(TWO_PAGES)));
+    try {
+      await walked('woo-pages/two-page-store', store, { pages: [1, 2], products: TWO_PAGE_PRODUCTS, stopped: null });
+      const text = await initWalk('woo-pages/two-page-store-text', store, { json: false });
+      check(text.run.code === 0 && JSON.stringify(text.pages) === '[1,2]', 'woo-pages/two-page-store-text/reads-both-pages',
+        `exit ${text.run.code}; pages ${JSON.stringify(text.pages)}; ${text.run.stderr.slice(0, 300)}`);
+      check(!Object.values(BOUND_NAME).some((re) => re.test(`${text.run.stdout}${text.run.stderr}`)),
+        'woo-pages/two-page-store-text/names-no-bound-when-none-ended-the-walk', text.run.stdout.slice(0, 400));
+    } finally { await store.close(); }
+  }
+
+  // (2) x-wp-totalpages is the end: a store that would answer more pages is never asked for them.
+  for (const [tag, totalPages, extra] of [
+    ['totalpages-2-max-pages-50', 2, ['--max-pages', '50']],
+    ['totalpages-2-default-bounds', 2, []],
+    ['totalpages-1-of-3-served', 1, ['--max-pages', '50']],
+  ]) {
+    const store = await startStore(wooStore(pagedProducts(ONE_PER_PAGE, { totalPages, serve: 3 })));
+    try {
+      await walked(`woo-pages/refused/past-x-wp-totalpages-${tag}`, store, { pages: range(totalPages), products: totalPages, stopped: null, extra });
+    } finally { await store.close(); }
+  }
+
+  // (3) The page bound: the walk stops exactly at it, and says so by name.
+  {
+    const store = await startStore(wooStore(pagedProducts(ONE_PER_PAGE)));
+    try {
+      await walked('woo-pages/max-pages-1', store, { pages: [1], products: 1, stopped: 'page-bound', extra: ['--max-pages', '1'] });
+      await walked('woo-pages/max-pages-2', store, { pages: [1, 2], products: 2, stopped: 'page-bound', extra: ['--max-pages', '2'] });
+      await walked('woo-pages/max-pages-3-is-the-last-page', store, { pages: [1, 2, 3], products: 3, stopped: null, extra: ['--max-pages', '3'] });
+      const text = await initWalk('woo-pages/max-pages-2-text', store, { json: false, extra: ['--max-pages', '2'] });
+      check(text.run.code === 0 && BOUND_NAME['page-bound'].test(`${text.run.stdout}${text.run.stderr}`),
+        'woo-pages/max-pages-2-text/names-the-page-bound', `exit ${text.run.code}; ${text.run.stdout.slice(0, 300)} ${text.run.stderr.slice(0, 300)}`);
+    } finally { await store.close(); }
+  }
+  // The default page bound, from README: a store reporting more pages than it is read to it, no further.
+  if (Number.isInteger(defaultPages) && defaultPages >= 1) {
+    const many = defaultPages + 3;
+    const store = await startStore(wooStore(pagedProducts([], { totalPages: many, serve: many, body: (n) => ONE_PER_PAGE[(n - 1) % 3] })));
+    try {
+      await walked('woo-pages/default-page-bound', store, { pages: range(defaultPages), products: defaultPages, stopped: 'page-bound' });
+    } finally { await store.close(); }
+  }
+
+  // (4) The byte bound: the bytes read over every page never pass it, and it is named when it ends the walk.
+  {
+    const [a, b] = TWO_PAGES.map((p) => p.length);
+    const store = await startStore(wooStore(pagedProducts(TWO_PAGES)));
+    try {
+      await walked('woo-pages/max-bytes-page-1-exactly', store, { pages: [1], stopped: 'byte-bound',
+        products: JSON.parse(TWO_PAGES[0].toString('utf8')).length, extra: ['--max-bytes', String(a)] });
+      await walked('woo-pages/max-bytes-both-pages-exactly', store, { pages: [1, 2], products: TWO_PAGE_PRODUCTS, stopped: null,
+        extra: ['--max-bytes', String(a + b)] });
+      const text = await initWalk('woo-pages/max-bytes-page-1-exactly-text', store, { json: false, extra: ['--max-bytes', String(a)] });
+      check(text.run.code === 0 && BOUND_NAME['byte-bound'].test(`${text.run.stdout}${text.run.stderr}`),
+        'woo-pages/max-bytes-page-1-exactly-text/names-the-byte-bound', `exit ${text.run.code}; ${text.run.stdout.slice(0, 300)} ${text.run.stderr.slice(0, 300)}`);
+      // A first page one byte past the configured bound is Woo-1's too-large refusal.
+      const over = await initWalk('woo-pages/refused/max-bytes-below-page-1', store, { extra: ['--max-bytes', String(a - 1)] });
+      check(over.run.code === 1 && WOO_REASONS['too-large'].test(over.run.stderr), 'woo-pages/refused/max-bytes-below-page-1/too-large-exit-1',
+        `exit ${over.run.code}; ${over.run.stderr.slice(0, 300)}`);
+      check(JSON.stringify(over.pages) === '[1]', 'woo-pages/refused/max-bytes-below-page-1/page-2-never-asked', JSON.stringify(over.pages));
+      over.unwritten();
+    } finally { await store.close(); }
+  }
+  {
+    const [a, b] = ONE_PER_PAGE.map((p) => p.length);
+    const store = await startStore(wooStore(pagedProducts(ONE_PER_PAGE)));
+    try {
+      // The bound falls inside page 2: page 2 may be begun (once), page 3 is never asked.
+      await walked('woo-pages/max-bytes-inside-page-2', store, { pages: [1], atMostOnce: [2], stopped: 'byte-bound',
+        extra: ['--max-bytes', String(a + b - 1)] });
+    } finally { await store.close(); }
+  }
+
+  // (5) Never another host: robots.txt was read from the store, so every page comes from the store.
+  for (const [tag, status] of [['302', 302], ['307', 307], ['301', 301]]) {
+    const other = await startStore(wooStore(pagedProducts(TWO_PAGES)));
+    const store = await startStore(wooStore(pagedProducts(TWO_PAGES, { onPage: (n, req, res) => {
+      if (n !== 2) return false;
+      res.writeHead(status, { location: `${other.origin}${WOO_PRODUCTS}?page=2` });
+      res.end();
+      return true;
+    } })));
+    try {
+      const label = `woo-pages/refused/page-2-redirects-to-another-host-${tag}`;
+      const w = await initWalk(label, store);
+      check(other.hits.length === 0, `${label}/other-host-never-asked`, JSON.stringify(other.hits));
+      check(w.run.code === 1, `${label}/refused-exit-1`, `exit ${w.run.code}; ${w.run.stdout.slice(0, 200)} ${w.run.stderr.slice(0, 300)}`);
+      check(/redirect|host/i.test(w.run.stderr), `${label}/refusal-names-the-redirect`, JSON.stringify(w.run.stderr.slice(0, 300)));
+      check(JSON.stringify(w.pages) === '[1,2]', `${label}/page-2-asked-once-of-the-store`, JSON.stringify(w.pages));
+      w.unwritten();
+    } finally { await store.close(); await other.close(); }
+  }
+  {
+    const other = await startStore(wooStore(pagedProducts(TWO_PAGES)));
+    const store = await startStore(wooStore(pagedProducts(TWO_PAGES, {
+      onPage: (n, req, res) => {
+        const headers = { ...WOO_JSON, 'x-wp-total': '3', 'x-wp-totalpages': '2',
+          link: `<${other.origin}${WOO_PRODUCTS}?page=${n + 1}>; rel="next"` };
+        if (n < 1 || n > 2) return false;
+        res.writeHead(200, { ...headers, 'content-length': String(TWO_PAGES[n - 1].length) });
+        res.end(TWO_PAGES[n - 1]);
+        return true;
+      },
+    })));
+    try {
+      const label = 'woo-pages/refused/link-next-names-another-host';
+      const w = await initWalk(label, store);
+      check(other.hits.length === 0, `${label}/other-host-never-asked`, JSON.stringify(other.hits));
+      check(w.run.code !== 0 || JSON.stringify(w.pages) === '[1,2]', `${label}/pages-come-from-the-store-only`,
+        `exit ${w.run.code}; pages ${JSON.stringify(w.pages)}`);
+    } finally { await store.close(); await other.close(); }
+  }
+
+  // (6) No retry storm: a page that fails is asked once, and no page after it is asked.
+  const failures2 = [
+    ['500', (res) => { res.writeHead(500, WOO_JSON); res.end('{"code":"internal_server_error","data":{"status":500}}'); }],
+    ['503-retry-after-0', (res) => { res.writeHead(503, { ...WOO_JSON, 'retry-after': '0' }); res.end('{}'); }],
+    ['429-retry-after-0', (res) => { res.writeHead(429, { ...WOO_JSON, 'retry-after': '0' }); res.end('{}'); }],
+    ['reset-mid-body', (res) => {
+      res.writeHead(200, { ...WOO_JSON, 'x-wp-totalpages': '3', 'content-length': String(ONE_PER_PAGE[1].length) });
+      res.write(ONE_PER_PAGE[1].subarray(0, 20));
+      setTimeout(() => res.socket?.destroy(), 50);
+    }],
+    ['stalled', (res) => {
+      res.writeHead(200, { ...WOO_JSON, 'x-wp-totalpages': '3', 'content-length': String(ONE_PER_PAGE[1].length) });
+      res.flushHeaders();
+      res.on('error', () => { /* the client gave up */ });
+    }],
+  ];
+  for (const [tag, fail] of failures2) {
+    const store = await startStore(wooStore(pagedProducts(ONE_PER_PAGE, { onPage: (n, req, res) => {
+      if (n !== 2) return false;
+      fail(res);
+      return true;
+    } })));
+    try {
+      const label = `woo-pages/no-retry-storm/page-2-${tag}`;
+      const w = await initWalk(label, store, { timeout: 120000 });
+      const count = (p) => w.pages.filter((x) => x === p).length;
+      check(count(1) === 1 && count(2) === 1, `${label}/each-page-asked-once`, JSON.stringify(w.pages));
+      check(count(3) === 0, `${label}/no-page-after-the-failed-one`, JSON.stringify(w.pages));
+      check(w.run.code !== 2, `${label}/not-misuse`, `exit ${w.run.code}`);
+      check(w.run.code !== 0 || /page\s*2|page=2|"page":\s*2/i.test(`${w.run.stdout}${w.run.stderr}`), `${label}/outcome-names-page-2`,
+        `exit ${w.run.code}; ${w.run.stdout.slice(0, 300)} ${w.run.stderr.slice(0, 300)}`);
+    } finally { await store.close(); }
+  }
+  {
+    const store = await startStore(wooStore(pagedProducts(ONE_PER_PAGE, { onPage: (n, req, res) => {
+      res.writeHead(503, { ...WOO_JSON, 'retry-after': '0' });
+      res.end('{}');
+      return true;
+    } })));
+    try {
+      const label = 'woo-pages/no-retry-storm/page-1-503-retry-after-0';
+      const w = await initWalk(label, store);
+      check(JSON.stringify(w.pages) === '[1]', `${label}/page-1-asked-once`, JSON.stringify(w.pages));
+      check(w.run.code === 1, `${label}/refused-exit-1`, `exit ${w.run.code}`);
+      w.unwritten();
+    } finally { await store.close(); }
+  }
+
+  // (7) Misuse: a bound that is not a positive integer, or a bound without --from woocommerce.
+  {
+    const store = await startStore(wooStore(pagedProducts(TWO_PAGES)));
+    try {
+      for (const flag of ['--max-pages', '--max-bytes']) {
+        for (const value of ['0', '-1', 'abc', '1.5', '']) {
+          const label = `woo-pages/refused/${flag.slice(2)}-${value === '' ? 'empty' : value}`;
+          const w = await initWalk(label, store, { extra: [flag, value] });
+          check(w.run.code === 2, `${label}/misuse-exit-2`, `exit ${w.run.code}; ${w.run.stderr.slice(0, 300)}`);
+          check(w.run.stderr.includes(flag), `${label}/names-${flag}`, JSON.stringify(w.run.stderr.slice(0, 300)));
+          check(w.hits.length === 0, `${label}/before-any-store-request`, JSON.stringify(w.hits));
+          w.unwritten();
+        }
+      }
+    } finally { await store.close(); }
+    for (const flag of ['--max-pages', '--max-bytes']) {
+      const label = `woo-pages/refused/${flag.slice(2)}-without-from-woocommerce`;
+      const dir = makeRepo('vite');
+      const before = treeState(dir);
+      const run = await runCli(['init', '--trade', 'retail', '--base-url', 'https://shop.example', flag, '2'], { cwd: dir });
+      guardClean(label, run);
+      check(run.code === 2 && run.stderr.includes(flag), `${label}/misuse-exit-2-naming-the-flag`, `exit ${run.code}; ${run.stderr.slice(0, 300)}`);
+      const diff = stateDiff(before, treeState(dir));
+      check(diff.length === 0, `${label}/writes-nothing`, JSON.stringify(diff.slice(0, 10)));
+    }
+  }
 });
 
 // ---------------------------------------------------------------- 12. publish --claim: the Catalog's proof file
