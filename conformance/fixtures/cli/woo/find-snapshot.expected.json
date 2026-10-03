@@ -1,0 +1,23 @@
+[
+  {
+    "id": 101,
+    "name": "Brass Desk Lamp",
+    "price": "89.00 EUR",
+    "stock_status": "in_stock",
+    "permalink": "https://shop.example/product/brass-desk-lamp/"
+  },
+  {
+    "id": 102,
+    "name": "Linen Shade",
+    "price": "24.00 EUR",
+    "stock_status": "in_stock",
+    "permalink": "https://shop.example/product/linen-shade/"
+  },
+  {
+    "id": 103,
+    "name": "Cloth Cord Set",
+    "price": "15.00 EUR",
+    "stock_status": "out_of_stock",
+    "permalink": "https://shop.example/product/cloth-cord-set/"
+  }
+]

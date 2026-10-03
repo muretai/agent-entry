@@ -2154,6 +2154,238 @@ await section('woo-pages', async () => {
   }
 });
 
+// ---------------------------------------------------------------- 11d. init --from woocommerce: the find offer and its snapshot
+//
+// WRITTEN BEFORE THE IMPLEMENTATION (test-first, skeleton item 4 of 6 of the Woo declaration
+// generator chain, Woo-4; parent intake 20261002T235854Z: public Store API only, bounded, robots.txt
+// respected, own vocabulary AT-1, deterministic compile, no payment verb). The implementer may not
+// edit this section or fixtures/cli/woo/find-snapshot.expected.json. Woo-1/2/3's pins above stand as
+// they are and are not repeated here.
+//
+// `init --from woocommerce <store>` also writes, beside agent-entry.json, the product snapshot
+// `agent-entry.products.json`, and the declaration carries exactly one door-bound offer of verb
+// `find` answered `door.reply: "catalog"` (beside Woo-2's one `ask`). --json `wrote` names both files.
+// The snapshot's bytes are `JSON.stringify(rows, null, 2) + "\n"`, one row per product read, in the
+// Store API's order, each row exactly these keys in this order:
+//   id            the product id
+//   name          the product name, as data
+//   price         "<major>.<minor> <currency_code>" from prices.price and prices.currency_minor_unit
+//   stock_status  "in_stock" | "out_of_stock" (from is_in_stock)
+//   permalink     the product's permalink, only when it is on the store's own origin
+// Nothing else: no description or short_description (none by default), no sku, prices block,
+// price_html, images, add_to_cart, meta_data. Every "<", ">" and "&" inside a string is written as
+// <, >, &: no reader of the raw bytes ever meets markup. A product whose permalink is
+// not on the store's origin (another host or port, another scheme, protocol-relative, javascript:)
+// is dropped from the snapshot, and that permalink is never requested.
+// The door answers `find` from that file: createAgentEntry({ ..., declaration, catalogFile }) with
+// catalogFile the snapshot's path replies { verb: "find", ..., status: "see_catalog", products },
+// `products` the snapshot's rows, read from the file -- never a request to the store at reply time.
+// Its reply text escapes "<" and ">" the same way, so a product name never reaches a reader as markup.
+
+const SNAPSHOT_FILE = 'agent-entry.products.json';
+const SNAPSHOT_KEYS = ['id', 'name', 'price', 'stock_status', 'permalink'];
+const SNAPSHOT_EXPECTED = readFileSync(join(WOO_FIX, 'find-snapshot.expected.json'), 'utf8');
+const FIND_SEED = '5e'.repeat(32);
+let findSequence = 0;
+
+/** The recorded products page (or `raw`) with the fixture's shop origin swapped for the store's. */
+const onOrigin = (text, origin) => text.split('https://shop.example').join(origin);
+
+/** A door built from the project's agent-entry.json and its snapshot file. */
+function findDoor(dir) {
+  const declaration = JSON.parse(readFileSync(join(dir, 'agent-entry.json'), 'utf8'));
+  return createAgentEntry({ seedHex: PUBLISH_SEED, name: declaration.entry.name, baseUrl: declaration.entry.baseUrl,
+    declaration, catalogFile: join(dir, SNAPSHOT_FILE), signedRatePerMin: 0, signedRatePerMinTotal: 0 });
+}
+
+/** One signed `find` knock at the door, in process, with every fetch counted (and refused) meanwhile. */
+async function knockFind(entry, text) {
+  const from = didFromSeedHex(FIND_SEED);
+  const messageId = `woo-find-${++findSequence}`;
+  const timestamp = Math.floor(Date.now() / 1000);
+  const sig = signEnvelope(FIND_SEED, { from, to: entry.did, messageId, contextId: null, timestamp, text });
+  const body = Buffer.from(JSON.stringify({
+    jsonrpc: '2.0', id: messageId, method: 'message/send',
+    params: { message: { kind: 'message', role: 'user', messageId, contextId: null, parts: [{ kind: 'text', text }],
+      metadata: { from, to: entry.did, timestamp, sig, offer: 'find' } } },
+  }));
+  const fetches = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => { fetches.push(String(input?.url ?? input)); throw new TypeError('no fetch at reply time'); };
+  let out;
+  try {
+    out = await entry.handleRequestAsync('POST', '/', { 'content-type': 'application/json' }, body, { remoteAddress: '127.0.0.1' });
+  } finally { globalThis.fetch = realFetch; }
+  const raw = Buffer.from(out.body || '').toString('utf8');
+  let replyText = null;
+  let reply = null;
+  try { replyText = JSON.parse(raw).result.parts[0].text; reply = JSON.parse(replyText); } catch { /* reported by callers */ }
+  return { out, raw, replyText, reply, fetches };
+}
+
+await section('woo-find', async () => {
+  /** One init against `store`; the snapshot's bytes (or null) and the declaration it wrote. */
+  async function initFind(label, store) {
+    const dir = makeRepo('vite');
+    const before = store.hits.length;
+    const run = await runCli(['init', '--from', 'woocommerce', store.origin, '--facts', WOO_FACTS_FILE, '--json'],
+      { cwd: dir, env: WOO_ENV });
+    guardClean(label, run, { onlyPort: store.port });
+    const hits = store.hits.slice(before);
+    if (!check(run.code === 0, `${label}/exit-0`, `exit ${run.code}; stdout ${run.stdout.slice(0, 300)}; stderr ${run.stderr.slice(0, 400)}`)) return null;
+    const snapPath = join(dir, SNAPSHOT_FILE);
+    if (!check(existsSync(snapPath), `${label}/writes-${SNAPSHOT_FILE}-beside-agent-entry.json`, JSON.stringify(walk(dir).slice(0, 20)))) return null;
+    const out = parseJsonOut(label, run);
+    check(Array.isArray(out?.wrote) && out.wrote.includes('agent-entry.json') && out.wrote.includes(SNAPSHOT_FILE),
+      `${label}/json-wrote-names-the-declaration-and-the-snapshot`, JSON.stringify(out?.wrote));
+    const raw = readFileSync(snapPath, 'utf8');
+    let rows = null;
+    try { rows = JSON.parse(raw); } catch (error) { check(false, `${label}/snapshot-is-json`, String(error)); }
+    let declaration = null;
+    try { declaration = readJson(join(dir, 'agent-entry.json')); } catch { /* below */ }
+    const offers = Array.isArray(declaration?.offers) ? declaration.offers : [];
+    const finds = offers.filter((o) => o?.verb === 'find' && o?.door);
+    check(finds.length === 1 && finds[0].door.reply === 'catalog', `${label}/one-door-bound-find-offer-answered-catalog`,
+      JSON.stringify(offers).slice(0, 400));
+    check(offers.filter((o) => o?.verb === 'ask' && o?.door?.reply === 'facts').length === 1, `${label}/the-ask-offer-stays`,
+      JSON.stringify(offers.map((o) => o?.verb)));
+    check(!offers.some((o) => PAYMENT_VERBS.includes(o?.verb) || o?.door?.reply === 'checkout'), `${label}/no-payment-verb`);
+    let valid = true;
+    try { validateDeclaration(clone(declaration)); } catch (error) { valid = false; check(false, `${label}/declaration-validates`, String(error?.message || error)); }
+    if (valid) check(true, `${label}/declaration-validates`);
+    check(seedLeaks(dir).length === 0, `${label}/no-trackable-seed`, JSON.stringify(seedLeaks(dir)));
+    check(!/AGENT_ENTRY_SEED_HEX|[0-9a-f]{64}/.test(raw), `${label}/snapshot-holds-no-secret`);
+    return { dir, raw, rows, hits, run };
+  }
+
+  // (1) The recorded page (one item out of stock): the snapshot's exact bytes.
+  {
+    let store = null;
+    store = await startStore(wooStore((req, res) => {
+      const bytes = Buffer.from(onOrigin(WOO_PAGE.toString('utf8'), store.origin));
+      res.writeHead(200, { ...WOO_JSON, 'x-wp-total': '3', 'x-wp-totalpages': '1', 'content-length': String(bytes.length) });
+      res.end(bytes);
+    }));
+    try {
+      const label = 'woo-find/recorded-page';
+      const want = onOrigin(SNAPSHOT_EXPECTED, store.origin);
+      const first = await initFind(label, store);
+      if (first) {
+        check(first.raw === want, `${label}/snapshot-exact-bytes`, `\n    got  ${JSON.stringify(first.raw)}\n    want ${JSON.stringify(want)}`);
+        const rows = Array.isArray(first.rows) ? first.rows : [];
+        check(rows.length === 3 && rows.every((r) => JSON.stringify(Object.keys(r)) === JSON.stringify(SNAPSHOT_KEYS)),
+          `${label}/rows-hold-exactly-id-name-price-stock_status-permalink`, JSON.stringify(rows.map((r) => Object.keys(r))));
+        check(rows.find((r) => r.id === 103)?.stock_status === 'out_of_stock' && rows.filter((r) => r.stock_status === 'in_stock').length === 2,
+          `${label}/the-out-of-stock-item-is-kept-and-named`, JSON.stringify(rows.map((r) => r.stock_status)));
+        for (const leak of ['description', 'short_description', 'Solid brass, hand finished', 'A solid brass desk lamp',
+          'Natural linen', 'sku', 'L-12', 'price_html', 'images', 'add_to_cart', 'categories', 'average_rating', 'low_stock_remaining']) {
+          check(!first.raw.includes(leak), `${label}/no-${leak.replace(/\W+/g, '-')}-in-the-snapshot`);
+        }
+
+        // Deterministic: the same recorded store gives the same snapshot bytes.
+        const second = await initFind(`${label}-again`, store);
+        if (second) check(second.raw === first.raw, `${label}/snapshot-byte-identical-across-runs`);
+
+        // The door answers find from the FILE: an edit on disk is what it replies, the store is
+        // closed, and no request leaves the door while it answers.
+        const snapPath = join(first.dir, SNAPSHOT_FILE);
+        const edited = JSON.parse(first.raw);
+        edited[0].name = 'Brass Desk Lamp (as the snapshot file says)';
+        writeFileSync(snapPath, `${JSON.stringify(edited, null, 2)}\n`);
+        const hitsBefore = store.hits.length;
+        await store.close();
+        let entry = null;
+        try { entry = findDoor(first.dir); } catch (error) { check(false, `${label}/door-builds-from-the-declaration-and-snapshot`, String(error?.message || error)); }
+        if (entry) {
+          const k = await knockFind(entry, 'find products {"q":"lamp"}');
+          check(k.out.status === 200 && k.reply !== null, `${label}/find-answered`, k.raw.slice(0, 300));
+          check(k.reply?.verb === 'find' && k.reply?.status === 'see_catalog', `${label}/find-reply-verb-and-status`,
+            JSON.stringify({ verb: k.reply?.verb, status: k.reply?.status }));
+          check(canonicalJSON(k.reply?.products ?? null) === canonicalJSON(edited), `${label}/find-replies-the-snapshot-file-rows`,
+            JSON.stringify(k.reply?.products).slice(0, 600));
+          check(k.fetches.length === 0, `${label}/find-reply-fetches-nothing`, JSON.stringify(k.fetches));
+          check(store.hits.length === hitsBefore, `${label}/store-never-asked-at-reply-time`);
+          check(!Object.hasOwn(k.reply || {}, 'deal'), `${label}/find-carries-no-deal`);
+        }
+      }
+    } finally { await store.close(); }
+  }
+
+  // (2) Refusals: hostile names stay data, other fields never leak, a foreign permalink is dropped
+  // and never followed -- neither by init nor by the door answering find.
+  {
+    const other = await startStore(wooStore(wooPage));
+    let store = null;
+    const SCRIPT_NAME = '<script>alert("snapshot")</script> Brass Desk Lamp';
+    const IMG_NAME = 'Linen Shade <img src=x onerror=alert(1)> & co';
+    const QUOTE_NAME = 'Plain Lamp", "status": "paid';
+    const hostile = (origin, port) => {
+      const base = JSON.parse(onOrigin(WOO_PAGE.toString('utf8'), origin));
+      const extra = (p, patch) => ({ ...p, meta_data: [{ key: '_supplier_cost', value: 'COST-4471' }], ...patch });
+      return [
+        extra(base[0], { name: SCRIPT_NAME }),
+        extra(base[1], { name: IMG_NAME }),
+        extra(base[1], { id: 107, name: 'Away Shade', permalink: `${other.origin}/product/linen-shade/` }),
+        extra(base[2], { permalink: 'javascript:alert(1)//' }),
+        extra(base[0], { id: 104, name: QUOTE_NAME, permalink: `${origin}/product/plain-lamp/` }),
+        extra(base[0], { id: 105, name: 'Proto Lamp', permalink: '//evil.example/product/proto/' }),
+        extra(base[0], { id: 106, name: 'Plain Http Lamp', permalink: `http://127.0.0.1:${port}/product/plain-http/` }),
+      ];
+    };
+    store = await startStore(wooStore((req, res) => {
+      const bytes = Buffer.from(JSON.stringify(hostile(store.origin, store.port)));
+      res.writeHead(200, { ...WOO_JSON, 'x-wp-total': '6', 'x-wp-totalpages': '1', 'content-length': String(bytes.length) });
+      res.end(bytes);
+    }));
+    try {
+      const label = 'woo-find/refused/hostile-page';
+      const got = await initFind(label, store);
+      if (got) {
+        const rows = Array.isArray(got.rows) ? got.rows : [];
+        check(rows.every((r) => JSON.stringify(Object.keys(r)) === JSON.stringify(SNAPSHOT_KEYS)),
+          `${label}/rows-hold-only-the-five-fields`, JSON.stringify(rows.map((r) => Object.keys(r))));
+        check(!/[<>]/.test(got.raw), `${label}/no-raw-markup-in-the-snapshot-bytes`, got.raw.slice(0, 400));
+        check(got.raw.includes('\\u003cscript\\u003e'), `${label}/markup-written-escaped`, got.raw.slice(0, 400));
+        check(rows.find((r) => r.id === 101)?.name === SCRIPT_NAME, `${label}/script-name-kept-as-data`,
+          JSON.stringify(rows.find((r) => r.id === 101)));
+        check(rows.find((r) => r.id === 104)?.name === QUOTE_NAME, `${label}/quote-name-kept-as-data`,
+          JSON.stringify(rows.find((r) => r.id === 104)));
+        check(rows.every((r) => typeof r.permalink === 'string' && r.permalink.startsWith(`${store.origin}/`)),
+          `${label}/every-permalink-is-on-the-store-origin`, JSON.stringify(rows.map((r) => r.permalink)));
+        check(!got.raw.includes('&') && rows.find((r) => r.id === 102)?.name === IMG_NAME, `${label}/img-name-escaped-and-kept-as-data`,
+          JSON.stringify(rows.find((r) => r.id === 102)));
+        check(JSON.stringify(rows.map((r) => r.id)) === '[101,102,104]', `${label}/foreign-permalink-products-dropped`,
+          JSON.stringify(rows.map((r) => r.id)));
+        for (const leak of [other.origin, 'javascript:', 'evil.example', `http://127.0.0.1:${store.port}`, 'meta_data',
+          '_supplier_cost', 'COST-4471', 'description', 'Solid brass, hand finished', 'sku', 'price_html']) {
+          check(!got.raw.includes(leak), `${label}/no-${leak.replace(/\W+/g, '-')}-in-the-snapshot`);
+        }
+        check(other.hits.length === 0, `${label}/foreign-permalink-never-requested-by-init`, JSON.stringify(other.hits));
+        check(got.hits.every((h) => ['/robots.txt', WOO_PRODUCTS].includes(pathOf(h))), `${label}/init-asked-only-robots-and-the-store-api`,
+          JSON.stringify(got.hits));
+
+        let entry = null;
+        try { entry = findDoor(got.dir); } catch (error) { check(false, `${label}/door-builds`, String(error?.message || error)); }
+        if (entry) {
+          const hitsBefore = store.hits.length;
+          const k = await knockFind(entry, 'find products {"q":"lamp"}');
+          check(k.reply?.verb === 'find' && k.reply?.status === 'see_catalog', `${label}/find-status-not-rewritten-by-a-name`,
+            JSON.stringify(k.reply).slice(0, 300));
+          check(k.reply && !Object.hasOwn(k.reply, 'paid'), `${label}/find-reply-gains-no-key-from-a-name`);
+          check(canonicalJSON(k.reply?.products ?? null) === canonicalJSON(rows), `${label}/find-replies-the-snapshot-rows`,
+            JSON.stringify(k.reply?.products).slice(0, 400));
+          check(!/<script|<img/i.test(k.raw) && !/[<>]/.test(k.replyText ?? '<'), `${label}/find-reply-escapes-markup`,
+            String(k.replyText).slice(0, 400));
+          check(!k.raw.includes(other.origin) && !k.raw.includes('javascript:') && !k.raw.includes('evil.example'),
+            `${label}/find-reply-carries-no-foreign-permalink`);
+          check(k.fetches.length === 0 && other.hits.length === 0 && store.hits.length === hitsBefore,
+            `${label}/find-reply-requests-nothing`, JSON.stringify(k.fetches));
+        }
+      }
+    } finally { await store.close(); await other.close(); }
+  }
+});
+
 // ---------------------------------------------------------------- 12. publish --claim: the Catalog's proof file
 //
 // WRITTEN BEFORE THE IMPLEMENTATION (test-first, P0 FRAME Claim-2, intake 20261003T131709Z-2).

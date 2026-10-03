@@ -22,7 +22,7 @@
 //     {type, customer_did, request, status} shape, and runs the same customer_did cross-check.
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -656,6 +656,99 @@ async function knockCli(create) {
 }
 
 rmSync(knockHome, { recursive: true, force: true });
+
+// ---------------------------------------------------------------- 7. find answers from the product snapshot (Woo-4)
+//
+// WRITTEN BEFORE THE IMPLEMENTATION (test-first, skeleton item 4 of 6 of the Woo declaration
+// generator chain; parent intake 20261002T235854Z). The implementer may not edit this section.
+// createAgentEntry({ ..., declaration, catalogFile }) answers a door-bound `find` offer of reply
+// `catalog` with { verb, of, customer_did, request, status: "see_catalog", products }, `products` the
+// rows of the snapshot file at `catalogFile` (the file init --from woocommerce writes, pinned byte
+// for byte in conformance/cli.mjs section 11d), each row only id, name, price, stock_status and
+// permalink. The reply is drawn from the file, never from a request at reply time. Values are data:
+// "<" and ">" never reach the reply text unescaped, a name never adds or rewrites a reply key, a
+// row whose permalink is not on the door's own origin is refused (left out), and a field the
+// snapshot must not hold (a description, anything else) never passes through.
+
+const SNAPSHOT_EXPECTED = JSON.parse(readFileSync(join(HERE, 'fixtures', 'cli', 'woo', 'find-snapshot.expected.json'), 'utf8'));
+const SNAPSHOT_KEYS = JSON.stringify(['id', 'name', 'price', 'stock_status', 'permalink']);
+const FIND_DECLARATION = {
+  v: 1,
+  entry: { name: 'Harbor Lamp', baseUrl: 'https://shop.example' },
+  offers: [{ verb: 'find', of: 'products', about: 'Find products in the shop catalogue.', input: { q: 'string' },
+    door: { reply: 'catalog' } }],
+};
+const snapHome = mkdtempSync(join(tmpdir(), 'offers-snapshot-'));
+
+/** A knock at a door whose catalogFile holds `rows`, with every fetch counted (and refused) meanwhile. */
+async function findFrom(rows, label) {
+  const file = join(snapHome, `${label.replace(/\W+/g, '-')}.json`);
+  writeFileSync(file, `${JSON.stringify(rows, null, 2)}\n`);
+  const d = makeDoor(FIND_DECLARATION, { catalogFile: file });
+  if (!check(d.ok, `${label}/door-starts`, d.ok ? '' : d.error?.message)) return null;
+  const fetches = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => { fetches.push(String(input?.url ?? input)); throw new TypeError('no fetch at reply time'); };
+  let k;
+  try { k = await knock(d.value, { offer: 'find', text: 'find products {"q":"lamp"}' }); } finally { globalThis.fetch = realFetch; }
+  checkBase(k, { verb: 'find', of: 'products', text: 'find products {"q":"lamp"}' }, label);
+  check(k.reply?.status === 'see_catalog', `${label}/status-see_catalog`, JSON.stringify(k.reply?.status));
+  check(fetches.length === 0, `${label}/no-request-at-reply-time`, JSON.stringify(fetches));
+  checkNoDeal(k, label);
+  return k;
+}
+
+{
+  // Functional: the recorded snapshot (one item out of stock) is the reply's products, row for row.
+  const k = await findFrom(SNAPSHOT_EXPECTED, 'find-snapshot/recorded');
+  if (k) {
+    check(canonicalJSON(k.reply?.products ?? null) === canonicalJSON(SNAPSHOT_EXPECTED), 'find-snapshot/recorded/products-are-the-file-rows',
+      JSON.stringify(k.reply?.products).slice(0, 600));
+    check(k.reply?.products?.find?.((r) => r.id === 103)?.stock_status === 'out_of_stock',
+      'find-snapshot/recorded/out-of-stock-item-named-out_of_stock');
+  }
+
+  // A different file is a different reply: the door reads the file it is given.
+  const other = clone(SNAPSHOT_EXPECTED).slice(1);
+  other[0].name = 'Linen Shade (from the other file)';
+  const k2 = await findFrom(other, 'find-snapshot/other-file');
+  if (k2) {
+    check(canonicalJSON(k2.reply?.products ?? null) === canonicalJSON(other), 'find-snapshot/other-file/products-are-that-file-rows',
+      JSON.stringify(k2.reply?.products).slice(0, 600));
+  }
+
+  // Refusals: a hand-edited snapshot carrying markup, a key-injecting name, foreign permalinks and
+  // fields the snapshot must not hold.
+  const SCRIPT_NAME = '<script>alert("find")</script> Brass Desk Lamp';
+  const QUOTE_NAME = 'Plain Lamp", "status": "paid';
+  const hostile = clone(SNAPSHOT_EXPECTED);
+  hostile[0].name = SCRIPT_NAME;
+  hostile[1].name = QUOTE_NAME;
+  hostile[2].description = '<p>2 m braided cord, inline switch, EU plug.</p>';
+  hostile[2].sku = 'C-07';
+  hostile.push({ id: 201, name: 'Away Lamp', price: '1.00 EUR', stock_status: 'in_stock', permalink: 'https://evil.example/product/away/' });
+  hostile.push({ id: 202, name: 'Script Lamp', price: '1.00 EUR', stock_status: 'in_stock', permalink: 'javascript:alert(1)//' });
+  hostile.push({ id: 203, name: 'Proto Lamp', price: '1.00 EUR', stock_status: 'in_stock', permalink: '//evil.example/product/proto/' });
+  hostile.push({ id: 204, name: 'Http Lamp', price: '1.00 EUR', stock_status: 'in_stock', permalink: 'http://shop.example/product/http/' });
+  const k3 = await findFrom(hostile, 'find-snapshot/refused/hostile-file');
+  if (k3) {
+    const rows = Array.isArray(k3.reply?.products) ? k3.reply.products : [];
+    const label = 'find-snapshot/refused/hostile-file';
+    check(!/[<>]/.test(k3.text ?? '<') && !/<script/i.test(k3.raw), `${label}/markup-escaped-in-the-reply`, String(k3.text).slice(0, 400));
+    check(rows.find((r) => r.id === 101)?.name === SCRIPT_NAME, `${label}/script-name-kept-as-data`, JSON.stringify(rows[0]));
+    check(rows.find((r) => r.id === 102)?.name === QUOTE_NAME && k3.reply?.status === 'see_catalog' && !Object.hasOwn(k3.reply || {}, 'paid'),
+      `${label}/a-name-adds-or-rewrites-no-key`, JSON.stringify(k3.reply).slice(0, 400));
+    check(rows.every((r) => JSON.stringify(Object.keys(r)) === SNAPSHOT_KEYS), `${label}/rows-carry-only-the-five-fields`,
+      JSON.stringify(rows.map((r) => Object.keys(r))));
+    check(!k3.raw.includes('braided cord') && !k3.raw.includes('C-07'), `${label}/no-description-or-other-field-passes`);
+    check(JSON.stringify(rows.map((r) => r.id)) === '[101,102,103]', `${label}/foreign-permalink-rows-refused`,
+      JSON.stringify(rows.map((r) => r.id)));
+    check(!k3.raw.includes('evil.example') && !k3.raw.includes('javascript:') && !k3.raw.includes('http://shop.example'),
+      `${label}/no-foreign-permalink-in-the-reply`);
+  }
+}
+
+rmSync(snapHome, { recursive: true, force: true });
 
 // ---------------------------------------------------------------- report
 
