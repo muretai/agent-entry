@@ -47,10 +47,16 @@
 //                 engagement_time_msec, session_id and typed dimensions only.
 //   knock <card-url> [--offer <id or verb>]  (S6b-1) and knockAgentEntry(url, { offer }) -> the knock
 //                 carries metadata.offer after sig; without it the POST body is byte for byte today's.
+//   init --from woocommerce <store-url>  (Woo chain item 1) refuses, exit 1, each with its own
+//                 reason on stderr and nothing written: a URL that is not https (before any
+//                 request), a store whose /wp-json/wc/store/v1/products is absent or not JSON, and a
+//                 first page past the byte bound. A well-formed in-bounds https store is not refused.
 import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
+import { createServer as createHttpsServer } from 'node:https';
 import { connect } from 'node:net';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync,
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync,
   rmSync, statSync, writeFileSync } from 'node:fs';
 import { networkInterfaces, tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
@@ -1265,6 +1271,231 @@ await section('bin', async () => {
     const help = await runCli([verb, '--help']);
     check(help.code === 0 && help.stdout.includes(verb), `bin/${verb}-help-exit-0`, `exit ${help.code}`);
   }
+});
+
+// ---------------------------------------------------------------- 11. init --from woocommerce: the refusals
+//
+// WRITTEN BEFORE THE IMPLEMENTATION (test-first, skeleton item 1 of 6 of the Woo declaration
+// generator chain; parent intake 20261002T235854Z: public Store API only, bounded, robots.txt
+// respected). `init --from woocommerce <store-url>` refuses, exit 1, each by its own reason:
+//   non-https   the URL is not https: refused before any request is made, even when a plain
+//               http listener there would answer a perfect products page.
+//   not-woo     GET <store>/wp-json/wc/store/v1/products is absent (404, or nothing listening) or
+//               does not answer JSON: not a WooCommerce store.
+//   too-large   the first products page exceeds the byte bound, with or without Content-Length.
+// No refusal writes anything: the project tree and HOME are byte for byte as before.
+// A well-formed, in-bounds https store is not refused for any of the three reasons.
+// The https store is a listener on 127.0.0.1 whose certificate chains to fixtures/cli/woo/test-ca.pem,
+// handed to the child as NODE_EXTRA_CA_CERTS: trust is added, verification is never turned off.
+
+const WOO_FIX = join(FIX, 'woo');
+const WOO_PRODUCTS = '/wp-json/wc/store/v1/products';
+const WOO_PAGE = readFileSync(join(WOO_FIX, 'products-page.json'));
+const WOO_TLS = { key: readFileSync(join(WOO_FIX, 'store-key.pem')), cert: readFileSync(join(WOO_FIX, 'store-cert.pem')) };
+const WOO_ENV = { NODE_EXTRA_CA_CERTS: join(WOO_FIX, 'test-ca.pem') };
+const WOO_OVERSIZE = 32 * 1024 * 1024;   // far past any first page a bounded public catalogue read needs
+const WOO_REASONS = {
+  'non-https': /\bhttps\b/i,
+  'not-woo': /wc\/store\/v1\/products|store api|not a woo/i,
+  'too-large': /\bbytes?\b|\bbound\b|too large|exceed/i,
+};
+const WOO_JSON = { 'content-type': 'application/json; charset=UTF-8' };
+
+/** Every path under dir (but .git) with its content hash: two equal states mean nothing was written. */
+function treeState(dir) {
+  const out = {};
+  const visit = (p) => {
+    for (const name of readdirSync(p).sort()) {
+      if (p === dir && name === '.git') continue;
+      const q = join(p, name);
+      const st = lstatSync(q);
+      const rel = relative(dir, q);
+      if (st.isDirectory()) { out[`${rel}/`] = 'dir'; visit(q); } else {
+        out[rel] = st.isFile() ? createHash('sha256').update(readFileSync(q)).digest('hex') : `other:${st.mode}`;
+      }
+    }
+  };
+  visit(dir);
+  return out;
+}
+
+function stateDiff(a, b) {
+  return [...new Set([...Object.keys(a), ...Object.keys(b)])].filter((k) => a[k] !== b[k]);
+}
+
+/** A store on 127.0.0.1 (https by default) recording every request it is asked. */
+function startStore(handler, { tls = true } = {}) {
+  return new Promise((resolveStart) => {
+    const hits = [];
+    const sockets = new Set();
+    const onRequest = (req, res) => {
+      hits.push({ method: req.method, url: req.url });
+      req.resume();
+      handler(req, res);
+    };
+    const server = tls ? createHttpsServer(WOO_TLS, onRequest) : createServer(onRequest);
+    server.on('connection', (s) => { sockets.add(s); s.on('close', () => sockets.delete(s)); });
+    server.on('tlsClientError', () => { /* a client that hangs up mid-handshake */ });
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      resolveStart({ port, hits, origin: `${tls ? 'https' : 'http'}://127.0.0.1:${port}`,
+        close: () => new Promise((r) => { for (const s of sockets) s.destroy(); server.close(() => r()); }) });
+    });
+  });
+}
+
+/** A shop: robots.txt allows everything (never the reason here), the products path answers `products`. */
+function wooStore(products) {
+  return (req, res) => {
+    const path = req.url.split('?')[0];
+    if (path === '/robots.txt') {
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('User-agent: *\nAllow: /\n');
+    } else if (path === WOO_PRODUCTS || path === `${WOO_PRODUCTS}/`) {
+      products(req, res);
+    } else {
+      res.writeHead(404, { 'content-type': 'text/html; charset=UTF-8' });
+      res.end('<!doctype html><title>Page not found</title>');
+    }
+  };
+}
+
+const wooPage = (req, res) => {
+  res.writeHead(200, { ...WOO_JSON, 'x-wp-total': '3', 'x-wp-totalpages': '1' });
+  res.end(WOO_PAGE);
+};
+
+/** A products page that is valid Woo JSON in every way but its size (> WOO_OVERSIZE bytes). */
+function oversizedPage({ declareLength }) {
+  const one = Buffer.from(JSON.stringify(JSON.parse(WOO_PAGE)[0]));
+  const unit = Buffer.concat([one, Buffer.from(',')]);
+  const count = Math.ceil(WOO_OVERSIZE / unit.length);
+  const tail = Buffer.concat([one, Buffer.from(']')]);
+  const total = 1 + count * unit.length + tail.length;
+  const block = Buffer.concat(Array(64).fill(unit));
+  return (req, res) => {
+    const headers = { ...WOO_JSON, 'x-wp-total': String(count + 1), 'x-wp-totalpages': '1' };
+    if (declareLength) headers['content-length'] = String(total);
+    res.writeHead(200, headers);
+    res.write('[');
+    let left = count;
+    res.on('close', () => { left = -1; });
+    res.on('error', () => { /* the client stopped reading at its bound */ });
+    const pump = () => {
+      while (left > 0) {
+        const n = Math.min(64, left);
+        left -= n;
+        if (!res.write(n === 64 ? block : Buffer.concat(Array(n).fill(unit)))) { res.once('drain', pump); return; }
+      }
+      if (left === 0) res.end(tail);
+    };
+    pump();
+  };
+}
+
+const askedProducts = (hits) => hits.some((h) => h.method === 'GET' && h.url.split('?')[0].replace(/\/$/, '') === WOO_PRODUCTS);
+
+await section('woo-init', async () => {
+  const refusalText = {};
+
+  /** One refusal: exit 1, its own reason on stderr, nothing written in the project or HOME. */
+  async function refusal(label, reason, url, { store = null, port = null, expectAsked = true } = {}) {
+    const dir = makeRepo('vite');
+    const home = tmp('ae-cli-woo-home-');
+    const before = { tree: treeState(dir), home: treeState(home) };
+    const run = await runCli(['init', '--from', 'woocommerce', url], { cwd: dir, env: { ...WOO_ENV, HOME: home } });
+    guardClean(label, run, { onlyPort: port ?? store?.port ?? null });
+    check(run.code === 1, `${label}/refused-exit-1`, `exit ${run.code}; stdout ${run.stdout.slice(0, 200)}; stderr ${run.stderr.slice(0, 300)}`);
+    check(WOO_REASONS[reason].test(run.stderr), `${label}/refusal-names-${reason}`, JSON.stringify(run.stderr.slice(0, 300)));
+    refusalText[reason] = refusalText[reason] ?? run.stderr.trim();
+    const tree = stateDiff(before.tree, treeState(dir));
+    check(tree.length === 0, `${label}/writes-nothing-in-the-project`, JSON.stringify(tree.slice(0, 10)));
+    const homeDiff = stateDiff(before.home, treeState(home));
+    check(homeDiff.length === 0, `${label}/writes-nothing-in-home`, JSON.stringify(homeDiff.slice(0, 10)));
+    check(!existsSync(join(dir, 'agent-entry.json')), `${label}/no-agent-entry.json`);
+    check(seedFilesAnywhere(dir).length === 0, `${label}/no-seed-minted`, JSON.stringify(seedFilesAnywhere(dir)));
+    if (store && expectAsked) {
+      check(askedProducts(store.hits), `${label}/asked-the-store-api-products-path`, JSON.stringify(store.hits.slice(0, 5)));
+    }
+    return run;
+  }
+
+  // (1) non-https: a plain http listener that would answer a perfect page is never asked at all.
+  {
+    const plain = await startStore(wooStore(wooPage), { tls: false });
+    try {
+      const label = 'woo-init/non-https';
+      const run = await refusal(label, 'non-https', plain.origin, { store: plain, expectAsked: false });
+      check(plain.hits.length === 0, `${label}/no-request-made`, JSON.stringify(plain.hits));
+      check(!run.guard.some((r) => (r.kind === 'connect' && r.port === plain.port) || r.kind === 'fetch'),
+        `${label}/no-connection-attempted`, JSON.stringify(run.guard.filter((r) => r.kind !== 'loaded').slice(0, 3)));
+    } finally { await plain.close(); }
+  }
+
+  // (2) not-woo: the products path absent (WordPress without Woo, a plain site, nothing listening)
+  // or answering something that is not JSON.
+  const notWoo = [
+    ['wordpress-without-woo-404', (req, res) => {
+      res.writeHead(404, WOO_JSON);
+      res.end(JSON.stringify({ code: 'rest_no_route', message: 'No route was found matching the URL and request method.', data: { status: 404 } }));
+    }],
+    ['plain-site-404', (req, res) => {
+      res.writeHead(404, { 'content-type': 'text/html; charset=UTF-8' });
+      res.end('<!doctype html><title>Not found</title><h1>404</h1>');
+    }],
+    ['html-200', (req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html; charset=UTF-8' });
+      res.end('<!doctype html><html><head><title>Harbor Lamp</title></head><body><h1>Lamps</h1></body></html>');
+    }],
+    ['json-header-html-body', (req, res) => {
+      res.writeHead(200, WOO_JSON);
+      res.end('<!doctype html><html><body>Lamps</body></html>');
+    }],
+  ];
+  for (const [tag, products] of notWoo) {
+    const store = await startStore(wooStore(products));
+    try {
+      await refusal(`woo-init/not-woo-${tag}`, 'not-woo', store.origin, { store });
+    } finally { await store.close(); }
+  }
+  {
+    const gone = await startStore(wooStore(wooPage));
+    const { port, origin } = gone;
+    await gone.close();
+    await refusal('woo-init/not-woo-connection-refused', 'not-woo', origin, { port });
+  }
+
+  // (3) too-large: a valid page past the bound, declared up front or only counted while reading.
+  for (const [tag, declareLength] of [['content-length', true], ['chunked', false]]) {
+    const store = await startStore(wooStore(oversizedPage({ declareLength })));
+    try {
+      await refusal(`woo-init/too-large-${tag}`, 'too-large', store.origin, { store });
+    } finally { await store.close(); }
+  }
+
+  const texts = Object.values(refusalText);
+  check(texts.length === 3 && new Set(texts).size === 3, 'woo-init/three-refusals-are-three-distinct-reasons',
+    JSON.stringify(refusalText).slice(0, 600));
+
+  // The positive case: https, a well-formed in-bounds page -> past all three checks.
+  {
+    const label = 'woo-init/in-bounds-https-store';
+    const store = await startStore(wooStore(wooPage));
+    try {
+      const dir = makeRepo('vite');
+      const run = await runCli(['init', '--from', 'woocommerce', store.origin], { cwd: dir, env: WOO_ENV });
+      guardClean(label, run, { onlyPort: store.port });
+      check(run.code !== 2, `${label}/the-form-is-not-misuse`, `exit ${run.code}: ${run.stderr.slice(0, 300)}`);
+      check(askedProducts(store.hits), `${label}/asked-the-store-api-products-path-over-https`, JSON.stringify(store.hits.slice(0, 5)));
+      const named = Object.entries(WOO_REASONS).filter(([, re]) => re.test(run.stderr)).map(([k]) => k);
+      check(run.code === 0 || named.length === 0, `${label}/not-refused-as-non-https-not-woo-or-too-large`,
+        `exit ${run.code}; reasons ${JSON.stringify(named)}; stderr ${JSON.stringify(run.stderr.slice(0, 300))}`);
+      check(!texts.includes(run.stderr.trim()), `${label}/not-any-refusal-text`, JSON.stringify(run.stderr.slice(0, 300)));
+    } finally { await store.close(); }
+  }
+
+  const help = await runCli(['init', '--help']);
+  check(help.code === 0 && /woocommerce/i.test(help.stdout), 'woo-init/init-help-names-woocommerce', `exit ${help.code}`);
 });
 
 // ---------------------------------------------------------------- the runner itself never dialled out
