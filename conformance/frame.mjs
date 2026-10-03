@@ -50,8 +50,10 @@
 //     (plus those two starter offers), with the project's own seed when init minted one, else the
 //     fixture seed, which every CLI child also gets as AGENT_ENTRY_SEED_HEX.
 //   - The store and the door share one https origin on 127.0.0.1 (the shop answers its own Store
-//     API; everything else is the door), with the test CA of fixtures/cli/woo handed to every
-//     child as NODE_EXTRA_CA_CERTS: trust is added, verification is never turned off.
+//     API; everything else is the door), with a throwaway test CA this run mints under a temp
+//     directory (fixtures/cli/runtime-tls.mjs, node:crypto only; no .pem is committed under
+//     conformance/) handed to every child as NODE_EXTRA_CA_CERTS: trust is added, verification is
+//     never turned off.
 //   - When a step's member has not landed, the next step proceeds from a stand-in so that its own
 //     red names its own member, not the one before it.
 //
@@ -59,16 +61,17 @@
 // and the runner imports the same guard.
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { createServer as createHttpsServer, request as httpsRequest } from 'node:https';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { guardLog } from './fixtures/cli/loopback-only.mjs';
+import { makeRuntimeTls } from './fixtures/cli/runtime-tls.mjs';
 import * as door from '../muretai-agent-entry.mjs';
 
 const {
@@ -81,7 +84,6 @@ const {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const BIN = join(HERE, '..', 'muretai-agent-entry.mjs');
 const FIX = join(HERE, 'fixtures', 'frame');
-const WOO_FIX = join(HERE, 'fixtures', 'cli', 'woo');
 const GUARD = join(HERE, 'fixtures', 'cli', 'loopback-only.mjs');
 const readJson = (p) => JSON.parse(readFileSync(p, 'utf8'));
 
@@ -89,9 +91,10 @@ const PAGES = [readFileSync(join(FIX, 'store-api-products-page-1.json')), readFi
 const FACTS_FILE = join(FIX, 'facts.json');
 const FACTS = readJson(FACTS_FILE);
 const SEEDS = readJson(join(FIX, 'seed.json'));
-const CA = readFileSync(join(WOO_FIX, 'test-ca.pem'));
-const TLS = { key: readFileSync(join(WOO_FIX, 'store-key.pem')), cert: readFileSync(join(WOO_FIX, 'store-cert.pem')) };
-const CHILD_TLS = { NODE_EXTRA_CA_CERTS: join(WOO_FIX, 'test-ca.pem') };
+const RUNTIME_TLS = makeRuntimeTls({ prefix: 'ae-frame-tls-' });
+const CA = RUNTIME_TLS.ca;
+const TLS = { key: RUNTIME_TLS.key, cert: RUNTIME_TLS.cert };
+const CHILD_TLS = { NODE_EXTRA_CA_CERTS: RUNTIME_TLS.caPath };
 
 const WOO_PRODUCTS = '/wp-json/wc/store/v1/products';
 const CLAIM_PATH = '/.well-known/muretai-catalog-claim.txt';
@@ -105,7 +108,7 @@ const DECLARED_UA = 'Claude-User/1.0 (+https://www.anthropic.com/claude-user)';
 
 // ---------------------------------------------------------------- scratch, children
 
-const scratch = [];
+const scratch = [RUNTIME_TLS.dir];
 function tmp(prefix) {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   scratch.push(dir);
@@ -722,6 +725,20 @@ test('frame 6b [Analytics-2 20261003T131711Z-2]: first_contact true on the custo
   assert.equal(split[newKey], 1, 'one first contact: the customer is new once');
   assert.equal(split[retKey], answered.length - 1, 'every later answered knock is returning');
   assert.ok(out.returning_customers >= 1, 'the store still says the customer came back');
+});
+
+test('frame: no .pem file is committed under conformance/ (the store TLS is minted at run time)', () => {
+  const root = join(HERE, '..');
+  const pem = [];
+  const visit = (p) => {
+    for (const name of readdirSync(p).sort()) {
+      const q = join(p, name);
+      if (lstatSync(q).isDirectory()) visit(q); else if (/\.pem$/i.test(name)) pem.push(relative(root, q));
+    }
+  };
+  visit(HERE);
+  assert.deepEqual(pem, [], 'a secret-shaped fixture under conformance/');
+  assert.ok(relative(root, RUNTIME_TLS.dir).startsWith('..'), `the store TLS lives outside the repository: ${RUNTIME_TLS.dir}`);
 });
 
 test('frame: the runner never dialled out', () => {

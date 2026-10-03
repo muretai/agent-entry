@@ -57,9 +57,9 @@
 //                 (no trailing newline), 404 without a code, GET in OPTIONS' Allow once claimed. Any
 //                 other code is refused naming 32/hex, and nothing is written.
 import { spawn, spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, createPrivateKey, X509Certificate } from 'node:crypto';
 import { createServer } from 'node:http';
-import { createServer as createHttpsServer } from 'node:https';
+import { createServer as createHttpsServer, request as httpsRequest } from 'node:https';
 import { connect } from 'node:net';
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync,
   rmSync, statSync, writeFileSync } from 'node:fs';
@@ -68,6 +68,7 @@ import { dirname, join, relative } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { guardLog, isLocalHost } from './fixtures/cli/loopback-only.mjs';
+import { makeRuntimeTls } from './fixtures/cli/runtime-tls.mjs';
 import * as door from '../muretai-agent-entry.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -1290,14 +1291,19 @@ await section('bin', async () => {
 //   too-large   the first products page exceeds the byte bound, with or without Content-Length.
 // No refusal writes anything: the project tree and HOME are byte for byte as before.
 // A well-formed, in-bounds https store is not refused for any of the three reasons.
-// The https store is a listener on 127.0.0.1 whose certificate chains to fixtures/cli/woo/test-ca.pem,
-// handed to the child as NODE_EXTRA_CA_CERTS: trust is added, verification is never turned off.
+// The https store is a listener on 127.0.0.1 whose certificate chains to a throwaway CA this run
+// mints under a temp directory (fixtures/cli/runtime-tls.mjs, node:crypto only), handed to the
+// child as NODE_EXTRA_CA_CERTS: trust is added, verification is never turned off. No certificate
+// or key is committed: no .pem file lives anywhere under conformance/ (a publisher's secret scan
+// refuses them, and the fix is to not commit them, never an allowlist).
 
 const WOO_FIX = join(FIX, 'woo');
 const WOO_PRODUCTS = '/wp-json/wc/store/v1/products';
 const WOO_PAGE = readFileSync(join(WOO_FIX, 'products-page.json'));
-const WOO_TLS = { key: readFileSync(join(WOO_FIX, 'store-key.pem')), cert: readFileSync(join(WOO_FIX, 'store-cert.pem')) };
-const WOO_ENV = { NODE_EXTRA_CA_CERTS: join(WOO_FIX, 'test-ca.pem') };
+const WOO_RUNTIME = makeRuntimeTls({ prefix: 'ae-cli-woo-tls-' });
+scratch.push(WOO_RUNTIME.dir);
+const WOO_TLS = { key: WOO_RUNTIME.key, cert: WOO_RUNTIME.cert };
+const WOO_ENV = { NODE_EXTRA_CA_CERTS: WOO_RUNTIME.caPath };
 const WOO_OVERSIZE = 32 * 1024 * 1024;   // far past any first page a bounded public catalogue read needs
 const WOO_REASONS = {
   'non-https': /\bhttps\b/i,
@@ -1399,6 +1405,84 @@ function oversizedPage({ declareLength }) {
 }
 
 const askedProducts = (hits) => hits.some((h) => h.method === 'GET' && h.url.split('?')[0].replace(/\/$/, '') === WOO_PRODUCTS);
+
+/** Every file under conformance/, relative to the repository root. */
+function conformanceFiles() {
+  const out = [];
+  const visit = (p) => {
+    for (const name of readdirSync(p).sort()) {
+      const q = join(p, name);
+      const st = lstatSync(q);
+      if (st.isDirectory()) visit(q); else out.push(relative(ROOT, q));
+    }
+  };
+  visit(HERE);
+  return out;
+}
+
+/** One https GET to a store; resolves { ok, status, code } and never turns verification off. */
+function tlsGet(origin, ca) {
+  return new Promise((resolveGet) => {
+    const req = httpsRequest(`${origin}/robots.txt`, ca ? { ca } : {}, (res) => {
+      res.resume();
+      res.on('end', () => resolveGet({ ok: true, status: res.statusCode }));
+    });
+    req.on('error', (error) => resolveGet({ ok: false, code: error.code || String(error) }));
+    req.setTimeout(15000, () => req.destroy(new Error('timeout')));
+    req.end();
+  });
+}
+
+// The certificate source: minted at run time, never committed.
+await section('woo-tls', async () => {
+  const pemFiles = conformanceFiles().filter((p) => /\.pem$/i.test(p));
+  check(pemFiles.length === 0, 'woo-tls/no-pem-file-under-conformance', JSON.stringify(pemFiles));
+  for (const name of ['store-cert.pem', 'store-key.pem', 'test-ca.pem']) {
+    check(!existsSync(join(WOO_FIX, name)), `woo-tls/fixture-${name}-deleted`);
+  }
+  check(existsSync(join(WOO_FIX, 'products-page.json')), 'woo-tls/products-page.json-stays');
+
+  const source = readFileSync(join(FIX, 'runtime-tls.mjs'), 'utf8');
+  const imports = [...source.matchAll(/^import\s[^;]*?from\s+'([^']+)'/gms)].map((m) => m[1]);
+  check(imports.length > 0 && imports.every((m) => m.startsWith('node:')) && imports.includes('node:crypto'),
+    'woo-tls/generator-is-node-builtins-only', JSON.stringify(imports));
+  check(!/child_process|openssl|spawn|exec/i.test(source.replace(/^\/\/.*$/gm, '')), 'woo-tls/generator-never-shells-out-to-openssl');
+
+  const ca = new X509Certificate(WOO_RUNTIME.ca);
+  const leaf = new X509Certificate(WOO_RUNTIME.cert);
+  check(ca.ca === true && ca.verify(ca.publicKey), 'woo-tls/ca-is-a-self-signed-ca');
+  check(leaf.ca === false && leaf.verify(ca.publicKey), 'woo-tls/leaf-is-signed-by-the-ca-and-is-not-a-ca');
+  check(leaf.checkIP('127.0.0.1') === '127.0.0.1', 'woo-tls/leaf-names-127.0.0.1', String(leaf.subjectAltName));
+  check(leaf.checkPrivateKey(createPrivateKey(WOO_TLS.key)), 'woo-tls/key-is-the-leaf-key');
+  const now = Date.now();
+  check(Date.parse(leaf.validFrom) <= now && now < Date.parse(leaf.validTo), 'woo-tls/leaf-is-valid-now', `${leaf.validFrom} .. ${leaf.validTo}`);
+  check(Date.parse(leaf.validTo) - now <= 31 * 24 * 3600 * 1000, 'woo-tls/leaf-is-short-lived', leaf.validTo);
+
+  const rel = relative(ROOT, WOO_RUNTIME.dir);
+  check(rel.startsWith('..') && !relative(tmpdir(), WOO_RUNTIME.dir).startsWith('..'),
+    'woo-tls/minted-under-a-temp-directory-outside-the-repository', WOO_RUNTIME.dir);
+  check(readFileSync(WOO_RUNTIME.caPath).equals(WOO_RUNTIME.ca), 'woo-tls/NODE_EXTRA_CA_CERTS-is-the-minted-ca');
+  if (process.platform !== 'win32') {
+    check((statSync(WOO_RUNTIME.keyPath).mode & 0o077) === 0, 'woo-tls/key-file-is-owner-only',
+      (statSync(WOO_RUNTIME.keyPath).mode & 0o777).toString(8));
+  }
+
+  const other = makeRuntimeTls({ prefix: 'ae-cli-woo-tls-other-' });
+  scratch.push(other.dir);
+  check(new X509Certificate(other.ca).fingerprint256 !== ca.fingerprint256 && !other.key.equals(WOO_RUNTIME.key),
+    'woo-tls/every-run-mints-fresh-keys');
+
+  // Trust is added, never disabled: only a client holding this run's CA reaches the store.
+  const store = await startStore(wooStore(wooPage));
+  try {
+    const trusted = await tlsGet(store.origin, WOO_RUNTIME.ca);
+    check(trusted.ok && trusted.status === 200, 'woo-tls/a-client-trusting-the-minted-ca-is-answered', JSON.stringify(trusted));
+    const bare = await tlsGet(store.origin, null);
+    check(!bare.ok, 'woo-tls/refused/a-client-without-the-ca-is-refused', JSON.stringify(bare));
+    const stranger = await tlsGet(store.origin, other.ca);
+    check(!stranger.ok, 'woo-tls/refused/another-runs-ca-is-refused', JSON.stringify(stranger));
+  } finally { await store.close(); }
+});
 
 await section('woo-init', async () => {
   const refusalText = {};
