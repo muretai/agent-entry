@@ -6,6 +6,9 @@
   "pickup": "Held items can be picked up at the shop within 48 hours.",
   "contact": "hello@harbor-lamp.example",
   "address": "12 Quay Street, Harbor Town.",
+  "human_contact_name": "Harbor Lamp Ltd., Ada Quay",
+  "human_contact_email": "ada@harbor-lamp.example",
+  "human_contact_phone": "+44 20 7946 0000",
   "warranty": "Two years on every lamp and part.",
   "holidays": "Closed on public holidays and the first week of August.",
   "languages": "English and German."

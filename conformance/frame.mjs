@@ -16,7 +16,7 @@
 // What each step pins (the CLI is `node muretai-agent-entry.mjs <verb> ...`, the package bin):
 //   1 Woo-2 (20261003T001757Z)   `init --from woocommerce <store> --facts <file>` in a project dir
 //        writes agent-entry.json: it validates, names the store's origin as entry.baseUrl, carries
-//        the facts file's ten facts as `facts`, and an offer of verb `ask` answered at the door by
+//        the facts file as `facts` (FACT_KEYS below), and an offer of verb `ask` answered at the door by
 //        `facts`. It reads only the store's public Store API (and robots.txt). Refusals: a store
 //        that is not https (Woo-1, landed 49930bf) and an incomplete facts file write nothing.
 //   2 the door (Suite S1, landed) started from that declaration serves the card and its signature,
@@ -41,8 +41,10 @@
 //        returning knocks.
 //
 // Frame choices a member must honour (none is invented beyond what its intake names):
-//   - Woo-2's ten facts: the six the intake names plus the four its open question proposes
-//     (address, warranty, holidays, languages): fixtures/frame/facts.json.
+//   - Woo-2's facts keys (Woo-2, chain item 2 of 6): the ten shop facts (the six the intake names
+//     plus address, warranty, holidays, languages), with the REQUIRED human contact after address:
+//     human_contact_name (a company or a person) and human_contact_email and/or
+//     human_contact_phone, at least one of the two: fixtures/frame/facts.json, FACT_KEYS.
 //   - find and hold are Woo-4/Woo-5, which the frame pass files as polish. Until the generated
 //     declaration carries them, the frame's door adds the retail starter's door-bound `find` and
 //     `hold` (OFFER_STARTERS.retail) beside what init wrote, so step 4 never waits on polish.
@@ -90,6 +92,8 @@ const readJson = (p) => JSON.parse(readFileSync(p, 'utf8'));
 const PAGES = [readFileSync(join(FIX, 'store-api-products-page-1.json')), readFileSync(join(FIX, 'store-api-products-page-2.json'))];
 const FACTS_FILE = join(FIX, 'facts.json');
 const FACTS = readJson(FACTS_FILE);
+const FACT_KEYS = ['hours', 'shipping', 'returns', 'payment', 'pickup', 'contact', 'address',
+  'human_contact_name', 'human_contact_email', 'human_contact_phone', 'warranty', 'holidays', 'languages'];
 const SEEDS = readJson(join(FIX, 'seed.json'));
 const RUNTIME_TLS = makeRuntimeTls({ prefix: 'ae-frame-tls-' });
 const CA = RUNTIME_TLS.ca;
@@ -377,7 +381,8 @@ test('frame 1 [Woo-2 20261003T001757Z]: init --from woocommerce <store> --facts 
   const declaration = readJson(path);
   validateDeclaration(declaration);
   assert.equal(new URL(declaration.entry.baseUrl).origin, state.shop.origin, 'entry.baseUrl names the store it was read from');
-  assert.deepEqual(declaration.facts, FACTS, 'the declaration carries the facts file, all ten, as written');
+  assert.deepEqual(Object.keys(FACTS).sort(), [...FACT_KEYS].sort(), 'the frame facts file carries the Woo-2 facts keys');
+  assert.deepEqual(declaration.facts, FACTS, 'the declaration carries the facts file, every key, as written');
   const ask = declaration.offers.filter((o) => o.verb === 'ask');
   assert.equal(ask.length, 1, `exactly one ask offer: ${JSON.stringify(declaration.offers).slice(0, 300)}`);
   assert.equal(ask[0].door?.reply, 'facts', 'the ask offer is answered at the door from the facts');

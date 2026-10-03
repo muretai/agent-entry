@@ -51,6 +51,10 @@
 //                 reason on stderr and nothing written: a URL that is not https (before any
 //                 request), a store whose /wp-json/wc/store/v1/products is absent or not JSON, and a
 //                 first page past the byte bound. A well-formed in-bounds https store is not refused.
+//   init --from woocommerce <store-url> [--facts <file>]  (Woo chain item 2) reads robots.txt and ONE
+//                 Store API page, writes agent-entry.json with one `ask` offer answered from the facts
+//                 (file, or prompted one per line); a facts file without the human contact
+//                 (human_contact_name + human_contact_email|phone) is refused by name before any request.
 //   publish --claim <32 lowercase hex>  (FRAME Claim-2) records the code in agent-entry.json, prints
 //                 `_muretai-catalog.<host> TXT muretai-catalog-claim=<code>`, and the door serves
 //                 GET /.well-known/muretai-catalog-claim.txt: 200 text/plain `muretai-catalog-claim=<code>`
@@ -1585,6 +1589,240 @@ await section('woo-init', async () => {
 
   const help = await runCli(['init', '--help']);
   check(help.code === 0 && /woocommerce/i.test(help.stdout), 'woo-init/init-help-names-woocommerce', `exit ${help.code}`);
+});
+
+// ---------------------------------------------------------------- 11b. init --from woocommerce: the ask offer
+//
+// WRITTEN BEFORE THE IMPLEMENTATION (test-first, skeleton item 2 of 6 of the Woo declaration
+// generator chain, Woo-2; parent intake 20261002T235854Z: public Store API only, bounded,
+// robots.txt respected, own vocabulary AT-1, deterministic compile, no payment verb). The
+// implementer may not edit this section or fixtures/cli/woo/facts.json.
+//
+// `init --from woocommerce <store> --facts <file>` (or, without --facts, the same facts prompted
+// one per line on stdin) reads robots.txt and exactly ONE page of the public Store API products
+// path, to prove the store answers, and writes agent-entry.json holding one offer answered at the
+// door from the facts (`door.reply: "facts"`), of verb `ask`, whose `facts` are the facts file as
+// written. Paging is Woo-3's: the store here has one page and nothing about a second is pinned.
+//
+// The facts keys, in this order (also the prompt order): the shop facts hours, shipping, returns,
+// payment, pickup, contact, then address, then the REQUIRED human contact, then warranty,
+// holidays, languages. Facts are strings (AT-1 `facts` maps a name to a string), so the human
+// contact is three flat keys:
+//   human_contact_name    a company name or a person name               required, non-blank
+//   human_contact_email   an email address                              at least one of these
+//   human_contact_phone   a phone number                                two, non-blank
+// A --facts file missing the human contact is refused, exit 1, naming the missing key(s), BEFORE
+// any request to the store (not even robots.txt) and before any file is written. A facts file
+// missing a shop fact, or carrying a non-string value, is refused by that key's name and writes
+// nothing. A robots.txt that disallows the Store API path is respected: refused, products never
+// asked, nothing written. The same facts file and the same recorded store give byte-identical
+// agent-entry.json across runs.
+
+const WOO_FACTS_FILE = join(WOO_FIX, 'facts.json');
+const WOO_FACTS = readJson(WOO_FACTS_FILE);
+const HUMAN_NAME = 'human_contact_name';
+const HUMAN_EMAIL = 'human_contact_email';
+const HUMAN_PHONE = 'human_contact_phone';
+const WOO_FACT_KEYS = ['hours', 'shipping', 'returns', 'payment', 'pickup', 'contact', 'address',
+  HUMAN_NAME, HUMAN_EMAIL, HUMAN_PHONE, 'warranty', 'holidays', 'languages'];
+const PAYMENT_VERBS = ['buy', 'pay', 'purchase', 'checkout', 'order'];
+
+/** The bin with stdin fed `input` (then closed): the prompted path. */
+function runCliInput(args, { cwd, env = {}, input = '', timeout = 30000 } = {}) {
+  const log = join(tmp('ae-cli-guard-'), 'guard.jsonl');
+  return new Promise((resolveRun) => {
+    const child = spawn(process.execPath, ['--import', pathToFileURL(GUARD).href, BIN, ...args], {
+      cwd: cwd || tmp(), env: { ...baseEnv(HOME), ...env, AE_CLI_GUARD_LOG: log },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeout);
+    child.stdout.on('data', (c) => { stdout += c.toString('utf8'); });
+    child.stderr.on('data', (c) => { stderr += c.toString('utf8'); });
+    child.stdin.on('error', () => { /* the child stopped reading */ });
+    child.stdin.end(input);
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      let guard = [];
+      try { guard = readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { /* none */ }
+      resolveRun({ code, signal, stdout, stderr, guard, timedOut });
+    });
+  });
+}
+
+const pathOf = (h) => h.url.split('?')[0].replace(/\/$/, '') || '/';
+const productsHits = (hits) => hits.filter((h) => pathOf(h) === WOO_PRODUCTS);
+const factsFileWith = (patch) => {
+  const facts = clone(WOO_FACTS);
+  for (const [k, v] of Object.entries(patch)) { if (v === undefined) delete facts[k]; else facts[k] = v; }
+  const file = join(tmp('ae-cli-woo-facts-'), 'facts.json');
+  writeFileSync(file, `${JSON.stringify(facts, null, 2)}\n`);
+  return { file, facts };
+};
+
+await section('woo-ask', async () => {
+  // The fixture is the pinned key list, no more, no less.
+  check(sorted(Object.keys(WOO_FACTS)) === sorted(WOO_FACT_KEYS), 'woo-ask/fixture-carries-the-pinned-facts-keys',
+    JSON.stringify(Object.keys(WOO_FACTS)));
+  check(Object.values(WOO_FACTS).every((v) => typeof v === 'string' && v.trim() !== ''), 'woo-ask/fixture-facts-are-strings');
+
+  /** One accepted init: the declaration it wrote (or null), every shared pin checked. */
+  async function accepted(label, store, { facts, file = null, input = null }) {
+    const dir = makeRepo('vite');
+    const before = store.hits.length;
+    const args = ['init', '--from', 'woocommerce', store.origin, ...(file ? ['--facts', file] : [])];
+    const run = input === null
+      ? await runCli(args, { cwd: dir, env: WOO_ENV })
+      : await runCliInput(args, { cwd: dir, env: WOO_ENV, input });
+    guardClean(label, run, { onlyPort: store.port });
+    if (!check(run.code === 0, `${label}/exit-0`, `exit ${run.code}; stdout ${run.stdout.slice(0, 300)}; stderr ${run.stderr.slice(0, 400)}`)) return null;
+    const path = join(dir, 'agent-entry.json');
+    if (!check(existsSync(path), `${label}/wrote-agent-entry.json`)) return null;
+    const bytes = readFileSync(path);
+    let declaration = null;
+    try { declaration = JSON.parse(bytes.toString('utf8')); } catch (error) { check(false, `${label}/agent-entry.json-is-json`, String(error)); return null; }
+    let valid = true;
+    try { validateDeclaration(declaration); } catch (error) { valid = false; check(false, `${label}/declaration-validates`, String(error?.message || error)); }
+    if (valid) check(true, `${label}/declaration-validates`);
+    check(new URL(String(declaration.entry?.baseUrl)).origin === store.origin, `${label}/entry.baseUrl-names-the-store`,
+      JSON.stringify(declaration.entry));
+    check(canonicalJSON(declaration.facts ?? null) === canonicalJSON(facts), `${label}/facts-are-the-given-facts-as-written`,
+      JSON.stringify(declaration.facts).slice(0, 600));
+    const offers = Array.isArray(declaration.offers) ? declaration.offers : [];
+    const factsOffers = offers.filter((o) => o?.door?.reply === 'facts');
+    check(factsOffers.length === 1 && factsOffers[0].verb === 'ask', `${label}/one-door.reply-facts-offer-of-verb-ask`,
+      JSON.stringify(offers).slice(0, 400));
+    check(!offers.some((o) => PAYMENT_VERBS.includes(o?.verb) || o?.door?.reply === 'checkout'), `${label}/no-payment-verb`,
+      JSON.stringify(offers.map((o) => o?.verb)));
+    if (valid) {
+      check(canonicalJSON(compileDeclaration(declaration)) === canonicalJSON(compileDeclaration(clone(declaration))),
+        `${label}/compiles-deterministically`);
+    }
+    // One page of the public Store API, robots.txt first, nothing else asked.
+    const hits = store.hits.slice(before);
+    const products = productsHits(hits);
+    check(products.length === 1 && products[0].method === 'GET', `${label}/exactly-one-store-api-page-fetched`, JSON.stringify(hits));
+    const page = products[0] ? new URL(products[0].url, 'https://x.invalid').searchParams.get('page') : null;
+    check(page === null || page === '1', `${label}/the-page-fetched-is-the-first`, JSON.stringify(products));
+    const robotsAt = hits.findIndex((h) => pathOf(h) === '/robots.txt');
+    const productsAt = hits.findIndex((h) => pathOf(h) === WOO_PRODUCTS);
+    check(robotsAt !== -1 && robotsAt < productsAt, `${label}/robots.txt-read-before-the-store-api`, JSON.stringify(hits));
+    check(hits.every((h) => ['/robots.txt', WOO_PRODUCTS].includes(pathOf(h))), `${label}/reads-only-robots.txt-and-the-store-api`,
+      JSON.stringify(hits));
+    check(seedLeaks(dir).length === 0, `${label}/no-trackable-seed`, JSON.stringify(seedLeaks(dir)));
+    const seeds = seedFilesAnywhere(dir).map((rel) => SEED_LINE.exec(readFileSync(join(dir, rel), 'utf8'))?.[1]).filter(Boolean);
+    check(!seeds.some((s) => `${run.stdout}${run.stderr}`.includes(s)), `${label}/seed-never-printed`);
+    check(!bytes.toString('utf8').includes('AGENT_ENTRY_SEED_HEX') && !seeds.some((s) => bytes.toString('utf8').includes(s)),
+      `${label}/no-seed-in-agent-entry.json`);
+    return { dir, bytes, declaration };
+  }
+
+  /** One refusal: exit (1 when `exact`), the named key(s) on stderr, nothing written anywhere. */
+  async function refused(label, store, { file = null, input = null, names = [], noRequest = false, exact = true, extraArgs = [] }) {
+    const dir = makeRepo('vite');
+    const home = tmp('ae-cli-woo-home-');
+    const before = { tree: treeState(dir), home: treeState(home), hits: store.hits.length };
+    const args = ['init', '--from', 'woocommerce', store.origin, ...(file ? ['--facts', file] : []), ...extraArgs];
+    const env = { ...WOO_ENV, HOME: home };
+    const run = input === null ? await runCli(args, { cwd: dir, env }) : await runCliInput(args, { cwd: dir, env, input });
+    guardClean(label, run, { onlyPort: store.port });
+    check(exact ? run.code === 1 : (run.code !== 0 && run.code !== null), `${label}/refused${exact ? '-exit-1' : ''}`,
+      `exit ${run.code}; stdout ${run.stdout.slice(0, 200)}; stderr ${run.stderr.slice(0, 300)}`);
+    for (const name of names) {
+      check(run.stderr.includes(name), `${label}/refusal-names-${name}`, JSON.stringify(run.stderr.slice(0, 400)));
+    }
+    if (noRequest) {
+      check(store.hits.length === before.hits, `${label}/refused-before-any-store-request`, JSON.stringify(store.hits.slice(before.hits)));
+    }
+    const tree = stateDiff(before.tree, treeState(dir));
+    check(tree.length === 0, `${label}/writes-nothing-in-the-project`, JSON.stringify(tree.slice(0, 10)));
+    const homeDiff = stateDiff(before.home, treeState(home));
+    check(homeDiff.length === 0, `${label}/writes-nothing-in-home`, JSON.stringify(homeDiff.slice(0, 10)));
+    check(!existsSync(join(dir, 'agent-entry.json')), `${label}/no-agent-entry.json`);
+    check(seedFilesAnywhere(dir).length === 0, `${label}/no-seed-minted`, JSON.stringify(seedFilesAnywhere(dir)));
+    return run;
+  }
+
+  const store = await startStore(wooStore(wooPage));
+  try {
+    // (1) --facts: one ask offer from the facts file, one Store API page read.
+    const first = await accepted('woo-ask/facts-file', store, { facts: WOO_FACTS, file: WOO_FACTS_FILE });
+
+    // (2) Deterministic: the same facts file, the same recorded store -> the same bytes.
+    const second = await accepted('woo-ask/facts-file-again', store, { facts: WOO_FACTS, file: WOO_FACTS_FILE });
+    if (first && second) {
+      check(first.bytes.equals(second.bytes), 'woo-ask/agent-entry.json-byte-identical-across-runs',
+        `${first.bytes.length} vs ${second.bytes.length} bytes`);
+      check(canonicalJSON(compileDeclaration(first.declaration)) === canonicalJSON(compileDeclaration(second.declaration)),
+        'woo-ask/compiled-contract-identical-across-runs');
+    }
+
+    // (3) The human contact needs a name and ONE of email or phone: either alone is enough.
+    for (const [tag, drop] of [['phone-only', HUMAN_EMAIL], ['email-only', HUMAN_PHONE]]) {
+      const { file, facts } = factsFileWith({ [drop]: undefined, [HUMAN_NAME]: 'Harbor Lamp Ltd.' });
+      await accepted(`woo-ask/human-contact-${tag}`, store, { facts, file });
+    }
+
+    // (4) No --facts: the facts are prompted, one line per key in the pinned order.
+    const answers = `${WOO_FACT_KEYS.map((k) => WOO_FACTS[k]).join('\n')}\n`;
+    await accepted('woo-ask/prompted', store, { facts: WOO_FACTS, input: answers });
+
+    // (5) Refused before any store request, by name: the human contact is missing or blank.
+    for (const [tag, patch, names] of [
+      ['no-name', { [HUMAN_NAME]: undefined }, [HUMAN_NAME]],
+      ['blank-name', { [HUMAN_NAME]: '   ' }, [HUMAN_NAME]],
+      ['neither-email-nor-phone', { [HUMAN_EMAIL]: undefined, [HUMAN_PHONE]: undefined }, [HUMAN_EMAIL, HUMAN_PHONE]],
+      ['blank-email-and-phone', { [HUMAN_EMAIL]: '', [HUMAN_PHONE]: ' ' }, [HUMAN_EMAIL, HUMAN_PHONE]],
+      ['no-human-contact-at-all', { [HUMAN_NAME]: undefined, [HUMAN_EMAIL]: undefined, [HUMAN_PHONE]: undefined },
+        [HUMAN_NAME, HUMAN_EMAIL, HUMAN_PHONE]],
+    ]) {
+      const { file } = factsFileWith(patch);
+      await refused(`woo-ask/refused/human-contact-${tag}`, store, { file, names, noRequest: true });
+    }
+
+    // (6) The rest of the facts shape, refused by the key's name, nothing written.
+    {
+      const { file } = factsFileWith({ returns: undefined });
+      await refused('woo-ask/refused/missing-shop-fact-returns', store, { file, names: ['returns'], exact: false });
+    }
+    {
+      const { file } = factsFileWith({ hours: 10 });
+      await refused('woo-ask/refused/non-string-fact-hours', store, { file, names: ['hours'], exact: false });
+    }
+    {
+      const file = join(tmp('ae-cli-woo-facts-'), 'facts.json');
+      writeFileSync(file, '{"hours": "Tue-Sat",');
+      await refused('woo-ask/refused/facts-file-not-json', store, { file, exact: false });
+    }
+    await refused('woo-ask/refused/facts-file-absent', store, { file: join(tmp('ae-cli-woo-facts-'), 'no-such-facts.json'), exact: false });
+
+    // (7) Prompted with nothing to read (stdin closed at once): refused, never hangs, writes nothing.
+    await refused('woo-ask/refused/prompted-stdin-empty', store, { input: '', exact: false });
+  } finally { await store.close(); }
+
+  // (8) robots.txt is respected: a store that disallows its Store API path is never asked for it.
+  {
+    const shy = await startStore((req, res) => {
+      if (pathOf(req) === '/robots.txt') {
+        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('User-agent: *\nDisallow: /wp-json/\n');
+      } else {
+        wooStore(wooPage)(req, res);
+      }
+    });
+    try {
+      const run = await refused('woo-ask/refused/robots-disallows-the-store-api', shy, { file: WOO_FACTS_FILE, exact: false });
+      check(/robots/i.test(run.stderr), 'woo-ask/refused/robots-disallows-the-store-api/refusal-names-robots.txt',
+        JSON.stringify(run.stderr.slice(0, 300)));
+      check(productsHits(shy.hits).length === 0, 'woo-ask/refused/robots-disallows-the-store-api/store-api-never-asked',
+        JSON.stringify(shy.hits));
+    } finally { await shy.close(); }
+  }
+
+  const help = await runCli(['init', '--help']);
+  check(help.code === 0 && help.stdout.includes('--facts'), 'woo-ask/init-help-names---facts', `exit ${help.code}`);
 });
 
 // ---------------------------------------------------------------- 12. publish --claim: the Catalog's proof file
