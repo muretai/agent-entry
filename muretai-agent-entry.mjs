@@ -58,6 +58,7 @@ import {
   realpathSync, renameSync, statSync, writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
+import { createInterface } from 'node:readline';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -5922,14 +5923,32 @@ const FRAMEWORKS = Object.freeze({
 const WOO_PAGE_MAX_BYTES = 4 * 1024 * 1024;
 const WOO_PRODUCTS_PATH = 'wp-json/wc/store/v1/products';
 const WOO_FROM = 'woocommerce';
+/** The most of a store's robots.txt init parses (RFC 9309 asks a crawler to parse at least 500 KiB). */
+const WOO_ROBOTS_MAX_BYTES = 512 * 1024;
+/** The product token robots.txt groups are matched against, and the User-Agent init sends. */
+const WOO_ROBOTS_AGENT = 'agent-entry';
+const WOO_USER_AGENT = 'agent-entry-init/1';
+/** The facts `init --from woocommerce` asks for, in this order (also the prompt order). The human
+ *  contact is required: human_contact_name, and human_contact_email or human_contact_phone. */
+const WOO_FACT_KEYS = Object.freeze(['hours', 'shipping', 'returns', 'payment', 'pickup', 'contact', 'address',
+  'human_contact_name', 'human_contact_email', 'human_contact_phone', 'warranty', 'holidays', 'languages']);
+const WOO_CONTACT_EITHER = Object.freeze(['human_contact_email', 'human_contact_phone']);
+const WOO_ASK_OFFER = deepFreeze({ verb: 'ask', of: 'shop',
+  about: 'Ask the shop about hours, shipping, returns, payment, pickup, warranty, and how to reach a person.',
+  input: { text: 'string' }, door: { reply: 'facts' } });
 
 const USAGE = {
   init: 'usage: agent-entry init (--trade restaurant|retail|clinic|repair | --from sodium.json) --base-url <url> [--name <name>] [--json]\n'
-    + '       agent-entry init --from woocommerce <https store url>\n'
+    + '       agent-entry init --from woocommerce <https store url> [--facts <file>] [--name <name>] [--json]\n'
     + '  Detects the framework, mints the site seed into a git-ignored file, writes agent-entry.json and\n'
     + '  .agents/skills/agent-entry/SKILL.md, and wires the door routes, the signposts and the page tag.\n'
-    + '  --from woocommerce reads the store\'s public Store API (wc/store/v1/products), https only and\n'
-    + `  bounded to ${WOO_PAGE_MAX_BYTES} bytes per page; it refuses a store that is not WooCommerce.`,
+    + '  --from woocommerce reads the store\'s robots.txt and ONE page of its public Store API\n'
+    + `  (wc/store/v1/products), https only and bounded to ${WOO_PAGE_MAX_BYTES} bytes per page; it refuses a store\n`
+    + '  that is not WooCommerce or whose robots.txt disallows that path. It writes only agent-entry.json: one\n'
+    + '  `ask` offer answered at the door from the shop\'s facts. --facts <file> is a JSON object of strings with\n'
+    + `  the keys ${WOO_FACT_KEYS.join(', ')}\n`
+    + '  (human_contact_email or human_contact_phone may be left out, not both); without --facts they are read\n'
+    + '  from stdin, one line each in that order.',
   publish: 'usage: agent-entry publish [--version <n>] [--claim <code>] [--json]   (alias: agent-entry deploy)\n'
     + '  Validates agent-entry.json, compiles and signs it, and writes <static dir>/.well-known/agent-tools.json,\n'
     + '  agent-tools.sig.json and agent-tools/v<n>.json. A published version is never rewritten.\n'
@@ -6062,10 +6081,9 @@ function mintSeed(root, slot) {
 
 // ------------------------------------------ init: a WooCommerce store's first products page
 
-/** The store's first public Store API products page, as parsed JSON, or a refusal naming one of
- *  three reasons: the URL is not https (decided before any request), the products path is not a
- *  WooCommerce Store API (absent, unreachable, or not JSON), or the page exceeds the byte bound. */
-async function wooFirstPage(storeUrl) {
+/** The store's base URL (https, no credentials, query or fragment, its path ending in "/"), or a
+ *  refusal. Decided before any request is made. */
+function wooStoreBase(storeUrl) {
   let base;
   try { base = new URL(storeUrl); } catch { throw new CliMisuse(`${JSON.stringify(String(storeUrl).slice(0, 80))} is not a URL`); }
   if (base.protocol !== 'https:') {
@@ -6076,7 +6094,169 @@ async function wooFirstPage(storeUrl) {
   base.search = '';
   base.hash = '';
   if (!base.pathname.endsWith('/')) base.pathname += '/';
+  return base;
+}
+
+/** The shop's facts, checked and in WOO_FACT_KEYS order, or a refusal naming every key that is
+ *  missing, blank, not a string or not one of the keys. `from` names where they came from. The
+ *  values stay data: they only ever reach agent-entry.json as JSON strings. */
+function wooFacts(raw, from, after) {
+  const refuse = (why) => new CliRefusal(`${from} ${why}. The facts are ${WOO_FACT_KEYS.join(', ')}, each a string; the human `
+    + `contact is required: human_contact_name, and human_contact_email or human_contact_phone. ${after}`);
+  if (!isPlainObject(raw)) throw refuse('is not a JSON object mapping each fact to a string');
+  const problems = [];
+  const stray = Object.keys(raw).filter((k) => !WOO_FACT_KEYS.includes(k));
+  if (stray.length) problems.push(`has unknown key(s) ${stray.map((k) => JSON.stringify(k.slice(0, 40))).join(', ')}`);
+  for (const key of WOO_FACT_KEYS) {
+    const value = raw[key];
+    if (value === undefined) {
+      if (!WOO_CONTACT_EITHER.includes(key)) problems.push(`${key} is missing`);
+    } else if (typeof value !== 'string') {
+      problems.push(`${key} must be a string, not ${value === null ? 'null' : Array.isArray(value) ? 'a list' : typeof value}`);
+    } else if (value.trim() === '') {
+      problems.push(`${key} is blank${WOO_CONTACT_EITHER.includes(key) ? ' (leave it out instead)' : ''}`);
+    } else if (LONE_SURROGATE.test(value)) {
+      problems.push(`${key} is not encodable UTF-8 (a lone surrogate)`);
+    }
+  }
+  if (!WOO_CONTACT_EITHER.some((k) => typeof raw[k] === 'string' && raw[k].trim() !== '')) {
+    problems.push(`the human contact has neither ${WOO_CONTACT_EITHER.join(' nor ')}: give at least one`);
+  }
+  if (problems.length) throw refuse(`is refused: ${problems.join('; ')}`);
+  const facts = {};
+  for (const key of WOO_FACT_KEYS) if (raw[key] !== undefined) facts[key] = raw[key];
+  return facts;
+}
+
+/** The facts from a --facts file, refused before any request when the file is absent, not JSON
+ *  or not the facts. */
+function wooFactsFile(file) {
+  const after = 'Nothing was asked of the store and nothing was written.';
+  let text;
+  try { text = readFileSync(resolve(process.cwd(), file), 'utf8'); } catch (e) {
+    throw new CliRefusal(`cannot read the facts file ${JSON.stringify(String(file).slice(0, 120))}: ${shortError(e)}. ${after}`);
+  }
+  let raw;
+  try { raw = JSON.parse(text.replace(/^﻿/, '')); } catch (e) {
+    throw new CliRefusal(`the facts file ${JSON.stringify(String(file).slice(0, 120))} is not JSON: ${shortError(e)}. ${after}`);
+  }
+  return wooFacts(raw, `the facts file ${JSON.stringify(String(file).slice(0, 120))}`, after);
+}
+
+/** The facts read from stdin, one line per key in WOO_FACT_KEYS order (an empty line leaves out
+ *  human_contact_email or human_contact_phone). Prompts on stderr only when stdin is a terminal. */
+async function wooFactsPrompted() {
+  const after = 'Nothing was written.';
+  const tty = Boolean(process.stdin.isTTY);
+  if (tty) {
+    process.stderr.write('No --facts file: answer each fact on one line. Leave human_contact_email or '
+      + 'human_contact_phone empty if the shop has none (not both).\n');
+  }
+  const rl = createInterface({ input: process.stdin, terminal: false, crlfDelay: Infinity });
+  const lines = rl[Symbol.asyncIterator]();
+  const raw = {};
+  try {
+    for (const key of WOO_FACT_KEYS) {
+      if (tty) process.stderr.write(`${key}: `);
+      const step = await lines.next();
+      if (step.done) {
+        throw new CliRefusal(`no facts to write: stdin ended before ${key}. Give --facts <file>, or answer one fact per line `
+          + `on stdin in this order: ${WOO_FACT_KEYS.join(', ')}. ${after}`);
+      }
+      if (step.value.trim() === '' && WOO_CONTACT_EITHER.includes(key)) continue;
+      raw[key] = step.value;
+    }
+  } finally {
+    rl.close();
+  }
+  return wooFacts(raw, 'the facts given on stdin', after);
+}
+
+/** The robots.txt rule that disallows `path` to agent-entry, or null when none does (RFC 9309:
+ *  the group naming agent-entry, else the `*` group; the longest matching rule wins, and an Allow
+ *  wins a tie). */
+function robotsDisallowing(text, path) {
+  const groups = [];
+  let group = null;
+  let inAgents = false;
+  for (const raw of text.split(/\r\n|\r|\n/)) {
+    const m = /^\s*([A-Za-z-]+)\s*:\s*(.*?)\s*$/.exec(raw.replace(/#.*/, ''));
+    if (!m) continue;
+    const field = m[1].toLowerCase();
+    if (field === 'user-agent') {
+      if (!inAgents) { group = { agents: [], rules: [] }; groups.push(group); }
+      group.agents.push(m[2].toLowerCase());
+      inAgents = true;
+    } else if (field === 'allow' || field === 'disallow') {
+      inAgents = false;
+      if (group && m[2]) group.rules.push({ allow: field === 'allow', pattern: m[2] });
+    }
+  }
+  const named = groups.filter((g) => g.agents.includes(WOO_ROBOTS_AGENT));
+  const rules = (named.length ? named : groups.filter((g) => g.agents.includes('*'))).flatMap((g) => g.rules);
+  let best = null;
+  for (const rule of rules) {
+    const anchored = rule.pattern.endsWith('$');
+    const body = anchored ? rule.pattern.slice(0, -1) : rule.pattern;
+    const source = body.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*');
+    if (!new RegExp(`^${source}${anchored ? '$' : ''}`).test(path)) continue;
+    if (!best || rule.pattern.length > best.pattern.length || (rule.pattern.length === best.pattern.length && rule.allow)) best = rule;
+  }
+  return best && !best.allow ? best.pattern : null;
+}
+
+/** Read the store's robots.txt and refuse when it disallows `url`'s path to agent-entry, or when it
+ *  answers a server error (the store cannot say now what it allows). No answer at all, a redirect
+ *  or a 4xx means no rules; the products request that follows reports an unreachable store. */
+async function wooRobotsAllow(url) {
+  const robots = new URL('/robots.txt', url);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 30000);
+  try {
+    let res;
+    try {
+      res = await fetch(robots, { redirect: 'manual', signal: ctrl.signal,
+        headers: { accept: 'text/plain', 'user-agent': WOO_USER_AGENT } });
+    } catch {
+      return;
+    }
+    if (res.status >= 500) {
+      ctrl.abort();
+      throw new CliRefusal(`robots.txt on ${url.host} answered status ${res.status}, so init cannot tell whether it may read `
+        + `${url.pathname}; it asked nothing more. Try again later. Nothing was written.`);
+    }
+    if (res.status !== 200) { ctrl.abort(); return; }
+    const chunks = [];
+    let total = 0;
+    if (res.body) {
+      const reader = res.body.getReader();
+      for (;;) {
+        let step;
+        try { step = await reader.read(); } catch { break; }
+        if (step.done) break;
+        chunks.push(step.value);
+        total += step.value.byteLength;
+        if (total >= WOO_ROBOTS_MAX_BYTES) { ctrl.abort(); break; }
+      }
+    }
+    const text = Buffer.concat(chunks).subarray(0, WOO_ROBOTS_MAX_BYTES).toString('utf8').replace(/^﻿/, '');
+    const rule = robotsDisallowing(text, url.pathname);
+    if (rule !== null) {
+      throw new CliRefusal(`robots.txt on ${url.host} disallows ${url.pathname} to ${WOO_ROBOTS_AGENT} (Disallow: ${rule.slice(0, 120)}), `
+        + 'so init does not read the store. Nothing was written.');
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The store's first public Store API products page, as parsed JSON, or a refusal naming one of
+ *  three reasons: the URL is not https (wooStoreBase, before any request), the products path is
+ *  not a WooCommerce Store API (absent, unreachable, or not JSON), or the page exceeds the byte
+ *  bound. robots.txt is read first, and a disallow is respected. */
+async function wooFirstPage(base) {
   const url = new URL(WOO_PRODUCTS_PATH, base);
+  await wooRobotsAllow(url);
   const where = `${url.host}${url.pathname}`;
   const notWoo = (why) => new CliRefusal(`not a WooCommerce store: GET ${where} ${why}, so this is no public Store API `
     + '(wc/store/v1/products). Check the URL is the shop\'s own address. Nothing was written.');
@@ -6087,7 +6267,7 @@ async function wooFirstPage(storeUrl) {
     let res;
     try {
       res = await fetch(url, { redirect: 'manual', signal: ctrl.signal,
-        headers: { accept: 'application/json', 'user-agent': 'agent-entry-init/1' } });
+        headers: { accept: 'application/json', 'user-agent': WOO_USER_AGENT } });
     } catch (e) {
       throw notWoo(`got no answer (${shortError(e.cause ?? e)})`);
     }
@@ -6129,13 +6309,30 @@ async function wooFirstPage(storeUrl) {
   }
 }
 
-async function initFromWoo(storeUrl) {
+/** `init --from woocommerce <store> [--facts <file>]`: robots.txt and one Store API page prove the
+ *  store answers; agent-entry.json gets one `ask` offer answered at the door from the facts. Only
+ *  that file is written: the store's door (the WordPress plugin) keeps its own seed. A facts file
+ *  is checked before any request; prompted facts are read once the store has answered. */
+async function initFromWoo(storeUrl, flags) {
   if (storeUrl === undefined) throw new CliMisuse('init --from woocommerce needs the store URL: init --from woocommerce <store-url>');
-  const { host, products } = await wooFirstPage(storeUrl);
-  // Past the three checks. Turning the page into offers is the next item of the Woo chain; until
-  // it lands, say so rather than write a declaration with nothing in it.
-  throw new CliRefusal(`read ${products.length} product${products.length === 1 ? '' : 's'} from ${host}. Writing offers from `
-    + 'them is not built yet in this version, so nothing was written.');
+  if (flags['base-url'] !== undefined) throw new CliMisuse('init --from woocommerce takes the store URL itself, not --base-url');
+  const base = wooStoreBase(storeUrl);
+  const factsFromFile = flags.facts === undefined ? null : wooFactsFile(flags.facts);
+  const declPath = join(process.cwd(), DECLARATION_FILE);
+  if (existsSync(declPath)) {
+    throw new CliRefusal(`${DECLARATION_FILE} already exists; init --from never overwrites it. Move it aside first. No request was made.`);
+  }
+  const { host, products } = await wooFirstPage(base);
+  const facts = factsFromFile ?? await wooFactsPrompted();
+  const declaration = checkedDeclaration({ v: 1, entry: { name: flags.name ?? base.hostname, baseUrl: base.href.replace(/\/$/, '') },
+    offers: [JSON.parse(JSON.stringify(WOO_ASK_OFFER))], facts });
+  writeFileSync(declPath, `${JSON.stringify(declaration, null, 2)}\n`, { flag: 'wx' });
+  emit(flags.json, { from: WOO_FROM, store: base.href, products: products.length, wrote: [DECLARATION_FILE] }, [
+    `Read robots.txt and one Store API page (${products.length} product${products.length === 1 ? '' : 's'}) from ${host}.`,
+    `Wrote ${DECLARATION_FILE}: one \`ask\` offer answered at the door from ${Object.keys(facts).length} facts.`,
+    `Next: run \`agent-entry publish\`, then \`agent-entry doctor\`.`,
+  ]);
+  return 0;
 }
 
 // ------------------------------------------ init: sodium.json -> offers (spec 3.1)
@@ -6663,13 +6860,15 @@ function skillSource(framework) {
 
 async function initMain(argv) {
   const positionals = [];
-  const flags = parseFlags(argv, { trade: 'string', from: 'string', name: 'string', 'base-url': 'string', json: 'boolean' }, positionals);
+  const flags = parseFlags(argv, { trade: 'string', from: 'string', name: 'string', 'base-url': 'string', json: 'boolean',
+    facts: 'string' }, positionals);
   // Only the literal `--from woocommerce` takes a store URL; any other --from is a sodium.json path.
   if (flags.from === WOO_FROM) {
     if (flags.trade !== undefined) throw new CliMisuse('give --trade or --from, not both');
     if (positionals.length > 1) throw new CliMisuse(`unexpected argument ${JSON.stringify(positionals[1].slice(0, 60))}`);
-    return initFromWoo(positionals[0]);
+    return initFromWoo(positionals[0], flags);
   }
+  if (flags.facts !== undefined) throw new CliMisuse('--facts goes with --from woocommerce');
   if (positionals.length) throw new CliMisuse(`unexpected argument ${JSON.stringify(positionals[0].slice(0, 60))}`);
   const root = process.cwd();
   if (flags.trade !== undefined && !TRADES.includes(flags.trade)) {
