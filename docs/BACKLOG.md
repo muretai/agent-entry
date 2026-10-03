@@ -56,7 +56,6 @@ S6a 215207Z (landed) -> 215208Z (impl) -> 215208Z-2 -> 215209Z; S6b 215209Z-2 (l
 
 ### 0. The frame (owner ruling 2026-10-03): every member [skeleton], no member waits on another track
 
-- P0 Woo declaration generator: `npx @muretai/agent-entry init --from woocommerce <store-url>` reads the shop's PUBLIC Store API and writes agent-entry.json (frame members Woo-1 refusals and Woo-2 `ask` from one page; Woo-3 pagination, Woo-4 `find` snapshot, Woo-5 `hold`, Woo-6 doctor are the polish members of the same chain). [20261003T001759Z] [skeleton]
 - P0 FRAME Claim-1 WooCommerce one-file plugin: examples/woocommerce-agent-entry.php serves the card, the signed tools contract and `POST /` from the generated declaration (ask -> facts, hold -> pending with a receipt), seed minted at activation; installing it IS the claim by install; conformance/recipes.mjs pins its bytes against the Node door's. [20261003T131709Z] [skeleton]
 - P1 FRAME Answer-1 owner decision on the wire: `agent-entry decide <receipt> approve|decline` sends the signed follow-up to the customer's DID through message/send with the deal receipt updated (AT-13, new AT-28), idempotent by receipt id; the Host's tap UI is trunk's. [20261003T131710Z] [skeleton]
 - P2 FRAME Visitor-1 the visitor skill carries the errand rule: spec/skill-distill.md and the distilled skill state the 2026-09-26 ruling in one sentence (the errand is the mandate), the journey step compares terms with the errand, no 'Ask first?' column; pin follows. [20261003T131710Z-2] [skeleton]
@@ -105,6 +104,7 @@ S6a 215207Z (landed) -> 215208Z (impl) -> 215208Z-2 -> 215209Z; S6b 215209Z-2 (l
 
 ## Done (not yet released)
 
+- P0 Woo declaration generator: `npx @muretai/agent-entry init --from woocommerce <store-url>` reads the shop's PUBLIC Store API and writes agent-entry.json (Woo-1 refusals, Woo-2 `ask` from one page, Woo-3 pagination, Woo-4 `find` snapshot, Woo-5 `hold`, Woo-6 `doctor --from woocommerce`). The whole chain has landed. [20261003T001756Z, 20261003T001757Z, 20261003T001757Z-2, 20261003T001758Z, 20261003T001758Z-2, 20261003T001759Z] [skeleton]
 - P1 S6b the knock speaks the verbs: S6b-2, checkedBookingReceipt recognises the Suite's default reply {verb, of, customer_did, request, status, facts|url by kind, deal?} next to the older {type, customer_did, request, status} shape, so the customer_did cross-check runs on a real Suite door's answer; S6b-1 (`--offer` on the knock) landed 9e58808. The whole chain has landed. [20261002T215209Z-2, 20261002T215210Z] [skeleton]
 - S6b-1 the knock gains `--offer` and sends metadata.offer (chain of S6b) [20261002T215209Z-2] d463ef2..9e58808
 - S6a-1 `counts` joins the accepted entry keys (chain of S6a) [20261002T215207Z] f1b4020..4a6617b
