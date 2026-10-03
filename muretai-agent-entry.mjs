@@ -6103,8 +6103,11 @@ const USAGE = {
   counts: 'usage: agent-entry counts --log <fileSink log> [--store <file store>] [--json] [--serve [--port <p>] [--host 127.0.0.1|::1]]\n'
     + '  Per offer: asked on the page, asked at the door, completed, receipts; referrals by engine; returning\n'
     + '  customers (a count); door knocks by stage and client class. --serve renders one page on loopback only.',
+  decide: 'usage: agent-entry decide <receipt file> approve\n'
+    + '  The owner\'s approval of a pending receipt the door signed: prints the signed message/send follow-up\n'
+    + '  (confirmReceipt\'s confirmed reply) from this site\'s DID to the receipt\'s customer_did. Nothing is sent.',
 };
-const CLI_USAGE = 'usage: agent-entry <init|publish|deploy|doctor|counts|knock> ... (agent-entry <verb> --help)';
+const CLI_USAGE = 'usage: agent-entry <init|publish|deploy|doctor|counts|decide|knock> ... (agent-entry <verb> --help)';
 
 /** Flags per verb: 'string' takes a value, 'boolean' does not. Unknown flags are misuse. A bare
  *  argument is misuse too, unless the verb passes `positionals` to collect them in. */
@@ -7951,6 +7954,44 @@ async function countsMain(argv) {
   });
 }
 
+// ------------------------------------------ decide
+
+/** The most of a receipt file `decide` reads. */
+const RECEIPT_FILE_MAX_BYTES = 1024 * 1024;
+
+/** `decide <receipt file> approve`: the owner's approval, built locally and never sent. The
+ *  follow-on is confirmReceipt's (it checks the receipt is this key's, pending and unedited); the
+ *  customer's DID is read from that signed follow-on only. Prints one JSON-RPC message/send. */
+async function decideMain(argv) {
+  const positionals = [];
+  parseFlags(argv, {}, positionals);
+  if (positionals.length !== 2 || positionals[1] !== 'approve') throw new CliMisuse('expected <receipt file> approve');
+  const path = resolve(process.cwd(), positionals[0]);
+  let stat;
+  try { stat = statSync(path); } catch { throw new CliRefusal(`no receipt file at ${positionals[0].slice(0, 200)}`); }
+  if (!stat.isFile()) throw new CliRefusal('the receipt is not a regular file');
+  if (stat.size > RECEIPT_FILE_MAX_BYTES) throw new CliRefusal(`the receipt file is over ${RECEIPT_FILE_MAX_BYTES} bytes`);
+  const receiptText = readFileSync(path, 'utf8');
+  const root = process.cwd();
+  const seed = findSeed(root, detectFramework(root));
+  if (!seed.hex) {
+    throw new CliRefusal(`no seed: ${SEED_NAME} is in none of this project's env files nor in the environment. `
+      + 'Run agent-entry init, which mints it into a git-ignored file.');
+  }
+  let text;
+  try { text = confirmReceipt(seed.hex, receiptText); } catch (e) { throw new CliRefusal(shortError(e)); }
+  const follow = JSON.parse(text);
+  const from = didFromSeedHex(seed.hex);
+  const to = follow.customer_did;
+  const messageId = newId();
+  const contextId = follow.deal.contextId ?? null;
+  const timestamp = nowEpoch();
+  const sig = signEnvelope(seed.hex, { from, to, messageId, contextId, timestamp, text });
+  const message = toA2A({ role: 'user', text, messageId, contextId, timestamp, from, to, sig });
+  process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: messageId, method: 'message/send', params: { message } })}\n`);
+  return 0;
+}
+
 // ------------------------------------------ dispatch
 
 function emit(json, doc, lines) {
@@ -7960,7 +8001,7 @@ function emit(json, doc, lines) {
 
 async function cliMain(argv) {
   const [verb, ...rest] = argv;
-  const verbs = { init: initMain, publish: publishMain, deploy: publishMain, doctor: doctorMain, counts: countsMain };
+  const verbs = { init: initMain, publish: publishMain, deploy: publishMain, doctor: doctorMain, counts: countsMain, decide: decideMain };
   if (verb === 'knock') return knockMain(argv);
   if (!Object.hasOwn(verbs, verb)) {
     console.error(CLI_USAGE);
