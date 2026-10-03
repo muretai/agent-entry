@@ -1,0 +1,57 @@
+[
+  {
+    "id": 203,
+    "name": "Cloth Cord Set",
+    "slug": "cloth-cord-set",
+    "parent": 0,
+    "type": "simple",
+    "variation": "",
+    "permalink": "https://harbor-lamp.example/product/cloth-cord-set/",
+    "sku": "C-07",
+    "short_description": "<p>Braided cloth cord with switch and plug.</p>",
+    "description": "<p>2 m braided cord, inline switch, EU plug.</p>",
+    "on_sale": false,
+    "prices": {
+      "price": "1500",
+      "regular_price": "1500",
+      "sale_price": "1500",
+      "price_range": null,
+      "currency_code": "EUR",
+      "currency_symbol": "€",
+      "currency_minor_unit": 2,
+      "currency_decimal_separator": ",",
+      "currency_thousand_separator": ".",
+      "currency_prefix": "",
+      "currency_suffix": " €"
+    },
+    "price_html": "<span class=\"woocommerce-Price-amount amount\">15,00&nbsp;&euro;</span>",
+    "average_rating": "5.00",
+    "review_count": 1,
+    "images": [],
+    "categories": [
+      { "id": 17, "name": "Parts", "slug": "parts", "link": "https://harbor-lamp.example/product-category/parts/" }
+    ],
+    "tags": [],
+    "brands": [],
+    "attributes": [],
+    "variations": [],
+    "grouped_products": [],
+    "has_options": false,
+    "is_purchasable": true,
+    "is_in_stock": false,
+    "is_on_backorder": false,
+    "low_stock_remaining": null,
+    "stock_availability": { "text": "Out of stock", "class": "out-of-stock" },
+    "sold_individually": false,
+    "add_to_cart": {
+      "text": "Read more",
+      "description": "Read more about “Cloth Cord Set”",
+      "url": "https://harbor-lamp.example/product/cloth-cord-set/",
+      "single_text": "Read more",
+      "minimum": 1,
+      "maximum": 9999,
+      "multiple_of": 1
+    },
+    "extensions": {}
+  }
+]
