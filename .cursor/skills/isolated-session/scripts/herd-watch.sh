@@ -26,8 +26,9 @@
 # the set (or a status in it) changes. A listing that fails or comes back empty discovers
 # nobody and drops no state; WORKERS names are still watched. Every pass also writes the
 # roll call to <HERD_DIR>/.watch/workers (`<UTC time> <w>[=<status>] ...`, removed when
-# herdr cannot be read): the coordinator's live-worker line (appl-hook.sh SessionStart)
-# comes from there, never from intake statuses.
+# herdr cannot be read). It is this pass's record, never a count: the coordinator's
+# live-worker line (appl-hook.sh SessionStart) asks `herdr agent list` itself, and quotes
+# this file, marked `(roll call; herdr unreachable)` with no count, only when herdr fails.
 #
 # A report is announced only when report.md is strictly newer than the worker's
 # permissions.json (rewritten on every spawn), so a report left over from an earlier run
@@ -127,7 +128,9 @@
 # in <HERD_DIR>/coordinator/owner-step-login-workers.txt. The worktree and the herd dir are
 # never touched. A worker whose <HERD_DIR>/<w>/close-requested (written by appl-hook.sh on a
 # final BLOCKED report; a regular file newer than the rules file) exists is due at once, and
-# the marker is removed once the close went through. An appl-close.sh refusal is
+# the marker is removed once the close went through. A worker herdr shows `working` on a pass
+# is never closed by it (a logged-out pane aside), marker or not: the marker stays for the
+# first pass that sees it idle. An appl-close.sh refusal is
 # `sweep-refused <w>`: nothing is forced, the
 # next candidate is still tried, and that worker waits another 20 minutes.
 # A logged-out worker is also, once per spawn (.watch/<w>.respawn), given its own
@@ -567,7 +570,9 @@ def listing(kind):
 
 
 def word(v):
-    return v if isinstance(v, str) and re.fullmatch(r"[a-z_]{1,20}", v) else "?"
+    """One state word for the roll call: herdr's agent_status, or `logged-out` -- the one
+    value with a hyphen, this watcher's own for a pane whose last reply is a logout (L1)."""
+    return v if isinstance(v, str) and (v == LOGOUT_KIND or re.fullmatch(r"[a-z_]{1,20}", v)) else "?"
 
 
 def detail(watch, w, text):
@@ -1391,7 +1396,8 @@ def sweep(names, agent_by, tab_by, panes, herd, watch, now, nudged=()):
     when its pane's last reply is `Not logged in` (logged `logged-out <w>` once per spawn,
     and named in the one workers owner step), or at once when appl-hook.sh left it a
     close-requested marker for this spawn (a final BLOCKED report: the hook never calls
-    herdr, so it asks, and this pass closes). A refusal is `sweep-refused <w>`: nothing is
+    herdr, so it asks, and this pass closes). A worker herdr shows `working` this pass is
+    never closed (unless its pane is logged out): a marker waits for its first idle pass. A refusal is `sweep-refused <w>`: nothing is
     forced, the next candidate is still tried, and that worker is not tried again for
     another SWEEP_AFTER. State is .watch/<w>.sweep, since every pass is a fresh process."""
     if os.path.islink(watch):
@@ -1445,7 +1451,10 @@ def sweep(names, agent_by, tab_by, panes, herd, watch, now, nudged=()):
                 state.pop("tried", None)               # of its close waits SWEEP_AFTER
             since = None
         tried = state.get("tried")
-        due = asked or (since is not None and (out or now - since > SWEEP_AFTER))
+        # a pane herdr shows working is at work this pass: never closed, its marker kept for
+        # the first idle pass (a logged-out pane keeps its own rule)
+        due = (status != "working" or out) and (
+            asked or (since is not None and (out or now - since > SWEEP_AFTER)))
         if (not due or live is None or w in live
                 or (isinstance(tried, int) and now - tried <= SWEEP_AFTER)):
             if state != before:
@@ -1570,8 +1579,8 @@ def backlog_pull(agents, herd):
     """Once per pass, when a slot is free, run the backlog pull (appl-backlog-pull.sh), so an
     idea in the backlog inbox is filed without waiting for the next landing or SessionStart.
     Live is this pass's own `herdr agent list` rows other than the coordinator pane (the
-    --notify target, a row named muretai-coordinator, or one whose tokens.muretai_agent is
-    dispatch-mac-a); the cap is the one number in <HERD_DIR>/coordinator/worker-cap, the
+    --notify target, a row named muretai-coordinator or $APPL_COORDINATOR_NAME -- the
+    pull's own name for it -- or one whose tokens.muretai_agent is dispatch-mac-a); the cap is the one number in <HERD_DIR>/coordinator/worker-cap, the
     pull's own source. A failed listing, no readable cap, or live >= cap: the pull is not
     run. The seam is appl-hook.sh's, APPL_BACKLOG_PULL (an executable run in place of
     `bash <scripts>/appl-backlog-pull.sh`); --repo is $APPL_BACKLOG_REPO when it is an
@@ -1595,7 +1604,7 @@ def backlog_pull(agents, herd):
         os.close(fd)
     if not re.fullmatch(r"[0-9]{1,6}", text):
         return
-    skip = never_swept()
+    skip = never_swept() | {os.environ.get("APPL_COORDINATOR_NAME") or COORDINATOR}
 
     def coordinator(a):
         t = a.get("tokens")
@@ -1716,19 +1725,30 @@ def main_once():
         kind = dialog_kind(pane)
         if kind is not None and kind != LOGOUT_KIND:   # a logged-out pane is the sweep's, below
             at_dialog[w] = kind
+    # a pane whose last reply is a logout (the line before it a `Background command ...
+    # completed` notice or an `Agent ... failed: ... authentication_failed` line, or
+    # nothing: last_reply() takes the last reply) is `<w>=logged-out` on the roll call, not
+    # the `done` herdr shows for it -- the coordinator can do nothing with a done worker
+    # that is in fact waiting for /login (L1 of 20260930T080513Z)
+    out = {w for w, pane in read.items()
+           if w not in at_dialog and pane.strip() and logged_out(pane)}
+
+    def state_of(w):
+        return LOGOUT_KIND if w in out else tab_by[w].get("agent_status")
+
     if tabs is None or agents is None:
         emit("WORKERS: herdr: unreadable")
         drop_state(os.path.join(watch, "workers"))
     else:
         emit("WORKERS: " + " ".join("dialog %s %s" % (at_dialog[w], w) if w in at_dialog
-                                    else "%s=%s" % (w, word(tab_by[w].get("agent_status"))) if w in tab_by else w
+                                    else "%s=%s" % (w, word(state_of(w))) if w in tab_by else w
                                     for w in names))
-        # the coordinator's live-worker line (appl-hook.sh SessionStart): herdr's, never
-        # intakes', one `<w>[=<state>]` word per worker; a dialog is `<kind>_dialog` (the
-        # hook reads `[a-z_]{1,20}`), a kind that does not fit plain `dialog`
+        # this pass's roll call, one `<w>[=<state>]` word per worker; a dialog is
+        # `<kind>_dialog`, a kind that does not fit `[a-z]{1,13}` plain `dialog`. A record,
+        # never a live count: appl-hook.sh's SessionStart line asks herdr itself
         roll = " ".join("%s=%s" % (w, at_dialog[w] + "_dialog" if re.fullmatch(r"[a-z]{1,13}", at_dialog[w])
                                    else "dialog") if w in at_dialog
-                        else "%s=%s" % (w, word(tab_by[w].get("agent_status"))) if w in tab_by else w
+                        else "%s=%s" % (w, word(state_of(w))) if w in tab_by else w
                         for w in names)
         put_text(os.path.join(watch, "workers"),
                  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)) + " " + roll + "\n")

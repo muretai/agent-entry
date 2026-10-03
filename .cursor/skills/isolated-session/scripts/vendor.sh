@@ -148,6 +148,7 @@ FILES = [
     f"{skill}/briefs/coordinator.md",
     f"{skill}/briefs/dispatch-ticket.md",
     f"{skill}/briefs/implementer.md",
+    f"{skill}/briefs/reviewer.md",
     f"{skill}/briefs/test-author.md",
     f"{skill}/briefs/worker.md",
     # the invocable APPL skill: the one parser, its phrase table and the two filing
@@ -157,6 +158,12 @@ FILES = [
     f"{skill}/scripts/appl-phrases.tsv",
     f"{skill}/scripts/appl-add.sh",
     f"{skill}/scripts/appl-backlog-add.sh",
+    # the lease Durable Object the do backend talks to: four worker files, so a
+    # consumer's vendor.sh check still carries them
+    f"{skill}/worker/wrangler.toml",
+    f"{skill}/worker/README.md",
+    f"{skill}/worker/lease-core.mjs",
+    f"{skill}/worker/worker.mjs",
 ]
 
 # FILES entries that are byte-identical copies of a home script outside the skill: the real

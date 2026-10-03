@@ -3450,7 +3450,7 @@ function readDeclaration(declaration) {
     refuseDeclaration('entry.prefer', `is not a valid order of ways in (${e.message})`);
   }
   if (entry.catalog !== undefined && typeof entry.catalog !== 'boolean') refuseDeclaration('entry.catalog', 'must be true or false');
-  if (entry.counts !== undefined) countsUrl(entry.counts);
+  const counts = entry.counts === undefined ? null : countsUrl(entry.counts);
 
   let facts;
   if (declaration.facts !== undefined) {
@@ -3473,7 +3473,7 @@ function readDeclaration(declaration) {
     ids.add(compiled.id);
     offers.push(compiled);
   });
-  return { name, origin, origins, prefer, offers, facts };
+  return { name, origin, origins, prefer, offers, facts, counts };
 }
 
 /** Returns the declaration unchanged, or throws a TypeError naming the field (AT-2). */
@@ -3888,6 +3888,7 @@ export function createAgentEntry({
       byId,
       byVerb,
       offerIds: new Set(contract.offers.map((o) => o.id)),
+      counts: read.counts,
     };
   } else if (toolsHistory !== null && toolsHistory !== undefined) {
     throw new TypeError('createAgentEntry: toolsHistory needs the declaration it precedes');
@@ -5128,14 +5129,30 @@ export function createAgentEntry({
     while (collectorSessions.size > COLLECTOR_MAX_SESSIONS) {
       collectorSessions.delete(collectorSessions.keys().next().value);
     }
-    for (const e of beacon.events.slice(0, take)) {
+    const kept = beacon.events.slice(0, take);
+    for (const e of kept) {
       observe({ stage: 'page', event: e.name, offer: e.offer ?? null, engine: e.engine ?? null,
         ms: e.ms ?? null, identified: 0, verified: false, ua_family: family,
         client_class: clientClass(family, 'page'),
         peer_did: null, owner_did: null, wba_did: null, text: null,
         ip_vendor: seen.ip_vendor, country: seen.country, signature_agent: null });
     }
+    if (tools.counts !== null && kept.length > 0) postCounts(beacon.session, kept);
     return { status: 204, headers: { 'Content-Length': '0', ...CORS_HEADERS }, body: Buffer.alloc(0) };
+  }
+
+  /** S6a-2: the counted events also go to `entry.counts`, the AT-14 body and nothing else — no
+   *  DID, no text, no visitor header, `Origin` the shop's own. Best-effort as gaSink is: one
+   *  attempt, never awaited, every failure swallowed, so the 204 and every signed reply are
+   *  the same bytes whether the sink is up, slow, hung or down. */
+  function postCounts(sessionId, events) {
+    try {
+      const body = JSON.stringify({ session: sessionId, events });
+      Promise.resolve()
+        .then(() => globalThis.fetch(tools.counts, { method: 'POST',
+          headers: { 'content-type': 'application/json', origin: doorOrigin }, body }))
+        .then(undefined, () => {});
+    } catch { /* the hosted count never changes what the door does */ }
   }
 
   /** What `Allow:` may truthfully say about THIS path, or null when the entry does not own
@@ -5874,10 +5891,19 @@ const FRAMEWORKS = Object.freeze({
   wordpress: { route: 'agent-entry-wordpress', static: '.' },
 });
 
+/** The most `init --from woocommerce` reads of the first products page. Counted on the bytes
+ *  actually received, so a chunked body without Content-Length stops here too. */
+const WOO_PAGE_MAX_BYTES = 4 * 1024 * 1024;
+const WOO_PRODUCTS_PATH = 'wp-json/wc/store/v1/products';
+const WOO_FROM = 'woocommerce';
+
 const USAGE = {
   init: 'usage: agent-entry init (--trade restaurant|retail|clinic|repair | --from sodium.json) --base-url <url> [--name <name>] [--json]\n'
+    + '       agent-entry init --from woocommerce <https store url>\n'
     + '  Detects the framework, mints the site seed into a git-ignored file, writes agent-entry.json and\n'
-    + '  .agents/skills/agent-entry/SKILL.md, and wires the door routes, the signposts and the page tag.',
+    + '  .agents/skills/agent-entry/SKILL.md, and wires the door routes, the signposts and the page tag.\n'
+    + '  --from woocommerce reads the store\'s public Store API (wc/store/v1/products), https only and\n'
+    + `  bounded to ${WOO_PAGE_MAX_BYTES} bytes per page; it refuses a store that is not WooCommerce.`,
   publish: 'usage: agent-entry publish [--version <n>] [--json]   (alias: agent-entry deploy)\n'
     + '  Validates agent-entry.json, compiles and signs it, and writes <static dir>/.well-known/agent-tools.json,\n'
     + '  agent-tools.sig.json and agent-tools/v<n>.json. A published version is never rewritten.',
@@ -5890,11 +5916,13 @@ const USAGE = {
 };
 const CLI_USAGE = 'usage: agent-entry <init|publish|deploy|doctor|counts|knock> ... (agent-entry <verb> --help)';
 
-/** Flags per verb: 'string' takes a value, 'boolean' does not. Unknown flags are misuse. */
-function parseFlags(argv, spec) {
+/** Flags per verb: 'string' takes a value, 'boolean' does not. Unknown flags are misuse. A bare
+ *  argument is misuse too, unless the verb passes `positionals` to collect them in. */
+function parseFlags(argv, spec, positionals = null) {
   const flags = {};
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
+    if (!arg.startsWith('--') && positionals !== null) { positionals.push(arg); continue; }
     if (!arg.startsWith('--')) throw new CliMisuse(`unexpected argument ${JSON.stringify(arg.slice(0, 60))}`);
     const [name, inline] = arg.slice(2).split(/=(.*)/s, 2);
     if (!Object.hasOwn(spec, name)) throw new CliMisuse(`unknown flag --${name.slice(0, 40)}`);
@@ -6002,6 +6030,84 @@ function mintSeed(root, slot) {
   }
   chmodSync(path, 0o600);
   return { hex, wrote: true };
+}
+
+// ------------------------------------------ init: a WooCommerce store's first products page
+
+/** The store's first public Store API products page, as parsed JSON, or a refusal naming one of
+ *  three reasons: the URL is not https (decided before any request), the products path is not a
+ *  WooCommerce Store API (absent, unreachable, or not JSON), or the page exceeds the byte bound. */
+async function wooFirstPage(storeUrl) {
+  let base;
+  try { base = new URL(storeUrl); } catch { throw new CliMisuse(`${JSON.stringify(String(storeUrl).slice(0, 80))} is not a URL`); }
+  if (base.protocol !== 'https:') {
+    throw new CliRefusal(`init --from woocommerce reads a store only over https, and ${base.protocol.replace(/:$/, '')}:// is not https. `
+      + 'Give the store\'s https:// URL. No request was made.');
+  }
+  if (base.username || base.password) throw new CliMisuse('the store URL must not carry a user name or password');
+  base.search = '';
+  base.hash = '';
+  if (!base.pathname.endsWith('/')) base.pathname += '/';
+  const url = new URL(WOO_PRODUCTS_PATH, base);
+  const where = `${url.host}${url.pathname}`;
+  const notWoo = (why) => new CliRefusal(`not a WooCommerce store: GET ${where} ${why}, so this is no public Store API `
+    + '(wc/store/v1/products). Check the URL is the shop\'s own address. Nothing was written.');
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 30000);
+  try {
+    let res;
+    try {
+      res = await fetch(url, { redirect: 'manual', signal: ctrl.signal,
+        headers: { accept: 'application/json', 'user-agent': 'agent-entry-init/1' } });
+    } catch (e) {
+      throw notWoo(`got no answer (${shortError(e.cause ?? e)})`);
+    }
+    if (res.status !== 200) {
+      ctrl.abort();
+      throw notWoo(`answered status ${res.status}${res.status >= 300 && res.status < 400 ? ' (a redirect, not followed)' : ''}`);
+    }
+    const tooLarge = (read) => new CliRefusal(`the first products page from ${url.host} exceeds the bound of `
+      + `${WOO_PAGE_MAX_BYTES} bytes (${read}); init reads no more of it. Nothing was written.`);
+    const declared = Number(res.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > WOO_PAGE_MAX_BYTES) {
+      ctrl.abort();
+      throw tooLarge(`Content-Length declares ${declared}`);
+    }
+    const chunks = [];
+    let total = 0;
+    if (res.body) {
+      const reader = res.body.getReader();
+      for (;;) {
+        let step;
+        try { step = await reader.read(); } catch (e) { throw notWoo(`broke off mid-answer (${shortError(e.cause ?? e)})`); }
+        if (step.done) break;
+        total += step.value.byteLength;
+        if (total > WOO_PAGE_MAX_BYTES) {
+          ctrl.abort();
+          throw tooLarge('more than that arrived');
+        }
+        chunks.push(step.value);
+      }
+    }
+    let page;
+    try { page = JSON.parse(Buffer.concat(chunks).toString('utf8').replace(/^﻿/, '')); } catch {
+      throw notWoo('answered something that is not JSON');
+    }
+    if (!Array.isArray(page)) throw notWoo('answered JSON that is not a list of products');
+    return { host: url.host, products: page };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function initFromWoo(storeUrl) {
+  if (storeUrl === undefined) throw new CliMisuse('init --from woocommerce needs the store URL: init --from woocommerce <store-url>');
+  const { host, products } = await wooFirstPage(storeUrl);
+  // Past the three checks. Turning the page into offers is the next item of the Woo chain; until
+  // it lands, say so rather than write a declaration with nothing in it.
+  throw new CliRefusal(`read ${products.length} product${products.length === 1 ? '' : 's'} from ${host}. Writing offers from `
+    + 'them is not built yet in this version, so nothing was written.');
 }
 
 // ------------------------------------------ init: sodium.json -> offers (spec 3.1)
@@ -6526,7 +6632,15 @@ function skillSource(framework) {
 }
 
 async function initMain(argv) {
-  const flags = parseFlags(argv, { trade: 'string', from: 'string', name: 'string', 'base-url': 'string', json: 'boolean' });
+  const positionals = [];
+  const flags = parseFlags(argv, { trade: 'string', from: 'string', name: 'string', 'base-url': 'string', json: 'boolean' }, positionals);
+  // Only the literal `--from woocommerce` takes a store URL; any other --from is a sodium.json path.
+  if (flags.from === WOO_FROM) {
+    if (flags.trade !== undefined) throw new CliMisuse('give --trade or --from, not both');
+    if (positionals.length > 1) throw new CliMisuse(`unexpected argument ${JSON.stringify(positionals[1].slice(0, 60))}`);
+    return initFromWoo(positionals[0]);
+  }
+  if (positionals.length) throw new CliMisuse(`unexpected argument ${JSON.stringify(positionals[0].slice(0, 60))}`);
   const root = process.cwd();
   if (flags.trade !== undefined && !TRADES.includes(flags.trade)) {
     throw new CliMisuse(`--trade must be one of ${TRADES.join(', ')}`);

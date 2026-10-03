@@ -77,6 +77,9 @@
 #               writable sandbox root IS this directory, and no session guard runs on
 #               that harness, so a primary checkout here is exit 2 before herdr is asked
 #               anything -- name the worktree instead.
+#               REQUIRED for HERD_SPAWN_HARNESS=grok as well: grok reads its instruction
+#               files from the directory it opens, so a primary checkout here is exit 2
+#               naming the fix -- pass --cwd <worktree>.
 #   --profile   which allowlist the session gets (below). `worker` (default) may run
 #               the test runner and the test files; `reviewer` may not -- a reviewer
 #               runs no tests, its brief says so, and what it reads is a diff an
@@ -87,18 +90,29 @@
 #               coordinator directory and edits only its intake/ and briefs/. The seat is
 #               not a harness name: the spawn must write this pane's allow and deny into
 #               a file that harness loads alone, and register appl-hook.sh on that pane
-#               alone. Claude can. Cursor and codex cannot, and each is exit 2 naming
-#               what is missing, before herdr is asked.
+#               alone. Claude does both in $HERD_DIR/<name>/permissions.json. Cursor does
+#               both in a mode-700 directory under $HERD_DIR/<name>/, handed to that pane
+#               as CURSOR_CONFIG_DIR, never ~/.cursor and never <cwd>/.cursor/cli.json.
+#               A slot that is a symlink, or that would make the pane read a shared file,
+#               is still exit 2, one line naming appl-hook and cli.json, before a tab
+#               exists. cursor-agent still reads ~/.cursor/rules and ~/.agents/skills
+#               (there is no switch to leave them out); that is said on stderr and in
+#               wall.log, not papered over. Codex and grok cannot, and each is exit 2
+#               naming what is missing, before herdr is asked.
 #               Its settings file alone also carries the harness: a UserPromptSubmit and
-#               a SessionStart hook through appl-hook.sh, the appl-*.sh scripts by exact
-#               path, and the Agent tool for the three appl-* subagents.
+#               a SessionStart hook through appl-hook.sh, a PostToolUse hook for the Agent
+#               tool only (appl-hook.sh records a helper's id at its launch), the
+#               appl-*.sh scripts by exact path, and the Agent tool for the three appl-*
+#               subagents.
 #   --allow 'Bash(...)'
 #               one more allow rule for this session (repeatable): the brief's author
 #               widening the list for a task-specific command, so the worker does not
 #               stop on it. Bash rules only. A rule a deny entry would beat anyway (it
 #               would still stop), or one naming a reader, an interpreter or a network
 #               command, is exit 2 with one line and no worker. An accepted rule goes
-#               into the settings file verbatim and nowhere else (no argv, no stdout).
+#               into the settings file verbatim. On the grok harness the same rule is
+#               also one `--allow` on the grok argv (that argv is the wall). It is
+#               never printed on stdout.
 #   --env K=V   extra environment for the tab (repeatable). A key the SPAWN sets itself is
 #               refused here, by name: CODEX_HOME, CURSOR_CONFIG_DIR, PYTHONNOUSERSITE,
 #               CLAUDE_CODE_DISABLE_AUTO_MEMORY, HERD_WORKER, HERD_BRIEF, HERD_REPORT,
@@ -297,6 +311,20 @@
 # account default (measured 2026-09-20 on codex-cli 0.155.1: `gpt-5.1-codex-max` is
 # refused for a ChatGPT account, so there is no id to pin here).
 #
+# THE GROK HARNESS (HERD_SPAWN_HARNESS=grok) is Grok Build, the `grok` binary. Measured
+# on grok 1.0.41 (`grok --help` only; this script never starts a grok session): the pane
+# is `grok --cwd <worktree>` with one `--allow <rule>` per rule of the worker allow list
+# and one `--deny <rule>` per deny rule. The brief is typed the same way as for cursor.
+# A grok worker starts only in a worktree, because its instruction files live in the
+# directory it opens; a primary checkout is exit 2 naming `pass --cwd <worktree>`. A
+# reviewer is exit 2 before herdr is asked anything, until which instruction files grok
+# reads is known; a coordinator is refused the same way (no per-pane slot for
+# appl-hook.sh either). `grok --help` lists no hooks flag and the grok config directory
+# holds no hooks config (ISSUE(grok-harness-has-no-hook)). The harness is refused at
+# selection until a hook registration exists. The auto-approve switch is never passed.
+# HERD_SPAWN_MODEL is `--model` when set; unset is the account default. HERD_SPAWN_PERMISSION_MODE does
+# not apply: a set value is exit 2 rather than a word this branch would drop.
+#
 # Every `python3` below is `-I` (isolated: no user site directory, no PYTHON* variable
 # read). Two of them decide what the reviewer is TOLD and what it may RUN -- the render of
 # its brief and the write of that permission list -- and a caller used to reach this script
@@ -313,6 +341,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 usage() {
   echo "usage: herd-spawn.sh <name> <brief-file> [--cwd DIR] [--profile worker|reviewer|coordinator] [--env K=V ...] [--var KEY=VALUE ...] [--allow 'Bash(...)' ...] [--muretai-agent NAME] [--role solo] [--open-worktree TITLE]" >&2
   echo "       HERD_SPAWN_HARNESS=codex requires --cwd <worktree>: a codex session's writable sandbox root IS the directory it opens in, and no session guard runs on that harness" >&2
+  echo "       HERD_SPAWN_HARNESS=grok requires --cwd <worktree>: grok reads its instruction files from the directory it opens, and a primary checkout is refused" >&2
   echo "       herd-spawn.sh --resume <name>   (a spawn that stopped at a first-run prompt, once the prompt is answered; same HERD_DIR)" >&2
   exit 2
 }
@@ -684,7 +713,7 @@ if [[ "${1:-}" == "--resume" ]]; then
     esac
   done < "$resume_rec"
   case "$harness" in
-    claude|cursor|codex) ;;
+    claude|cursor|codex|grok) ;;
     *) harness="" ;;
   esac
   if [[ -z "$pane" || -z "$tab_id" || -z "$harness" || -z "$wall_state" || ! -d "$cwd" ]]; then
@@ -717,6 +746,18 @@ case "$name" in
 esac
 if [[ ${#name} -gt 32 ]]; then
   echo "herd-spawn: a worker name is at most 32 characters (herdr's agent-name rule): ${name} (${#name})" >&2
+  exit 2
+fi
+# $HERD_DIR/<name> is on the worker's allow-write line, and the default HERD_DIR holds the
+# landing gate's slot directory (tools/gate_slots.py): a worker by that name would be
+# handed the machine-wide semaphore every gate waits on; and it holds the gate-scratch root
+# (lib.sh's iso_gate_scratch_root), where a landing builds BASE's lint and invariant copies
+if [[ "$name" == "gate-slots" ]]; then
+  echo "herd-spawn: the worker name gate-slots is reserved (it names the landing gate's slot directory); nothing was started" >&2
+  exit 2
+fi
+if [[ "$name" == "gate-scratch" ]]; then
+  echo "herd-spawn: the worker name gate-scratch is reserved (it names the landing gate's scratch directory); nothing was started" >&2
   exit 2
 fi
 if [[ ! -f "$brief" ]]; then
@@ -958,21 +999,23 @@ unset HERD_SPAWN_PERMISSION_MODE
 # forty minutes; on the owner's subscription that is the cost that matters, and the
 # top-tier model is not what the reading needs. Dropped from this process like the
 # mode, so a worker's own spawns start from the default again.
-# The harness: `claude` (Claude Code), `cursor` (Cursor's CLI agent, `cursor-agent`) or
-# `codex` (codex-cli), HERD_SPAWN_HARNESS. herdr drives any of them in a pane; the brief,
-# the report directory and the receipt tools are the same. Cursor reads its rules from
-# `<cwd>/.cursor/cli.json` (written below from the same allow/deny lists) and runs in its
-# classifier mode (`--auto-review`); the isolated-session hook speaks its dialect already.
-# Another model's eyes on a diff see other things; the cost lands on the other plan.
+# The harness: `claude` (Claude Code), `cursor` (Cursor's CLI agent, `cursor-agent`),
+# `codex` (codex-cli) or `grok` (Grok Build), HERD_SPAWN_HARNESS. herdr drives any of them
+# in a pane; the brief, the report directory and the receipt tools are the same. Cursor
+# reads its rules from `<cwd>/.cursor/cli.json` (written below from the same allow/deny
+# lists) and runs in its classifier mode (`--auto-review`); the isolated-session hook
+# speaks its dialect already. Another model's eyes on a diff see other things; the cost
+# lands on the other plan.
 #
 # Codex is different in kind and the top-of-file header says how: no per-command rules,
 # so the sandbox and the approval policy are the whole wall, `worker` is the only profile,
-# and the config home is the spawn's.
+# and the config home is the spawn's. Grok's wall is one `--allow` per allow rule and one
+# `--deny` per deny rule on the grok argv; the header says the rest.
 harness="${HERD_SPAWN_HARNESS-claude}"
 case "$harness" in
-  claude|cursor|codex) ;;
+  claude|cursor|codex|grok) ;;
   *)
-    echo "herd-spawn: HERD_SPAWN_HARNESS must be claude, cursor or codex (got '${harness}'); the worker ${name} was not started" >&2
+    echo "herd-spawn: HERD_SPAWN_HARNESS must be claude, cursor, codex or grok (got '${harness}'); the worker ${name} was not started" >&2
     exit 2
     ;;
 esac
@@ -988,6 +1031,13 @@ if [[ "$harness" == "codex" && -n "$permission_mode_set" ]]; then
   echo "herd-spawn: HERD_SPAWN_PERMISSION_MODE does not apply to the codex harness: its approval policy is fixed at -a on-request and this script passes no other, so a mode set here would be validated and then dropped; unset it, or start the worker on claude; the worker ${name} was not started" >&2
   exit 2
 fi
+# grok has a permission-mode flag, and this script does not pass one: the wall is the
+# --allow / --deny list. A value accepted above and then dropped would be a knob that
+# looks like it did something. Unset stays the normal path.
+if [[ "$harness" == "grok" && -n "$permission_mode_set" ]]; then
+  echo "herd-spawn: HERD_SPAWN_PERMISSION_MODE does not apply to the grok harness: its wall is one --allow per rule of the worker allow list and this script passes no permission mode, so a mode set here would be validated and then dropped; unset it; the worker ${name} was not started" >&2
+  exit 2
+fi
 # A Cursor session reads the user's own instruction files -- ~/.cursor/rules/*.mdc,
 # ~/.agents/skills/ -- and cursor-agent has no switch to leave them out (measured
 # 2026-09-12: a rule planted under ~/.cursor/rules steered a herd session at once).
@@ -999,6 +1049,22 @@ fi
 # primary (-2).
 if [[ "$harness" == "cursor" && "$profile" == "reviewer" ]]; then
   echo "herd-spawn: the cursor harness reviews nothing yet: cursor-agent reads the user's own rules and skills, which any session of this user may write; the worker ${name} was not started" >&2
+  exit 2
+fi
+# A grok reviewer is refused until which instruction files grok reads from the directory
+# it opens is known. The same shape as the cursor refusal: one line, exit 2, before herdr
+# is asked anything, and no brief is written. The profile is refused, not the harness.
+if [[ "$harness" == "grok" && "$profile" == "reviewer" ]]; then
+  echo "herd-spawn: the grok harness reviews nothing yet: which instruction files grok reads from the directory it opens has not been measured, so a reviewer would obey files this spawn does not own; the worker ${name} was not started" >&2
+  exit 2
+fi
+# The grok harness is refused until its rules are a spelling grok enforces, the path
+# denies are on that pane, and a hook is registered. This is before anything is written
+# or asked: no herdr call, no report directory, no rules file, no wall.log line, no
+# worktree hold. No variable, flag or --allow word turns it back on. The reviewer
+# refusal above stays its own sentence. A Grok model on the cursor harness is not this.
+if [[ "$harness" == "grok" ]]; then
+  echo "herd-spawn: the grok harness is refused: its rules are not translated into a spelling grok enforces, it gets none of the path denies, and it is unwalled with no hook registered; the worker ${name} was not started" >&2
   exit 2
 fi
 # A codex session reviews nothing for a reason of its own: the deny list a reviewer is held
@@ -1036,20 +1102,20 @@ unset HERD_SPAWN_MODEL
 # The coordinator seat is two inputs this spawn can write for THIS pane alone: the allow
 # and deny, into a file the harness loads and the worker cannot rewrite, and appl-hook.sh
 # on UserPromptSubmit and SessionStart. Claude's --settings file is both, and
-# --setting-sources project keeps the user's own allow out of it. A harness that has
-# neither input does not sit, and the refusal names the gap rather than a product.
-# Translating Read(//) into Read(/) would not make a wall: cursor still has no per-pane
-# hook, still reads instruction files the spawn does not own, and writes its rules into
-# the cwd, which a coordinator shares with every other session because its cwd is the
-# primary. Codex has no per-command deny and no hook at all. Neither writes
-# rules.unenforced.json here: that file records a worker's lists, and a coordinator that
-# cannot sit is not started.
-if [[ "$harness" == "cursor" && "$profile" == "coordinator" ]]; then
-  echo "herd-spawn: the cursor harness does not take the coordinator profile: appl-hook.sh has no per-pane slot on it (the hook is written only into the claude --settings file), and cursor-agent reads the user's own rules and skills, which any session of this user may write; its rules file is <cwd>/.cursor/cli.json, shared by every Cursor session in that directory, and a coordinator's cwd is the primary; the worker ${name} was not started" >&2
-  exit 2
-fi
+# --setting-sources project keeps the user's own allow out of it. Cursor's is a private
+# CURSOR_CONFIG_DIR under $HERD_DIR/<name>/ (checked once that directory exists, below):
+# the shared <cwd>/.cursor/cli.json is never written, and a cursor coordinator's cwd is
+# the primary, which is the normal seat. What Cursor still has no switch for is the
+# user's own rules and skills; that limit is recorded when the pane is started, not
+# used to refuse a pane that has a private directory. Codex has no per-command deny and
+# no hook at all. A coordinator that cannot sit does not write rules.unenforced.json:
+# that file records a worker's lists.
 if [[ "$harness" == "codex" && "$profile" == "coordinator" ]]; then
   echo "herd-spawn: the codex harness does not take the coordinator profile: it has no per-command deny list and no session-guard hook, so the spawn cannot write this pane's allow and deny or register appl-hook.sh on it alone; the worker ${name} was not started" >&2
+  exit 2
+fi
+if [[ "$harness" == "grok" && "$profile" == "coordinator" ]]; then
+  echo "herd-spawn: the grok harness does not take the coordinator profile: which instruction files it reads has not been measured, and appl-hook.sh has no per-pane slot on it (the hook is written only into the claude --settings file); the worker ${name} was not started" >&2
   exit 2
 fi
 
@@ -1542,6 +1608,24 @@ fi
 # the key a live worker holds is not handed to a second one. With --open-worktree this is
 # judged after the open: ensure-worktree.sh already refuses a lock handed to another worker
 # by name, and says so; an open is never the pair hand-over.
+#
+# ... and a key the worktree's lock does not carry is not handed in at all
+# (ISSUE(spawn-hands-a-key-that-does-not-match-the-lock)): a worker spawned with --cwd into a
+# linked worktree whose lock names another owner could never pass assert-head there, and it
+# would sit idle in its pane with nothing said. Exact strings: `claude:<k>` and `<k>` are two
+# keys. The primary, a worktree with no lock and a spawn with no caller key are left as they
+# were; so is --open-worktree, whose open judges the lock itself.
+if [[ -n "$caller_key" && "$open_given" != "yes" && -f "$cwd/.git" ]] &&
+   [[ "$(iso_primary_of "$cwd" 2>/dev/null || true)" != "$cwd" ]]; then
+  cwd_lock="$(iso_lock_path "$cwd" 2>/dev/null || true)"
+  if [[ -n "$cwd_lock" && -f "$cwd_lock" && ! -L "$cwd_lock" ]]; then
+    cwd_lock_owner="$(iso_lock_get "$cwd_lock" owner)"
+    if [[ -n "$cwd_lock_owner" && "$cwd_lock_owner" != "$caller_key" ]]; then
+      echo "herd-spawn: the lock of ${cwd} is owned by $(iso_safe_text "$cwd_lock_owner" || echo '?'), not by the owner key $(iso_safe_text "$caller_key" || echo '?') this spawn hands over; a worker under that key could never pass assert-head there -- spawn it under the key the lock carries (the author's \$HERD_DIR/.keys/<author> record); the worker ${name} was not started" >&2
+      exit 2
+    fi
+  fi
+fi
 if [[ -n "$caller_key" ]]; then
   if [[ "$open_given" == "yes" ]]; then
     key_guard "$caller_key" "$cwd" no
@@ -1611,7 +1695,64 @@ brief_abs="$(cd "$(dirname "$brief")" && pwd)/$(basename "$brief")"
 # loop reports as exit 1: closed, not open.
 # --strict-mcp-config: no MCP server from ~/.claude.json or a project file reaches a
 # herd session (none is passed, so none is loaded)
+# A cursor coordinator's config directory is private only when it is a real directory
+# under this pane, owned by the caller, and not the user's ~/.cursor or <cwd>/.cursor.
+# A symlink is refused before it is followed: the slot the test plants points into the
+# shared rules, and replacing it would be writing through that link.
+cursor_slot_is_private() {
+  local slot="$1" resolved pane shared user
+  if [[ -L "$slot" || ( -e "$slot" && ! -d "$slot" ) ]]; then
+    return 1
+  fi
+  if [[ -d "$slot" ]]; then
+    [[ -O "$slot" ]] || return 1
+    resolved="$(cd "$slot" && pwd -P)" || return 1
+    pane="$(cd "$herd_dir/${name}" && pwd -P)" || return 1
+    case "$resolved/" in
+      "$pane"/*) ;;
+      *) return 1 ;;
+    esac
+    if [[ -d "$cwd/.cursor" ]]; then
+      shared="$(cd "$cwd/.cursor" && pwd -P)" || return 1
+      case "$resolved/" in
+        "$shared"/*) return 1 ;;
+      esac
+    fi
+    if [[ -n "${HOME:-}" && -d "${HOME}/.cursor" ]]; then
+      user="$(cd "${HOME}/.cursor" && pwd -P)" || return 1
+      case "$resolved/" in
+        "$user"/*) return 1 ;;
+      esac
+    fi
+  fi
+  return 0
+}
+cursor_coord_refuse() {
+  echo "herd-spawn: the cursor harness cannot register appl-hook.sh on this pane alone: ${name}'s CURSOR_CONFIG_DIR is not a private directory, so the pane would read the shared <cwd>/.cursor/cli.json; the worker ${name} was not started" >&2
+  exit 2
+}
 if [[ "$harness" == "cursor" ]]; then
+  if [[ "$profile" == "coordinator" ]]; then
+    # The pane's own config home, not the user's and not the checkout's. The allow/deny
+    # and the appl-hook registration are written into it later, once the lists exist.
+    # The user's ~/.cursor/cli-config.json is not consulted: this directory is allowlist
+    # because we write it, and a coordinator's cwd is the primary.
+    cursor_home="$herd_dir/${name}/cursor-config"
+    cursor_slot_is_private "$cursor_home" || cursor_coord_refuse
+    if [[ ! -d "$cursor_home" ]]; then
+      mkdir -m 700 "$cursor_home" 2>/dev/null || cursor_coord_refuse
+    fi
+    [[ -L "$cursor_home" ]] && cursor_coord_refuse
+    chmod 700 "$cursor_home" 2>/dev/null || cursor_coord_refuse
+    cursor_slot_is_private "$cursor_home" || cursor_coord_refuse
+    # Honest limit: cursor-agent has no switch that drops the user's rules and skills.
+    # Said where the person spawning reads it, and again in wall.log below.
+    cursor_rules_note="cursor: this pane reads the user's own rules and skills (~/.cursor/rules, ~/.agents/skills); cursor-agent has no switch to leave them out"
+    echo "$cursor_rules_note" >&2
+    agent_args=(--trust --workspace "$cwd" --add-dir "$herd_dir/${name}")
+    [[ -z "$model" ]] || agent_args+=(--model "$model")
+    typed="cursor-agent ${agent_args[*]}"
+  else
   # --trust: no workspace prompt in a pane nobody answers; --workspace pins the checkout
   # the tab opened in. NOT --auto-review: under the classifier mode Cursor's CLI ran
   # `git push`, `cat` and `curl` past their deny rules (measured 2026-09-12); in the
@@ -1650,6 +1791,7 @@ PY
   agent_args=(--trust --workspace "$cwd" --add-dir "$herd_dir/${name}")
   [[ -z "$model" ]] || agent_args+=(--model "$model")
   typed="cursor-agent ${agent_args[*]}"
+  fi
 elif [[ "$harness" == "codex" ]]; then
   # The config home is the SPAWN's. Codex resolves CODEX_HOME (default ~/.codex) and loads
   # AGENTS.md and config.toml from it; the user's copies there are writable by any session
@@ -1728,6 +1870,17 @@ elif [[ "$harness" == "codex" ]]; then
   [[ -z "$model" ]] || agent_args+=(-m "$model")
   agent_args+=(-s workspace-write -a on-request)
   typed="codex ${agent_args[*]}"
+elif [[ "$harness" == "grok" ]]; then
+  # Like cursor: the instruction files grok reads live in the directory it opens, so the
+  # cwd is never the primary. --cwd is grok's flag for that directory (measured on
+  # grok 1.0.41). The allow and deny rules are appended once the lists exist, below.
+  if [[ "$(iso_primary_of "$cwd" 2>/dev/null || true)" == "$cwd" ]]; then
+    echo "herd-spawn: a grok session does not start in the primary checkout: its instruction files live in the directory it opens, so a primary would be this repository's own; pass --cwd <worktree>; the worker ${name} was not started" >&2
+    exit 2
+  fi
+  agent_args=(--cwd "$cwd")
+  [[ -z "$model" ]] || agent_args+=(--model "$model")
+  typed="grok ${agent_args[*]}"
 else
   agent_args=(--permission-mode "$permission_mode" --model "$model" --add-dir "$herd_dir/${name}"
               --settings "$perms" --setting-sources project --strict-mcp-config)
@@ -1772,8 +1925,9 @@ fi
 #   keeps its session state there and does not start without it -- and a write there can
 #   plant instructions for a LATER session), and the `coordinator` profile is never walled
 #   (its whole job is dms and inbox reads through the node: the network and the bindings).
-#   The cursor and codex harnesses are not walled in v1 either (codex brings a sandbox of
-#   its own, and sandbox-exec does not nest under one); wall.log says why, per spawn.
+#   The cursor, codex and grok harnesses are not walled in v1 either (codex brings a sandbox of
+#   its own, grok's wall is the --allow/--deny argv, and sandbox-exec does not nest under one);
+#   wall.log says why, per spawn.
 # THE PROBE runs before herdr is asked for a tab, through the SAME plug with the SAME
 # profile the agent later gets, from a scratch directory inside HERD_DIR that is removed
 # afterwards. It tries to list the two directories; either one it can see into is a leak.
@@ -2387,11 +2541,13 @@ PY
 # only that branch's ref -- never the whole common directory.
 wall_branch="$(git -C "$cwd" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
 wall_gitdir="$(git -C "$cwd" rev-parse --path-format=absolute --git-dir 2>/dev/null || true)"
-HS_WALL_DIR="$wall_dir" HS_WALLS="$walls_dir" HS_CWD="$cwd" HS_HERD="$herd_dir" HS_NAME="$name" \
+# (`if !` rather than `<<'PY' || exit 2`: the here-document line ends in <<'PY', the shape
+# tests/test_nested_gate_slot.py reads this program by.)
+if ! HS_WALL_DIR="$wall_dir" HS_WALLS="$walls_dir" HS_CWD="$cwd" HS_HERD="$herd_dir" HS_NAME="$name" \
   HS_PRIMARY="$wall_primary" HS_COMMON="$wall_common" HS_PLUG="$here/walls/${wall_os}.sh" \
   HS_AGENT_CMD="$agent_cmd" HS_RUN_SRC="$wall_run_src" \
   HS_BRANCH="$wall_branch" HS_GITDIR="$wall_gitdir" \
-  python3 -I - <<'PY' || exit 2
+  python3 -I - <<'PY'
 import os, shutil, stat, sys
 wd, walls, cwd, herd, name = (os.environ[k] for k in ("HS_WALL_DIR", "HS_WALLS", "HS_CWD", "HS_HERD", "HS_NAME"))
 primary, common, plug = os.environ["HS_PRIMARY"], os.environ["HS_COMMON"], os.environ["HS_PLUG"]
@@ -2461,8 +2617,15 @@ if fixtures:
     lines.append("allow-write " + real(fixtures))
 # The common directory is not a trust anchor: a worker who can write every ref can point
 # main at their own commit. Allow the object store, this worktree's git dir, and this
-# branch's ref (the lock file is <ref>.lock, so the ref path is a prefix). Deny main,
-# master and packed-refs after that allow; a later Seatbelt rule wins.
+# branch's ref and its reflog, each as a LITERAL path together with its `.lock` (git writes
+# <ref>.lock and renames it onto <ref>). They used to be prefixes, and a prefix on
+# refs/heads/feat/w also covered refs/heads/feat/w2.lock -- another worktree's branch whose
+# name merely begins with ours (tests/test_herd_wall_sequencer.py, w2_ref_lock). Deny
+# main, master and packed-refs after that allow; a later Seatbelt rule wins.
+# Deleting any ref -- this worktree's CHERRY_PICK_HEAD, REBASE_HEAD, MERGE_HEAD -- takes
+# <common>/packed-refs.lock even when the ref is not packed, so that one file is allowed
+# too, literal: a `git cherry-pick --quit` or a rebase can clear its own sequencer state.
+# packed-refs itself stays denied, so a rewrite of it (renaming the lock onto it) still fails.
 branch = os.environ.get("HS_BRANCH", "")
 gitdir = os.environ.get("HS_GITDIR", "")
 if common and branch:
@@ -2472,8 +2635,9 @@ if common and branch:
         if gd != cm and (gd + "/").startswith(cm + "/worktrees/"):
             lines.append("allow-write " + gd)
     ref = real(os.path.join(common, "refs", "heads", branch))
-    lines.append("allow-write-prefix " + ref)
-    lines.append("allow-write-prefix " + real(os.path.join(common, "logs", "refs", "heads", branch)))
+    reflog = real(os.path.join(common, "logs", "refs", "heads", branch))
+    for p in (ref, ref + ".lock", reflog, reflog + ".lock", real(os.path.join(common, "packed-refs.lock"))):
+        lines.append("allow-write-literal " + p)
     for denied in ("refs/heads/main", "refs/heads/master",
                    "logs/refs/heads/main", "logs/refs/heads/master", "packed-refs"):
         lines.append("deny-write " + real(os.path.join(common, denied)))
@@ -2490,6 +2654,36 @@ lines += ["deny-write " + real(os.path.join(herd, name, "brief.md")),
           "deny-write " + real(walls), "deny-write " + keys, "deny-read " + keys]
 if bindings:
     lines += ["deny-write " + bindings, "deny-read " + bindings]
+# The landing gate's slot directory: flock(2) needs only an open descriptor, a read-only one
+# locks too, and the wall allows reads by default -- so the worker is denied READ as well as
+# write there, or it could hold every slot and hang every gate on the machine. Its place is
+# tools/gate_slots.py's; a checkout without that module (a vendored skill) denies the
+# default place, spelled here once.
+slots = []
+repo_tools = os.path.normpath(os.path.join(os.path.dirname(plug), "..", "..", "..", "..", "..", "tools"))
+if os.path.isfile(os.path.join(repo_tools, "gate_slots.py")):
+    sys.path.insert(0, repo_tools)
+    try:
+        import gate_slots
+        slots.append(str(gate_slots.slot_dir()))
+    except Exception:  # noqa: BLE001 -- the default below still stands
+        pass
+    finally:
+        sys.path.remove(repo_tools)
+if home:
+    slots.append(os.path.join(home, ".cache", "muretai-herd", "gate-slots"))
+# The gate-scratch root (lib.sh's iso_gate_scratch_root): where a landing builds BASE's lint
+# and invariant copies. A worker that could write there could swap BASE's sec_lint.py or plant
+# its bytecode while the launcher lands; one that could list it would learn every landing's
+# scratch name. Denied read and write, at the seam when the spawn sets it and at the default.
+if os.environ.get("MURETAI_GATE_SCRATCH_DIR"):
+    slots.append(os.environ["MURETAI_GATE_SCRATCH_DIR"])
+if home:
+    slots.append(os.path.join(home, ".cache", "muretai-herd", "gate-scratch"))
+for s in slots:
+    for p in sorted({os.path.abspath(s), real(s)}):
+        if ("deny-read " + p) not in lines:
+            lines += ["deny-write " + p, "deny-read " + p]
 write("profile", "\n".join(lines) + "\n")
 write("run.py", os.environ["HS_RUN_SRC"])
 if os.path.isfile(plug) and not os.path.islink(plug):
@@ -2503,6 +2697,9 @@ else:
         if os.path.lexists(os.path.join(wd, t)):
             os.unlink(os.path.join(wd, t))
 PY
+then
+  exit 2
+fi
 # The claim probe (THE OWNER KEY above). Runs through the plug, under the worker's profile,
 # the scripts a worker runs to hold its folder -- claim-worktree.sh, then assert-head.sh from
 # another shell, as each Bash call of a session is -- with the key the tab will carry, in a
@@ -2753,6 +2950,7 @@ HS_WALL_DIR="$wall_dir" HS_NAME="$name" HS_AGENT_CMD="$agent_cmd" HS_PY="$wall_p
   HS_RECORD="spawn worker=${name} profile=${profile} harness=${harness} mode=${wall_mode} wall=${wall_state} egress=open ${bounds_said}${wall_why:+ ${wall_why}}" \
   HS_WALLED="$wall_state" HS_BOUNDED="$bounded" HS_CPU="$wall_cpu" HS_MEM="$wall_mem" HS_PROCS="$wall_procs" \
   HS_GATE_NONE="$gate_none" HS_PROFILE="$profile" \
+  HS_CURSOR_RULES_NOTE="${cursor_rules_note-}" \
   python3 -I - <<'PY' || exit 2
 import json, os, shlex, subprocess, time
 wd = os.environ["HS_WALL_DIR"]
@@ -2771,6 +2969,8 @@ stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
 logged = stamp + " " + os.environ["HS_RECORD"] + "\n"
 if os.environ.get("HS_GATE_NONE"):
     logged += stamp + " " + os.environ["HS_GATE_NONE"] + "\n"
+if os.environ.get("HS_CURSOR_RULES_NOTE"):
+    logged += stamp + " " + os.environ["HS_CURSOR_RULES_NOTE"] + "\n"
 write("wall.log", logged)
 shim = os.path.join("bin", os.environ["HS_AGENT_CMD"])
 if os.environ["HS_BOUNDED"] != "yes":
@@ -2839,6 +3039,15 @@ else:
           "exec " + " ".join(shlex.quote(a) for a in (os.environ["HS_PY"], "-I", os.path.join(wd, "run.py"), "run",
                                                        os.path.join(wd, "run.json"), "--")) + ' "$@"\n', 0o700)
 PY
+# grok 1.0.41 has no hooks file this spawn can register (grok --help lists no hooks
+# flag; the config directory holds none). Said here, where the wall record is. The
+# claim that the session guard already covers this pane stays out until a hook
+# registration exists.
+if [[ "$harness" == "grok" ]]; then
+  printf '%s %s\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" \
+    "hook=none (grok has no hooks file: grok --help lists no hooks flag and the grok config directory holds no hooks config) ISSUE(grok-harness-has-no-hook)" \
+    >> "$wall_dir/wall.log"
+fi
 # Only a spawn that GETS a landing needs land.sh: the same test run.json's `gate` uses (walled,
 # on a branch, in a repository). A spawn in a detached checkout has no branch to land, so
 # nothing would ever run the lander; refusing it for a missing one refused the daily review.
@@ -2861,7 +3070,22 @@ fi
 # brief.md only a REGULAR file is unlinked (the re-spawn of a name gets its new brief);
 # a symlink or a directory there is exit 2 BEFORE the operator's copy is touched, and a
 # path that exists again between the unlink and the create is a refusal, never a merge.
-python3 -I - "$brief_abs" "$rendered" "$bfile" "NAME=${name}" "PRIMARY=${cwd}" "REPORT=${report}" \
+# {{PRIMARY}} is the git primary of the cwd. A linked worktree used to be told the
+# worktree itself, so the brief's finish-worktree.sh line named the worktree's copy,
+# which the cursor rules refuse. iso_primary_of is unchanged; pwd -P resolves the path
+# it returns. A cwd that is the primary itself stays that path. --var PRIMARY= still
+# overrides: the built-ins are filled first.
+brief_primary="$cwd"
+if [[ -f "$cwd/.git" ]]; then
+  _linked_primary="$(iso_primary_of "$cwd" 2>/dev/null || true)"
+  if [[ -n "${_linked_primary}" && "${_linked_primary}" != "$cwd" && -d "${_linked_primary}" ]]; then
+    if _resolved="$(cd "${_linked_primary}" && pwd -P)"; then
+      brief_primary="$_resolved"
+    fi
+  fi
+fi
+unset _linked_primary _resolved
+python3 -I - "$brief_abs" "$rendered" "$bfile" "NAME=${name}" "PRIMARY=${brief_primary}" "REPORT=${report}" \
   ${vars[@]+"${vars[@]}"} <<'PY' || exit $?
 import os, re, stat, sys
 src, dst, bfile = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -3017,10 +3241,17 @@ PY
 # --- the owner key this worker holds -----------------------------------------------------
 # $HERD_DIR/.keys/<name>: the caller's --env ISOLATED_SESSION_OWNER and a newline, made the
 # way the .repos record is, removed with the brief when the spawn fails. key_guard reads it
-# to name the live worker a later spawn under the same key would duplicate. A spawn without
-# a caller key removes one an earlier spawn of the name left.
-if [[ -n "$caller_key" ]]; then
-  python3 -I - "$key_record" "$caller_key" <<'PY' || exit 2
+# to name the live worker a later spawn under the same key would duplicate. A walled (or
+# inherited-wall) worker with no caller key gets its own name on its tab (THE OWNER KEY), and
+# that key is recorded the same way, so the implementer's spawn reads it back rather than
+# retyping it (ISSUE(spawn-hands-a-key-that-does-not-match-the-lock)). A spawn that puts no
+# key on the tab removes one an earlier spawn of the name left.
+record_key="$caller_key"
+if [[ -z "$record_key" ]] && [[ "$wall_state" == "walled" || "$wall_state" == "inherited" ]]; then
+  record_key="$owner_key"
+fi
+if [[ -n "$record_key" ]]; then
+  python3 -I - "$key_record" "$record_key" <<'PY' || exit 2
 import os, sys
 path, key = sys.argv[1], sys.argv[2]
 if os.path.lexists(path):
@@ -3143,7 +3374,7 @@ if [[ "$profile" == "coordinator" ]]; then
   # The coordinator harness (plan 2026-09-19): the pane's deterministic steps, each script
   # by its exact path (both spellings, like the spawner: never a directory or an `appl-*`
   # glob, which would run whatever a diff drops beside them), and the Agent tool for its
-  # three small-model subagents only. appl-hook.sh is not here: the hook runs it, the
+  # four small-model subagents only. appl-hook.sh is not here: the hook runs it, the
   # model never needs to.
   for s in appl-verify.sh appl-status.sh appl-hydrate.sh appl-role-of.sh appl-close.sh; do
     allow+=("Bash(bash .cursor/skills/isolated-session/scripts/${s}:*)")
@@ -3151,7 +3382,7 @@ if [[ "$profile" == "coordinator" ]]; then
       allow+=("Bash(bash ${spawner_primary}/.cursor/skills/isolated-session/scripts/${s}:*)")
     fi
   done
-  allow+=("Agent(appl-brief-writer)" "Agent(appl-report-reader)" "Agent(appl-prompt-triage)")
+  allow+=("Agent(appl-brief-writer)" "Agent(appl-report-reader)" "Agent(appl-prompt-triage)" "Agent(appl-splitter)")
 else
 # The reviewer's ONE write through a tool is its receipt, so its audit_scope.py rules name
 # that verb (`write-receipt`) and no other: a `write-baseline --out docs/BACKLOG.md` or any
@@ -3268,7 +3499,9 @@ if [[ "$harness" == "codex" ]]; then
 fi
 rm -f "$rules_out"
 HS_CWD="$cwd" HS_HERD="$herd_dir" HS_HARNESS="$harness" HS_NAME="$name" HS_PRIMARY="$(iso_primary_of "$cwd" 2>/dev/null || true)" \
+  HS_BRIEF_PRIMARY="${brief_primary:-$cwd}" \
   HS_CODEX_HOME="${codex_home:-}" HS_CODEX_AUTH="${user_auth:-}" HS_MODEL="$model" HS_PROFILE="$profile" \
+  HS_CURSOR_HOME="${cursor_home-}" \
   python3 -I - "$rules_out" "${#allow[@]}" "${allow[@]}" "${deny[@]}" <<'PY' || half_fail 2 "the rules file for ${name} could not be written; the agent was not started"
 import json, os, shlex, sys
 path, n = sys.argv[1], int(sys.argv[2])
@@ -3413,6 +3646,10 @@ if os.environ.get("HS_PROFILE") == "coordinator":
                                          "timeout": 3600}]}],
         "SessionStart": [{"matcher": "startup|resume|compact|clear",
                           "hooks": [{"type": "command", "command": hook + "SessionStart", "timeout": 60}]}],
+        # after an Agent call, the hook records a helper's id at its launch: the only way it
+        # knows whose `<agent-message>` hand-back arrives later (it names nothing but the id)
+        "PostToolUse": [{"matcher": "Agent",
+                         "hooks": [{"type": "command", "command": hook + "PostToolUse", "timeout": 30}]}],
     }
 with os.fdopen(fd, "w", encoding="utf-8") as f:
     if os.environ.get("HS_HARNESS") == "codex":
@@ -3453,6 +3690,62 @@ if os.environ.get("HS_HARNESS") == "codex":
     os.symlink(os.environ["HS_CODEX_AUTH"], auth)
 
 
+# Cursor's Shell `*` spans spaces and the line is not split on `|`, `;` or `&&`.
+# The worker allow is therefore the brief's own spellings, not the claude list
+# translated by cursor_rule (that translation is what let a trailing star run a
+# second command). A star that is still needed -- a test file name, a commit
+# message, a path -- is paired with the denies below, which beat the allow.
+CURSOR_WORKER_DENY = [
+    "Shell(*;*)",
+    "Shell(*|*)",
+    "Shell(*&&*)",
+    "Shell(*||*)",
+    "Shell(*$(*)",
+    "Shell(*`*)",
+    "Shell(*>*)",
+    "Shell(*<*)",
+    "Shell(*&*)",
+    "Shell(env:*)",
+    "Shell(/usr/bin/env:*)",
+    "Shell(PYTHONNOUSERSITE=*)",
+    "Shell(PYTHONPATH=*)",
+    "Shell(PYTHONHOME=*)",
+    "Shell(ISOLATED_SESSION_OWNER=*)",
+    "Shell(git:add -*)",
+    "Shell(git:commit --*)",
+    "Shell(git:commit -m * -m * -m *)",
+]
+
+
+def cursor_worker_allow(primary, brief_primary, herd, name):
+    """The cursor worker's allow list: the commands the briefs name, and a Write
+    of this pane's report.md only. Read of the pane directory stays, so the
+    prompt's `Read brief.md` is not a prompt of its own."""
+    scripts = ".cursor/skills/isolated-session/scripts"
+    allow = [
+        "Shell(python3:-I tests/*.py)",
+        "Shell(python3:-I tools/run_tests.py --affected main..HEAD -j4)",
+        "Shell(python3:-I tools/ledger.py new *)",
+        "Shell(bash:" + scripts + "/stale.sh)",
+        "Shell(bash:" + scripts + "/ensure-worktree.sh *)",
+        "Shell(bash:" + scripts + "/assert-head.sh *)",
+        "Shell(bash:" + scripts + "/vendor.sh check)",
+        "Shell(git:add)",
+        "Shell(git:add *)",
+        "Shell(git:commit -m *)",
+        "Shell(cd:*)",
+        "Read(" + os.path.join(herd, name) + "/**)",
+        "Write(" + os.path.join(herd, name, "report.md") + ")",
+    ]
+    roots = []
+    for root in (brief_primary, primary):
+        if root and root not in roots:
+            roots.append(root)
+    for root in roots:
+        allow.append("Shell(bash:" + root + "/" + scripts + "/finish-worktree.sh *)")
+    return allow
+
+
 def cursor_rule(rule):
     """Claude Code's spelling to Cursor's: `Bash(x y:*)` (the prefix and a space) is
     `Shell(x:y*)` (the command base, then its arguments); `Bash(x*)` is `Shell(x*)`;
@@ -3488,26 +3781,82 @@ def cursor_rules(rules):
     return out
 
 
-if os.environ.get("HS_HARNESS") == "cursor":
-    # the same lists, in Cursor's spelling, at the one place its CLI reads them: the
-    # workspace's own .cursor/cli.json (exclusive, like the file above; the path is
-    # gitignored in this tree so a worker's primary stays clean). In allowlist mode a
-    # write outside an allowed path waits for a person, so the worker's report
-    # directory and the primary's session worktrees are allowed: the isolated-session
-    # hook -- which Cursor's CLI does run, measured -- still refuses another session's
-    # worktree inside that allowance.
+if os.environ.get("HS_HARNESS") == "cursor" and os.environ.get("HS_PROFILE") == "coordinator":
+    # The pane's own config home (CURSOR_CONFIG_DIR), not <cwd>/.cursor/cli.json.
+    # cli-config.json is the file Cursor reads approvalMode from; the project file's
+    # schema refuses that key. hooks.json is the user-level hook file Cursor reads
+    # from that config directory. The two events appl-hook.sh is registered for are
+    # the same two the claude --settings file registers.
+    cfg_dir = os.environ.get("HS_CURSOR_HOME", "")
+
+    def _under(child, parent):
+        if not parent:
+            return False
+        return child == parent or child.startswith(parent + os.sep)
+
+    real = os.path.realpath(cfg_dir) if cfg_dir else ""
+    pane = os.path.realpath(os.path.join(herd, name_of_worker))
+    shared = os.path.realpath(os.path.join(cwd, ".cursor"))
+    home_cursor = os.path.realpath(os.path.join(home, ".cursor")) if home else ""
+    if (not cfg_dir or os.path.islink(cfg_dir) or not os.path.isdir(cfg_dir)
+            or not _under(real, pane) or real == pane
+            or _under(real, shared) or _under(real, home_cursor)):
+        print("herd-spawn: the cursor harness cannot register appl-hook.sh on this pane alone: "
+              "CURSOR_CONFIG_DIR is not a private directory, so the pane would read the shared "
+              "<cwd>/.cursor/cli.json; the worker was not started", file=sys.stderr)
+        sys.exit(2)
+    coord_allow = cursor_rules(rest[:n])
+    coord_deny = cursor_rules(rest[n:] + extra_deny)
     primary = os.environ.get("HS_PRIMARY", "")
-    cursor_allow = cursor_rules(rest[:n])
-    cursor_allow += ["Read(" + os.path.join(herd, name_of_worker) + "/**)",
-                     "Write(" + os.path.join(herd, name_of_worker) + "/**)"]
-    cursor_deny = cursor_rules(rest[n:] + extra_deny)
     if primary:
-        # the session worktrees may be written (the guard still holds each to its
-        # session); the primary is never granted for reading -- its keys/ holds the
-        # resident agents' seeds, and the diff is read through git, not the tree
-        # (ISSUE(security-audit-2026-09-12-cursor-s-project-rul-e6f4))
-        cursor_allow += ["Write(" + os.path.join(primary, ".worktrees") + "/**)"]
-        cursor_deny += ["Read(" + os.path.join(primary, "keys") + "/**)"]
+        coord_deny.append("Read(" + os.path.join(primary, "keys") + "/**)")
+    hook = ('HERD_DIR=' + shlex.quote(herd) + ' bash "${CLAUDE_PROJECT_DIR:-.}"'
+            '/.cursor/skills/isolated-session/scripts/appl-hook.sh ')
+
+    def write_cfg(filename, payload):
+        dest = os.path.join(cfg_dir, filename)
+        if os.path.islink(dest) or (os.path.lexists(dest) and not os.path.isfile(dest)):
+            print("herd-spawn: the cursor harness cannot register appl-hook.sh on this pane alone: "
+                  + dest + " is not a regular file, so the pane would read the shared "
+                  "<cwd>/.cursor/cli.json; the worker was not started", file=sys.stderr)
+            sys.exit(2)
+        if os.path.lexists(dest):
+            os.unlink(dest)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(dest, flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=1)
+            f.write("\n")
+
+    write_cfg("cli-config.json", {
+        "approvalMode": "allowlist",
+        "permissions": {"allow": coord_allow, "deny": coord_deny},
+    })
+    write_cfg("hooks.json", {
+        "version": 1,
+        "hooks": {
+            "beforeSubmitPrompt": [{"command": hook + "UserPromptSubmit"}],
+            "sessionStart": [{"command": hook + "SessionStart"}],
+            "postToolUse": [{"command": hook + "PostToolUse", "matcher": "Agent"}],
+        },
+    })
+
+if os.environ.get("HS_HARNESS") == "cursor" and os.environ.get("HS_PROFILE") != "coordinator":
+    # The worker's allow is the brief's spellings (cursor_worker_allow), not the
+    # claude list in Cursor's spelling: a trailing star there spans a pipe or a
+    # semicolon. The deny list is still that translation, plus the chain and
+    # guard-prefix denies a star cannot express. The file is the workspace's
+    # .cursor/cli.json (exclusive; gitignored here). The primary is never granted
+    # for reading -- its keys/ holds the resident agents' seeds
+    # (ISSUE(security-audit-2026-09-12-cursor-s-project-rul-e6f4)).
+    primary = os.environ.get("HS_PRIMARY", "")
+    brief_primary = os.environ.get("HS_BRIEF_PRIMARY", "") or primary
+    cursor_allow = cursor_worker_allow(primary, brief_primary, herd, name_of_worker)
+    cursor_deny = cursor_rules(rest[n:] + extra_deny) + CURSOR_WORKER_DENY
+    if primary:
+        cursor_deny.append("Read(" + os.path.join(primary, "keys") + "/**)")
     cli = os.path.join(cwd, ".cursor", "cli.json")
     os.makedirs(os.path.dirname(cli), exist_ok=True)
     if os.path.lexists(cli):
@@ -3520,6 +3869,19 @@ if os.environ.get("HS_HARNESS") == "cursor":
         json.dump({"permissions": {"allow": cursor_allow, "deny": cursor_deny}}, f, indent=1)
         f.write("\n")
 PY
+# grok takes each rule as its own flag (measured: grok 1.0.41 --help, --allow and --deny).
+# The typed-line bound above is the claude/cursor/codex form, which keeps the rules in a
+# file so the line stays under what a pty will type. These flags ARE the wall, so they
+# are appended after that bound. A pty that drops input past about 1 KB would cut the
+# list: ISSUE(grok-allow-argv-exceeds-pty-bound).
+if [[ "$harness" == "grok" ]]; then
+  for rule in "${allow[@]}"; do
+    agent_args+=(--allow "$rule")
+  done
+  for rule in "${deny[@]}"; do
+    agent_args+=(--deny "$rule")
+  done
+fi
 # A new tab's shell needs a moment to print its prompt, and `herdr agent start` refuses
 # a pane that is not at one: called 143 ms after `tab create` it failed (2026-09-12).
 # So try again, two seconds apart, for HERD_SPAWN_READY_SECS (default 30). Only a FAST

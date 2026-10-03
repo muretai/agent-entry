@@ -2,16 +2,16 @@
   "_": "Written by .cursor/skills/isolated-session/scripts/vendor.sh pull --ref; never edit the copies by hand. `vendor.sh check` holds them to these digests, and to the closure of what the scripts reference, with no home checkout present. The skill's home is APPL; edit it there, tag a release, and pull again.",
   "from": "appl",
   "repository": "private",
-  "ref": "v0.1.1",
-  "commit": "da7c69362bddf8e34057952a0c6b006f9ef1448b",
-  "date": "2026-09-30",
+  "ref": "v0.1.2",
+  "commit": "10d10f6044cb291b5563d1454992b5a31976153d",
+  "date": "2026-10-03",
   "files": {
     ".cursor/skills/isolated-session/SKILL.md": {
-      "sha256": "2737aa6542c0e2b6265b1b6f05b0d5564473ac88f8664329a31e2ad49f041e05",
+      "sha256": "eec37e59172ce6ee7e583c4503c96c4c9c33ce9646cc29465197c0634727410f",
       "mode": "100644"
     },
     ".cursor/skills/isolated-session/scripts/lib.sh": {
-      "sha256": "69d28ba7acbd187e8c38057eaa223ef6566c20616d22070a6ab4166c3c7bf7b2",
+      "sha256": "65e1cce7835a14be9294fc3065a4b2150e1281071a25ce41989eac4f242fe3ad",
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/ensure-worktree.sh": {
@@ -27,7 +27,7 @@
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/finish-worktree.sh": {
-      "sha256": "3b1eec257821a0e85ae2ae42a161b191e24f1fbb416fb38c37894b4f18da8f14",
+      "sha256": "036add2e24687a9f686f2488fad5863ddf71255bb0bbf43cd2dd9d022dd08f73",
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/landing-lease.sh": {
@@ -35,11 +35,11 @@
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/landing-lease.py": {
-      "sha256": "d5fe4d7a9b02929ba1a3bfe22b853a016b1a4835c4fe5f5ef4cb0c7bbade04c8",
+      "sha256": "70ee57b26adc7e6d54ae47dd5ee9e89d3e089a2dea623bdd8c2eb1628c212dae",
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/lease_core.py": {
-      "sha256": "e753cd523c1121fc91823f11c9a2f63f3397f544989f116cf178e02312a620fc",
+      "sha256": "021065a1e413d5b8d1b6579acca8ebadd527f68c5f54fce8c73c78d32312ba21",
       "mode": "100644"
     },
     ".cursor/skills/isolated-session/scripts/dispatch-init.sh": {
@@ -55,19 +55,19 @@
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/vendor.sh": {
-      "sha256": "121618c3e4cf4a40d9e1ba65bd5a51164e81432eac068ad97b10d838ddbb70b0",
+      "sha256": "f8464daa24db8e8ea114acc76916d8a156e19a029830cbaaa9de1a1515b00a7f",
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/herd-spawn.sh": {
-      "sha256": "46dea3855f79e26d5780a77b611e350f10df12e88d7cb69f79dc358e5f0fbcdb",
+      "sha256": "b7352da4f1e0fe014e4469ea318569a4bfe5f0c37f8c8647fd1d4949c5b07475",
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/land.sh": {
-      "sha256": "b196bb261a703cd7459e68e5917eaf96b02366d58e3df91dcefbc0d0d4f21be1",
+      "sha256": "7af76af792ee1c7926ae915fda70f711fb0c7fa43ea14d95182253b28e8e8467",
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/walls/darwin.sh": {
-      "sha256": "f65e7da5374b031577091fe411543d435a99e2e52673a8e52c2ac948419d66ce",
+      "sha256": "75636ecf3a830fdceb87229a5d80ea338463f87b878748e54621aa7d4bd86957",
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/walls/darwin.sb.template": {
@@ -83,11 +83,11 @@
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/herd-watch.sh": {
-      "sha256": "d98b72817b996e80e7223b63fb200c2aec61ebdf34aa6a85d13aa43be3602bce",
+      "sha256": "4a19738c5613c599174a68e33b665fff0aaeae35cf18cea3325db4562a984f61",
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/briefs/coordinator.md": {
-      "sha256": "498746a27354137a925689352d8da857c18e3c96d4248d933f70b854ff1cb45d",
+      "sha256": "f22012579c8e0ef05e58c8dbff29a3d722076b2d2579ff2d74e7e0d589ecbde8",
       "mode": "100644"
     },
     ".cursor/skills/isolated-session/briefs/dispatch-ticket.md": {
@@ -95,11 +95,15 @@
       "mode": "100644"
     },
     ".cursor/skills/isolated-session/briefs/implementer.md": {
-      "sha256": "803d11f9dad7da02504e98038fcbe147e3ea7d582d5a5942d7a3ea109da1b6b4",
+      "sha256": "0bfdb344d579e9cd5f5f1957ebf1ae020cb648bc118a668556e90bf737ae7729",
+      "mode": "100644"
+    },
+    ".cursor/skills/isolated-session/briefs/reviewer.md": {
+      "sha256": "295b17b0543fcb6e558301653ee5fa5697fbf68930b5ebe6d89ae5d6bdadde6a",
       "mode": "100644"
     },
     ".cursor/skills/isolated-session/briefs/test-author.md": {
-      "sha256": "6eaefb22724b534f82d10f913d39a504f8898c195407ad352674e3f16f21a512",
+      "sha256": "08b739cd701a93865b9fa06636561de0f19cf7213a0f21f8f85fbace9252c7d9",
       "mode": "100644"
     },
     ".cursor/skills/isolated-session/briefs/worker.md": {
@@ -122,12 +126,28 @@
       "sha256": "71659195a27ffacd459665b2432cb6a782b5b772a863057b834a89fc4224611f",
       "mode": "100644"
     },
+    ".cursor/skills/isolated-session/worker/wrangler.toml": {
+      "sha256": "fc2865327b67ec54d6190fdb2bdaa78ff8d7e4337ad14794a403793ff5189202",
+      "mode": "100644"
+    },
+    ".cursor/skills/isolated-session/worker/README.md": {
+      "sha256": "60f004d750c47c0cd3b9e8fd3fc65a49ceb62b7eb6f4738655da8573da61defa",
+      "mode": "100644"
+    },
+    ".cursor/skills/isolated-session/worker/lease-core.mjs": {
+      "sha256": "512f88d200148334525af58abf6c8802be231b7163a716bbf6323d782493eb0f",
+      "mode": "100644"
+    },
+    ".cursor/skills/isolated-session/worker/worker.mjs": {
+      "sha256": "1fe5fa009558ef7db0be1f2585bf1baba8faf17eb3c6b98afa07aa5ee450bc68",
+      "mode": "100644"
+    },
     ".cursor/skills/isolated-session/scripts/trust/claude.sh": {
       "sha256": "d42b6da2ec323d3094061d3da6cf3d35cb6611aea1c0d388ab34f7a77dcad9f5",
       "mode": "100755"
     },
     ".claude/skills/appl/SKILL.md": {
-      "sha256": "1a3ced807dd3768aa021208f3b3512b43380f0242268e4edd49cd7710375970a",
+      "sha256": "6e874b05e28e99108bc208284df2a7b0624c2c5c69c3288d9527939b3431f729",
       "mode": "100644"
     },
     ".cursor/rules/appl.mdc": {
@@ -135,7 +155,7 @@
       "mode": "100644"
     },
     "tests/test_isolated_session.py": {
-      "sha256": "31f58d32f5d745da4fa890c09493ab4e127b0e66c98ab5a85b2390a8e323279b",
+      "sha256": "41f2ff2fb472101361d6bd2aca57d984b08e4b43220067961bf9b99ba41a3748",
       "mode": "100644"
     }
   }

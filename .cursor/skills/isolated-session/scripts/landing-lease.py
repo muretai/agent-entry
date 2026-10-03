@@ -452,6 +452,20 @@ def config_file(ddir: Path) -> Path:
     return lease_core.config_path(os.environ.get("LANDING_LEASE_CONFIG"), ddir / "lease.toml")
 
 
+def with_do_when_file_has_no_backend(cfg: Dict[str, str], path: Path) -> Dict[str, str]:
+    """An on-disk lease file with no backend word stays on do.
+
+    No file at all leaves the key unset, so lease_core.DEFAULT_BACKEND (none) applies
+    and no node is required. An explicit backend word, including none and do, is kept."""
+    if (cfg.get("backend") or "").strip():
+        return cfg
+    if path.is_symlink() or not path.is_file():
+        return cfg
+    out = dict(cfg)
+    out["backend"] = "do"
+    return out
+
+
 # -- the verbs ------------------------------------------------------------------------------
 
 def parse_args(argv: List[str]) -> tuple:
@@ -490,7 +504,8 @@ def lease_main(argv: List[str]) -> int:
     try:
         verb, as_name, repo, epoch = parse_args(argv)
         ddir = dispatch_dir()
-        cfg = lease_core.read_config(config_file(ddir))
+        path = config_file(ddir)
+        cfg = with_do_when_file_has_no_backend(lease_core.read_config(path), path)
     except lease_core.ConfigError as e:
         return lease_core.emit(PROG, lease_core.Outcome("config", reason=str(e)))
 
@@ -534,7 +549,19 @@ def lease_main(argv: List[str]) -> int:
         lease_core.check_url(url)
         return DoBackend(url, repo, did, seed, crypto, epoch)
 
-    return lease_core.dispatch(PROG, verb, cfg, {"do": build_do, "host": build_host})
+    def build_none(cfg: Dict[str, str]) -> lease_core.Backend:
+        return lease_core.NoneBackend()
+
+    def build_command(cfg: Dict[str, str]) -> lease_core.Backend:
+        raw = cfg.get("command")
+        if raw is None or not raw.strip():
+            raise lease_core.ConfigError(
+                "backend = command needs a command key in the [lease] section "
+                "(command is missing or empty)")
+        return lease_core.CommandBackend(raw, epoch)
+
+    return lease_core.dispatch(PROG, verb, cfg, {
+        "none": build_none, "do": build_do, "command": build_command, "host": build_host})
 
 
 def doctor_main() -> int:
@@ -543,7 +570,8 @@ def doctor_main() -> int:
     It prints no path: the doctor's lines are shown to people on other machines."""
     ddir = dispatch_dir()
     try:
-        cfg = lease_core.read_config(config_file(ddir))
+        path = config_file(ddir)
+        cfg = with_do_when_file_has_no_backend(lease_core.read_config(path), path)
         name = lease_core.select_backend(cfg)
     except lease_core.ConfigError as e:
         print("MISSING lease: %s -- fix the [lease] configuration (LANDING_LEASE_CONFIG, "

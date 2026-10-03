@@ -15,6 +15,24 @@
 //   Cross-origin (or no Origin) -> 403. Over 2048 bytes -> 413. Other refusals -> 4xx.
 //   observer env = { stage: "page", event, offer, engine, ms, ua_family, client_class,
 //                    ip_vendor, country, ... } with no DID and no text.
+//
+// Agent Entry S6a-2 (split 2 of 4 of intake 20261002T130609Z), section 8 below, WRITTEN BEFORE
+// THE IMPLEMENTATION: a door whose declaration names `entry.counts` (an absolute https URL, S6a-1)
+// also POSTs the SAME AT-14 body to that URL, best-effort and non-blocking exactly as gaSink is.
+//   - One POST per accepted beacon that counted at least one event, to exactly entry.counts,
+//     with `Origin` = the beacon's (already checked) origin, because trunk's collector
+//     (agent/shopcounts.py origin_ok) takes only the shop's own origin.
+//   - body = { "session": <the beacon's session>, "events": <the events the door COUNTED> }:
+//     the per-session cap trims it (events past 100 are not sent), and a refused beacon sends
+//     nothing. Nothing else rides along: no DID, no text, no input value, no address, no
+//     ua_family / ip_vendor / country, no page header. <= 2048 bytes, <= 100 events.
+//   - The bytes are ones trunk's collector accepts: parseBeaconTrunk below is a line-for-line
+//     JS twin of agent/shopcounts.py parse_beacon (trunk S5, 94b76839).
+//   - Fire-and-forget: a slow, hanging, throwing, rejecting or non-2xx sink never delays the
+//     204 or a signed reply, never changes one byte of either, is never retried, and never
+//     surfaces as an unhandled rejection. No entry.counts -> no request at all.
+//   The door reaches the network through globalThis.fetch (read no earlier than createAgentEntry,
+//   as gaSink's default is), so the stub below sees every byte that would leave.
 import * as door from '../muretai-agent-entry.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -297,6 +315,405 @@ const session = () => `tab-${String(++sessionSeq).padStart(8, '0')}`;
         `HTTP ${out.status} Allow=${allow}`);
     }
   }
+}
+
+// ---------------------------------------------------------------- 8. entry.counts: the door posts the same body (S6a-2)
+
+// agent/shopcounts.py parse_beacon (trunk S5, 94b76839), twinned: the hosted collector's verdict
+// on a body. True when trunk would count it, false when it refuses the whole body.
+const TRUNK_EVENT_NAMES = ['page_ready', 'referral', 'offer_registered', 'offer_started',
+  'offer_succeeded', 'offer_failed', 'ask_denied', 'handoff'];
+const TRUNK_ENGINES = ['chatgpt', 'claude', 'perplexity', 'gemini', 'copilot', 'grok', 'deepseek',
+  'mistral', 'you', 'other'];
+const TRUNK_VERBS = ['find', 'ask', 'quote', 'book', 'hold', 'order', 'buy', 'track', 'change', 'cancel', 'join'];
+const TRUNK_OFFER = new RegExp(`^(${TRUNK_VERBS.join('|')})_[a-z][a-z0-9_]*$`);
+const TRUNK_SESSION = /^[A-Za-z0-9_-]{8,64}$/;
+
+function parseBeaconTrunk(raw) {
+  if (raw.length > 2048) return false;
+  if (raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf) return false;
+  let doc;
+  try { doc = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw)); } catch { return false; }
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return false;
+  if (JSON.stringify(Object.keys(doc).sort()) !== '["events","session"]') return false;
+  if (typeof doc.session !== 'string' || !TRUNK_SESSION.test(doc.session)) return false;
+  if (!Array.isArray(doc.events) || doc.events.length === 0 || doc.events.length > 100) return false;
+  for (const e of doc.events) {
+    if (!e || typeof e !== 'object' || Array.isArray(e)) return false;
+    if (Object.keys(e).some((k) => !['name', 'offer', 'engine', 'ms'].includes(k)) || !('name' in e)) return false;
+    if (typeof e.name !== 'string' || !TRUNK_EVENT_NAMES.includes(e.name)) return false;
+    if ('offer' in e && (typeof e.offer !== 'string' || e.offer.length > 64 || !TRUNK_OFFER.test(e.offer))) return false;
+    if ('engine' in e && (typeof e.engine !== 'string' || !TRUNK_ENGINES.includes(e.engine))) return false;
+    if ('ms' in e && !(Number.isInteger(e.ms) && e.ms >= 0 && e.ms <= 600000)) return false;
+  }
+  return true;
+}
+
+// The twin itself is pinned first, so a wrong twin cannot make a wrong post look right.
+{
+  const t = (v) => parseBeaconTrunk(Buffer.from(typeof v === 'string' ? v : JSON.stringify(v)));
+  check(t({ session: 'tab-twin0000', events: [{ name: 'offer_succeeded', offer: 'hold_item', ms: 3 }] }),
+    'counts/trunk-twin/accepts-a-good-body');
+  check(!t({ session: 'tab-twin0000', events: [{ name: 'page_ready' }], ua_family: 'chrome' }),
+    'counts/trunk-twin/refuses-an-extra-top-level-key');
+  check(!t({ session: 'tab-twin0000', events: [{ name: 'page_ready', did: A_DID }] }),
+    'counts/trunk-twin/refuses-an-extra-event-key');
+  check(!t({ session: 'tab-twin0000', events: [] }), 'counts/trunk-twin/refuses-no-events');
+  check(!t({ session: 'tab-twin0000', events: Array.from({ length: 101 }, () => ({ name: 'page_ready' })) }),
+    'counts/trunk-twin/refuses-101-events');
+  check(!t({ session: 'tab-twin0000', events: [{ name: 'offer_started', offer: 'teleport' }] }),
+    'counts/trunk-twin/refuses-an-offer-off-the-registry');
+}
+
+const COUNTS = 'https://counts.muretai.example/shops/harbor-lamp/.well-known/agent-tools/events';
+const realFetch = globalThis.fetch;
+const wire = { mode: 'ok', calls: [] };
+let unhandled = 0;
+process.on('unhandledRejection', () => { unhandled += 1; });
+
+const headerObject = (h) => {
+  try { return Object.fromEntries(new Headers(h || {})); } catch { return { unreadable: String(h) }; }
+};
+const bodyBytes = (b) => {
+  if (b === undefined || b === null) return Buffer.alloc(0);
+  if (typeof b === 'string') return Buffer.from(b, 'utf8');
+  if (b instanceof ArrayBuffer) return Buffer.from(b);
+  if (ArrayBuffer.isView(b)) return Buffer.from(b.buffer, b.byteOffset, b.byteLength);
+  return Buffer.from(String(b), 'utf8');
+};
+
+globalThis.fetch = function countsFetchStub(url, init = {}) {
+  wire.calls.push({
+    url: typeof url === 'string' ? url : (url?.url ?? String(url)),
+    method: String(init.method || 'GET').toUpperCase(),
+    headers: headerObject(init.headers),
+    body: bodyBytes(init.body),
+  });
+  switch (wire.mode) {
+    case 'throw': throw new Error('the counts sink is unreachable');
+    case 'reject': return Promise.reject(new Error('ECONNREFUSED counts sink'));
+    case 'timeout': return new Promise((_, reject) => {
+      setTimeout(() => reject(Object.assign(new Error('timed out'), { name: 'TimeoutError' })), 20).unref();
+    });
+    case 'hang': return new Promise(() => {});
+    case 'slow': return new Promise((done) => {
+      setTimeout(() => done(new Response(null, { status: 204 })), 3000).unref();
+    });
+    case '500': return Promise.resolve(new Response('{"error":"down"}', { status: 500 }));
+    case '404': return Promise.resolve(new Response('', { status: 404 }));
+    default: return Promise.resolve(new Response(null, { status: 204 }));
+  }
+};
+
+const settle = (ms = 40) => new Promise((done) => setTimeout(done, ms));
+const LATE = Symbol('late');
+async function inTime(promise, ms = 1000) {
+  let timer;
+  const late = new Promise((done) => { timer = setTimeout(() => done(LATE), ms); });
+  try { return await Promise.race([promise, late]); } finally { clearTimeout(timer); }
+}
+
+function countsDeclaration(counts = COUNTS) {
+  const declaration = JSON.parse(JSON.stringify(harbor.declaration));
+  if (counts !== null) declaration.entry.counts = counts;
+  return declaration;
+}
+const countsDoor = (extra = {}) => makeDoor({ declaration: countsDeclaration(), signedRatePerMin: 0,
+  signedRatePerMinTotal: 0, ...extra });
+// null, not undefined: undefined would take the default and give the plain door entry.counts too.
+const plainDoor = (extra = {}) => makeDoor({ declaration: countsDeclaration(null), signedRatePerMin: 0,
+  signedRatePerMinTotal: 0, ...extra });
+
+const sameResponse = (a, b) => a.status === b.status
+  && JSON.stringify(a.headers || {}) === JSON.stringify(b.headers || {})
+  && Buffer.compare(Buffer.from(a.body || ''), Buffer.from(b.body || '')) === 0;
+
+const parsed = (call) => { try { return JSON.parse(call.body.toString('utf8')); } catch { return null; } };
+const canon = (v) => JSON.stringify(v, (k, x) => (x && typeof x === 'object' && !Array.isArray(x)
+  ? Object.fromEntries(Object.keys(x).sort().map((key) => [key, x[key]])) : x));
+const COOKIE = 'wp_session=ZZ-cookie-5521';
+
+/** What a post may never carry, in its body or its headers. */
+function checkClean(call, label) {
+  const flatBody = call.body.toString('utf8');
+  const flatHeaders = JSON.stringify(call.headers);
+  for (const [what, needle] of [['did', 'did:key:'], ['forged-address', FORGED_CF_IP], ['socket-address', SOCKET],
+    ['cookie', 'ZZ-cookie-5521'], ['user-agent', 'Chrome/140.0'], ['knock-text', 'ZZ-knock-text-8830']]) {
+    check(!flatBody.includes(needle), `${label}/body-carries-no-${what}`, flatBody);
+    check(!flatHeaders.includes(needle), `${label}/headers-carry-no-${what}`, flatHeaders);
+  }
+  for (const field of ['stage', 'ua_family', 'client_class', 'ip_vendor', 'country', 'signature_agent',
+    'peer_did', 'owner_did', 'wba_did', 'text', 'identified', 'verified']) {
+    check(!new RegExp(`"${field}"\\s*:`).test(flatBody), `${label}/body-has-no-${field}`, flatBody);
+  }
+  check(call.body.length <= 2048, `${label}/at-most-2048-bytes`, String(call.body.length));
+  const doc = parsed(call);
+  check(Array.isArray(doc?.events) && doc.events.length <= 100, `${label}/at-most-100-events`);
+  check(parseBeaconTrunk(call.body), `${label}/trunk-shopcounts-accepts-the-bytes`, flatBody);
+}
+
+// 8a. No entry.counts, no request: the hosted dashboard is opt-in.
+{
+  wire.mode = 'ok';
+  const before = wire.calls.length;
+  const { entry, error } = plainDoor();
+  if (check(entry !== null, 'counts/plain-door-starts', error?.message)) {
+    const out = await post(entry, { session: session(), events: [{ name: 'page_ready' }] });
+    await settle();
+    check(out.status === 204, 'counts/plain-door-204', `HTTP ${out.status}`);
+    check(wire.calls.length === before, 'counts/no-entry-counts-sends-nothing', `${wire.calls.length - before} request(s)`);
+  }
+}
+
+// 8b. An accepted beacon is posted to entry.counts: the same session, the counted events, nothing else.
+{
+  wire.mode = 'ok';
+  const { entry, error, sink } = countsDoor();
+  const plain = plainDoor().entry;
+  if (check(entry !== null && plain !== null, 'counts/door-with-entry-counts-starts', error?.message)) {
+    const s = session();
+    const events = [
+      { name: 'page_ready' },
+      { name: 'referral', engine: 'claude' },
+      { name: 'offer_registered', offer: 'hold_item' },
+      { name: 'offer_started', offer: 'hold_item' },
+      { name: 'offer_succeeded', offer: 'hold_item', ms: 120 },
+      { name: 'handoff', offer: 'hold_item' },
+    ];
+    const before = wire.calls.length;
+    const out = await post(entry, { session: s, events }, { cookie: COOKIE });
+    const base = await post(plain, { session: session(), events }, { cookie: COOKIE });
+    check(sameResponse(out, base), 'counts/accept/the-204-is-the-plain-doors-204',
+      `${out.status} ${JSON.stringify(out.headers)} vs ${base.status} ${JSON.stringify(base.headers)}`);
+    check(pageEvents(sink).length === events.length, 'counts/accept/the-local-observer-still-sees-every-event',
+      `got ${pageEvents(sink).length}`);
+    await settle();
+    const mine = wire.calls.slice(before);
+    if (check(mine.length === 1, 'counts/accept/exactly-one-post-per-beacon', `${mine.length} request(s)`)) {
+      const call = mine[0];
+      check(call.url === COUNTS, 'counts/accept/posted-to-exactly-entry-counts', call.url);
+      check(call.method === 'POST', 'counts/accept/method-POST', call.method);
+      check(call.headers.origin === ORIGIN, 'counts/accept/origin-is-the-shops-own',
+        JSON.stringify(call.headers.origin));
+      const doc = parsed(call);
+      check(doc !== null, 'counts/accept/body-is-json', call.body.toString('utf8'));
+      check(JSON.stringify(Object.keys(doc || {}).sort()) === '["events","session"]',
+        'counts/accept/body-is-session-and-events-only', JSON.stringify(Object.keys(doc || {})));
+      check(doc?.session === s, 'counts/accept/the-pages-own-session', JSON.stringify(doc?.session));
+      check(canon(doc?.events) === canon(events), 'counts/accept/the-same-events-in-order',
+        JSON.stringify(doc?.events));
+      checkClean(call, 'counts/accept');
+    }
+    check(entry.ledger.size === 0, 'counts/accept/never-on-the-ledger');
+  }
+}
+
+// 8c. The per-session cap trims what is sent: 100 events per session reach entry.counts, no more.
+{
+  wire.mode = 'ok';
+  const { entry } = countsDoor();
+  if (entry) {
+    const s = 'tab-capposted';
+    const forty = { session: s, events: Array.from({ length: 40 }, () => ({ name: 'page_ready' })) };
+    const sizes = [];
+    for (let i = 0; i < 4; i += 1) {
+      const before = wire.calls.length;
+      const out = await post(entry, i < 3 ? forty : { session: s, events: [{ name: 'page_ready' }] });
+      check(out.status === 204, `counts/cap/beacon-${i}-204`, `HTTP ${out.status}`);
+      await settle();
+      const mine = wire.calls.slice(before);
+      sizes.push(mine.map((c) => parsed(c)?.events?.length ?? -1));
+      for (const [j, c] of mine.entries()) checkClean(c, `counts/cap/beacon-${i}-post-${j}`);
+    }
+    check(JSON.stringify(sizes) === '[[40],[40],[20],[]]', 'counts/cap/40-40-20-then-nothing',
+      JSON.stringify(sizes));
+  }
+}
+
+// 8d. The largest beacon that fits is still a body trunk takes; nothing grows past 2048 on the way.
+{
+  wire.mode = 'ok';
+  const { entry } = countsDoor();
+  if (entry) {
+    const many = (n, s) => JSON.stringify({ session: s,
+      events: Array.from({ length: n }, (_, i) => ({ name: 'offer_succeeded', offer: 'hold_item', ms: 600000 - i })) });
+    let fits = 1;
+    while (Buffer.byteLength(many(fits + 1, 'tab-postsize00'), 'utf8') <= 2048) fits += 1;
+    const before = wire.calls.length;
+    const out = await post(entry, many(fits, 'tab-postsize00'));
+    check(out.status === 204, 'counts/size/largest-beacon-204', `HTTP ${out.status}`);
+    await settle();
+    const mine = wire.calls.slice(before);
+    if (check(mine.length === 1, 'counts/size/largest-beacon-posted-once', `${mine.length} request(s)`)) {
+      checkClean(mine[0], 'counts/size');
+      check(parsed(mine[0])?.events?.length === fits, 'counts/size/every-counted-event-sent',
+        `${parsed(mine[0])?.events?.length} of ${fits}`);
+    }
+  }
+}
+
+// 8e. A refused beacon sends nothing: no part of it reaches entry.counts, trimmed or not.
+{
+  wire.mode = 'ok';
+  const { entry } = countsDoor();
+  if (entry) {
+    const one = (event, extra = {}) => ({ session: session(), events: [event], ...extra });
+    for (const [label, body, headers] of [
+      ['oversize-413', JSON.stringify({ session: session(),
+        events: Array.from({ length: 99 }, () => ({ name: 'offer_started', offer: 'hold_item' })) })],
+      ['101-events', { session: session(), events: Array.from({ length: 101 }, () => ({ name: 'page_ready' })) }],
+      ['foreign-origin', one({ name: 'page_ready' }), { origin: 'https://evil.example' }],
+      ['no-origin', one({ name: 'page_ready' }), { origin: undefined }],
+      ['event-did', one({ name: 'offer_started', offer: 'hold_item', did: A_DID })],
+      ['event-text', one({ name: 'offer_started', offer: 'hold_item', text: 'Do you have a table Saturday?' })],
+      ['event-input-value', one({ name: 'offer_started', offer: 'hold_item', sku: 'L-12' })],
+      ['top-level-did', one({ name: 'page_ready' }, { did: A_DID })],
+      ['session-is-a-did', { session: A_DID, events: [{ name: 'page_ready' }] }],
+      ['offer-is-a-did', one({ name: 'offer_started', offer: A_DID })],
+      ['one-bad-event-among-good', { session: session(),
+        events: [{ name: 'page_ready' }, { name: 'offer_started', offer: 'hold_item', text: 'secret' }] }],
+      ['unknown-name', one({ name: 'tool_started' })],
+      ['bom', Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(JSON.stringify(one({ name: 'page_ready' })))])],
+    ]) {
+      const hdrs = { ...BEACON, ...(headers || {}) };
+      if (hdrs.origin === undefined) delete hdrs.origin;
+      const buffer = Buffer.isBuffer(body) ? body : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
+      const before = wire.calls.length;
+      const out = await entry.handleRequestAsync('POST', EVENTS, hdrs, buffer, { remoteAddress: SOCKET });
+      await settle(10);
+      check(out.status >= 400 && out.status < 500, `counts/refused/${label}/4xx`, `HTTP ${out.status}`);
+      check(wire.calls.length === before, `counts/refused/${label}/nothing-posted`,
+        wire.calls.slice(before).map((c) => c.body.toString('utf8')).join(' | '));
+    }
+  }
+}
+
+// 8f. A slow or hanging sink never delays the 204, and the post is still attempted (fire, then forget).
+for (const mode of ['slow', 'hang']) {
+  wire.mode = mode;
+  const { entry } = countsDoor();
+  const plain = plainDoor().entry;
+  if (entry && plain) {
+    const body = { session: session(), events: [{ name: 'offer_started', offer: 'hold_item' }] };
+    const before = wire.calls.length;
+    const started = Date.now();
+    const out = await inTime(post(entry, body));
+    const took = Date.now() - started;
+    check(out !== LATE && took < 1000, `counts/${mode}-sink/the-204-is-not-delayed`, `${took} ms`);
+    if (out !== LATE) {
+      const base = await post(plain, body);
+      check(sameResponse(out, base), `counts/${mode}-sink/the-204-is-unchanged`, `HTTP ${out.status}`);
+    }
+    await settle();
+    check(wire.calls.length - before === 1, `counts/${mode}-sink/the-post-was-attempted-once`,
+      `${wire.calls.length - before} request(s)`);
+  }
+}
+
+// 8g. A failing sink (throws, rejects, times out, answers non-2xx) changes nothing and is never retried.
+for (const mode of ['throw', 'reject', 'timeout', '500', '404']) {
+  wire.mode = mode;
+  const { entry, sink } = countsDoor();
+  const plain = plainDoor().entry;
+  if (entry && plain) {
+    const unhandledBefore = unhandled;
+    const before = wire.calls.length;
+    let threw = null;
+    let out = null;
+    const body = { session: session(), events: [{ name: 'page_ready' }, { name: 'referral', engine: 'perplexity' }] };
+    try { out = await inTime(post(entry, body)); } catch (e) { threw = e; }
+    check(threw === null, `counts/${mode}-sink/nothing-thrown-out-of-the-door`, threw?.message);
+    check(out !== LATE, `counts/${mode}-sink/the-204-is-not-delayed`);
+    if (out && out !== LATE) {
+      const base = await post(plain, body);
+      check(sameResponse(out, base), `counts/${mode}-sink/the-204-is-unchanged`, `HTTP ${out.status} ${out.text}`);
+    }
+    check(pageEvents(sink).length === 2, `counts/${mode}-sink/the-local-observer-still-counts`,
+      `got ${pageEvents(sink).length}`);
+    await settle(150);
+    check(wire.calls.length - before === 1, `counts/${mode}-sink/one-attempt-no-retry`,
+      `${wire.calls.length - before} request(s)`);
+    check(unhandled === unhandledBefore, `counts/${mode}-sink/no-unhandled-rejection`,
+      `${unhandled - unhandledBefore}`);
+  }
+}
+
+// 8h. A signed reply is the same bytes with a slow or failing sink as without entry.counts. The
+//     reply's own messageId, timestamp and signature are fresh per reply, so those three values
+//     are replaced by placeholders in the raw bytes before comparing; everything else is byte-equal.
+{
+  const VISITOR_SEED = '6b'.repeat(32);
+  const VISITOR = didFromSeedHex(VISITOR_SEED);
+  let seq = 0;
+  async function knock(entry) {
+    const text = 'ZZ-knock-text-8830 brass lamps please';
+    const messageId = `counts-knock-${++seq}`;
+    const timestamp = Math.floor(Date.now() / 1000);
+    const sig = door.signEnvelope(VISITOR_SEED, { from: VISITOR, to: entry.did, messageId, contextId: null, timestamp, text });
+    const buffer = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: messageId, method: 'message/send',
+      params: { message: { kind: 'message', role: 'user', messageId, contextId: null, parts: [{ kind: 'text', text }],
+        metadata: { from: VISITOR, to: entry.did, timestamp, sig, offer: 'find_products' } } } }));
+    const started = Date.now();
+    const out = await inTime(entry.handleRequestAsync('POST', '/', { 'content-type': 'application/json' }, buffer,
+      { remoteAddress: SOCKET }));
+    const took = Date.now() - started;
+    if (out === LATE) return { late: true, took };
+    const raw = Buffer.from(out.body || '').toString('utf8');
+    let result = null;
+    try { result = JSON.parse(raw).result; } catch { /* reported below */ }
+    const replyText = result?.parts?.[0]?.text;
+    const signed = Boolean(result) && door.verifyEnvelope({
+      from: result.metadata?.from, to: result.metadata?.to, messageId: result.messageId,
+      contextId: result.contextId ?? null, timestamp: result.metadata?.timestamp, text: replyText,
+      sig: result.metadata?.sig }, { recipientDid: VISITOR, signerDid: entry.did });
+    let normal = raw.split(messageId).join('<request-id>');
+    for (const [value, slot] of [[result?.messageId, '<reply-id>'], [result?.metadata?.sig, '<sig>']]) {
+      if (typeof value === 'string' && value) normal = normal.split(value).join(slot);
+    }
+    if (Number.isSafeInteger(result?.metadata?.timestamp)) {
+      normal = normal.split(`"timestamp":${result.metadata.timestamp}`).join('"timestamp":"<ts>"');
+    }
+    return { late: false, took, out, normal, signed, replyText };
+  }
+
+  wire.mode = 'ok';
+  const plain = plainDoor().entry;
+  const base = plain ? await knock(plain) : null;
+  check(base && !base.late && base.out.status === 200 && base.signed, 'counts/knock/baseline-is-a-signed-reply',
+    base?.normal);
+  for (const mode of ['ok', 'slow', 'hang', 'throw', 'reject', 'timeout', '500']) {
+    wire.mode = mode;
+    const { entry } = countsDoor();
+    if (!entry || !base) continue;
+    const unhandledBefore = unhandled;
+    const before = wire.calls.length;
+    const k = await knock(entry);
+    check(!k.late && k.took < 1000, `counts/knock/${mode}-sink/the-signed-reply-is-not-delayed`, `${k.took} ms`);
+    if (k.late) continue;
+    check(k.signed, `counts/knock/${mode}-sink/the-reply-is-still-signed-by-the-door`);
+    check(k.out.status === base.out.status
+        && JSON.stringify(k.out.headers || {}) === JSON.stringify(base.out.headers || {}),
+      `counts/knock/${mode}-sink/status-and-headers-unchanged`, `${k.out.status} ${JSON.stringify(k.out.headers)}`);
+    check(k.replyText === base.replyText, `counts/knock/${mode}-sink/the-signed-text-is-byte-equal`, k.replyText);
+    check(k.normal === base.normal, `counts/knock/${mode}-sink/the-reply-bytes-are-byte-equal`,
+      `${k.normal}\n      vs ${base.normal}`);
+    await settle(mode === 'timeout' ? 150 : 40);
+    check(unhandled === unhandledBefore, `counts/knock/${mode}-sink/no-unhandled-rejection`);
+    for (const [j, c] of wire.calls.slice(before).entries()) {
+      check(c.url === COUNTS, `counts/knock/${mode}-sink/post-${j}/only-to-entry-counts`, c.url);
+      checkClean(c, `counts/knock/${mode}-sink/post-${j}`);
+    }
+  }
+}
+
+// 8i. Every request the door made in this file went to entry.counts and carried a body trunk accepts.
+{
+  check(wire.calls.length > 0, 'counts/the-door-posted-at-all', 'no request reached the fetch stub');
+  for (const [i, c] of wire.calls.entries()) {
+    check(c.url === COUNTS && c.method === 'POST', `counts/all/request-${i}/a-POST-to-entry-counts`, `${c.method} ${c.url}`);
+    check(parseBeaconTrunk(c.body), `counts/all/request-${i}/trunk-accepts`, c.body.toString('utf8'));
+  }
+  globalThis.fetch = realFetch;
 }
 
 // ---------------------------------------------------------------- report

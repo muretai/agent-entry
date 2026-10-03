@@ -20,6 +20,9 @@
 #   egress open                  the only egress policy wall v1 has (see the template)
 #   allow-write <dir>            the worker may write under <dir>
 #   allow-write-prefix <path>    ... and any path that begins with <path> (~/.claude.json*)
+#   allow-write-literal <path>   ... and exactly <path>, nothing beside or beneath it (a ref
+#                                and its .lock; a prefix on refs/heads/feat/w also covered
+#                                feat/w2.lock)
 #   deny-write <path>            but never under <path>, though an allow-write covers it
 #   deny-read <dir>              and never read, list or stat anything under <dir>
 #
@@ -64,6 +67,7 @@ rules_for() {
     case "$verb" in
       allow-write)        printf '(allow file-write* (subpath "%s"))\n' "$path" ;;
       allow-write-prefix) printf '(allow file-write* (prefix "%s"))\n' "$path" ;;
+      allow-write-literal) printf '(allow file-write* (literal "%s"))\n' "$path" ;;
       deny-write)         printf '(deny file-write* (subpath "%s"))\n' "$path" ;;
       deny-read)          printf '(deny file-read* (subpath "%s"))\n' "$path" ;;
     esac
@@ -77,7 +81,7 @@ render() {
     verb="${line%% *}"
     case "$verb" in
       egress) egress="${line#* }" ;;
-      allow-write|allow-write-prefix|deny-write|deny-read) ;;
+      allow-write|allow-write-prefix|allow-write-literal|deny-write|deny-read) ;;
       *) die "profile line refused (unknown verb): ${verb}" ;;
     esac
   done < "$profile"
@@ -112,6 +116,7 @@ render() {
         done
         rules_for allow-write "$profile"
         rules_for allow-write-prefix "$profile"
+        rules_for allow-write-literal "$profile"
         ;;
       DENY_WRITE) rules_for deny-write "$profile" ;;
       DENY_READ) rules_for deny-read "$profile" ;;
