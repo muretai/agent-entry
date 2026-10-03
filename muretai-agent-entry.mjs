@@ -3658,6 +3658,47 @@ function inputValues(text, input) {
   return out;
 }
 
+/** Woo-4: a product snapshot row is exactly id, name, price, stock_status and permalink, in that
+ *  order (catalogRow builds it); stock_status is one of these. */
+const CATALOG_STOCK = Object.freeze(['in_stock', 'out_of_stock']);
+/** The most of a snapshot file the door reads to answer `find`. */
+const CATALOG_FILE_MAX_BYTES = 16 * 1024 * 1024;
+
+/** `value` when it is an https permalink on `origin` exactly, else null. Never requested. */
+function catalogPermalink(value, origin) {
+  if (typeof value !== 'string' || !value.startsWith(`${origin}/`)) return null;
+  let url;
+  try { url = new URL(value); } catch { return null; }
+  return url.protocol === 'https:' && url.origin === origin ? value : null;
+}
+
+/** One snapshot row built from an allowlist (never a spread of `row`): { id, name, price,
+ *  stock_status, permalink }, or null when a field is missing, mistyped or off `origin`. */
+function catalogRow(row, origin) {
+  if (!isPlainObject(row)) return null;
+  const { id, name, price, stock_status: stockStatus } = row;
+  const permalink = catalogPermalink(row.permalink, origin);
+  if (!Number.isSafeInteger(id) || id < 0 || typeof name !== 'string' || typeof price !== 'string'
+      || !CATALOG_STOCK.includes(stockStatus) || permalink === null) return null;
+  return { id, name, price, stock_status: stockStatus, permalink };
+}
+
+/** JSON text with every "<", ">" and "&" written as a \u escape: the same data, and no reader of
+ *  the raw bytes ever meets markup. Only ever applied to JSON.stringify's output. */
+const jsonWithoutMarkup = (json) => json.replace(/[<>&]/g, (c) => `\\u00${c.charCodeAt(0).toString(16)}`);
+
+/** The rows of the snapshot file at `path` that are still well-formed and on `origin`: read as
+ *  data (JSON.parse of a regular file), never fetched. Throws when the file is not a readable
+ *  regular file holding a JSON list. */
+function readCatalogFile(path, origin) {
+  const info = statSync(path);
+  if (!info.isFile()) throw new TypeError(`${path} is not a regular file`);
+  if (info.size > CATALOG_FILE_MAX_BYTES) throw new TypeError(`${path} is larger than ${CATALOG_FILE_MAX_BYTES} bytes`);
+  const rows = JSON.parse(readFileSync(path, 'utf8'));
+  if (!Array.isArray(rows)) throw new TypeError(`${path} is not a JSON list of products`);
+  return rows.map((row) => catalogRow(row, origin)).filter((row) => row !== null);
+}
+
 /**
  * createAgentEntry(opts) -> { did, card, ledger, handleRequest, handleRequestAsync, listen }
  *
@@ -3772,6 +3813,10 @@ function inputValues(text, input) {
  *                  if you need a metric, send a salted, site-scoped digest and keep the DID
  *                  in your own store. This module ships no sink and names no vendor — the
  *                  slot is here so an adapter can live outside it.
+ *   catalogFile    the product snapshot `init --from woocommerce` wrote (agent-entry.products.json).
+ *                  A door-bound `catalog` offer then replies its rows as `products`, read from
+ *                  this file at reply time; nothing is requested of the store. Rows whose
+ *                  permalink is not https on this door's origin are left out.
  */
 export function createAgentEntry({
   seedHex,
@@ -3799,6 +3844,7 @@ export function createAgentEntry({
   store = null,
   declaration = undefined,
   toolsHistory = null,
+  catalogFile = null,
 } = {}) {
   if (!seedHex) throw new TypeError('createAgentEntry: seedHex is required');
   if (!baseUrl) throw new TypeError('createAgentEntry: baseUrl is required (it is signed into the card)');
@@ -3841,6 +3887,14 @@ export function createAgentEntry({
   // the no-envelope refusal returns the same object (E2, after it).
   const requirement = signedEnvelopeRequirement(did, doorUrl, howToUrl);
   const doorOrigin = new URL(canonUrl).origin;
+  // Woo-4: a snapshot that cannot be read now would answer every `find` with nothing; refuse to
+  // start instead. It is read again at each reply, so an edit on disk is what the door says.
+  if (catalogFile !== null && catalogFile !== undefined) {
+    if (typeof catalogFile !== 'string' || !catalogFile) throw new TypeError('createAgentEntry: catalogFile must be a file path');
+    try { readCatalogFile(catalogFile, doorOrigin); } catch (e) {
+      throw new TypeError(`createAgentEntry: catalogFile cannot be read as a product snapshot: ${String(e?.message || e).slice(0, 200)}`);
+    }
+  }
 
   // Suite S1: a DECLARATION makes this door serve its signed contract, generate its skills
   // and answer its offers. Refuse-to-start posture, as for `prefer` (AE-30): a declaration
@@ -4984,6 +5038,10 @@ export function createAgentEntry({
         break;
       case 'catalog':
         reply.status = 'see_catalog';
+        if (catalogFile) {
+          // A snapshot gone unreadable since start answers an empty list, never a request.
+          try { reply.products = readCatalogFile(catalogFile, doorOrigin); } catch { reply.products = []; }
+        }
         break;
       case 'checkout': {
         const values = inputValues(env.text, offer.input);
@@ -5000,7 +5058,8 @@ export function createAgentEntry({
       reply.deal = dealBlock(seedHex, did, { ...reply },
         { partyB: toDid, contextId: msg.contextId ?? null, ref: msg.messageId });
     }
-    return JSON.stringify(reply);
+    // Product names are data: their markup reaches the reply text only as \u escapes.
+    return reply.products ? jsonWithoutMarkup(JSON.stringify(reply)) : JSON.stringify(reply);
   }
 
   function respond(env, reqId, msg, toDid, chosen = null) {
@@ -5940,6 +5999,10 @@ const WOO_CONTACT_EITHER = Object.freeze(['human_contact_email', 'human_contact_
 const WOO_ASK_OFFER = deepFreeze({ verb: 'ask', of: 'shop',
   about: 'Ask the shop about hours, shipping, returns, payment, pickup, warranty, and how to reach a person.',
   input: { text: 'string' }, door: { reply: 'facts' } });
+/** Woo-4: the one `find` offer, answered at the door from the product snapshot file. */
+const WOO_FIND_OFFER = deepFreeze({ verb: 'find', of: 'products', about: 'Find products in the shop catalogue.',
+  input: { q: 'string' }, door: { reply: 'catalog' } });
+const WOO_SNAPSHOT_FILE = 'agent-entry.products.json';
 
 const USAGE = {
   init: 'usage: agent-entry init (--trade restaurant|retail|clinic|repair | --from sodium.json) --base-url <url> [--name <name>] [--json]\n'
@@ -5952,8 +6015,9 @@ const USAGE = {
     + '  never past x-wp-totalpages, never from another host, with no retries. --max-pages <n> (default\n'
     + `  ${WOO_DEFAULT_MAX_PAGES}) and --max-bytes <n> (default ${WOO_DEFAULT_MAX_BYTES}, over every page together) bound the\n`
     + '  walk, and a bound that ends it is named. It refuses a store that is not WooCommerce or whose\n'
-    + '  robots.txt disallows that path. It writes only agent-entry.json: one\n'
-    + '  `ask` offer answered at the door from the shop\'s facts. --facts <file> is a JSON object of strings with\n'
+    + '  robots.txt disallows that path. It writes agent-entry.json: one `ask` offer answered at the\n'
+    + '  door from the shop\'s facts and one `find` offer answered from agent-entry.products.json, the\n'
+    + '  product snapshot it writes beside it. --facts <file> is a JSON object of strings with\n'
     + `  the keys ${WOO_FACT_KEYS.join(', ')}\n`
     + '  (human_contact_email or human_contact_phone may be left out, not both); without --facts they are read\n'
     + '  from stdin, one line each in that order.',
@@ -6367,6 +6431,21 @@ async function wooProductPages(base, { maxPages, maxBytes }) {
   }
 }
 
+/** One Store API product as a snapshot row: only id, name, the price as "<major>.<minor> <CUR>",
+ *  stock_status from is_in_stock, and a permalink https on `origin` exactly; null (the product
+ *  left out) when any of them is missing or off origin. Read from named fields, never spread. */
+function wooSnapshotRow(product, origin) {
+  if (!isPlainObject(product) || !isPlainObject(product.prices) || typeof product.is_in_stock !== 'boolean') return null;
+  const { price: amount, currency_minor_unit: minor, currency_code: currency } = product.prices;
+  if (typeof amount !== 'string' || !/^\d+$/.test(amount) || !Number.isSafeInteger(minor) || minor < 0 || minor > 8
+      || typeof currency !== 'string' || !/^[A-Z]{3}$/.test(currency)) return null;
+  const digits = amount.replace(/^0+(?=\d)/, '').padStart(minor + 1, '0');
+  const major = digits.slice(0, digits.length - minor);
+  const price = `${minor ? `${major}.${digits.slice(digits.length - minor)}` : major} ${currency}`;
+  return catalogRow({ id: product.id, name: product.name, price,
+    stock_status: product.is_in_stock ? 'in_stock' : 'out_of_stock', permalink: product.permalink }, origin);
+}
+
 /** A --max-pages / --max-bytes value: a positive integer, or misuse naming the flag. */
 function wooBound(flags, name, fallback) {
   const raw = flags[name];
@@ -6389,15 +6468,20 @@ async function initFromWoo(storeUrl, flags) {
   const base = wooStoreBase(storeUrl);
   const factsFromFile = flags.facts === undefined ? null : wooFactsFile(flags.facts);
   const declPath = join(process.cwd(), DECLARATION_FILE);
-  if (existsSync(declPath)) {
-    throw new CliRefusal(`${DECLARATION_FILE} already exists; init --from never overwrites it. Move it aside first. No request was made.`);
+  const snapPath = join(process.cwd(), WOO_SNAPSHOT_FILE);
+  for (const [path, rel] of [[declPath, DECLARATION_FILE], [snapPath, WOO_SNAPSHOT_FILE]]) {
+    if (existsSync(path)) {
+      throw new CliRefusal(`${rel} already exists; init --from never overwrites it. Move it aside first. No request was made.`);
+    }
   }
   const walk = await wooProductPages(base, { maxPages, maxBytes });
   const { host, products, pages } = walk;
   const facts = factsFromFile ?? await wooFactsPrompted();
   const declaration = checkedDeclaration({ v: 1, entry: { name: flags.name ?? base.hostname, baseUrl: base.href.replace(/\/$/, '') },
-    offers: [JSON.parse(JSON.stringify(WOO_ASK_OFFER))], facts });
+    offers: [JSON.parse(JSON.stringify(WOO_ASK_OFFER)), JSON.parse(JSON.stringify(WOO_FIND_OFFER))], facts });
+  const rows = products.map((product) => wooSnapshotRow(product, base.origin)).filter((row) => row !== null);
   writeFileSync(declPath, `${JSON.stringify(declaration, null, 2)}\n`, { flag: 'wx' });
+  writeFileSync(snapPath, `${jsonWithoutMarkup(JSON.stringify(rows, null, 2))}\n`, { flag: 'wx' });
   const stoppedLine = walk.stopped === 'page-bound'
     ? [`Stopped at the page bound (--max-pages ${maxPages}): the store has more pages, not read.`]
     : walk.stopped === 'byte-bound'
@@ -6405,10 +6489,13 @@ async function initFromWoo(storeUrl, flags) {
         + `${walk.partial ? `was begun and left unread (${walk.partial})` : 'and later pages were not read'}.`]
       : [];
   emit(flags.json, { from: WOO_FROM, store: base.href, products: products.length, pages, stopped: walk.stopped,
-    wrote: [DECLARATION_FILE] }, [
+    wrote: [DECLARATION_FILE, WOO_SNAPSHOT_FILE] }, [
     `Read robots.txt and ${pages} Store API page${pages === 1 ? '' : 's'} (${products.length} product${products.length === 1 ? '' : 's'}) from ${host}.`,
     ...stoppedLine,
-    `Wrote ${DECLARATION_FILE}: one \`ask\` offer answered at the door from ${Object.keys(facts).length} facts.`,
+    `Wrote ${DECLARATION_FILE}: one \`ask\` offer answered at the door from ${Object.keys(facts).length} facts, and one \`find\` `
+      + `offer answered from ${WOO_SNAPSHOT_FILE}.`,
+    `Wrote ${WOO_SNAPSHOT_FILE}: ${rows.length} product${rows.length === 1 ? '' : 's'}`
+      + `${rows.length < products.length ? ` (${products.length - rows.length} left out: incomplete, or a permalink not on ${base.origin})` : ''}.`,
     `Next: run \`agent-entry publish\`, then \`agent-entry doctor\`.`,
   ]);
   return 0;
