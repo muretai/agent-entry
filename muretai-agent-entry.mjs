@@ -3204,7 +3204,13 @@ const OFFER_SPELLING = /^[a-z][a-z0-9_]*$/;
 const INPUT_FIELD = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CALL_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 const DECLARATION_KEYS = ['v', 'entry', 'offers', 'facts'];
-const ENTRY_KEYS = ['name', 'baseUrl', 'domains', 'prefer', 'catalog', 'counts'];
+const ENTRY_KEYS = ['name', 'baseUrl', 'domains', 'prefer', 'catalog', 'counts', 'claim'];
+/** FRAME Claim-2: the Catalog's claim code, exactly 32 lowercase hex, as the Catalog issues it. */
+const CATALOG_CLAIM = /^[0-9a-f]{32}$/;
+const CATALOG_CLAIM_RULE = 'must be the Catalog\'s claim code: exactly 32 lowercase hex characters';
+/** Where the door serves the claim proof, at the ORIGIN (the Catalog proves a host, not a mount). */
+export const CATALOG_CLAIM_PATH = '/.well-known/muretai-catalog-claim.txt';
+const CATALOG_CLAIM_PREFIX = 'muretai-catalog-claim=';
 const OFFER_KEYS = ['verb', 'of', 'about', 'input', 'effect', 'ask', 'then', 'page', 'door'];
 
 /** Where the contract, its signature and the collector live, under the entry's mount. */
@@ -3420,7 +3426,7 @@ function readDeclaration(declaration) {
   if (declaration.v !== 1) refuseDeclaration('v', 'must be 1');
 
   const entry = declaration.entry;
-  if (!isPlainObject(entry)) refuseDeclaration('entry', 'must be an object: {name, baseUrl, domains?, prefer?, catalog?, counts?}');
+  if (!isPlainObject(entry)) refuseDeclaration('entry', 'must be an object: {name, baseUrl, domains?, prefer?, catalog?, counts?, claim?}');
   onlyKeys(entry, ENTRY_KEYS, 'entry');
   const name = declaredString(entry.name, 'entry.name');
   if (typeof entry.baseUrl !== 'string') refuseDeclaration('entry.baseUrl', 'must be the URL visitors dial');
@@ -3451,6 +3457,10 @@ function readDeclaration(declaration) {
   }
   if (entry.catalog !== undefined && typeof entry.catalog !== 'boolean') refuseDeclaration('entry.catalog', 'must be true or false');
   const counts = entry.counts === undefined ? null : countsUrl(entry.counts);
+  if (entry.claim !== undefined && (typeof entry.claim !== 'string' || !CATALOG_CLAIM.test(entry.claim))) {
+    refuseDeclaration('entry.claim', CATALOG_CLAIM_RULE);
+  }
+  const claim = entry.claim ?? null;
 
   let facts;
   if (declaration.facts !== undefined) {
@@ -3473,7 +3483,7 @@ function readDeclaration(declaration) {
     ids.add(compiled.id);
     offers.push(compiled);
   });
-  return { name, origin, origins, prefer, offers, facts, counts };
+  return { name, origin, origins, prefer, offers, facts, counts, claim };
 }
 
 /** Returns the declaration unchanged, or throws a TypeError naming the field (AT-2). */
@@ -3889,6 +3899,7 @@ export function createAgentEntry({
       byVerb,
       offerIds: new Set(contract.offers.map((o) => o.id)),
       counts: read.counts,
+      claim: read.claim === null ? null : Buffer.from(`${CATALOG_CLAIM_PREFIX}${read.claim}`, 'utf8'),
     };
   } else if (toolsHistory !== null && toolsHistory !== undefined) {
     throw new TypeError('createAgentEntry: toolsHistory needs the declaration it precedes');
@@ -5076,6 +5087,13 @@ export function createAgentEntry({
     return null;
   }
 
+  /** FRAME Claim-2: the Catalog's proof file, at the ORIGIN's well-known path whatever the
+   *  mount (the Catalog proves a host). Only when the declaration carries a claim: without
+   *  one the path is the ordinary unowned 404, and nothing advertises it. */
+  function isClaimPath(pathname) {
+    return Boolean(tools && tools.claim) && pathname === CATALOG_CLAIM_PATH;
+  }
+
   // session -> events counted. Bounded by COLLECTOR_MAX_SESSIONS, oldest forgotten first.
   const collectorSessions = new Map();
 
@@ -5163,6 +5181,7 @@ export function createAgentEntry({
    *  never do. Whatever the GET route does for an address we do not own (404), OPTIONS and
    *  the method table do the same. */
   function allowFor(pathname) {
+    if (isClaimPath(pathname)) return ALLOW_CARD;
     const resource = toolsResource(pathname);
     if (resource) return resource.kind === 'events' ? ALLOW_DOOR : ALLOW_CARD;
     if (CARD_ROUTES.has(pathname) || SIG_ROUTES.has(pathname)) return ALLOW_CARD;
@@ -5231,6 +5250,12 @@ export function createAgentEntry({
           : tools.versions[(resource.kind === 'version' ? resource.n : tools.versions.length) - 1];
         return { status: 200, headers: cardHeaders(body.length), body };
       }
+      // The claim proof, byte-exact as the Catalog issued it: no trailing newline.
+      if (isClaimPath(pathname)) {
+        return { status: 200,
+          headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Content-Length': String(tools.claim.length), ...CORS_HEADERS },
+          body: tools.claim };
+      }
       // The human notice — NOT served on a guest mount, where GET belongs to the site (E3).
       // Falling through to 404 is deliberate and is the same non-disclosure the POST route
       // already makes: an entry beside other agents does not confirm what lives at an
@@ -5280,6 +5305,7 @@ export function createAgentEntry({
         if (resource.kind === 'events') return collect(headers, bodyBuffer || Buffer.alloc(0), family, seen);
         return jsonResponse(405, { error: 'method not allowed' }, allowHeaders(ALLOW_CARD));
       }
+      if (isClaimPath(pathname)) return jsonResponse(405, { error: 'method not allowed' }, allowHeaders(ALLOW_CARD));
       // EXACTLY the address the card names. A POST anywhere else is not this contract —
       // and when this entry is mounted under a path, "anywhere else" INCLUDES the bare
       // host, which belongs to the site (or to the neighbour agent) and not to us.
@@ -5904,9 +5930,11 @@ const USAGE = {
     + '  .agents/skills/agent-entry/SKILL.md, and wires the door routes, the signposts and the page tag.\n'
     + '  --from woocommerce reads the store\'s public Store API (wc/store/v1/products), https only and\n'
     + `  bounded to ${WOO_PAGE_MAX_BYTES} bytes per page; it refuses a store that is not WooCommerce.`,
-  publish: 'usage: agent-entry publish [--version <n>] [--json]   (alias: agent-entry deploy)\n'
+  publish: 'usage: agent-entry publish [--version <n>] [--claim <code>] [--json]   (alias: agent-entry deploy)\n'
     + '  Validates agent-entry.json, compiles and signs it, and writes <static dir>/.well-known/agent-tools.json,\n'
-    + '  agent-tools.sig.json and agent-tools/v<n>.json. A published version is never rewritten.',
+    + '  agent-tools.sig.json and agent-tools/v<n>.json. A published version is never rewritten.\n'
+    + '  --claim <32 lowercase hex> records the Catalog\'s claim code in agent-entry.json (the door then serves\n'
+    + `  ${CATALOG_CLAIM_PATH}) and prints the DNS TXT record that proves the host instead.`,
   doctor: 'usage: agent-entry doctor [--url <site url>] [--json]\n'
     + '  Local: seed kept out of git, contract published and verifying, door module and page tag wired, and\n'
     + '  one in-process knock per door-bound offer. --url: the same against the live site, over the network.',
@@ -6251,6 +6279,8 @@ function doorModuleSource(framework) {
     '',
     '/** True for a request the door answers: its well-known paths, and POST / OPTIONS at its url. */',
     'export function isDoorRequest(method, pathname) {',
+    '  // The Catalog claim proof lives at the ORIGIN, and is the door\'s only once agent-entry.json holds a claim.',
+    `  if (pathname === ${JSON.stringify(CATALOG_CLAIM_PATH)}) return typeof declaration.entry.claim === 'string';`,
     "  if (pathname === (MOUNT || '/') || pathname === MOUNT + '/') return MOUNT !== '' || method === 'POST' || method === 'OPTIONS';",
     '  if (MOUNT && !pathname.startsWith(MOUNT + \'/\')) return false;',
     '  const rest = pathname.slice(MOUNT.length);',
@@ -6751,7 +6781,11 @@ function writeAtomic(path, bytes) {
 }
 
 async function publishMain(argv) {
-  const flags = parseFlags(argv, { version: 'string', json: 'boolean' });
+  const flags = parseFlags(argv, { version: 'string', json: 'boolean', claim: 'string' });
+  // Refused before anything is read or written, and never echoed: the value may carry anything.
+  if (flags.claim !== undefined && !CATALOG_CLAIM.test(flags.claim)) {
+    throw new CliRefusal(`--claim ${CATALOG_CLAIM_RULE}, as the Catalog issued it (no prefix, no spaces)`);
+  }
   let target = null;
   if (flags.version !== undefined) {
     if (!/^[1-9][0-9]{0,8}$/.test(flags.version)) throw new CliMisuse('--version must be a positive integer');
@@ -6762,6 +6796,9 @@ async function publishMain(argv) {
   if (!existsSync(declPath)) throw new CliRefusal(`no ${DECLARATION_FILE} here: run agent-entry init first`);
   let declaration;
   try { declaration = readJsonFile(declPath); } catch (e) { throw new CliRefusal(`${DECLARATION_FILE} is not JSON: ${shortError(e)}`); }
+  // FRAME Claim-2: the claim rides in entry.claim, outside the contract, so it never moves the hash.
+  const claimChanged = flags.claim !== undefined && isPlainObject(declaration?.entry) && declaration.entry.claim !== flags.claim;
+  if (claimChanged) declaration.entry.claim = flags.claim;
   let read;
   try { read = readDeclaration(declaration); } catch (e) { throw new CliRefusal(e.message); }
   const framework = detectFramework(root);
@@ -6795,6 +6832,7 @@ async function publishMain(argv) {
   }
 
   const contract = version <= n ? prior[version - 1] : compileDeclaration(declaration, { version });
+  if (claimChanged) writeAtomic(declPath, `${JSON.stringify(declaration, null, 2)}\n`);
   const wk = join(root, wkRel);
   const current = join(wk, 'agent-tools.json');
   const sigPath = join(wk, 'agent-tools.sig.json');
@@ -6811,9 +6849,17 @@ async function publishMain(argv) {
     writeAtomic(sigPath, JSON.stringify(makeToolsEnvelope(seed.hex, contract, nowEpoch())));
     changed = true;
   }
-  emit(flags.json, { version, hash: contract.hash }, [changed
+  const doc = { version, hash: contract.hash };
+  const lines = [changed
     ? `Published v${version} (sha256 ${contract.hash.slice(0, 16)}…) to ${wkRel}/agent-tools.json, .sig.json and agent-tools/v${version}.json.`
-    : `v${version} is already published with this content; nothing to do.`]);
+    : `v${version} is already published with this content; nothing to do.`];
+  if (flags.claim !== undefined) {
+    const dns = `_muretai-catalog.${new URL(read.origin).hostname} TXT ${CATALOG_CLAIM_PREFIX}${flags.claim}`;
+    Object.assign(doc, { claim: flags.claim, claimPath: CATALOG_CLAIM_PATH, dns });
+    lines.push(`Recorded the Catalog claim in ${DECLARATION_FILE}; the door serves it at ${CATALOG_CLAIM_PATH}.`,
+      'Or prove the host by DNS instead, with this TXT record:', dns);
+  }
+  emit(flags.json, doc, lines);
   return 0;
 }
 
