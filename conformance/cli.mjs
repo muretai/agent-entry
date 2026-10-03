@@ -51,6 +51,11 @@
 //                 reason on stderr and nothing written: a URL that is not https (before any
 //                 request), a store whose /wp-json/wc/store/v1/products is absent or not JSON, and a
 //                 first page past the byte bound. A well-formed in-bounds https store is not refused.
+//   publish --claim <32 lowercase hex>  (FRAME Claim-2) records the code in agent-entry.json, prints
+//                 `_muretai-catalog.<host> TXT muretai-catalog-claim=<code>`, and the door serves
+//                 GET /.well-known/muretai-catalog-claim.txt: 200 text/plain `muretai-catalog-claim=<code>`
+//                 (no trailing newline), 404 without a code, GET in OPTIONS' Allow once claimed. Any
+//                 other code is refused naming 32/hex, and nothing is written.
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
@@ -1496,6 +1501,173 @@ await section('woo-init', async () => {
 
   const help = await runCli(['init', '--help']);
   check(help.code === 0 && /woocommerce/i.test(help.stdout), 'woo-init/init-help-names-woocommerce', `exit ${help.code}`);
+});
+
+// ---------------------------------------------------------------- 12. publish --claim: the Catalog's proof file
+//
+// WRITTEN BEFORE THE IMPLEMENTATION (test-first, P0 FRAME Claim-2, intake 20261003T131709Z-2).
+// `publish --claim <code>` with exactly 32 lowercase hex records the code in the door's config
+// (agent-entry.json, the one config the door reads: a door built from that file the way the wired
+// agent-entry.door.mjs builds it serves the claim), and prints the DNS TXT alternative as one line
+// `_muretai-catalog.<host> TXT muretai-catalog-claim=<code>`. The door then answers
+// GET /.well-known/muretai-catalog-claim.txt with 200, text/plain, body exactly
+// `muretai-catalog-claim=<code>` -- no trailing newline: trunk catalog/service.py hands the owner
+// `file_body = CLAIM_PREFIX + code` with none, and its reader (_proof_file) strips each line. Without
+// a code the path is 404 and not advertised; with one, OPTIONS on it is 204 with GET in Allow.
+// Any other code is refused by name (32 / hex), exit 1 or 2, and nothing is written.
+
+const CLAIM_PATH = '/.well-known/muretai-catalog-claim.txt';
+const CLAIM_CODE = '0123456789abcdef0fedcba987654321';
+const CLAIM_CODE_2 = 'a'.repeat(16) + '5'.repeat(16);
+const BAD_CLAIMS = [
+  ['31-hex', CLAIM_CODE.slice(0, 31)],
+  ['33-hex', `${CLAIM_CODE}0`],
+  ['uppercase', CLAIM_CODE.toUpperCase()],
+  ['mixed-case', `${CLAIM_CODE.slice(0, 31)}F`],
+  ['non-hex', 'g'.repeat(32)],
+  ['64-hex', CLAIM_CODE.repeat(2)],
+  ['prefixed', `muretai-catalog-claim=${CLAIM_CODE}`],
+  ['trailing-space', `${CLAIM_CODE} `],
+  ['leading-space', ` ${CLAIM_CODE}`],
+  ['newline-injected', `${CLAIM_CODE}\nX-Evil: 1`],
+  ['trailing-newline', `${CLAIM_CODE}\n`],
+  ['path-traversal', '../../../../etc/passwd0123456789'],
+  ['empty', ''],
+];
+const CLAIM_REASON = /\b32\b|\bhex/i;
+const DNS_LINE = (code) => `_muretai-catalog.shop.example TXT muretai-catalog-claim=${code}`;
+
+/** A door built from the project's agent-entry.json the way the wired door module builds it. */
+function doorFromProject(dir) {
+  const declaration = JSON.parse(readFileSync(join(dir, 'agent-entry.json'), 'utf8'));
+  return createAgentEntry({ seedHex: PUBLISH_SEED, name: declaration.entry.name, baseUrl: declaration.entry.baseUrl,
+    declaration });
+}
+
+async function claimGet(entry, method = 'GET') {
+  const out = await entry.handleRequestAsync(method, CLAIM_PATH, { 'user-agent': 'muretai-catalog/1' }, Buffer.alloc(0),
+    { remoteAddress: '127.0.0.1' });
+  const headers = Object.fromEntries(Object.entries(out.headers || {}).map(([k, v]) => [k.toLowerCase(), String(v)]));
+  return { status: out.status, headers, body: Buffer.from(out.body || '') };
+}
+
+/** No claim served and none advertised. */
+async function checkNoClaim(label, dir) {
+  let entry = null;
+  try { entry = doorFromProject(dir); } catch (e) { check(false, `${label}/door-builds-from-agent-entry.json`, e.message); return; }
+  const get = await claimGet(entry);
+  check(get.status === 404, `${label}/claim-path-404`, `HTTP ${get.status} ${get.body.toString('utf8').slice(0, 120)}`);
+  check(!get.body.toString('utf8').includes('muretai-catalog-claim='), `${label}/no-proof-body`);
+  const opt = await claimGet(entry, 'OPTIONS');
+  check(!(opt.status === 204 && /\bGET\b/.test(opt.headers.allow || '')), `${label}/claim-path-not-advertised`,
+    `HTTP ${opt.status} Allow ${opt.headers.allow}`);
+}
+
+await section('publish-claim', async () => {
+  // Before any claim: 404, not advertised.
+  {
+    const dir = makePublishProject(DECL_V1);
+    const pub = await runCli(['publish', '--json'], { cwd: dir });
+    check(pub.code === 0, 'publish-claim/setup-publish', `exit ${pub.code}: ${pub.stderr.slice(0, 200)}`);
+    await checkNoClaim('publish-claim/unset', dir);
+  }
+
+  // The functional case.
+  {
+    const label = 'publish-claim/valid';
+    const dir = makePublishProject(DECL_V1);
+    const contractBefore = compileDeclaration(clone(DECL_V1), { version: 1 }).hash;
+    const run = await runCli(['publish', '--claim', CLAIM_CODE], { cwd: dir });
+    guardClean(label, run);
+    check(run.code === 0, `${label}/exit-0`, `exit ${run.code}: ${run.stderr.slice(0, 300)}`);
+    check(run.stdout.split('\n').map((l) => l.trim()).includes(DNS_LINE(CLAIM_CODE)), `${label}/prints-the-dns-txt-alternative`,
+      JSON.stringify(run.stdout.slice(0, 600)));
+    const declText = readText(join(dir, 'agent-entry.json')) || '';
+    check(declText.includes(CLAIM_CODE), `${label}/code-recorded-in-agent-entry.json`, declText.slice(0, 300));
+    check(!declText.includes(PUBLISH_SEED), `${label}/config-holds-no-seed`);
+    let decl = null;
+    try { decl = JSON.parse(declText); validateDeclaration(decl); passed += 1; } catch (e) {
+      check(false, `${label}/recorded-config-still-validates`, e.message);
+    }
+    if (decl) {
+      check(compileDeclaration(clone(decl), { version: 1 }).hash === contractBefore, `${label}/claim-does-not-change-the-contract`);
+    }
+
+    let entry = null;
+    try { entry = doorFromProject(dir); } catch (e) { check(false, `${label}/door-builds-from-agent-entry.json`, e.message); }
+    if (entry) {
+      const get = await claimGet(entry);
+      const want = Buffer.from(`muretai-catalog-claim=${CLAIM_CODE}`, 'utf8');
+      check(get.status === 200, `${label}/claim-path-200`, `HTTP ${get.status} ${get.body.toString('utf8').slice(0, 120)}`);
+      check(/^text\/plain(\s*;\s*charset=utf-8)?$/i.test(get.headers['content-type'] || ''), `${label}/content-type-text-plain`,
+        get.headers['content-type']);
+      check(get.body.equals(want), `${label}/body-exactly-the-proof-no-trailing-newline`, JSON.stringify(get.body.toString('utf8')));
+      if (get.headers['content-length'] !== undefined) {
+        check(Number(get.headers['content-length']) === want.length, `${label}/content-length-matches`, get.headers['content-length']);
+      }
+      const opt = await claimGet(entry, 'OPTIONS');
+      check(opt.status === 204 && /\bGET\b/.test(opt.headers.allow || ''), `${label}/options-advertises-get-on-the-claim-path`,
+        `HTTP ${opt.status} Allow ${opt.headers.allow}`);
+      check(/\bGET\b/.test(opt.headers['access-control-allow-methods'] || ''), `${label}/options-cors-methods-include-get`,
+        opt.headers['access-control-allow-methods']);
+      const post = await claimGet(entry, 'POST');
+      check(post.status === 405 && /\bGET\b/.test(post.headers.allow || ''), `${label}/post-is-405-with-allow`,
+        `HTTP ${post.status} Allow ${post.headers.allow}`);
+      const other = await entry.handleRequestAsync('GET', '/.well-known/muretai-catalog-claim.txt.bak', {}, Buffer.alloc(0),
+        { remoteAddress: '127.0.0.1' });
+      check(other.status === 404, `${label}/only-the-exact-path-is-served`, `HTTP ${other.status}`);
+    }
+
+    // A refused code on an already-claimed project changes nothing: the first claim still stands.
+    const before = treeState(dir);
+    const bad = await runCli(['publish', '--claim', CLAIM_CODE.toUpperCase()], { cwd: dir });
+    check(bad.code === 1 || bad.code === 2, `${label}/later-bad-code-refused`, `exit ${bad.code}`);
+    const diff = stateDiff(before, treeState(dir));
+    check(diff.length === 0, `${label}/later-bad-code-writes-nothing`, JSON.stringify(diff));
+    if (entry) {
+      const still = await claimGet(doorFromProject(dir));
+      check(still.body.toString('utf8') === `muretai-catalog-claim=${CLAIM_CODE}`, `${label}/first-claim-still-served`,
+        JSON.stringify(still.body.toString('utf8')));
+    }
+
+    // A second valid code replaces the first: one claim, the latest.
+    const again = await runCli(['publish', '--claim', CLAIM_CODE_2], { cwd: dir });
+    check(again.code === 0 && again.stdout.split('\n').map((l) => l.trim()).includes(DNS_LINE(CLAIM_CODE_2)),
+      `${label}/second-code-accepted-and-printed`, `exit ${again.code}: ${again.stderr.slice(0, 200)}`);
+    try {
+      const now = await claimGet(doorFromProject(dir));
+      check(now.status === 200 && now.body.toString('utf8') === `muretai-catalog-claim=${CLAIM_CODE_2}`,
+        `${label}/second-code-served`, JSON.stringify(now.body.toString('utf8')));
+    } catch (e) { check(false, `${label}/second-code-door-builds`, e.message); }
+  }
+
+  // Refusals: named, nothing recorded, nothing served, no DNS line printed.
+  for (const [tag, code] of BAD_CLAIMS) {
+    const label = `publish-claim/refuses-${tag}`;
+    const dir = makePublishProject(DECL_V1);
+    const before = treeState(dir);
+    const run = await runCli(['publish', '--claim', code], { cwd: dir });
+    guardClean(label, run);
+    check(run.code === 1 || run.code === 2, `${label}/nonzero-exit`, `exit ${run.code}; stdout ${run.stdout.slice(0, 200)}`);
+    check(CLAIM_REASON.test(run.stderr) && /claim/i.test(run.stderr), `${label}/refusal-names-the-reason`,
+      JSON.stringify(run.stderr.slice(0, 300)));
+    check(!run.stdout.includes('_muretai-catalog.'), `${label}/prints-no-dns-line`, run.stdout.slice(0, 200));
+    const diff = stateDiff(before, treeState(dir));
+    check(diff.length === 0, `${label}/writes-nothing`, JSON.stringify(diff));
+    await checkNoClaim(label, dir);
+  }
+
+  // Misuse: the flag without a value.
+  {
+    const dir = makePublishProject(DECL_V1);
+    const before = treeState(dir);
+    const run = await runCli(['publish', '--claim'], { cwd: dir });
+    check(run.code === 2, 'publish-claim/flag-without-value-exit-2', `exit ${run.code}`);
+    check(stateDiff(before, treeState(dir)).length === 0, 'publish-claim/flag-without-value-writes-nothing');
+  }
+
+  const help = await runCli(['publish', '--help']);
+  check(help.code === 0 && help.stdout.includes('--claim'), 'publish-claim/publish-help-names---claim', `exit ${help.code}`);
 });
 
 // ---------------------------------------------------------------- the runner itself never dialled out
