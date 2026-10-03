@@ -685,6 +685,17 @@ site.
 
 [github.com/muretai/agent-entry-wordpress](https://github.com/muretai/agent-entry-wordpress)
 
+`npx @muretai/agent-entry init --from woocommerce https://shop.example.com --facts facts.json`
+writes the store's `agent-entry.json` from its public Store API. It reads robots.txt, then
+the products pages in order, each once, never past the store's `x-wp-totalpages`, never from
+another host and with no retries, within two bounds:
+
+- `--max-pages <n>`: the most products pages read; default 10.
+- `--max-bytes <n>`: the most body bytes read over every page together; default 50331648 (48 MiB).
+
+A bound that ends the walk is named: `stopped` is `"page-bound"` or `"byte-bound"` in
+`--json` (`null` when the last page was read), and the text says so.
+
 ### Run the example
 
 ```bash

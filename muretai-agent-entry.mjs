@@ -5918,9 +5918,13 @@ const FRAMEWORKS = Object.freeze({
   wordpress: { route: 'agent-entry-wordpress', static: '.' },
 });
 
-/** The most `init --from woocommerce` reads of the first products page. Counted on the bytes
+/** The most `init --from woocommerce` reads of any one products page. Counted on the bytes
  *  actually received, so a chunked body without Content-Length stops here too. */
 const WOO_PAGE_MAX_BYTES = 4 * 1024 * 1024;
+/** The walk's default bounds (README names both): the most products pages read, and the most body
+ *  bytes read over every page together (more than the default pages at the per-page bound). */
+const WOO_DEFAULT_MAX_PAGES = 10;
+const WOO_DEFAULT_MAX_BYTES = 48 * 1024 * 1024;
 const WOO_PRODUCTS_PATH = 'wp-json/wc/store/v1/products';
 const WOO_FROM = 'woocommerce';
 /** The most of a store's robots.txt init parses (RFC 9309 asks a crawler to parse at least 500 KiB). */
@@ -5939,12 +5943,16 @@ const WOO_ASK_OFFER = deepFreeze({ verb: 'ask', of: 'shop',
 
 const USAGE = {
   init: 'usage: agent-entry init (--trade restaurant|retail|clinic|repair | --from sodium.json) --base-url <url> [--name <name>] [--json]\n'
-    + '       agent-entry init --from woocommerce <https store url> [--facts <file>] [--name <name>] [--json]\n'
+    + '       agent-entry init --from woocommerce <https store url> [--facts <file>] [--max-pages <n>]\n'
+    + '                                           [--max-bytes <n>] [--name <name>] [--json]\n'
     + '  Detects the framework, mints the site seed into a git-ignored file, writes agent-entry.json and\n'
     + '  .agents/skills/agent-entry/SKILL.md, and wires the door routes, the signposts and the page tag.\n'
-    + '  --from woocommerce reads the store\'s robots.txt and ONE page of its public Store API\n'
-    + `  (wc/store/v1/products), https only and bounded to ${WOO_PAGE_MAX_BYTES} bytes per page; it refuses a store\n`
-    + '  that is not WooCommerce or whose robots.txt disallows that path. It writes only agent-entry.json: one\n'
+    + '  --from woocommerce reads the store\'s robots.txt, then the pages of its public Store API\n'
+    + `  (wc/store/v1/products) in order, each once, https only and at most ${WOO_PAGE_MAX_BYTES} bytes a page,\n`
+    + '  never past x-wp-totalpages, never from another host, with no retries. --max-pages <n> (default\n'
+    + `  ${WOO_DEFAULT_MAX_PAGES}) and --max-bytes <n> (default ${WOO_DEFAULT_MAX_BYTES}, over every page together) bound the\n`
+    + '  walk, and a bound that ends it is named. It refuses a store that is not WooCommerce or whose\n'
+    + '  robots.txt disallows that path. It writes only agent-entry.json: one\n'
     + '  `ask` offer answered at the door from the shop\'s facts. --facts <file> is a JSON object of strings with\n'
     + `  the keys ${WOO_FACT_KEYS.join(', ')}\n`
     + '  (human_contact_email or human_contact_phone may be left out, not both); without --facts they are read\n'
@@ -6250,17 +6258,11 @@ async function wooRobotsAllow(url) {
   }
 }
 
-/** The store's first public Store API products page, as parsed JSON, or a refusal naming one of
- *  three reasons: the URL is not https (wooStoreBase, before any request), the products path is
- *  not a WooCommerce Store API (absent, unreachable, or not JSON), or the page exceeds the byte
- *  bound. robots.txt is read first, and a disallow is respected. */
-async function wooFirstPage(base) {
-  const url = new URL(WOO_PRODUCTS_PATH, base);
-  await wooRobotsAllow(url);
-  const where = `${url.host}${url.pathname}`;
-  const notWoo = (why) => new CliRefusal(`not a WooCommerce store: GET ${where} ${why}, so this is no public Store API `
-    + '(wc/store/v1/products). Check the URL is the shop\'s own address. Nothing was written.');
-
+/** One products page, asked once (no retry, no redirect followed): { products, bytes, totalPages }
+ *  (totalPages null when x-wp-totalpages is absent or not a positive integer), { over } when the
+ *  body passes `cap` bytes (counted as it streams; init stops reading there), or { failed } naming
+ *  why the page is no Store API page. */
+async function wooPage(url, cap) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 30000);
   try {
@@ -6269,18 +6271,21 @@ async function wooFirstPage(base) {
       res = await fetch(url, { redirect: 'manual', signal: ctrl.signal,
         headers: { accept: 'application/json', 'user-agent': WOO_USER_AGENT } });
     } catch (e) {
-      throw notWoo(`got no answer (${shortError(e.cause ?? e)})`);
+      return { failed: `got no answer (${shortError(e.cause ?? e)})` };
     }
     if (res.status !== 200) {
       ctrl.abort();
-      throw notWoo(`answered status ${res.status}${res.status >= 300 && res.status < 400 ? ' (a redirect, not followed)' : ''}`);
+      if (res.status >= 300 && res.status < 400) {
+        let to = '';
+        try { to = ` to ${new URL(res.headers.get('location'), url).host}`; } catch { /* no usable Location */ }
+        return { failed: `answered status ${res.status} (a redirect${to}, not followed)`, redirect: true };
+      }
+      return { failed: `answered status ${res.status}` };
     }
-    const tooLarge = (read) => new CliRefusal(`the first products page from ${url.host} exceeds the bound of `
-      + `${WOO_PAGE_MAX_BYTES} bytes (${read}); init reads no more of it. Nothing was written.`);
     const declared = Number(res.headers.get('content-length'));
-    if (Number.isFinite(declared) && declared > WOO_PAGE_MAX_BYTES) {
+    if (res.headers.has('content-length') && Number.isFinite(declared) && declared > cap) {
       ctrl.abort();
-      throw tooLarge(`Content-Length declares ${declared}`);
+      return { over: `Content-Length declares ${declared}` };
     }
     const chunks = [];
     let total = 0;
@@ -6288,47 +6293,121 @@ async function wooFirstPage(base) {
       const reader = res.body.getReader();
       for (;;) {
         let step;
-        try { step = await reader.read(); } catch (e) { throw notWoo(`broke off mid-answer (${shortError(e.cause ?? e)})`); }
+        try { step = await reader.read(); } catch (e) { return { failed: `broke off mid-answer (${shortError(e.cause ?? e)})` }; }
         if (step.done) break;
         total += step.value.byteLength;
-        if (total > WOO_PAGE_MAX_BYTES) {
+        if (total > cap) {
           ctrl.abort();
-          throw tooLarge('more than that arrived');
+          return { over: 'more than that arrived' };
         }
         chunks.push(step.value);
       }
     }
-    let page;
-    try { page = JSON.parse(Buffer.concat(chunks).toString('utf8').replace(/^﻿/, '')); } catch {
-      throw notWoo('answered something that is not JSON');
+    let products;
+    try { products = JSON.parse(Buffer.concat(chunks).toString('utf8').replace(/^﻿/, '')); } catch {
+      return { failed: 'answered something that is not JSON' };
     }
-    if (!Array.isArray(page)) throw notWoo('answered JSON that is not a list of products');
-    return { host: url.host, products: page };
+    if (!Array.isArray(products)) return { failed: 'answered JSON that is not a list of products' };
+    const header = res.headers.get('x-wp-totalpages');
+    const totalPages = header !== null && /^[1-9]\d*$/.test(header.trim()) ? Number(header.trim()) : null;
+    return { products, bytes: total, totalPages };
   } finally {
     clearTimeout(timer);
   }
 }
 
-/** `init --from woocommerce <store> [--facts <file>]`: robots.txt and one Store API page prove the
+/** The store's public Store API products, page 1 then ?page=2 ... in order, each asked once, from
+ *  the store's own origin only (page URLs are built here; a Link header is never followed). The
+ *  walk ends at the first of: the last page (x-wp-totalpages, or an empty page when the store
+ *  sends none), `maxPages`, or `maxBytes` read over every page together; `stopped` names a bound
+ *  that ended it. Refusals: page 1 that is no Store API page (not-woo) or larger than the bound
+ *  (too-large), as in Woo-1; a later page that fails, redirects or breaks off, named by number.
+ *  robots.txt is read first, and a disallow is respected. */
+async function wooProductPages(base, { maxPages, maxBytes }) {
+  const first = new URL(WOO_PRODUCTS_PATH, base);
+  await wooRobotsAllow(first);
+  const where = `${first.host}${first.pathname}`;
+  const products = [];
+  let bytes = 0;
+  let pages = 0;
+  let totalPages = null;
+  const done = (stopped, extra = {}) => ({ host: first.host, products, pages, bytes, stopped, ...extra });
+  for (let n = 1; ; n += 1) {
+    if (totalPages !== null && n > totalPages) return done(null);
+    if (n > maxPages) return done('page-bound');
+    if (bytes >= maxBytes) return done('byte-bound', { next: n });
+    const url = new URL(first);
+    if (n > 1) url.searchParams.set('page', String(n));
+    const cap = Math.min(WOO_PAGE_MAX_BYTES, maxBytes - bytes);
+    const got = await wooPage(url, cap);
+    if (n === 1) {
+      if (got.failed) {
+        throw new CliRefusal(`not a WooCommerce store: GET ${where} ${got.failed}, so this is no public Store API `
+          + '(wc/store/v1/products). Check the URL is the shop\'s own address. Nothing was written.');
+      }
+      if (got.over) {
+        const bound = cap < WOO_PAGE_MAX_BYTES ? `--max-bytes bound of ${cap}` : `bound of ${WOO_PAGE_MAX_BYTES}`;
+        throw new CliRefusal(`the first products page from ${first.host} exceeds the ${bound} bytes (${got.over}); `
+          + 'init reads no more of it. Nothing was written.');
+      }
+    } else {
+      if (got.failed) {
+        throw new CliRefusal(`page ${n} of the Store API on ${first.host} (GET ${where}?page=${n}) ${got.failed}`
+          + `${got.redirect ? `: init reads only ${first.host}` : ''}. init asks each page once and does not retry; `
+          + `${pages} page${pages === 1 ? ' was' : 's were'} read. Run it again later, or with --max-pages ${n - 1} `
+          + 'to stop before that page. Nothing was written.');
+      }
+      if (got.over) return done('byte-bound', { next: n, partial: got.over });
+    }
+    pages += 1;
+    bytes += got.bytes;
+    for (const product of got.products) products.push(product);
+    if (got.totalPages !== null) totalPages = got.totalPages;
+    if (totalPages === null && got.products.length === 0) return done(null);
+  }
+}
+
+/** A --max-pages / --max-bytes value: a positive integer, or misuse naming the flag. */
+function wooBound(flags, name, fallback) {
+  const raw = flags[name];
+  if (raw === undefined) return fallback;
+  if (!/^[1-9]\d*$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+    throw new CliMisuse(`--${name} must be a positive integer, not ${JSON.stringify(String(raw).slice(0, 40))}`);
+  }
+  return Number(raw);
+}
+
+/** `init --from woocommerce <store> [--facts <file>]`: robots.txt and the bounded Store API walk prove the
  *  store answers; agent-entry.json gets one `ask` offer answered at the door from the facts. Only
  *  that file is written: the store's door (the WordPress plugin) keeps its own seed. A facts file
  *  is checked before any request; prompted facts are read once the store has answered. */
 async function initFromWoo(storeUrl, flags) {
   if (storeUrl === undefined) throw new CliMisuse('init --from woocommerce needs the store URL: init --from woocommerce <store-url>');
   if (flags['base-url'] !== undefined) throw new CliMisuse('init --from woocommerce takes the store URL itself, not --base-url');
+  const maxPages = wooBound(flags, 'max-pages', WOO_DEFAULT_MAX_PAGES);
+  const maxBytes = wooBound(flags, 'max-bytes', WOO_DEFAULT_MAX_BYTES);
   const base = wooStoreBase(storeUrl);
   const factsFromFile = flags.facts === undefined ? null : wooFactsFile(flags.facts);
   const declPath = join(process.cwd(), DECLARATION_FILE);
   if (existsSync(declPath)) {
     throw new CliRefusal(`${DECLARATION_FILE} already exists; init --from never overwrites it. Move it aside first. No request was made.`);
   }
-  const { host, products } = await wooFirstPage(base);
+  const walk = await wooProductPages(base, { maxPages, maxBytes });
+  const { host, products, pages } = walk;
   const facts = factsFromFile ?? await wooFactsPrompted();
   const declaration = checkedDeclaration({ v: 1, entry: { name: flags.name ?? base.hostname, baseUrl: base.href.replace(/\/$/, '') },
     offers: [JSON.parse(JSON.stringify(WOO_ASK_OFFER))], facts });
   writeFileSync(declPath, `${JSON.stringify(declaration, null, 2)}\n`, { flag: 'wx' });
-  emit(flags.json, { from: WOO_FROM, store: base.href, products: products.length, wrote: [DECLARATION_FILE] }, [
-    `Read robots.txt and one Store API page (${products.length} product${products.length === 1 ? '' : 's'}) from ${host}.`,
+  const stoppedLine = walk.stopped === 'page-bound'
+    ? [`Stopped at the page bound (--max-pages ${maxPages}): the store has more pages, not read.`]
+    : walk.stopped === 'byte-bound'
+      ? [`Stopped at the byte bound (--max-bytes ${maxBytes}, ${walk.bytes} bytes read): page ${walk.next} `
+        + `${walk.partial ? `was begun and left unread (${walk.partial})` : 'and later pages were not read'}.`]
+      : [];
+  emit(flags.json, { from: WOO_FROM, store: base.href, products: products.length, pages, stopped: walk.stopped,
+    wrote: [DECLARATION_FILE] }, [
+    `Read robots.txt and ${pages} Store API page${pages === 1 ? '' : 's'} (${products.length} product${products.length === 1 ? '' : 's'}) from ${host}.`,
+    ...stoppedLine,
     `Wrote ${DECLARATION_FILE}: one \`ask\` offer answered at the door from ${Object.keys(facts).length} facts.`,
     `Next: run \`agent-entry publish\`, then \`agent-entry doctor\`.`,
   ]);
@@ -6861,14 +6940,16 @@ function skillSource(framework) {
 async function initMain(argv) {
   const positionals = [];
   const flags = parseFlags(argv, { trade: 'string', from: 'string', name: 'string', 'base-url': 'string', json: 'boolean',
-    facts: 'string' }, positionals);
+    facts: 'string', 'max-pages': 'string', 'max-bytes': 'string' }, positionals);
   // Only the literal `--from woocommerce` takes a store URL; any other --from is a sodium.json path.
   if (flags.from === WOO_FROM) {
     if (flags.trade !== undefined) throw new CliMisuse('give --trade or --from, not both');
     if (positionals.length > 1) throw new CliMisuse(`unexpected argument ${JSON.stringify(positionals[1].slice(0, 60))}`);
     return initFromWoo(positionals[0], flags);
   }
-  if (flags.facts !== undefined) throw new CliMisuse('--facts goes with --from woocommerce');
+  for (const name of ['facts', 'max-pages', 'max-bytes']) {
+    if (flags[name] !== undefined) throw new CliMisuse(`--${name} goes with --from woocommerce`);
+  }
   if (positionals.length) throw new CliMisuse(`unexpected argument ${JSON.stringify(positionals[0].slice(0, 60))}`);
   const root = process.cwd();
   if (flags.trade !== undefined && !TRADES.includes(flags.trade)) {
