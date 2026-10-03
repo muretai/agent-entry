@@ -9,7 +9,7 @@
 //
 // node:crypto signs but does not build X.509, so the two certificates are DER-encoded here by
 // hand (RFC 5280): v3, ecdsa-with-SHA256 over P-256 keys, valid from one hour ago for one day.
-import { createPublicKey, generateKeyPairSync, randomBytes, sign, createHash } from 'node:crypto';
+import { KeyObject, createPublicKey, generateKeyPairSync, randomBytes, sign, createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -61,8 +61,11 @@ const ECDSA_SHA256 = seq(oid('1.2.840.10045.4.3.2'));
 const name = (cn) => seq(set(seq(oid('2.5.4.3'), utf8(cn))));
 const extension = (id, critical, value) => seq(oid(id), ...(critical ? [bool(true)] : []), octets(value));
 
-function spkiDer(publicKey) {
-  return createPublicKey(publicKey).export({ type: 'spki', format: 'der' });
+/** A public KeyObject is exported as is: Node 26 refuses createPublicKey() on a KeyObject that is
+ *  already public (ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE). Anything else still goes through it. */
+export function spkiDer(publicKey) {
+  const key = publicKey instanceof KeyObject && publicKey.type === 'public' ? publicKey : createPublicKey(publicKey);
+  return key.export({ type: 'spki', format: 'der' });
 }
 
 /** The SHA-1 of the subjectPublicKey bits (RFC 5280 4.2.1.2 method 1). A P-256 SPKI ends with
