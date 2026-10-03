@@ -5613,10 +5613,18 @@ export function describeKnockRequirements(accepts) {
   });
 }
 
+/** The keys a Suite door's default reply (AT-12/AT-13) may carry; anything else is dropped. */
+const SUITE_BOOKING_KEYS = Object.freeze(['verb', 'of', 'customer_did', 'request', 'status', 'facts', 'url', 'deal']);
+
 /**
  * Surface a shop-signed booking receipt from verified reply text.
  * Every field is taken from those bytes — never from the visitor's ask.
  * A receipt filed under someone else's customer_did is not this visitor's booking.
+ * Two shapes are recognised: the older `{type, customer_did, request, status}` and the Suite's
+ * own default reply `{verb, of, customer_did, request, status, facts|url by kind, deal?}`.
+ * For the Suite shape the booking keeps the signed object's Suite keys as they are (the deal's
+ * termsHash commits to the reply minus `deal`, so they must not be rewritten); sale fields such
+ * as paid/amount are dropped from both shapes.
  */
 function checkedBookingReceipt(replyText, visitorDid) {
   let parsed;
@@ -5626,22 +5634,33 @@ function checkedBookingReceipt(replyText, visitorDid) {
     return null;
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-  const { type, customer_did, request, status } = parsed;
-  if (typeof type !== 'string' || typeof customer_did !== 'string'
-      || typeof request !== 'string' || typeof status !== 'string') {
+  const { type, verb, of, customer_did, request, status } = parsed;
+  if (typeof customer_did !== 'string' || typeof request !== 'string' || typeof status !== 'string') {
+    return null;
+  }
+  let booking;
+  if (typeof type === 'string') {
+    booking = { type, customer_did, request, status };
+  } else if (typeof verb === 'string' && typeof of === 'string') {
+    booking = {};
+    for (const key of SUITE_BOOKING_KEYS) {
+      if (Object.hasOwn(parsed, key)) booking[key] = parsed[key];
+    }
+  } else {
     return null;
   }
   if (customer_did !== visitorDid) {
     throw new Error('knock: the signed reply files a booking under a different customer');
   }
-  return { type, customer_did, request, status };
+  return booking;
 }
 
 /**
  * Read and verify an Agent Card, send one signed knock, and verify a successful reply.
  * No invitation, account, token, Muretai node, or dependency is involved.
  * When the verified reply carries a booking, `text` is the checked
- * `{type, customer_did, request, status}` JSON — not the shop's raw signed body.
+ * `{type, customer_did, request, status}` or Suite `{verb, of, customer_did, request, status,
+ * facts|url, deal?}` JSON — not the shop's raw signed body.
  * `reply` remains the verified signed wire (`reply.result.parts[0].text`).
  * `offer` (an offer id or a registry verb, AT-11) rides as `metadata.offer` after `sig`, as
  * doctor's knock sends it; it is not signed (tools spec section 4). A value that is not AT-1's
