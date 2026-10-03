@@ -52,6 +52,7 @@ follow-up -> the owner reads who came and who came back. Its proof is conformanc
 until every member lands. Chains in flight: Woo 001756Z -> 001757Z -> {001757Z-2, 001758Z, 001758Z-2} -> 001759Z;
 S6a 215207Z (landed) -> 215208Z (impl) -> 215208Z-2 -> 215209Z; S6b 215209Z-2 (landed) -> 215210Z (tests).)
 - P0 FRAME TEST the one test that walks the thin line: conformance/frame.mjs, test author only, red at every step a member makes green (init from a fixture Woo store, door up, claim file served, knock find/ask/hold, decide approve, counts shows who and first_contact); not wired into npm test until green. [20261003T131708Z] [skeleton]
+- P0 FRAME Claim-2 publish --claim serves the Catalog's proof file: `publish --claim <32 hex>` makes the door serve /.well-known/muretai-catalog-claim.txt with body `muretai-catalog-claim=<code>` (trunk catalog/service.py contract) and prints the DNS TXT alternative; 404 without a code. [20261003T131709Z-2] [skeleton]
 
 ## Next (queued, in order)
 
@@ -59,7 +60,6 @@ S6a 215207Z (landed) -> 215208Z (impl) -> 215208Z-2 -> 215209Z; S6b 215209Z-2 (l
 
 - P0 Woo declaration generator: `npx @muretai/agent-entry init --from woocommerce <store-url>` reads the shop's PUBLIC Store API and writes agent-entry.json (frame members Woo-1 refusals and Woo-2 `ask` from one page; Woo-3 pagination, Woo-4 `find` snapshot, Woo-5 `hold`, Woo-6 doctor are the polish members of the same chain). [20261003T001759Z] [skeleton]
 - P0 FRAME Claim-1 WooCommerce one-file plugin: examples/woocommerce-agent-entry.php serves the card, the signed tools contract and `POST /` from the generated declaration (ask -> facts, hold -> pending with a receipt), seed minted at activation; installing it IS the claim by install; conformance/recipes.mjs pins its bytes against the Node door's. [20261003T131709Z] [skeleton]
-- P0 FRAME Claim-2 publish --claim serves the Catalog's proof file: `publish --claim <32 hex>` makes the door serve /.well-known/muretai-catalog-claim.txt with body `muretai-catalog-claim=<code>` (trunk catalog/service.py contract) and prints the DNS TXT alternative; 404 without a code. [20261003T131709Z-2] [skeleton]
 - P1 FRAME Answer-1 owner decision on the wire: `agent-entry decide <receipt> approve|decline` sends the signed follow-up to the customer's DID through message/send with the deal receipt updated (AT-13, new AT-28), idempotent by receipt id; the Host's tap UI is trunk's. [20261003T131710Z] [skeleton]
 - P2 FRAME Visitor-1 the visitor skill carries the errand rule: spec/skill-distill.md and the distilled skill state the 2026-09-26 ruling in one sentence (the errand is the mandate), the journey step compares terms with the errand, no 'Ask first?' column; pin follows. [20261003T131710Z-2] [skeleton]
 - P1 FRAME Analytics-1 counts coverage header and who in three tiers: `counts` opens with log range / last event / store present / rows dropped, then door knocks by signed (signature_agent), declared (AI ua_family) and network (ip_vendor) tiers plus country; vendor and engine vocabularies never merged; reads only what fileSink writes. [20261003T131711Z] [skeleton]
