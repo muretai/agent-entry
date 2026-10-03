@@ -3204,7 +3204,10 @@ export const INPUT_TYPES = Object.freeze(['string', 'integer', 'number', 'boolea
 const OFFER_SPELLING = /^[a-z][a-z0-9_]*$/;
 const INPUT_FIELD = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CALL_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
-const DECLARATION_KEYS = ['v', 'entry', 'offers', 'facts'];
+const DECLARATION_KEYS = ['v', 'entry', 'offers', 'facts', 'facts_source'];
+/** Who gave a fact, in `facts_source` beside `facts` (a fact itself is a string, AT-1). Metadata:
+ *  it never enters the contract. */
+const FACT_SOURCES = Object.freeze(['claimant']);
 const ENTRY_KEYS = ['name', 'baseUrl', 'domains', 'prefer', 'catalog', 'counts', 'claim'];
 /** FRAME Claim-2: the Catalog's claim code, exactly 32 lowercase hex, as the Catalog issues it. */
 const CATALOG_CLAIM = /^[0-9a-f]{32}$/;
@@ -3422,7 +3425,7 @@ function readOffer(offer, i, hasFacts) {
 
 /** The whole declaration, validated and compiled to everything but `version` and `hash`. */
 function readDeclaration(declaration) {
-  if (!isPlainObject(declaration)) refuseDeclaration('declaration', 'must be an object: {v, entry, offers, facts?}');
+  if (!isPlainObject(declaration)) refuseDeclaration('declaration', 'must be an object: {v, entry, offers, facts?, facts_source?}');
   onlyKeys(declaration, DECLARATION_KEYS, 'declaration');
   if (declaration.v !== 1) refuseDeclaration('v', 'must be 1');
 
@@ -3470,6 +3473,15 @@ function readDeclaration(declaration) {
     for (const [key, value] of Object.entries(declaration.facts)) {
       declaredString(key, 'facts');
       facts[key] = declaredString(value, `facts.${key.slice(0, 40)}`);
+    }
+  }
+  if (declaration.facts_source !== undefined) {
+    if (!isPlainObject(declaration.facts_source)) refuseDeclaration('facts_source', 'must map a fact name to who gave it');
+    for (const [key, value] of Object.entries(declaration.facts_source)) {
+      if (facts === undefined || !Object.hasOwn(facts, key)) {
+        refuseDeclaration(`facts_source.${key.slice(0, 40)}`, 'names a fact that facts does not hold');
+      }
+      if (!FACT_SOURCES.includes(value)) refuseDeclaration(`facts_source.${key.slice(0, 40)}`, `must be one of ${FACT_SOURCES.join(', ')}`);
     }
   }
 
@@ -6094,7 +6106,12 @@ const USAGE = {
     + '  Validates agent-entry.json, compiles and signs it, and writes <static dir>/.well-known/agent-tools.json,\n'
     + '  agent-tools.sig.json and agent-tools/v<n>.json. A published version is never rewritten.\n'
     + '  --claim <32 lowercase hex> records the Catalog\'s claim code in agent-entry.json (the door then serves\n'
-    + `  ${CATALOG_CLAIM_PATH}) and prints the DNS TXT record that proves the host instead.`,
+    + `  ${CATALOG_CLAIM_PATH}) and prints the DNS TXT record that proves the host instead.\n`
+    + '       agent-entry publish --claim <code> --address <text> --contact-name <text> [--contact-email <text>]\n'
+    + '                           [--contact-phone <text>] [--version <n>] [--json]\n'
+    + '  The claimant\'s address and human contact (a name, and an email or a phone): shown, then confirmed\n'
+    + '  with `yes` on stdin, and only then written as entered into agent-entry.json facts, with facts_source\n'
+    + '  naming each one "claimant". Anything but yes writes nothing. No network.',
   doctor: 'usage: agent-entry doctor [--url <site url> | --from woocommerce] [--json]\n'
     + '  Local: seed kept out of git, contract published and verifying, door module and page tag wired, and\n'
     + '  one in-process knock per door-bound offer. --url: the same against the live site, over the network.\n'
@@ -7221,12 +7238,60 @@ function writeAtomic(path, bytes) {
   renameSync(tmpPath, path);
 }
 
+/** The claimant's flags and the facts each one fills. */
+const CLAIMANT_FLAGS = Object.freeze({ address: 'address', 'contact-name': 'human_contact_name',
+  'contact-email': 'human_contact_email', 'contact-phone': 'human_contact_phone' });
+/** The human contact a claim replaces as a whole: a key the claimant left out is removed. */
+const CLAIMANT_CONTACT_KEYS = Object.freeze(['human_contact_name', 'human_contact_email', 'human_contact_phone']);
+
+/** The claimant's facts, as entered, or null when no claimant flag was given. The human contact
+ *  is checked first, then the address; each refusal names what is missing. A blank email or phone
+ *  beside a given other counts as left out. Values are never trimmed, folded or echoed here. */
+function claimantFacts(flags) {
+  const given = Object.keys(CLAIMANT_FLAGS).filter((f) => flags[f] !== undefined);
+  if (given.length === 0) return null;
+  if (flags.claim === undefined) throw new CliMisuse(`--${given[0]} is the claimant's, and needs --claim <code>`);
+  const filled = (f) => typeof flags[f] === 'string' && flags[f].trim() !== '';
+  const missing = [];
+  if (!filled('contact-name')) {
+    missing.push('the human contact has no name: give --contact-name (human_contact_name), a company or a person');
+  }
+  if (!filled('contact-email') && !filled('contact-phone')) {
+    missing.push('the human contact has no way to reach them: give --contact-email (human_contact_email) '
+      + 'or --contact-phone (human_contact_phone), or both');
+  }
+  if (!filled('address')) missing.push('there is no address: give --address (address)');
+  if (missing.length) throw new CliRefusal(`claim refused, ${missing.join('; ')}. Nothing was written.`);
+  const facts = {};
+  for (const [flag, key] of Object.entries(CLAIMANT_FLAGS)) if (filled(flag)) facts[key] = flags[flag];
+  return facts;
+}
+
+/** Shows the claimant's facts JSON-escaped (no raw control character or newline reaches the
+ *  terminal) and reads one line from stdin: true only for `yes` or `y`. Stdin ending declines. */
+async function claimantConfirms(facts) {
+  const width = Math.max(...Object.keys(facts).map((k) => k.length));
+  process.stderr.write(['The claimant entered these facts, to be stored exactly as shown:',
+    ...Object.entries(facts).map(([k, v]) => `  ${k.padEnd(width)}  ${JSON.stringify(v)}`),
+    'Store them in agent-entry.json? Type yes to confirm: '].join('\n'));
+  const rl = createInterface({ input: process.stdin, terminal: false, crlfDelay: Infinity });
+  try {
+    const step = await rl[Symbol.asyncIterator]().next();
+    process.stderr.write('\n');
+    return !step.done && ['yes', 'y'].includes(step.value.trim().toLowerCase());
+  } finally {
+    rl.close();
+  }
+}
+
 async function publishMain(argv) {
-  const flags = parseFlags(argv, { version: 'string', json: 'boolean', claim: 'string' });
+  const flags = parseFlags(argv, { version: 'string', json: 'boolean', claim: 'string', address: 'string',
+    'contact-name': 'string', 'contact-email': 'string', 'contact-phone': 'string' });
   // Refused before anything is read or written, and never echoed: the value may carry anything.
   if (flags.claim !== undefined && !CATALOG_CLAIM.test(flags.claim)) {
     throw new CliRefusal(`--claim ${CATALOG_CLAIM_RULE}, as the Catalog issued it (no prefix, no spaces)`);
   }
+  const claimant = claimantFacts(flags);
   let target = null;
   if (flags.version !== undefined) {
     if (!/^[1-9][0-9]{0,8}$/.test(flags.version)) throw new CliMisuse('--version must be a positive integer');
@@ -7240,6 +7305,15 @@ async function publishMain(argv) {
   // FRAME Claim-2: the claim rides in entry.claim, outside the contract, so it never moves the hash.
   const claimChanged = flags.claim !== undefined && isPlainObject(declaration?.entry) && declaration.entry.claim !== flags.claim;
   if (claimChanged) declaration.entry.claim = flags.claim;
+  // The claimant's facts are held here, in memory, until they confirm: the claimant replaces the
+  // human contact as a whole, and facts_source names exactly the keys they wrote.
+  if (claimant !== null && isPlainObject(declaration)) {
+    const facts = isPlainObject(declaration.facts) ? { ...declaration.facts } : {};
+    for (const key of CLAIMANT_CONTACT_KEYS) delete facts[key];
+    declaration.facts = { ...facts, ...claimant };
+    declaration.facts_source = Object.fromEntries(Object.keys(claimant).map((k) => [k, 'claimant']));
+  }
+  const declarationChanged = claimChanged || claimant !== null;
   let read;
   try { read = readDeclaration(declaration); } catch (e) { throw new CliRefusal(e.message); }
   const framework = detectFramework(root);
@@ -7273,7 +7347,10 @@ async function publishMain(argv) {
   }
 
   const contract = version <= n ? prior[version - 1] : compileDeclaration(declaration, { version });
-  if (claimChanged) writeAtomic(declPath, `${JSON.stringify(declaration, null, 2)}\n`);
+  if (claimant !== null && !await claimantConfirms(claimant)) {
+    throw new CliRefusal('the claimant did not confirm (only yes or y does). Nothing was written.');
+  }
+  if (declarationChanged) writeAtomic(declPath, `${JSON.stringify(declaration, null, 2)}\n`);
   const wk = join(root, wkRel);
   const current = join(wk, 'agent-tools.json');
   const sigPath = join(wk, 'agent-tools.sig.json');
@@ -7299,6 +7376,10 @@ async function publishMain(argv) {
     Object.assign(doc, { claim: flags.claim, claimPath: CATALOG_CLAIM_PATH, dns });
     lines.push(`Recorded the Catalog claim in ${DECLARATION_FILE}; the door serves it at ${CATALOG_CLAIM_PATH}.`,
       'Or prove the host by DNS instead, with this TXT record:', dns);
+  }
+  if (claimant !== null) {
+    doc.claimant = Object.keys(claimant);
+    lines.push(`Stored the claimant's ${Object.keys(claimant).join(', ')} in ${DECLARATION_FILE} facts, as entered.`);
   }
   emit(flags.json, doc, lines);
   return 0;

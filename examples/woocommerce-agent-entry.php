@@ -479,7 +479,7 @@ function mae_woo_declaration() {
     if (!$d instanceof stdClass) {
         mae_woo_refuse('declaration', 'must be an object: {v, entry, offers, facts?}');
     }
-    mae_woo_only_keys($d, array('v', 'entry', 'offers', 'facts'), 'declaration');
+    mae_woo_only_keys($d, array('v', 'entry', 'offers', 'facts', 'facts_source'), 'declaration');
     if (($d->v ?? null) !== 1 && ($d->v ?? null) !== 1.0) {   // JSON.parse reads 1.0 as 1
         mae_woo_refuse('v', 'must be 1');
     }
@@ -527,6 +527,20 @@ function mae_woo_declaration() {
         foreach (get_object_vars($d->facts) as $key => $value) {
             mae_woo_declared_string((string) $key, 'facts');
             mae_woo_declared_string($value, 'facts');
+        }
+    }
+    // Who gave a fact (metadata beside facts, never in the contract), as the Node door reads it.
+    if (mae_woo_has($d, 'facts_source')) {
+        if (!$d->facts_source instanceof stdClass) {
+            mae_woo_refuse('facts_source', 'must map a fact name to who gave it');
+        }
+        foreach (get_object_vars($d->facts_source) as $key => $value) {
+            if (!$has_facts || !property_exists($d->facts, (string) $key)) {
+                mae_woo_refuse('facts_source', 'names a fact that facts does not hold');
+            }
+            if ($value !== 'claimant') {
+                mae_woo_refuse('facts_source', 'must be one of claimant');
+            }
         }
     }
     if (!is_array($d->offers ?? null) || count($d->offers) === 0) {
