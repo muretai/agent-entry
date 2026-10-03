@@ -415,12 +415,13 @@ async function inTime(promise, ms = 1000) {
 
 function countsDeclaration(counts = COUNTS) {
   const declaration = JSON.parse(JSON.stringify(harbor.declaration));
-  if (counts !== undefined) declaration.entry.counts = counts;
+  if (counts !== null) declaration.entry.counts = counts;
   return declaration;
 }
 const countsDoor = (extra = {}) => makeDoor({ declaration: countsDeclaration(), signedRatePerMin: 0,
   signedRatePerMinTotal: 0, ...extra });
-const plainDoor = (extra = {}) => makeDoor({ declaration: countsDeclaration(undefined), signedRatePerMin: 0,
+// null, not undefined: undefined would take the default and give the plain door entry.counts too.
+const plainDoor = (extra = {}) => makeDoor({ declaration: countsDeclaration(null), signedRatePerMin: 0,
   signedRatePerMinTotal: 0, ...extra });
 
 const sameResponse = (a, b) => a.status === b.status
