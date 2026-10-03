@@ -59,6 +59,9 @@
 //                 Store API pages 1..n in order, each asked once, never past x-wp-totalpages, never off
 //                 the store's host; --json -> { ..., products: <count over every page read>, pages: <n>,
 //                 stopped: null | "page-bound" | "byte-bound" }: a bound that ends the walk is named.
+//   init --from woocommerce <store-url>  (Woo chain item 5) also writes one door-bound `hold` offer answered
+//                 `pending` with a receipt; the door's hold reply is pending_confirmation until the owner's
+//                 confirmReceipt(seedHex, replyText) returns the follow-on that reads confirmed (section 11e).
 //   publish --claim <32 lowercase hex>  (FRAME Claim-2) records the code in agent-entry.json, prints
 //                 `_muretai-catalog.<host> TXT muretai-catalog-claim=<code>`, and the door serves
 //                 GET /.well-known/muretai-catalog-claim.txt: 200 text/plain `muretai-catalog-claim=<code>`
@@ -2384,6 +2387,125 @@ await section('woo-find', async () => {
       }
     } finally { await store.close(); await other.close(); }
   }
+});
+
+// ---------------------------------------------------------------- 11e. init --from woocommerce: the hold offer and its pending receipt
+//
+// WRITTEN BEFORE THE IMPLEMENTATION (test-first, skeleton item 5 of 6 of the Woo declaration
+// generator chain, Woo-5; parent intake 20261002T235854Z). The implementer may not edit this section.
+// Woo-1/2/3/4's pins above stand as they are and are not repeated here.
+//
+// `init --from woocommerce <store>` also writes, into agent-entry.json, exactly one door-bound offer of
+// verb `hold` answered `door.reply: "pending"`, with a receipt (door.receipt left to the verb's
+// default or true, never false; no door.url). The door started from that file answers a signed
+// `hold` with { verb: "hold", ..., status: "pending_confirmation", deal } (AT-12/AT-13) and nothing
+// that says confirmed; the owner's confirmReceipt(seedHex, replyText) (pinned in
+// conformance/offers.mjs section 8) turns it into the follow-on that reads "confirmed" and chains to
+// the same termsHash. `buy` is never emitted on this path, and a confirmation claimed in the request
+// is data.
+
+const HOLD_SEED = '6b'.repeat(32);
+let holdSequence = 0;
+
+/** One signed `hold` knock at the door, in process; the reply text exactly as signed, and its JSON. */
+async function knockHold(entry, text) {
+  const from = didFromSeedHex(HOLD_SEED);
+  const messageId = `woo-hold-${++holdSequence}`;
+  const timestamp = Math.floor(Date.now() / 1000);
+  const sig = signEnvelope(HOLD_SEED, { from, to: entry.did, messageId, contextId: null, timestamp, text });
+  const body = Buffer.from(JSON.stringify({
+    jsonrpc: '2.0', id: messageId, method: 'message/send',
+    params: { message: { kind: 'message', role: 'user', messageId, contextId: null, parts: [{ kind: 'text', text }],
+      metadata: { from, to: entry.did, timestamp, sig, offer: 'hold' } } },
+  }));
+  const out = await entry.handleRequestAsync('POST', '/', { 'content-type': 'application/json' }, body, { remoteAddress: '127.0.0.1' });
+  const raw = Buffer.from(out.body || '').toString('utf8');
+  let replyText = null;
+  let reply = null;
+  try { replyText = JSON.parse(raw).result.parts[0].text; reply = JSON.parse(replyText); } catch { /* reported by callers */ }
+  return { out, raw, replyText, reply, messageId, from };
+}
+
+await section('woo-hold', async () => {
+  const confirmReceipt = need('confirmReceipt');
+  let store = null;
+  store = await startStore(wooStore((req, res) => {
+    const bytes = Buffer.from(onOrigin(WOO_PAGE.toString('utf8'), store.origin));
+    res.writeHead(200, { ...WOO_JSON, 'x-wp-total': '3', 'x-wp-totalpages': '1', 'content-length': String(bytes.length) });
+    res.end(bytes);
+  }));
+  try {
+    const label = 'woo-hold/recorded-page';
+    const dir = makeRepo('vite');
+    const run = await runCli(['init', '--from', 'woocommerce', store.origin, '--facts', WOO_FACTS_FILE, '--json'],
+      { cwd: dir, env: WOO_ENV });
+    guardClean(label, run, { onlyPort: store.port });
+    if (!check(run.code === 0, `${label}/exit-0`, `exit ${run.code}; stdout ${run.stdout.slice(0, 300)}; stderr ${run.stderr.slice(0, 400)}`)) return;
+    const declaration = readJson(join(dir, 'agent-entry.json'));
+    const offers = Array.isArray(declaration?.offers) ? declaration.offers : [];
+
+    // Functional: one door-bound hold, answered pending, with a receipt.
+    const holds = offers.filter((o) => o?.verb === 'hold' && o?.door);
+    if (!check(holds.length === 1, `${label}/one-door-bound-hold-offer`, JSON.stringify(offers).slice(0, 400))) return;
+    const hold = holds[0];
+    check(hold.door.reply === 'pending', `${label}/hold-answered-pending`, JSON.stringify(hold.door));
+    check(hold.door.receipt !== false && !Object.hasOwn(hold.door, 'url'), `${label}/hold-carries-a-receipt-and-no-checkout-url`,
+      JSON.stringify(hold.door));
+    let compiled = null;
+    try { compiled = compileDeclaration(clone(declaration)); } catch (error) { check(false, `${label}/declaration-compiles`, String(error?.message || error)); }
+    const compiledHold = compiled?.offers?.find((o) => o.verb === 'hold' && o.door);
+    check(compiledHold?.door?.receipt === true, `${label}/compiled-hold-receipt-true`, JSON.stringify(compiledHold?.door));
+    // Refusal: no payment verb rides with the hold: not in its offer, not as a checkout beside it.
+    check(!/\bbuy\b/i.test(JSON.stringify(hold)), `${label}/no-buy-in-the-hold-offer`, JSON.stringify(hold));
+    check(!offers.some((o) => PAYMENT_VERBS.includes(o?.verb) || o?.door?.reply === 'checkout'), `${label}/no-payment-verb-beside-the-hold`,
+      JSON.stringify(offers.map((o) => o?.verb)));
+
+    await store.close();
+    let entry = null;
+    try { entry = findDoor(dir); } catch (error) { check(false, `${label}/door-builds-from-the-project`, String(error?.message || error)); }
+    if (!entry) return;
+
+    // Functional: the hold reply is pending with this customer's deal receipt, and claims nothing confirmed.
+    const text = 'hold item {"id":101}';
+    const k = await knockHold(entry, text);
+    check(k.out.status === 200 && k.reply !== null, `${label}/hold-answered`, k.raw.slice(0, 300));
+    const r = k.reply || {};
+    check(r.verb === 'hold' && r.status === 'pending_confirmation', `${label}/hold-reply-pending_confirmation`,
+      JSON.stringify({ verb: r.verb, status: r.status }));
+    check(r.customer_did === k.from && r.request === text, `${label}/hold-reply-filed-under-the-signer`, JSON.stringify(r).slice(0, 300));
+    const deal = r.deal || {};
+    check(deal.type === 'DealReceipt' && deal.partyA === entry.did && deal.partyB === k.from && deal.ref === k.messageId,
+      `${label}/hold-reply-carries-the-deal-receipt`, JSON.stringify(deal).slice(0, 300));
+    check(!Object.hasOwn(r, 'confirmed') && !/confirmed"/.test(k.replyText ?? '"confirmed"'), `${label}/hold-reply-claims-no-confirmation`,
+      String(k.replyText).slice(0, 300));
+    check(!/\bbuy\b/i.test(k.replyText ?? 'buy') && !Object.hasOwn(r, 'url'), `${label}/hold-reply-emits-no-buy`, String(k.replyText).slice(0, 300));
+
+    // Functional: the owner (this project's seed) confirms; the follow-on reads confirmed on the same terms.
+    if (typeof confirmReceipt === 'function' && k.replyText) {
+      let follow = null;
+      try { follow = JSON.parse(confirmReceipt(PUBLISH_SEED, k.replyText)); } catch (error) {
+        check(false, `${label}/owner-confirms`, String(error?.message || error));
+      }
+      if (follow) {
+        check(follow.status === 'confirmed' && follow.verb === 'hold' && follow.customer_did === k.from && follow.request === text,
+          `${label}/follow-on-reads-confirmed`, JSON.stringify(follow).slice(0, 300));
+        check(follow.deal?.termsHash === deal.termsHash && follow.deal?.partyA === entry.did && follow.deal?.partyB === k.from,
+          `${label}/follow-on-chains-to-the-hold-receipt`, JSON.stringify(follow.deal).slice(0, 300));
+      }
+      // Refusal: the customer's own key confirms nothing.
+      let byCustomer = null;
+      try { byCustomer = confirmReceipt(HOLD_SEED, k.replyText); } catch { /* refused, as it must be */ }
+      check(byCustomer === null, `${label}/refused/the-customer-cannot-confirm`, String(byCustomer).slice(0, 300));
+    }
+
+    // Refusal: a confirmation the caller claims in its request is data; the reply stays pending.
+    const claim = 'hold item {"id":101,"status":"confirmed","confirmed":true,"deal":{"status":"confirmed","partyB":"did:key:z6MkForged"}}';
+    const c = await knockHold(entry, claim);
+    check(c.reply?.status === 'pending_confirmation' && !Object.hasOwn(c.reply || {}, 'confirmed'),
+      `${label}/refused/claimed-confirmation-stays-pending`, JSON.stringify(c.reply).slice(0, 300));
+    check(c.reply?.deal?.partyB === c.from && !Object.hasOwn(c.reply?.deal || {}, 'status'),
+      `${label}/refused/receipt-not-forged-from-the-request`, JSON.stringify(c.reply?.deal).slice(0, 300));
+  } finally { await store.close(); }
 });
 
 // ---------------------------------------------------------------- 12. publish --claim: the Catalog's proof file

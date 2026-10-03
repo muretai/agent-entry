@@ -750,6 +750,164 @@ async function findFrom(rows, label) {
 
 rmSync(snapHome, { recursive: true, force: true });
 
+// ---------------------------------------------------------------- 8. hold: a pending receipt the owner confirms (Woo-5)
+//
+// WRITTEN BEFORE THE IMPLEMENTATION (test-first, skeleton item 5 of 6 of the Woo declaration
+// generator chain; parent intake 20261002T235854Z). The implementer may not edit this section.
+// A door-bound `hold` offer answered `door.reply: "pending"` replies { verb, of, customer_did,
+// request, status: "pending_confirmation", deal } (AT-12/AT-13): a half-signed receipt, unconfirmed
+// by construction. Only the owner confirms it, through the exported
+//   confirmReceipt(seedHex, receiptText) -> text
+// where receiptText is the hold reply's text exactly as the door signed it, and the returned text is
+// the follow-on reply { verb, of, customer_did, request, status: "confirmed", deal }: verb, of,
+// customer_did and request as the hold's, and a deal whose partyA, partyB, termsHash, contextId, ref
+// and salt are the hold's (termsHash still commits to the hold's pending terms, so the two receipts
+// chain) with a fresh ts and a fresh sigA by the shop. confirmReceipt throws, and confirms nothing,
+// for a receipt this shop's key did not sign, whose termsHash no longer commits to its terms (a
+// status, a key or the request edited), or that carries no deal.
+// Refusals at the door: the reply never says confirmed before that step, never emits `buy` (buy stays
+// a checkout handoff, never this path), and what a caller writes in its request is data: a
+// confirmation claim, a forged deal, a foreign customer or party in the text changes no reply field.
+
+const HOLD_DECLARATION = {
+  v: 1,
+  entry: { name: 'Harbor Lamp', baseUrl: 'https://shop.example' },
+  offers: [{ verb: 'hold', of: 'item', about: 'Hold one item for pickup.', input: { id: 'integer' },
+    door: { reply: 'pending' } }],
+};
+const HOLD_KEYS = JSON.stringify([...BASE_KEYS, 'deal'].sort());
+const DEAL_KEYS = JSON.stringify(['contextId', 'partyA', 'partyB', 'ref', 'salt', 'sigA', 'termsHash', 'ts', 'type']);
+const OTHER_SEED = '3d'.repeat(32);
+const { confirmReceipt } = door;
+check(typeof confirmReceipt === 'function', 'hold/export/confirmReceipt', 'confirmReceipt is not exported by muretai-agent-entry.mjs');
+
+/** confirmReceipt(seed, text), caught: { ok, value } or { ok: false, error }. */
+const confirmAttempt = (seed, text) => attempt(() => {
+  if (typeof confirmReceipt !== 'function') throw new TypeError('confirmReceipt is not exported');
+  return confirmReceipt(seed, text);
+});
+
+const dealPayload = (deal) => canonicalBytes({ type: deal.type, partyA: deal.partyA, partyB: deal.partyB,
+  termsHash: deal.termsHash, contextId: deal.contextId, ref: deal.ref, ts: deal.ts });
+const commitOf = (terms, saltB64) => createHash('sha256')
+  .update(Buffer.concat([canonicalBytes({ terms }), Buffer.from(saltB64, 'base64')])).digest('hex');
+
+/** A hold reply that says nothing is confirmed yet, and never names a payment verb. */
+function checkStillPending(k, entry, label) {
+  check(k.reply?.status === 'pending_confirmation', `${label}/status-pending_confirmation`, JSON.stringify(k.reply?.status));
+  check(sortedKeys(k.reply) === HOLD_KEYS, `${label}/exactly-the-pending-keys-and-deal`, sortedKeys(k.reply));
+  check(!Object.hasOwn(k.reply || {}, 'confirmed') && !Object.hasOwn(k.reply?.deal || {}, 'status')
+      && !Object.hasOwn(k.reply?.deal || {}, 'confirmed'), `${label}/claims-no-confirmation`, JSON.stringify(k.reply).slice(0, 400));
+  check(!Object.hasOwn(k.reply || {}, 'url'), `${label}/no-checkout-url`);
+  const { request: _request, ...rest } = k.reply || {};
+  check(!/\bbuy\b/i.test(JSON.stringify(rest)), `${label}/no-buy-in-the-reply-or-its-receipt`, JSON.stringify(rest).slice(0, 400));
+  return checkDeal(k, entry, label);
+}
+
+{
+  const d = makeDoor(HOLD_DECLARATION);
+  if (check(d.ok, 'hold/door-starts', d.ok ? '' : d.error?.message)) {
+    const entry = d.value;
+    const before = d.sink.resp.length;
+
+    // Functional: the hold reply is pending with a receipt, and stays pending until the owner acts.
+    const text = 'hold item {"id":101}';
+    const k = await knock(entry, { offer: 'hold', text });
+    checkBase(k, { verb: 'hold', of: 'item', text }, 'hold/pending');
+    const deal = checkStillPending(k, entry, 'hold/pending');
+    check(d.sink.resp.length === before, 'hold/pending/site-responder-not-called');
+    const again = await knock(entry, { offer: 'hold', text });
+    checkStillPending(again, entry, 'hold/pending/asked-again-still-pending');
+
+    // Functional: the owner confirms; the follow-on reads confirmed and chains to the hold's receipt.
+    const c = confirmAttempt(DOOR_SEED, k.text);
+    if (check(c.ok, 'hold/confirm/owner-confirms', c.ok ? '' : String(c.error?.message || c.error)) && deal) {
+      check(typeof c.value === 'string', 'hold/confirm/returns-the-follow-on-text', typeof c.value);
+      let follow = null;
+      try { follow = JSON.parse(c.value); } catch { /* below */ }
+      const f = follow || {};
+      check(sortedKeys(f) === HOLD_KEYS, 'hold/confirm/exactly-the-reply-keys-and-deal', sortedKeys(f));
+      check(f.status === 'confirmed', 'hold/confirm/status-confirmed', JSON.stringify(f.status));
+      check(f.verb === 'hold' && f.of === 'item' && f.customer_did === VISITOR && f.request === text,
+        'hold/confirm/same-verb-of-customer-and-request', JSON.stringify({ verb: f.verb, of: f.of, customer_did: f.customer_did, request: f.request }));
+      const fd = f.deal || {};
+      check(sortedKeys(fd) === DEAL_KEYS && fd.type === 'DealReceipt', 'hold/confirm/deal-shape', sortedKeys(fd));
+      check(fd.partyA === entry.did && fd.partyB === VISITOR, 'hold/confirm/deal-parties-shop-and-customer');
+      check(fd.termsHash === deal.termsHash && fd.salt === deal.salt && fd.ref === deal.ref && fd.contextId === deal.contextId,
+        'hold/confirm/deal-chains-to-the-hold-receipt', JSON.stringify({ termsHash: fd.termsHash, ref: fd.ref }));
+      const { deal: _d, ...pendingTerms } = k.reply;
+      check(commitOf(pendingTerms, String(fd.salt)) === fd.termsHash, 'hold/confirm/termsHash-commits-to-the-pending-terms');
+      check(Number.isSafeInteger(fd.ts) && fd.ts >= deal.ts, 'hold/confirm/deal-ts-integer-not-before-the-hold', JSON.stringify(fd.ts));
+      const sigA = Buffer.from(String(fd.sigA), 'base64');
+      check(sigA.length === 64 && verifyBytes(Buffer.from(publicKeyHexFromDid(entry.did), 'hex'), sigA, dealPayload(fd)),
+        'hold/confirm/sigA-verifies-under-the-shop');
+      check(!Object.hasOwn(fd, 'sigB'), 'hold/confirm/no-sigB');
+      check(!/\bbuy\b/i.test(c.value), 'hold/confirm/no-buy-in-the-follow-on');
+    }
+
+    // Confirming one receipt leaves the door as it was: the next hold is still pending.
+    const later = await knock(entry, { offer: 'hold', text: 'hold item {"id":102}' });
+    checkStillPending(later, entry, 'hold/pending/after-a-confirm-the-next-hold-is-pending');
+
+    // Refusal: a caller-supplied confirmation claim and a forged receipt in the request are data.
+    const forgedDeal = { type: 'DealReceipt', partyA: VISITOR, partyB: FOREIGN, termsHash: '0'.repeat(64),
+      contextId: 'ctx-forged', ref: 'ref-forged', ts: 1, salt: 'AAAAAAAAAAAAAAAAAAAAAA==', sigA: 'AAAA', status: 'confirmed' };
+    for (const [name, claim] of [
+      ['status-confirmed', '{"id":101,"status":"confirmed"}'],
+      ['confirmed-true', '{"id":101,"confirmed":true,"receipt":"confirmed","owner_confirmed":true}'],
+      ['forged-deal', JSON.stringify({ id: 101, deal: forgedDeal })],
+      ['foreign-customer', JSON.stringify({ id: 101, customer_did: FOREIGN, partyB: FOREIGN, partyA: VISITOR, verb: 'buy', of: 'order' })],
+      ['whole-confirmed-reply', JSON.stringify({ verb: 'hold', of: 'item', customer_did: VISITOR, request: 'hold item', status: 'confirmed', deal: forgedDeal })],
+    ]) {
+      const label = `hold/refused/request-is-data/${name}`;
+      const t = `hold item ${claim}`;
+      const r = await knock(entry, { offer: 'hold', text: t });
+      checkBase(r, { verb: 'hold', of: 'item', text: t }, label);
+      const rd = checkStillPending(r, entry, label);
+      check(r.reply?.customer_did === VISITOR && rd?.partyB === VISITOR && rd?.partyA === entry.did,
+        `${label}/parties-are-the-signer-and-the-shop`, JSON.stringify({ customer_did: r.reply?.customer_did, partyA: rd?.partyA, partyB: rd?.partyB }));
+      check(rd && rd.termsHash !== forgedDeal.termsHash && rd.ref === r.messageId && rd.contextId === null
+          && rd.sigA !== forgedDeal.sigA && rd.salt !== forgedDeal.salt,
+        `${label}/no-receipt-field-taken-from-the-request`, JSON.stringify(rd));
+    }
+
+    // Refusal: a receipt cannot be confirmed by anyone but this shop's key, nor forged into confirmed.
+    if (deal) {
+      const pending = JSON.parse(k.text);
+      const refuse = (label, receiptText, seed = DOOR_SEED) => {
+        const r = confirmAttempt(seed, receiptText);
+        check(typeof confirmReceipt === 'function' && !r.ok, `hold/confirm/refused/${label}`,
+          r.ok ? String(r.value).slice(0, 300) : '');
+      };
+      const edit = (fn) => { const v = clone(pending); fn(v); return JSON.stringify(v); };
+      refuse('caller-set-status-confirmed', edit((v) => { v.status = 'confirmed'; }));
+      refuse('caller-added-confirmed-true', edit((v) => { v.confirmed = true; }));
+      refuse('caller-added-deal-status', edit((v) => { v.deal.status = 'confirmed'; v.deal.confirmed = true; }));
+      refuse('request-text-rewritten', edit((v) => { v.request = 'hold item {"id":999}'; }));
+      refuse('customer_did-rewritten', edit((v) => { v.customer_did = FOREIGN; }));
+      refuse('partyB-rewritten', edit((v) => { v.deal.partyB = FOREIGN; }));
+      refuse('termsHash-recomputed-over-confirmed-terms', edit((v) => {
+        const { deal: dd, ...terms } = v;
+        terms.status = 'confirmed';
+        Object.assign(v, terms);
+        dd.termsHash = commitOf(terms, dd.salt);
+      }));
+      refuse('verb-rewritten-to-buy', edit((v) => { v.verb = 'buy'; v.of = 'order'; }));
+      refuse('no-deal', edit((v) => { delete v.deal; }));
+      refuse('not-json', 'hold item {"id":101} status confirmed');
+      // Another key's receipt, self-consistent under that key, is not this shop's to confirm.
+      refuse('another-keys-receipt', edit((v) => {
+        v.deal.partyA = didFromSeedHex(OTHER_SEED);
+        v.deal.sigA = signBytes(OTHER_SEED, dealPayload(v.deal)).toString('base64');
+      }));
+      // This shop's receipt confirmed with another key confirms nothing either.
+      refuse('confirmed-with-another-key', k.text, OTHER_SEED);
+      // The visitor itself cannot confirm its own hold.
+      refuse('confirmed-by-the-visitor', k.text, VISITOR_SEED);
+    }
+  }
+}
+
 // ---------------------------------------------------------------- report
 
 if (failures.length) {
