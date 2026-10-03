@@ -51,7 +51,6 @@ declaration -> a door that is its claim -> find / ask / hold -> the owner approv
 follow-up -> the owner reads who came and who came back. Its proof is conformance/frame.mjs (FRAME TEST below), red
 until every member lands. Chains in flight: Woo 001756Z -> 001757Z -> {001757Z-2, 001758Z, 001758Z-2} -> 001759Z;
 S6a 215207Z (landed) -> 215208Z (impl) -> 215208Z-2 -> 215209Z; S6b 215209Z-2 (landed) -> 215210Z (tests).)
-- P0 FRAME TEST the one test that walks the thin line: conformance/frame.mjs, test author only, red at every step a member makes green (init from a fixture Woo store, door up, claim file served, knock find/ask/hold, decide approve, counts shows who and first_contact); not wired into npm test until green. [20261003T131708Z] [skeleton]
 
 ## Next (queued, in order)
 
@@ -112,6 +111,7 @@ S6a 215207Z (landed) -> 215208Z (impl) -> 215208Z-2 -> 215209Z; S6b 215209Z-2 (l
 - isolated-session: re-vendor APPL v0.1.1 (da7c693) [20260930T020158Z] 1bc9b04
 - P1 S6b the knock speaks the verbs: S6b-2, checkedBookingReceipt recognises the Suite's default reply shape next to the older one (tests in flight); S6b-1 (`--offer` on the knock) landed 9e58808. Tail id. [20261002T215210Z] [skeleton]
 - P0 FRAME Claim-2 publish --claim serves the Catalog's proof file: `publish --claim <32 hex>` makes the door serve /.well-known/muretai-catalog-claim.txt with body `muretai-catalog-claim=<code>` (trunk catalog/service.py contract) and prints the DNS TXT alternative; 404 without a code. [20261003T131709Z-2] [skeleton]
+- P0 FRAME TEST the one test that walks the thin line: conformance/frame.mjs, test author only, red at every step a member makes green (init from a fixture Woo store, door up, claim file served, knock find/ask/hold, decide approve, counts shows who and first_contact); not wired into npm test until green. [20261003T131708Z] [skeleton]
 
 ## Done v1.13.1 (2026-09-28)
 
