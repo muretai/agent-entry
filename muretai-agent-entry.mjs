@@ -6095,9 +6095,11 @@ const USAGE = {
     + '  agent-tools.sig.json and agent-tools/v<n>.json. A published version is never rewritten.\n'
     + '  --claim <32 lowercase hex> records the Catalog\'s claim code in agent-entry.json (the door then serves\n'
     + `  ${CATALOG_CLAIM_PATH}) and prints the DNS TXT record that proves the host instead.`,
-  doctor: 'usage: agent-entry doctor [--url <site url>] [--json]\n'
+  doctor: 'usage: agent-entry doctor [--url <site url> | --from woocommerce] [--json]\n'
     + '  Local: seed kept out of git, contract published and verifying, door module and page tag wired, and\n'
-    + '  one in-process knock per door-bound offer. --url: the same against the live site, over the network.',
+    + '  one in-process knock per door-bound offer. --url: the same against the live site, over the network.\n'
+    + '  --from woocommerce: one signed knock per door-bound offer of agent-entry.json, at its entry.baseUrl only;\n'
+    + '  a hold is probed, never confirmed. One PASS/FAIL row per offer; exit 1 if any failed.',
   counts: 'usage: agent-entry counts --log <fileSink log> [--store <file store>] [--json] [--serve [--port <p>] [--host 127.0.0.1|::1]]\n'
     + '  Per offer: asked on the page, asked at the door, completed, receipts; referrals by engine; returning\n'
     + '  customers (a count); door knocks by stage and client class. --serve renders one page on loopback only.',
@@ -7650,8 +7652,97 @@ async function doctorLocal(root, add) {
     { knockSeed: newSeedHex(), expectDid: seed.hex ? didFromSeedHex(seed.hex) : null, expectHash: publishedHash });
 }
 
+/** `doctor --from woocommerce`: one signed knock per door-bound offer of the generated declaration,
+ *  at the origin its entry.baseUrl names and nowhere else; no redirect is followed, a hold is only
+ *  probed (never confirmed), nothing is written. A FAIL names the offer and a fixed reason, never
+ *  the door's own text: a failing door may echo secrets. Every offer gets its row. */
+async function doctorWoo(root, add, kSeed) {
+  let compiled;
+  let base;
+  try {
+    const declaration = readJsonFile(join(root, DECLARATION_FILE));
+    base = canonicalBaseUrl(declaration.entry.baseUrl, { warn: false });
+    compiled = compileDeclaration(declaration);
+  } catch {
+    add('declaration', 'FAIL', `${DECLARATION_FILE} compiles`, 'missing or invalid: run agent-entry init --from woocommerce');
+    return;
+  }
+  const origin = new URL(base).origin;
+  const mount = new URL(base).pathname.replace(/\/+$/, '');
+  const send = liveTransport(origin);
+  const offers = compiled.offers.filter((o) => o.door);
+  add('declaration', 'PASS', `${DECLARATION_FILE} compiles`, `${offers.length} door-bound offers, knocked at ${origin} only`);
+
+  let card = null;
+  let endpoint = null;
+  let unreached = 'unreachable';
+  try {
+    const r = await send('GET', mount + AGENT_CARD_PATH, { headers: { accept: 'application/json' } });
+    try { card = r.status === 200 ? JSON.parse(r.text) : null; } catch { /* below */ }
+    if (r.status !== 200) unreached = `card answered status ${r.status}`;
+    else if (!isPlainObject(card) || typeof card.did !== 'string') { card = null; unreached = 'malformed card'; }
+    if (card) {
+      const declared = card.securitySchemes?.[SIGNED_ENVELOPE_SCHEME]?.agentEntry?.endpoint
+        || card.supportedInterfaces?.find((i) => i?.protocolBinding === 'JSONRPC')?.url || `${base}/`;
+      const u = new URL(declared, origin);
+      if (u.origin === origin) endpoint = u.pathname + u.search;
+      else unreached = 'card points off the declared door';
+    }
+  } catch { /* unreachable */ }
+
+  for (const offer of offers) {
+    const fail = (why) => add(`offer.${offer.id}`, 'FAIL', `${offer.id} answers at the door`, why);
+    if (endpoint === null) { fail(unreached); continue; }
+    const knock = offerKnock(kSeed, card.did, offer);
+    let r;
+    try {
+      r = await send('POST', endpoint, { headers: { 'content-type': 'application/json', accept: 'application/json' }, body: knock.body });
+    } catch { fail('unreachable'); continue; }
+    if (r.status !== 200) { fail(`status ${r.status}`); continue; }
+    let reply = null;
+    try { reply = JSON.parse(r.text); } catch { /* below */ }
+    if (!isPlainObject(reply)) { fail('malformed reply'); continue; }
+    if (reply.error) { fail(`refused (${Number.isInteger(reply.error.code) ? reply.error.code : 'error'})`); continue; }
+    const msg = reply.result;
+    const meta = msg?.metadata || {};
+    const fields = { from: meta.from, to: meta.to, messageId: msg?.messageId, contextId: msg?.contextId ?? null,
+      timestamp: meta.timestamp, text: msg ? messageText(msg) : '', sig: meta.sig };
+    if (meta.from !== card.did || meta.to !== knock.from || !verifyEnvelope(fields, { recipientDid: knock.from, signerDid: card.did })) {
+      fail('unsigned reply');
+      continue;
+    }
+    if (offer.door.reply === 'brain') { add(`offer.${offer.id}`, 'PASS', `${offer.id} answers at the door`, 'signed reply'); continue; }
+    let body = null;
+    try { body = JSON.parse(fields.text); } catch { /* below */ }
+    const want = REPLY_STATUS[offer.door.reply];
+    if (!isPlainObject(body) || body.verb !== offer.verb || body.of !== offer.of || body.status !== want) { fail('unexpected reply'); continue; }
+    if (offer.door.receipt && (body.deal?.type !== 'DealReceipt' || body.deal.partyA !== card.did || body.deal.partyB !== knock.from)) {
+      fail('no receipt for this visitor');
+      continue;
+    }
+    add(`offer.${offer.id}`, 'PASS', `${offer.id} answers at the door`, `${want}${offer.door.receipt ? ' with a deal block' : ''}`);
+  }
+}
+
 async function doctorMain(argv) {
-  const flags = parseFlags(argv, { url: 'string', json: 'boolean' });
+  const flags = parseFlags(argv, { url: 'string', json: 'boolean', from: 'string' });
+  if (flags.from !== undefined) {
+    if (flags.from !== 'woocommerce') throw new CliMisuse('--from takes woocommerce');
+    if (flags.url !== undefined) throw new CliMisuse('--from woocommerce knocks the door its declaration names; leave out --url');
+    let kSeed;
+    try {
+      kSeed = knockSeed(process.env.AGENT_ENTRY_KNOCK_KEY || resolve(homedir(), '.config', 'muretai-agent-entry', 'knock-seed'));
+    } catch { throw new CliRefusal('the knock key is unreadable: it must hold one lowercase 32-byte seed in hex'); }
+    const rows = [];
+    await doctorWoo(process.cwd(), (id, level, label, detail = '') => rows.push({ id, level, label, detail: String(detail) }), kSeed);
+    const failed = rows.some((r) => r.level === 'FAIL');
+    emit(flags.json, { mode: 'woocommerce', rows }, [
+      ...rows.map((r) => `${r.level.padEnd(4)}  ${r.label}${r.detail ? ` - ${r.detail}` : ''}`),
+      '',
+      failed ? 'doctor: FAIL' : 'doctor: every door-bound offer answered',
+    ]);
+    return failed ? 1 : 0;
+  }
   let base = null;
   if (flags.url !== undefined) {
     let u;
