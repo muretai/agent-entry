@@ -3642,6 +3642,70 @@ function dealBlock(seedHex, partyA, terms, { partyB, contextId, ref }) {
     salt: salt.toString('base64'), sigA: signBytes(seedHex, payload).toString('base64') };
 }
 
+/** A pending reply is exactly these keys, and its deal exactly these (dealBlock's shape). */
+const PENDING_REPLY_KEYS = Object.freeze(['verb', 'of', 'customer_did', 'request', 'status', 'deal']);
+const DEAL_RECEIPT_KEYS = Object.freeze(['type', 'partyA', 'partyB', 'termsHash', 'contextId', 'ref', 'ts', 'salt', 'sigA']);
+
+/** True when `obj` has exactly the keys in `keys`, no more and no fewer. */
+const hasExactKeys = (obj, keys) => Object.keys(obj).length === keys.length && keys.every((k) => Object.hasOwn(obj, k));
+
+/**
+ * confirmReceipt(seedHex, receiptText) -> text
+ *
+ * The owner's confirmation of a pending receipt (AT-12/AT-13, Woo-5). `receiptText` is a door's
+ * `pending` reply exactly as it was signed: { verb, of, customer_did, request, status:
+ * "pending_confirmation", deal }. Returns the follow-on reply text, the same fields with
+ * status "confirmed" and a deal keeping partyA, partyB, termsHash, salt, ref and contextId, with a
+ * fresh ts (never before the hold's) and a fresh sigA by this key. termsHash still commits to the
+ * pending terms, so the follow-on chains to the receipt the visitor holds.
+ *
+ * The deal's sigA is verified under the key `seedHex` derives BEFORE anything else is read from
+ * the receipt; then it must be exactly the door's pending shape, and its termsHash must still
+ * commit to its terms. Anything else throws, and nothing is confirmed. No field comes from the
+ * caller beyond the signed receipt.
+ */
+export function confirmReceipt(seedHex, receiptText) {
+  if (typeof seedHex !== 'string' || !/^[0-9a-f]{64}$/i.test(seedHex)) throw new TypeError('confirmReceipt: seedHex must be 64 hex characters');
+  if (typeof receiptText !== 'string') throw new TypeError('confirmReceipt: receiptText must be the reply text');
+  const shop = didFromSeedHex(seedHex);
+  let receipt;
+  try { receipt = JSON.parse(receiptText); } catch { throw new TypeError('confirmReceipt: the receipt is not JSON'); }
+  const deal = isPlainObject(receipt) ? receipt.deal : undefined;
+  if (!isPlainObject(deal)) throw new TypeError('confirmReceipt: the receipt carries no deal');
+  // 1. This shop signed it: sigA over the seven fields, with partyA this key's DID.
+  const sigA = typeof deal.sigA === 'string' && /^[A-Za-z0-9+/]+={0,2}$/.test(deal.sigA) ? Buffer.from(deal.sigA, 'base64') : null;
+  const signed = { type: deal.type, partyA: shop, partyB: deal.partyB, termsHash: deal.termsHash,
+    contextId: deal.contextId, ref: deal.ref, ts: deal.ts };
+  let verified = false;
+  try {
+    verified = sigA !== null && sigA.length === 64
+      && verifyBytes(Buffer.from(publicKeyHexFromDid(shop), 'hex'), sigA, canonicalBytes(signed));
+  } catch { verified = false; }
+  if (!verified || deal.partyA !== shop) throw new TypeError('confirmReceipt: the receipt is not signed by this key');
+  // 2. Exactly the door's pending shape: no extra key, no confirmation claimed anywhere.
+  if (!hasExactKeys(receipt, PENDING_REPLY_KEYS) || !hasExactKeys(deal, DEAL_RECEIPT_KEYS)) {
+    throw new TypeError('confirmReceipt: the receipt is not a pending reply');
+  }
+  const { verb, of, customer_did: customerDid, request, status } = receipt;
+  if (status !== 'pending_confirmation' || deal.type !== 'DealReceipt') throw new TypeError('confirmReceipt: the receipt is not pending');
+  if (typeof verb !== 'string' || typeof of !== 'string' || typeof request !== 'string' || typeof customerDid !== 'string'
+      || customerDid !== deal.partyB || typeof deal.termsHash !== 'string' || !/^[0-9a-f]{64}$/.test(deal.termsHash)
+      || typeof deal.ref !== 'string' || (deal.contextId !== null && typeof deal.contextId !== 'string')
+      || !Number.isSafeInteger(deal.ts) || typeof deal.salt !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(deal.salt)) {
+    throw new TypeError('confirmReceipt: the receipt is not a pending reply');
+  }
+  // 3. Its termsHash still commits to its terms: nothing in the reply was edited after signing.
+  const terms = { verb, of, customer_did: customerDid, request, status };
+  const commit = createHash('sha256')
+    .update(Buffer.concat([canonicalBytes({ terms }), Buffer.from(deal.salt, 'base64')])).digest('hex');
+  if (commit !== deal.termsHash) throw new TypeError('confirmReceipt: the receipt\'s terms were changed after it was signed');
+  const ts = Math.max(nowEpoch(), deal.ts);
+  const next = { type: 'DealReceipt', partyA: shop, partyB: deal.partyB, termsHash: deal.termsHash,
+    contextId: deal.contextId, ref: deal.ref, ts };
+  return JSON.stringify({ verb, of, customer_did: customerDid, request, status: 'confirmed',
+    deal: { ...next, salt: deal.salt, sigA: signBytes(seedHex, canonicalBytes(next)).toString('base64') } });
+}
+
 /** The input values a visitor wrote as a JSON object after the words (the skill example's
  *  shape, `buy order {"hold_id":"H-1"}`), limited to the offer's own fields. */
 function inputValues(text, input) {
@@ -6002,6 +6066,10 @@ const WOO_ASK_OFFER = deepFreeze({ verb: 'ask', of: 'shop',
 /** Woo-4: the one `find` offer, answered at the door from the product snapshot file. */
 const WOO_FIND_OFFER = deepFreeze({ verb: 'find', of: 'products', about: 'Find products in the shop catalogue.',
   input: { q: 'string' }, door: { reply: 'catalog' } });
+/** Woo-5: the one `hold` offer, answered at the door pending with a receipt the owner confirms
+ *  (confirmReceipt). No url, no payment verb: paying stays at the shop's own checkout. */
+const WOO_HOLD_OFFER = deepFreeze({ verb: 'hold', of: 'item', about: 'Hold one item for pickup; the shop confirms it.',
+  input: { id: 'integer' }, door: { reply: 'pending' } });
 const WOO_SNAPSHOT_FILE = 'agent-entry.products.json';
 
 const USAGE = {
@@ -6016,8 +6084,9 @@ const USAGE = {
     + `  ${WOO_DEFAULT_MAX_PAGES}) and --max-bytes <n> (default ${WOO_DEFAULT_MAX_BYTES}, over every page together) bound the\n`
     + '  walk, and a bound that ends it is named. It refuses a store that is not WooCommerce or whose\n'
     + '  robots.txt disallows that path. It writes agent-entry.json: one `ask` offer answered at the\n'
-    + '  door from the shop\'s facts and one `find` offer answered from agent-entry.products.json, the\n'
-    + '  product snapshot it writes beside it. --facts <file> is a JSON object of strings with\n'
+    + '  door from the shop\'s facts, one `find` offer answered from agent-entry.products.json, the\n'
+    + '  product snapshot it writes beside it, and one `hold` offer answered pending with a receipt\n'
+    + '  the owner confirms. --facts <file> is a JSON object of strings with\n'
     + `  the keys ${WOO_FACT_KEYS.join(', ')}\n`
     + '  (human_contact_email or human_contact_phone may be left out, not both); without --facts they are read\n'
     + '  from stdin, one line each in that order.',
@@ -6478,7 +6547,7 @@ async function initFromWoo(storeUrl, flags) {
   const { host, products, pages } = walk;
   const facts = factsFromFile ?? await wooFactsPrompted();
   const declaration = checkedDeclaration({ v: 1, entry: { name: flags.name ?? base.hostname, baseUrl: base.href.replace(/\/$/, '') },
-    offers: [JSON.parse(JSON.stringify(WOO_ASK_OFFER)), JSON.parse(JSON.stringify(WOO_FIND_OFFER))], facts });
+    offers: [WOO_ASK_OFFER, WOO_FIND_OFFER, WOO_HOLD_OFFER].map((o) => JSON.parse(JSON.stringify(o))), facts });
   const rows = products.map((product) => wooSnapshotRow(product, base.origin)).filter((row) => row !== null);
   writeFileSync(declPath, `${JSON.stringify(declaration, null, 2)}\n`, { flag: 'wx' });
   writeFileSync(snapPath, `${jsonWithoutMarkup(JSON.stringify(rows, null, 2))}\n`, { flag: 'wx' });
@@ -6492,8 +6561,8 @@ async function initFromWoo(storeUrl, flags) {
     wrote: [DECLARATION_FILE, WOO_SNAPSHOT_FILE] }, [
     `Read robots.txt and ${pages} Store API page${pages === 1 ? '' : 's'} (${products.length} product${products.length === 1 ? '' : 's'}) from ${host}.`,
     ...stoppedLine,
-    `Wrote ${DECLARATION_FILE}: one \`ask\` offer answered at the door from ${Object.keys(facts).length} facts, and one \`find\` `
-      + `offer answered from ${WOO_SNAPSHOT_FILE}.`,
+    `Wrote ${DECLARATION_FILE}: one \`ask\` offer answered at the door from ${Object.keys(facts).length} facts, one \`find\` `
+      + `offer answered from ${WOO_SNAPSHOT_FILE}, and one \`hold\` offer answered pending with a receipt the owner confirms.`,
     `Wrote ${WOO_SNAPSHOT_FILE}: ${rows.length} product${rows.length === 1 ? '' : 's'}`
       + `${rows.length < products.length ? ` (${products.length - rows.length} left out: incomplete, or a permalink not on ${base.origin})` : ''}.`,
     `Next: run \`agent-entry publish\`, then \`agent-entry doctor\`.`,
