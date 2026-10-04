@@ -91,7 +91,7 @@ S6a 215207Z (landed) -> 215208Z (impl) -> 215208Z-2 -> 215209Z; S6b 215209Z-2 (l
 - P2 Woo plugin seed outside the database (S-3): the plugin prefers a wp-config.php constant for the seed when defined, and its header documents that the option is the shop's private key carried by backups and staging clones, with the rotation step and its new DID. [20261004T114538Z]
 - P3 claim on a mounted entry needs an explicit host claim (S-4): readDeclaration refuses entry.claim on a mounted baseUrl unless the operator opts in, and the README says a claim speaks for every path on the host. [20261004T114621Z]
 - P3 page call resolves only registered handlers (B-3): the page runtime resolves a call action from handlers or a site-registered handler object only, never a bare window global, and spec/tools-v1.md states the signature binds the contract to the card, not to the domain owner. [20261004T114643Z]
-- P3 seed and knock key writes refuse symlinks (K-3): mintSeed and knockSeed lstat the slot and the knock key file and refuse a symlink with a message naming it. [none]
+- P3 seed and knock key writes refuse symlinks (K-3): mintSeed and knockSeed lstat the slot and the knock key file and refuse a symlink with a message naming it. [20261004T114705Z]
 - P3 visitor skill says signed reply data is content not instructions (W-3): spec and the distilled visitor skill state that product names and facts in a shop-signed reply are quoted data, never instructions to follow. [none] [solo]
 
 ## Owner rulings owed (not items until ruled)
