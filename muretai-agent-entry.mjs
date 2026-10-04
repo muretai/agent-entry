@@ -6085,7 +6085,7 @@ const WOO_HOLD_OFFER = deepFreeze({ verb: 'hold', of: 'item', about: 'Hold one i
 const WOO_SNAPSHOT_FILE = 'agent-entry.products.json';
 
 const USAGE = {
-  init: 'usage: agent-entry init (--trade restaurant|retail|clinic|repair | --from sodium.json) --base-url <url> [--name <name>] [--json]\n'
+  init: 'usage: agent-entry init --trade restaurant|retail|clinic|repair --base-url <url> [--name <name>] [--json]\n'
     + '       agent-entry init --from woocommerce <https store url> [--facts <file>] [--max-pages <n>]\n'
     + '                                           [--max-bytes <n>] [--name <name>] [--json]\n'
     + '  Detects the framework, mints the site seed into a git-ignored file, writes agent-entry.json and\n'
@@ -6592,74 +6592,12 @@ async function initFromWoo(storeUrl, flags) {
   return 0;
 }
 
-// ------------------------------------------ init: sodium.json -> offers (spec 3.1)
-
-const SODIUM_RISK = Object.freeze({ read_only: 'none', reversible: 'reversible', state_changing: 'changes',
-  destructive: 'changes', financial: 'pays' });
-const SODIUM_CONFIRM = Object.freeze({ recommended: 'advised', required: 'always' });
-
-/** A whole sodium.json v1 file as `offers[]`, `page` filled and `door` left empty, or a refusal
- *  naming the tool (AT-2's whole-refusal posture: nothing is converted when one tool cannot be). */
-function offersFromSodium(doc) {
-  if (!isPlainObject(doc) || !Array.isArray(doc.tools) || doc.tools.length === 0) {
-    throw new CliRefusal('sodium.json: `tools` must be a non-empty list');
-  }
-  if (doc.version !== undefined && doc.version !== 1) throw new CliRefusal('sodium.json: only version 1 files can be converted');
-  const offers = doc.tools.map((tool, i) => {
-    const id = typeof tool?.id === 'string' && tool.id ? tool.id
-      : (typeof tool?.name === 'string' && tool.name ? tool.name : `tools[${i}]`);
-    const refuse = (why) => {
-      throw new CliRefusal(`sodium.json: tool "${id.slice(0, 64)}" ${why}. Nothing was converted: the whole file is refused.`);
-    };
-    if (!isPlainObject(tool)) refuse('is not an object');
-    const run = isPlainObject(tool.run) ? tool.run : {};
-    if (run.type === 'interaction' || Object.hasOwn(run, 'steps')) {
-      refuse('runs interaction steps, and v1 has no page action for them yet (the `steps` action is a follow-up)');
-    }
-    const cut = id.indexOf('_');
-    if (cut <= 0 || cut === id.length - 1) refuse('cannot be split into a verb and an object at its first "_"');
-    if (typeof tool.description !== 'string' || !tool.description) refuse('has no description to become `about`');
-    const input = {};
-    for (const [key, field] of Object.entries(isPlainObject(tool.input) ? tool.input : {})) {
-      const type = typeof field === 'string' ? field : field?.type;
-      if (!INPUT_TYPES.includes(type)) refuse(`has input "${String(key).slice(0, 40)}" of type ${JSON.stringify(type)}, which v1 has no field type for`);
-      input[key] = type;
-    }
-    if (!Array.isArray(tool.on) || tool.on.length === 0) refuse('names no `on` routes');
-    const on = tool.on.map((p) => (typeof p === 'string' ? p : refuse('is registered on a {path, when} route, which v1 cannot express')));
-    let action;
-    switch (run.type) {
-      case 'request':
-        action = { fetch: { method: run.method ?? 'GET', path: run.path, ...(run.query !== undefined ? { query: run.query } : {}) } };
-        break;
-      case 'form': action = { fill: { form: run.selector } }; break;
-      case 'extract': action = { read: run.selector }; break;
-      case 'navigate': action = { open: run.url }; break;
-      case 'call': action = { call: run.function }; break;
-      default: refuse(`has a run type ${JSON.stringify(run.type ?? null).slice(0, 40)} that v1 does not know`);
-    }
-    const effect = Object.hasOwn(SODIUM_RISK, tool.risk) ? SODIUM_RISK[tool.risk] : refuse('has no risk v1 can map to an effect');
-    const offer = { verb: id.slice(0, cut), of: id.slice(cut + 1), about: tool.description, input, effect };
-    // Raise only (AT-5): a confirmation below the effect's floor adds nothing, and Sodium's
-    // `destructive` floor is `required`, which v1 spells as ask `always`.
-    const floor = ASK_ORDER.indexOf(ASK_FLOOR[effect]);
-    let ask = Object.hasOwn(SODIUM_CONFIRM, tool.confirmation) ? SODIUM_CONFIRM[tool.confirmation] : null;
-    if (tool.risk === 'destructive') ask = 'always';
-    if (ask !== null && ASK_ORDER.indexOf(ask) >= floor) offer.ask = ask;
-    offer.page = { on, do: action };
-    return { id, offer };
-  });
-  return offers;
-}
-
-/** Validate a declaration the CLI built; a refusal names the sodium tool when there is one. */
-function checkedDeclaration(declaration, toolIds = null) {
+/** Validate a declaration the CLI built. */
+function checkedDeclaration(declaration) {
   try {
     validateDeclaration(declaration);
   } catch (e) {
-    const m = /offers\[(\d+)\]/.exec(e.message);
-    const tool = toolIds && m ? toolIds[Number(m[1])] : null;
-    throw new CliRefusal(tool ? `sodium.json: tool "${tool}" does not convert: ${e.message}` : e.message);
+    throw new CliRefusal(e.message);
   }
   return declaration;
 }
@@ -7119,12 +7057,13 @@ async function initMain(argv) {
   const positionals = [];
   const flags = parseFlags(argv, { trade: 'string', from: 'string', name: 'string', 'base-url': 'string', json: 'boolean',
     facts: 'string', 'max-pages': 'string', 'max-bytes': 'string' }, positionals);
-  // Only the literal `--from woocommerce` takes a store URL; any other --from is a sodium.json path.
+  // Only the literal `--from woocommerce` takes a store URL. Any other --from is misuse.
   if (flags.from === WOO_FROM) {
     if (flags.trade !== undefined) throw new CliMisuse('give --trade or --from, not both');
     if (positionals.length > 1) throw new CliMisuse(`unexpected argument ${JSON.stringify(positionals[1].slice(0, 60))}`);
     return initFromWoo(positionals[0], flags);
   }
+  if (flags.from !== undefined) throw new CliMisuse('init --from accepts only woocommerce');
   for (const name of ['facts', 'max-pages', 'max-bytes']) {
     if (flags[name] !== undefined) throw new CliMisuse(`--${name} goes with --from woocommerce`);
   }
@@ -7133,7 +7072,6 @@ async function initMain(argv) {
   if (flags.trade !== undefined && !TRADES.includes(flags.trade)) {
     throw new CliMisuse(`--trade must be one of ${TRADES.join(', ')}`);
   }
-  if (flags.trade !== undefined && flags.from !== undefined) throw new CliMisuse('give --trade or --from, not both');
   const framework = detectFramework(root);
   if (framework === null) {
     throw new CliRefusal('init found no framework here (Next, Nuxt, SvelteKit, Astro, Vite, Express, a static site '
@@ -7156,28 +7094,13 @@ async function initMain(argv) {
   // Everything that can refuse is decided before anything is written.
   const declPath = join(root, DECLARATION_FILE);
   let declaration = null;
-  if (flags.from !== undefined || !existsSync(declPath)) {
-    if (flags.from === undefined && trade === null) throw new CliMisuse('give --trade (restaurant, retail, clinic, repair) or --from sodium.json');
-    if (existsSync(declPath)) throw new CliRefusal(`${DECLARATION_FILE} already exists; init --from never overwrites it. Move it aside first.`);
+  if (!existsSync(declPath)) {
+    if (trade === null) throw new CliMisuse('give --trade (restaurant, retail, clinic, repair)');
     if (typeof flags['base-url'] !== 'string') throw new CliMisuse('--base-url is required: the URL visitors reach this site at');
     const pkg = readPackageJson(root);
-    let offers;
-    let toolIds = null;
-    let appName = null;
-    if (flags.from !== undefined) {
-      let doc;
-      try { doc = readJsonFile(resolve(root, flags.from)); } catch (e) {
-        throw new CliRefusal(`cannot read ${flags.from}: ${shortError(e)}`);
-      }
-      const converted = offersFromSodium(doc);
-      offers = converted.map((c) => c.offer);
-      toolIds = converted.map((c) => c.id);
-      appName = typeof doc.app?.name === 'string' && doc.app.name ? doc.app.name : null;
-    } else {
-      offers = JSON.parse(JSON.stringify(OFFER_STARTERS[trade]));
-    }
-    const name = flags.name ?? appName ?? (typeof pkg?.name === 'string' && pkg.name ? pkg.name : basename(root));
-    declaration = checkedDeclaration({ v: 1, entry: { name, baseUrl: flags['base-url'] }, offers }, toolIds);
+    const offers = JSON.parse(JSON.stringify(OFFER_STARTERS[trade]));
+    const name = flags.name ?? (typeof pkg?.name === 'string' && pkg.name ? pkg.name : basename(root));
+    declaration = checkedDeclaration({ v: 1, entry: { name, baseUrl: flags['base-url'] }, offers });
   }
   const refusal = seedSlotRefusal(root, fw.slot);
   if (refusal) throw new CliRefusal(refusal);

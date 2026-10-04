@@ -464,8 +464,8 @@ await section('static', async () => {
   const at = relParas.findIndex((p) => p.startsWith('**Agent connectors'));
   const para = at < 0 ? '' : relParas[at];
   check(at >= 0, 'static/spec-relationship-section-has-an-Agent-connectors-paragraph',
-    'a paragraph opening "**Agent connectors (Muse, Instinct).**"');
-  check(para.includes('Muse') && para.includes('Instinct'), 'static/spec-Agent-connectors-names-Muse-and-Instinct', '');
+    'a paragraph opening "**Agent connectors.**"');
+  check(/^\*\*Agent connectors\.\*\*/.test(para), 'static/spec-Agent-connectors-heading-is-generic', para.slice(0, 80));
   const bold = (p) => (/^\*\*([^*]+)\*\*/.exec(p) || [])[1] || '';
   const neighbours = [relParas[at - 1], relParas[at + 1]].filter(Boolean).map(bold);
   check(at >= 0 && neighbours.some((b) => b.startsWith('MCP')), 'static/spec-Agent-connectors-sits-beside-MCP',

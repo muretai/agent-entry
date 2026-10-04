@@ -3,6 +3,12 @@
 Releases before 1.12.0 are recorded in the commit history and in the README's "Since 1.x"
 paragraphs.
 
+## 1.14.0 — breaking CLI change (not yet published)
+
+Breaking CLI change.
+
+- removed: the third-party config converter; use init --scan or write agent-entry.json
+
 ## 1.13.0 — Agent Entry Suite S1 to S4: one declaration, verbs first, on the door and the page (2026-09-26)
 
 A site can now describe what a customer can do there in one declaration, `agent-entry.json`,
@@ -102,7 +108,7 @@ Choices made in the implementation, where the tests left room:
 
 ### Follow-ups (named, not built here)
 
-- Steps page action (`sodium.json` `interaction{steps}`).
+- Steps page action (a multi-step page action).
 - Negotiation on `quote` / `hold` (coordination turns, R9, after the pilot shop).
 - WordPress plugin and serverless templates render the same declaration.
 - Hosted no-code tier.
@@ -223,7 +229,7 @@ Choices made in the implementation, where the tests left room:
 
 #### Follow-ups (named, not built here)
 
-- `steps` page action (`sodium.json` `interaction{steps}`), with the page runtime executing it.
+- `steps` page action (a multi-step page action), with the page runtime executing it.
 - A `destroys` effect, if one is ever added to S1. `destructiveHint` must then cover it as well
   as `pays`.
 - A CSP note for sites that vendor the runtime. The page needs `script-src 'self'` for the
@@ -250,7 +256,7 @@ What landed, all inside `muretai-agent-entry.mjs` (still one file, still zero de
   `astro`, `vite` or `express`. It hands a static site to `agent-entry-serverless` and WordPress
   to `agent-entry-wordpress`. For a directly wired framework it:
   - mints the seed into `.env.local` (Next) or `.env` (the others), mode 0600;
-  - writes `agent-entry.json` from `OFFER_STARTERS[trade]`, or converts `--from sodium.json`;
+  - writes `agent-entry.json` from `OFFER_STARTERS[trade]`;
   - writes `.agents/skills/agent-entry/SKILL.md`, and `agent-entry.door.mjs`, a framework-free
     door module with a Web-standard handler and a Node/Connect one;
   - adds the framework glue: Next middleware, a Next pages API route plus rewrites, a Nitro
@@ -287,9 +293,9 @@ What landed, all inside `muretai-agent-entry.mjs` (still one file, still zero de
   - the `counts` shape, and a `fileSink` that carries no DID or text;
   - R6, loopback only;
   - the `gaSink` body limits.
-- Decision 5 (`init --from sodium.json`) is accepted as pinned, including the whole-file refusal
-  on an `interaction{steps}` tool. The field shapes follow the Sodium facts in the design record
-  (verified 2026-09-22). No Sodium package was downloaded to check them.
+- Decision 5 (the third-party config converter) is accepted as pinned, including the whole-file refusal
+  on a multi-step page action. The field shapes follow the design record
+  (verified 2026-09-22).
 - **`completed` for door-bound offers** means the door sent a signed reply whose status is final
   for that reply kind: `answered` (`facts`) and `continue_at_checkout` (`checkout`). A pending
   reply that is confirmed later is out of scope. The pinned page-only case stands:
@@ -318,8 +324,8 @@ Choices made in the implementation, where the tests left room:
   tag, and init lists the step under `manual`.
 - Next pages router: `POST /` reaches the API route through a rewrite matched on
   `Content-Type: application/json`, because rewrites cannot match a method.
-- `sodium.json` `destructive` maps to `effect: changes` with `ask: always`, and `confirmation:
-  none` adds no `ask`.
+- A destructive action in a converted config maps to `effect: changes` with `ask: always`, and
+  `confirmation: none` adds no `ask`.
 - In live mode, `doctor` knocks with the same key as `knock` (`AGENT_ENTRY_KNOCK_KEY`), so the
   shop sees one "doctor" account. The local knocks use a throwaway key in process.
 - `counts --serve` also refuses a request whose `Host` is not a loopback name (DNS rebinding),
@@ -332,7 +338,7 @@ Choices made in the implementation, where the tests left room:
 
 ### S3 follow-ups (named, not built here)
 
-- Verify `--from` against a real published `sodium.json`.
+- Verify the third-party config converter against a real published config file.
 - Offer `--from --skip-steps`, which converts the rest with a warning, once the `steps` action
   exists.
 - Reuse `conformance/receptor-check.mjs` in `doctor --url`. It is not reused yet: it posts probes

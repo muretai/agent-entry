@@ -466,9 +466,6 @@ file (`.env.local` for Next, `.env` otherwise), with mode 0600.
 - A static host is handed to `agent-entry-serverless`, and WordPress to `agent-entry-wordpress`.
   Those products keep the seed in the platform's own secret store, so `init` writes no seed for
   them.
-- `init --from sodium.json` follows §3.1. One tool with no v1 equivalent (`interaction{steps}`,
-  a `{path, when}` route, a non-scalar input type) refuses the whole file, naming the tool, and
-  writes nothing (AT-2's posture).
 
 **AT-23. `publish` never rewrites a version.** `publish` validates the declaration (a refusal
 names the field), compiles it, signs it with the site's seed, and writes three files under
@@ -542,33 +539,7 @@ refuses a missing id or secret and returns an observer.
 
 ## 3. Informative
 
-### 3.1 Mapping from `sodium.json`
-
-A `sodium.json` v1 file (Sodium, 2026-09) describes page tools only. It maps onto `page`
-bindings, and its `door` bindings are left empty:
-
-| `sodium.json` | `agent-entry.json` |
-|---|---|
-| `tools[].id` / `name` | `verb` + `of` (split at the first `_`; an unknown verb is kept and needs `effect`, AT-4) |
-| `description` | `about` |
-| `input` field map (`optional` flags) | `input` (types only; v1 has no optional marker) |
-| `on: [glob]` | `page.on` |
-| `run: navigate` | `page.do.open` |
-| `run: extract` | `page.do.read` |
-| `run: form` | `page.do.fill` |
-| `run: request` | `page.do.fetch` |
-| `run: call` | `page.do.call` |
-| `run: interaction{steps}` | no equivalent yet (the `steps` page action is a follow-up) |
-| `risk: read_only / reversible / state_changing / destructive / financial` | `effect: none / reversible / changes / changes / pays` |
-| `confirmation: none / recommended / required` | `ask: never / advised / always` (raise only) |
-| server-signed deploy receipt | the site's own `agenttools` envelope (AT-8); no third-party key |
-| `tool_*` telemetry names | the collector names (AT-14) |
-
-The converter is `init --from sodium.json` (AT-22). The field shapes it reads (`input: {f: {type,
-optional}}`, `run: {type, …}`) follow the Sodium facts recorded on 2026-09-22 and have not yet
-been checked against a real published `sodium.json`.
-
-### 3.2 Relation to commerce verbs elsewhere
+### 3.1 Relation to commerce verbs elsewhere
 
 UCP and the agent-commerce blueprints use `search_products → add_to_cart → checkout`. In this
 registry those are `find products`, `hold item` or `order …`, and `buy order`. `buy` is
@@ -619,7 +590,7 @@ countersigned deal attach later.
 | AT-19 | page runtime: same origin only |
 | AT-20 | page runtime: SPA resync and abort |
 | AT-21 | page runtime: count emission |
-| AT-22 | `init`: the seed slot git would never carry; `--from sodium.json` |
+| AT-22 | `init`: the seed slot git would never carry |
 | AT-23 | `publish`: immutable versions, refusals that write nothing |
 | AT-24 | `doctor`: local and live checks, one knock per door-bound offer, the AT-4 warning |
 | AT-25 | counts: `fileSink` privacy, `completed`, loopback-only `--serve` |

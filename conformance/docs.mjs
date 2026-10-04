@@ -356,7 +356,10 @@ await section('changelog', async () => {
   for (const n of ['S2', 'S3']) {
     check(sub.some((l) => new RegExp(`^### Suite ${n}\\b`).test(l)), `changelog/1.13.0-keeps-Suite-${n}`, '');
   }
-  check(headings.indexOf(h113[0]) === 0, 'changelog/1.13.0-is-the-newest-section', JSON.stringify(headings.slice(0, 2)));
+  check(/^## 1\.14\.0\b/.test(headings[0]) && /breaking CLI change/i.test(headings[0]),
+    'changelog/next-version-records-the-breaking-cli-change', headings[0] || '');
+  check(headings.indexOf(h113[0]) === 1, 'changelog/1.13.0-follows-the-next-version',
+    JSON.stringify(headings.slice(0, 2)));
 });
 
 // ---------------------------------------------------------------- verdict

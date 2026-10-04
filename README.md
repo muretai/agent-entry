@@ -383,8 +383,8 @@ the code that calls `handleRequest`, or in your logs.
 Honest limits. A range says whose **network** a request came from, not who sent it: a VPS on
 AWS is `aws`, and a crawler that moved is `null` until the lists catch up. Anthropic, Fly, Azure
 and Hetzner publish no list the helper can fetch, so they are named only if you add their ranges
-yourself. `country` exists only where Cloudflare adds `CF-IPCountry`. An agent that drives a
-stealth browser on a person's own login — the Instinct class — shows as `stealth-agent`, with
+yourself. `country` exists only where Cloudflare adds `CF-IPCountry`. An assistant driving a
+stealth browser on the person's own login shows as `stealth-agent`, with
 at most a hosting vendor; it becomes a name only when it knocks with a DID.
 
 One rule holds this together, enforced by the contract suite rather than promised:
@@ -467,7 +467,7 @@ npx @muretai/agent-entry init --trade retail --base-url https://shop.example.com
 `agent-entry init` detects the framework (Next.js app or pages router, Nuxt, SvelteKit, Astro,
 Vite, Express), mints your site's seed into `.env.local` or `.env` (mode `0600`, checked to be
 git-ignored, never printed), writes a starter `agent-entry.json` for your trade (`restaurant`,
-`retail`, `clinic` or `repair`; or `--from sodium.json` to convert a Sodium config), and wires the
+`retail`, `clinic` or `repair`), and wires the
 door's routes, the three signposts and the page tag. It never replaces a file you already have:
 a step it cannot do safely is listed under `manual`. A static host is sent to
 [agent-entry-serverless](https://github.com/muretai/agent-entry-serverless) and WordPress to
@@ -742,7 +742,7 @@ Register with the Woo Catalog: `POST <catalog origin>/catalog/register` with you
 
 These are deliberately small request desks, not scheduling systems: replace each responder's
 `pending_*_confirmation` result with the business's own availability and confirmation write.
-Instinct, Muse, Grok Bot, Claude Code, OpenClaw, Hermes, or any other runtime that can hold an
+A consumer assistant, a coding agent, an agent runtime, or any other runtime that can hold an
 Ed25519 key can read the card and use the same signed POST.
 
 ### What `baseUrl` may be

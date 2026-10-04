@@ -4,7 +4,7 @@
 //
 // WRITTEN BEFORE THE IMPLEMENTATION (test-first pair). The authority is the owner-approved
 // design (`agent-entry-suite-design.md` sections 4 and 5) and spec/tools-v1.md (AT-4 for the
-// doctor warning, AT-10 for immutable versions, 3.1 for the sodium.json mapping), not the
+// doctor warning and AT-10 for immutable versions), not the
 // implementer. S1's API is used as landed and never redefined here.
 //
 // THE SUITE NEVER DIALS OUT. Every CLI child runs with fixtures/cli/loopback-only.mjs preloaded,
@@ -18,7 +18,7 @@
 //   exit status   0 = done / every hard check passed, 1 = refused or a check FAILed, 2 = misuse.
 //   --json        stdout is exactly one JSON document and nothing else.
 //   seed slot     `AGENT_ENTRY_SEED_HEX=<64 hex>` in a file git ignores (the examples' name).
-//   init [--from sodium.json] [--trade restaurant|retail|clinic|repair] [--name N] [--base-url U] [--json]
+//   init [--trade restaurant|retail|clinic|repair] [--name N] [--base-url U] [--json]
 //                 -> { framework, trade, did, seed: { path } | null, route?, wrote: [paths] }
 //                 framework in next-app | next-pages | nuxt | sveltekit | astro | vite | express
 //                 | static (route "agent-entry-serverless") | wordpress (route "agent-entry-wordpress").
@@ -97,7 +97,6 @@ const FIX = join(HERE, 'fixtures', 'cli');
 const GUARD = join(FIX, 'loopback-only.mjs');
 const readJson = (p) => JSON.parse(readFileSync(p, 'utf8'));
 const TREES = readJson(join(FIX, 'frameworks.json'));
-const SODIUM_EXPECTED = readJson(join(FIX, 'sodium-offers.expected.json'));
 const DECL_V1 = readJson(join(FIX, 'declaration-v1.json'));
 const DECL_V1_CHANGED = readJson(join(FIX, 'declaration-v1-changed.json'));
 const DOCTOR = readJson(join(FIX, 'doctor-declaration.json'));
@@ -438,42 +437,6 @@ await section('r1', async () => {
       }
     }
   }
-});
-
-// ---------------------------------------------------------------- 3. init --from sodium.json
-
-await section('from-sodium', async () => {
-  const label = 'from-sodium';
-  const dir = makeRepo('vite', { extra: { 'sodium.json': readFileSync(join(FIX, 'sodium.json'), 'utf8') } });
-  const run = await runCli(['init', '--json', '--from', 'sodium.json', '--base-url', 'https://shop.example'], { cwd: dir });
-  guardClean(label, run);
-  if (check(run.code === 0, `${label}/exit-0`, `exit ${run.code}: ${run.stderr}`)) {
-    let decl = null;
-    try { decl = JSON.parse(readFileSync(join(dir, 'agent-entry.json'), 'utf8')); } catch { /* below */ }
-    if (check(decl !== null, `${label}/writes-agent-entry.json`)) {
-      try { validateDeclaration(decl); passed += 1; } catch (e) { check(false, `${label}/declaration-validates`, e.message); }
-      check(decl.entry?.name === SODIUM_EXPECTED.entry_name && decl.entry?.baseUrl === 'https://shop.example',
-        `${label}/entry-from-app-name`, JSON.stringify(decl.entry));
-      check(JSON.stringify(decl.offers) === JSON.stringify(SODIUM_EXPECTED.offers), `${label}/offers-exactly-mapped`,
-        JSON.stringify(decl.offers));
-      check(Array.isArray(decl.offers) && decl.offers.every((o) => !Object.hasOwn(o, 'door') && o.page),
-        `${label}/page-filled-door-left-empty`);
-    }
-  }
-
-  // A tool with no v1 equivalent (interaction steps) refuses the whole file, naming the tool.
-  const sodium = readJson(join(FIX, 'sodium.json'));
-  sodium.tools.push({ id: 'compare_lamps', name: 'compare_lamps', description: 'Compare two lamps.',
-    input: {}, on: ['/shop/**'], run: { type: 'interaction', steps: [{ click: '#compare' }] }, risk: 'read_only' });
-  const dir2 = makeRepo('vite', { extra: { 'sodium.json': `${JSON.stringify(sodium, null, 2)}\n` } });
-  const refused = await runCli(['init', '--json', '--from', 'sodium.json', '--base-url', 'https://shop.example'], { cwd: dir2 });
-  guardClean(`${label}/steps`, refused);
-  check(refused.code === 1, `${label}/steps-refused-exit-1`, `exit ${refused.code}`);
-  check(refused.stderr.includes('compare_lamps'), `${label}/steps-refusal-names-the-tool`, refused.stderr.slice(0, 300));
-  check(!existsSync(join(dir2, 'agent-entry.json')), `${label}/steps-refusal-writes-no-partial-declaration`);
-
-  const missing = await runCli(['init', '--json', '--from', 'nope.json'], { cwd: makeRepo('vite') });
-  check(missing.code === 1 || missing.code === 2, `${label}/missing-file-refused`, `exit ${missing.code}`);
 });
 
 // ---------------------------------------------------------------- 4. publish / deploy, R3
