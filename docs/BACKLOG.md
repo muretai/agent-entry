@@ -97,6 +97,22 @@ Rules for this section: one observer row, many destinations; every sink is an ad
 - P2 segmentSink: Segment HTTP Tracking API (`/v1/track`, write key), anonymousId random per sink, properties = allowlisted fields; Segment then fans out to whatever the site has wired there, which covers the long tail of services. [none]
 - P2 README "Counting visits" becomes a table of destinations (own DB, file, GA, PostHog, Plausible, Matomo, Mixpanel, Amplitude, Segment, any endpoint), each row: what is sent, what is never sent, the one-line setup, and the custom dimensions or properties to register; written only for sinks that have landed and been tested. [none] [after P1 compose sinks]
 
+### 0d. A strict superset of Sodium (owner 2026-10-04; design record ~/.cache/muretai-herd/coordinator/briefs/agent-entry-sodium-superset-and-site-fde.md)
+
+Sodium (read 2026-10-04): init detects the framework and wires its SDK, tools are declared by hand in sodium.json, deploy
+is signed and versioned, doctor checks config, the dashboard shows calls, success rate, P95 latency and answer-engine
+referrals. Every row below closes one Sodium row Agent Entry lacks; the differentiation (door, DIDs, accounts, receipts,
+claim, identification) is already ours. The Site FDE (an LLM service that integrates and maintains this for a business)
+is PRODUCT and lives in trunk by the boundary rule; the OSS items here are its tools.
+
+- P1 init --scan discovers the site's existing features: crawl public same-origin pages (robots.txt first, sitemap when present, bounded pages and bytes), read forms, search forms and SearchAction, Product/Offer JSON-LD, add-to-cart, known booking widgets, contact forms and order lookup from markup, map each to a registry verb and a page action, and write agent-entry.draft.json with every offer `review: true` and its evidence (page, selector, fields); `init --accept <id>` adopts an offer; nothing is published from a draft; deterministic heuristics, no model, pinned on recorded fixture sites. [none] [skeleton]
+- P1 init detects the framework and wires the page runtime: Next.js, Nuxt, SvelteKit, Astro, Angular, Vite, plain HTML and WordPress are detected from the project files and get the runtime wired (script tag, layout component or plugin hook) with a printed diff before any write; an unknown project gets the one-line snippet. [none] [skeleton]
+- P1 doctor in a real browser: `doctor --browser` loads each page an offer lives on in a headless browser (an optional peer, never a dependency), checks the page runtime registered every offer as a WebMCP tool, and calls each one as an agent would (read-only ones for real, changing ones up to the ask floor), reporting per tool. [none] [skeleton]
+- P1 counts per tool: success rate, P95 latency, sessions per day, from the AT-14 events the runtime already sends (`ms`, offer_succeeded / offer_failed, session); the same numbers Sodium's dashboard shows, on the shop's own machine. [none] [after P1 FRAME Analytics-1 counts coverage header and who in three tiers]
+- P1 coding-agent skill: an Agent Skill (and an MCP server exposing the same verbs) that lets Claude Code, Cursor or Codex read the app, edit agent-entry.json, run init --scan / doctor, and publish, so "ask your AI to update the config" works with any coding agent; shipped in this package, versioned with it. [none]
+- P2 rollback and diff: `publish --rollback <version>` re-signs a prior contract as the newest version, `publish --withdraw <version>` serves 410 for it, `publish --diff` prints what changes before signing. [none]
+- P1 steps page action moves up from P2 to P1 (multi-step interactions are a Sodium row); see the polish line. [none] [after P0 FRAME TEST the one test that walks the thin line]
+
 ### 1. Polish (each waits for its frame member; filed only when the frame test is green)
 
 - P2 OSS boundary document: docs/OSS_BOUNDARY.md states the line in one table (OSS here: door, spec, conformance, declaration and Woo generator, one-file plugin, decide / track / receipts, local counts, fileSink and gaSink, knock and the visitor skill; product in trunk: Catalog, Claim Desk, hosted door, hosted ledger and dashboards, answering AI, billing), the rule that no Muretai-specific name is hard-coded in the OSS door, and when a separate product repository is cut; README links it from "What this is part of". [20261004T132749Z] [solo]
@@ -145,6 +161,7 @@ Rules for this section: one observer row, many destinations; every sink is an ad
 
 ## Dependencies on other repositories (tracked there, named here)
 
+- product (trunk), proposed 2026-10-04, owner decision pending: the Site FDE, an LLM service Muretai runs that audits a site (init --scan --render plus a model), proposes offers with evidence, integrates by PR / WordPress plugin config / tag snippet (never holds production credentials, never deploys), proves it with doctor --browser, re-scans nightly and opens fix PRs, and proposes new offers from counts. Design: briefs/agent-entry-sodium-superset-and-site-fde.md.
 - trunk FRAME Hosted-1 [20261003T131712Z]: the hosted shop door takes an agent-entry.json declaration and answers find / ask /
   hold with the Suite's default replies (today it has none: free text by the brain). Without it a claimed shop that installs
   nothing has no answering surface.
