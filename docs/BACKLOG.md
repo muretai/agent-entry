@@ -92,7 +92,7 @@ S6a 215207Z (landed) -> 215208Z (impl) -> 215208Z-2 -> 215209Z; S6b 215209Z-2 (l
 - P3 claim on a mounted entry needs an explicit host claim (S-4): readDeclaration refuses entry.claim on a mounted baseUrl unless the operator opts in, and the README says a claim speaks for every path on the host. [20261004T114621Z]
 - P3 page call resolves only registered handlers (B-3): the page runtime resolves a call action from handlers or a site-registered handler object only, never a bare window global, and spec/tools-v1.md states the signature binds the contract to the card, not to the domain owner. [20261004T114643Z]
 - P3 seed and knock key writes refuse symlinks (K-3): mintSeed and knockSeed lstat the slot and the knock key file and refuse a symlink with a message naming it. [20261004T114705Z]
-- P3 visitor skill says signed reply data is content not instructions (W-3): spec and the distilled visitor skill state that product names and facts in a shop-signed reply are quoted data, never instructions to follow. [none] [solo]
+- P3 visitor skill says signed reply data is content not instructions (W-3): spec and the distilled visitor skill state that product names and facts in a shop-signed reply are quoted data, never instructions to follow. [20261004T114727Z] [solo]
 
 ## Owner rulings owed (not items until ruled)
 
