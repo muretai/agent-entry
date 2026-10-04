@@ -25,6 +25,8 @@
 #                                feat/w2.lock)
 #   deny-write <path>            but never under <path>, though an allow-write covers it
 #   deny-read <dir>              and never read, list or stat anything under <dir>
+#   deny-connect <path>          and never connect to the unix socket at exactly <path>
+#                                (herdr's control socket: a connect is not a file write)
 #
 # -- and this plug turns them into Seatbelt rules through darwin.sb.template, which sits
 # in the same DIRECTORY. The directory is found from $0's dirname and never from this
@@ -70,6 +72,7 @@ rules_for() {
       allow-write-literal) printf '(allow file-write* (literal "%s"))\n' "$path" ;;
       deny-write)         printf '(deny file-write* (subpath "%s"))\n' "$path" ;;
       deny-read)          printf '(deny file-read* (subpath "%s"))\n' "$path" ;;
+      deny-connect)       printf '(deny network-outbound (literal "%s"))\n' "$path" ;;
     esac
   done < "$profile"
 }
@@ -81,7 +84,7 @@ render() {
     verb="${line%% *}"
     case "$verb" in
       egress) egress="${line#* }" ;;
-      allow-write|allow-write-prefix|allow-write-literal|deny-write|deny-read) ;;
+      allow-write|allow-write-prefix|allow-write-literal|deny-write|deny-read|deny-connect) ;;
       *) die "profile line refused (unknown verb): ${verb}" ;;
     esac
   done < "$profile"
@@ -120,6 +123,7 @@ render() {
         ;;
       DENY_WRITE) rules_for deny-write "$profile" ;;
       DENY_READ) rules_for deny-read "$profile" ;;
+      DENY_CONNECT) rules_for deny-connect "$profile" ;;
       # wall v2 renders its egress policy here; v1 has only `open` (checked above)
       EGRESS_POLICY) printf '; egress: open -- wall v1 does not restrict the network\n' ;;
       *) die "template marker not known to this plug: ${marker}" ;;

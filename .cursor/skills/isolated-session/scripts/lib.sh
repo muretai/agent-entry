@@ -172,35 +172,66 @@ PY
 # its trailing newline and any surrounding spaces or tabs stripped, and 0 -- only when the
 # path is a REGULAR file (not a symlink) of this user's whose mode has no group or world
 # bit, holding one line of printable, space-free ASCII (the stripping is of that one line:
-# a second line, even an empty one, still refuses). Anything else prints nothing and returns 1, exactly like an
-# absent file: the caller falls back to the shared login and never says why, so no
-# message can carry the value. The value is never written to a file by this function.
+# a second line, even an empty one, still refuses). Anything else prints nothing and
+# returns 1, exactly like an absent file: the caller falls back to the shared login, and
+# no message here can carry the value. The value is never written to a file by this
+# function.
 iso_herd_oauth_token() {
+  iso_herd_oauth_token_read plain
+}
+
+# The same judgment, said on stdout as one line, for a caller that names a rejection:
+# `honored <token>`, or `rejected <why>` for a file present but rejected -- why is one of
+# mode, owner, symlink, charset, size, a fixed word that never carries the value -- or
+# nothing for an absent, empty, whitespace-only, unreadable or otherwise non-regular
+# file. Read the stdout, not the status: everything rides the one python run whose argv
+# names the token path (the owner check included), and only its stdout is the answer.
+iso_herd_oauth_token_judged() {
+  iso_herd_oauth_token_read judged
+}
+
+iso_herd_oauth_token_read() {
   [[ -n "${HOME:-}" ]] || return 1
-  python3 -I - "${HOME}/.muretai/herd/oauth-token" <<'PY'
+  python3 -I - "${HOME}/.muretai/herd/oauth-token" "$1" <<'PY'
 import os, stat, sys
-p = sys.argv[1]
+p, mode = sys.argv[1], sys.argv[2]
+
+
+def refuse(why=""):
+    if why and mode == "judged":
+        sys.stdout.write("rejected " + why + "\n")
+    sys.exit(1)
+
+
 try:
     st = os.lstat(p)
-    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
-        sys.exit(1)
+    if stat.S_ISLNK(st.st_mode):
+        refuse("symlink")
+    if not stat.S_ISREG(st.st_mode):
+        refuse()
+    if st.st_uid != os.getuid():
+        refuse("owner")
+    if st.st_mode & 0o077:
+        refuse("mode")
     fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         data = os.read(fd, 4097)
     finally:
         os.close(fd)
 except OSError:
-    sys.exit(1)
+    refuse()
+if not data.strip():
+    refuse()
 if len(data) > 4096:
-    sys.exit(1)
+    refuse("size")
 if data.endswith(b"\n"):
     data = data[:-1]
 if data.endswith(b"\r"):
     data = data[:-1]
 data = data.strip(b" \t")
 if not data or any(b < 0x21 or b > 0x7e for b in data):
-    sys.exit(1)
-sys.stdout.write(data.decode("ascii"))
+    refuse("charset")
+sys.stdout.write(("honored " if mode == "judged" else "") + data.decode("ascii"))
 PY
 }
 

@@ -14,6 +14,8 @@ Bash runs one command per call. Never chain with `&&` or `;`. Read exit codes fr
 
 To run a test file (to see it red), the one spelling your rules allow is `python3 -I tests/<file>.py`, run as its own command, with no pipe, redirect, `tail` or `head` after it.
 
+For JavaScript tests (a `.mjs` file under conformance/ or tests/) the spelling is not a bare node run, which your rules deny, but `bash .cursor/skills/isolated-session/scripts/run-node.sh conformance/<file>.mjs` (or the same with `tests/<file>.mjs`): one path, nothing after it, run as its own command. A syntax check is `node --check <file>`, with a relative path inside the worktree. The verifier cannot run a JavaScript test itself, so a report that says a JavaScript TEST_PATHS entry was not run is refused: run it before you report.
+
 If the permission harness denies that run (a denial, not a test failure), do not retry it and do not respell the command. Commit the tests as usual, then write {{REPORT}} with the usual COMMIT= and TEST_PATHS= lines plus this sentence, verbatim, at the start of a line: `Tests not run locally: the harness denied the run; expected red`. Then finish: you still do not implement, and you still do not run `finish-worktree.sh`.
 
 A fixture line that sets a guard variable sec_lint watches (HERD_SPAWN_BIN, for example) trips sec_lint's guard-override refusal on your commit, and no later commit can clear that refusal: the commit stays in the branch's history. So such a line carries, in the same commit, this trailing comment, with the reason after the double dash: `# sec-lint: allow guard-override -- <reason>` (the form tests/test_appl_gate_tools.py:259 uses).

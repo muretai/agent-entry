@@ -151,6 +151,15 @@
 # logged `<UTC time> nudged <w>` in coordinator.log; the pass that nudges closes nothing and
 # restarts that worker's idle count.
 #
+# The resubmit (every pass). Text the watcher itself typed -- a notification or an `intake
+# <path>` at the --notify pane, CONTINUE or a re-sent spawn line at a worker -- can sit
+# unsubmitted in the prompt bar (a background shell running, a banner) while herdr reports
+# success. Each typed text is recorded (.watch/<w>.typed, the newest per pane); the next pass
+# that reads that pane consumes the record and, when the LAST prompt line is exactly that
+# text and the pane is at no dialog, presses ONE Enter, logged `<UTC time> resubmitted <w>`
+# in coordinator.log. Any other bar gets nothing. Never a second Enter for one text, and
+# nothing read from a pane is ever typed.
+#
 # Stuck spawns (every pass whose listings answered, before the sweep). A spawned worker once
 # sat at its runtime's folder-trust dialog for 16 hours: herd-spawn.sh had removed its
 # brief.md, no report came, the idle sweep never fires on a `blocked` pane, and the slot
@@ -168,11 +177,17 @@
 #
 # The backlog pull (every pass whose agent listing answered, last). When a slot is free --
 # the listing's rows other than the coordinator pane are fewer than the one number in
-# <HERD_DIR>/coordinator/worker-cap -- the pass runs appl-backlog-pull.sh ONCE with --repo
-# $APPL_BACKLOG_REPO (an absolute path; else this checkout), through appl-hook.sh's seam
-# APPL_BACKLOG_PULL. So an idea in the backlog inbox (tools/appl-backlog-add.sh) is filed
-# without waiting for a landing. No listing, no readable cap, no free slot, or a logged-out
-# --notify target: not run. The pull's output never reaches this pass's stdout.
+# <HERD_DIR>/coordinator/worker-cap -- the pass runs appl-backlog-pull.sh, through
+# appl-hook.sh's seam APPL_BACKLOG_PULL, once per repo in the dispatch repos ($DISPATCH_DIR/
+# repos, default ~/.muretai/dispatch/repos; `<name>=<absolute path>` lines) that has a
+# docs/BACKLOG.md or a <HERD_DIR>/coordinator/backlog/<name>/inbox directory, in file order,
+# stopping at the first pull that files (exit 0, the intake's path on stdout). A pull that
+# exits non-zero is skipped and logged `<UTC time> backlog-pull-refused <name>` in
+# coordinator.log; its output is never read. $APPL_BACKLOG_REPO (an absolute path) restricts
+# the pass to that one repo, no fallback. So an idea in a backlog inbox
+# (tools/appl-backlog-add.sh) is filed without waiting for a landing. No listing, no
+# readable cap, no free slot, or a logged-out --notify target: not run. The pull's output
+# never reaches this pass's stdout.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 export HERD_WATCH_HERE="$here"
@@ -546,7 +561,8 @@ def emit(line):
     print(line, flush=True)
     target = os.environ.get("HERD_WATCH_NOTIFY", "")
     if target and NAME_RE.fullmatch(target) and line.startswith(NOTIFIED) and not TARGET_OUT:
-        herdr("agent", "prompt", target, line, timeout=30)      # a down pane is not our failure
+        if herdr("agent", "prompt", target, line, timeout=30)[0] == 0:   # a down pane is not our failure
+            typed(os.path.join(herd_dir(), ".watch"), target, line)
 
 
 def herdr(*args, timeout=60):
@@ -804,6 +820,8 @@ def resume(w, tab, agent, pane, herd, watch, now):
             herdr("agent", "wait", w, "--until", "idle", "--timeout", "120000", timeout=180)
     if ok:
         ok = herdr("agent", "prompt", w, CONTINUE)[0] == 0
+        if ok:
+            typed(watch, w, CONTINUE)
     detail(watch, w, "RESUME attempt %d (%s%s): %s" % (count + 1, "restart" if restart else "prompt",
                                                       ", " + phrase if phrase else "", "ok" if ok else "failed"))
     if ok:
@@ -1029,6 +1047,7 @@ def intake_watchdog(agents, herd, watch, now):
             continue                                   # typed inside this grace period already
         if herdr("agent", "prompt", target, "intake " + path, timeout=30)[0] != 0:
             continue                                   # the pane is down: try again next pass
+        typed(watch, target, "intake " + path)
         kept[name] = {"mtime": mtime, "at": now}
         log_reprompt(coord, name, now)
     if kept != state:
@@ -1127,6 +1146,7 @@ def check_target(herd, watch, now):
                     os.unlink(step)
             except OSError:
                 pass
+        resubmit(target, pane, herd, watch, now)       # this pane read, before anything is typed
         return
     TARGET_OUT = True
     if os.path.lexists(state):
@@ -1583,10 +1603,11 @@ def backlog_pull(agents, herd):
     pull's own name for it -- or one whose tokens.muretai_agent is dispatch-mac-a); the cap is the one number in <HERD_DIR>/coordinator/worker-cap, the
     pull's own source. A failed listing, no readable cap, or live >= cap: the pull is not
     run. The seam is appl-hook.sh's, APPL_BACKLOG_PULL (an executable run in place of
-    `bash <scripts>/appl-backlog-pull.sh`); --repo is $APPL_BACKLOG_REPO when it is an
-    absolute path, else the checkout this script lives in. The pull counts again under its
-    own lock and files at most one intake; its output and exit never reach this pass's
-    stdout (fixed vocabulary only)."""
+    `bash <scripts>/appl-backlog-pull.sh`). --repo is $APPL_BACKLOG_REPO alone when it is an
+    absolute path (no fallback); else each dispatch repo with a backlog or an inbox
+    (backlog_repos), in file order, stopping at the first pull that files. The pull counts
+    again under its own lock and files at most one intake; its output never reaches this
+    pass's stdout (fixed vocabulary only)."""
     if agents is None or TARGET_OUT:
         return                                         # logged out: appl-add would type into it
     coord = os.path.join(herd, "coordinator")
@@ -1613,16 +1634,67 @@ def backlog_pull(agents, herd):
     if sum(1 for a in agents if not coordinator(a)) >= int(text):
         return
     here = os.environ.get("HERD_WATCH_HERE", "")
-    repo = os.environ.get("APPL_BACKLOG_REPO", "")
-    if not repo.startswith("/"):
-        repo = os.path.normpath(os.path.join(here, "..", "..", "..", ".."))
     exe = os.environ.get("APPL_BACKLOG_PULL", "")
     argv = [exe] if exe else ["bash", os.path.join(here, "appl-backlog-pull.sh")]
+    repo = os.environ.get("APPL_BACKLOG_REPO", "")
+    if repo.startswith("/"):
+        pull_one(argv, repo, None, herd, coord)          # the override: that repo, no fallback
+        return
+    for name, path in backlog_repos(coord):
+        if pull_one(argv, path, name, herd, coord):
+            return                                     # one intake per pass
+
+
+REPO_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def backlog_repos(coord):
+    """(name, path) per `<name>=<absolute path>` line of the dispatch repos ($DISPATCH_DIR/repos,
+    default ~/.muretai/dispatch/repos), in file order, first spelling of a name wins; comments,
+    relative paths and names outside REPO_NAME_RE are skipped. Kept: a repo with a
+    docs/BACKLOG.md or an existing <coord>/backlog/<name>/inbox directory."""
+    d = os.environ.get("DISPATCH_DIR") or os.path.join(HOME, ".muretai", "dispatch")
     try:
-        subprocess.run(argv + ["--repo", repo], env=dict(os.environ, HERD_DIR=herd),
-                       stdin=subprocess.DEVNULL, capture_output=True, timeout=180)
+        fd = os.open(os.path.join(d, "repos"), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return []
+    try:
+        data = os.read(fd, 1 << 16).decode("utf-8", "replace")
+    except OSError:
+        return []
+    finally:
+        os.close(fd)
+    out, seen = [], set()
+    for line in data.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, sep, path = line.partition("=")
+        name, path = name.strip(), path.strip()
+        if not sep or not path.startswith("/") or not REPO_NAME_RE.fullmatch(name) or name in seen:
+            continue
+        seen.add(name)
+        path = os.path.normpath(path)
+        if (os.path.isfile(os.path.join(path, "docs", "BACKLOG.md"))
+                or os.path.isdir(os.path.join(coord, "backlog", name, "inbox"))):
+            out.append((name, path))
+    return out
+
+
+def pull_one(argv, repo, name, herd, coord):
+    """run the pull for one repo; True when it filed (exit 0 and the intake's path on stdout).
+    A non-zero exit is `<UTC time> backlog-pull-refused <name>` in coordinator.log (for a
+    listed repo); its output is never read, logged or echoed."""
+    try:
+        r = subprocess.run(argv + ["--repo", repo], env=dict(os.environ, HERD_DIR=herd),
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=180)
     except (OSError, subprocess.SubprocessError):
-        pass
+        return False
+    if r.returncode != 0:
+        if name is not None:
+            log_reprompt(coord, name, clock(), "backlog-pull-refused")
+        return False
+    return bool(r.stdout.strip())
 
 
 # ------------------------------------------------------------------ the stall nudge
@@ -1640,9 +1712,8 @@ def spawn_line(herd, w):
             + os.path.join(wdir, "report.md") + ".")
 
 
-def prompt_shape(pane, line):
-    """'typed' when the pane's LAST prompt line is exactly line, 'empty' when it shows the
-    runtime's placeholder, else None -- herd-spawn.sh's stall_shape, in the same words"""
+def last_prompt_row(pane):
+    """what the pane's LAST prompt line holds (escapes dropped, stripped), or None"""
     text = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?", "", pane)
     text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b.", "", text)
     last = None
@@ -1650,6 +1721,13 @@ def prompt_shape(pane, line):
         m = PROMPT_ROW_RE.fullmatch(row)
         if m:
             last = (m.group(1) or "").strip()
+    return last
+
+
+def prompt_shape(pane, line):
+    """'typed' when the pane's LAST prompt line is exactly line, 'empty' when it shows the
+    runtime's placeholder, else None -- herd-spawn.sh's stall_shape, in the same words"""
+    last = last_prompt_row(pane)
     if last is None:
         return None
     if last == line:
@@ -1701,6 +1779,45 @@ def nudge(w, agent, tab, pane, herd, watch, now):
             except OSError:
                 pass
         log_reprompt(coord, w, now, "nudged")
+    if shape != "typed" and ok:
+        typed(watch, w, line)
+    return True
+
+
+# ------------------------------------------------------------------ the resubmit
+
+def typed(watch, w, text):
+    """Record the text this watcher just typed into w's pane (.watch/<w>.typed), so a later
+    pass can see whether it was submitted. One text per pane: the newest replaces the older."""
+    put_state(os.path.join(watch, w + ".typed"), {"text": text})
+
+
+def resubmit(w, pane, herd, watch, now):
+    """A text the watcher typed (a notification or an `intake <path>` at the --notify pane,
+    CONTINUE or a re-sent spawn line at a worker) can sit UNSUBMITTED in the prompt bar when
+    the pane runs a background shell or shows a banner, and herdr raises no stall for it. On
+    the next pass that reads the pane, the record is consumed: when the LAST prompt line is
+    exactly that text (and the pane is at no dialog its adapter names), ONE Enter and
+    `<UTC time> resubmitted <w>` in coordinator.log. Any other bar -- empty, a prefix, more
+    text, a draft -- gets nothing and the record is gone, so one text is never pressed twice.
+    The only key is Enter; nothing read from the pane is typed. True when it pressed."""
+    state, spath = sweep_state(watch, w, "typed")
+    text = state.get("text")
+    if not isinstance(text, str) or not text or not (pane or "").strip():
+        return False                                   # nothing typed, or no proof either way
+    drop_state(spath)                                  # one look per text, before the key
+    if last_prompt_row(pane) != text or dialog_kind(pane) is not None:
+        return False
+    ok = herdr("agent", "send-keys", w, "enter")[0] == 0
+    detail(watch, w, "RESUBMIT enter: %s" % ("ok" if ok else "failed"))
+    coord = os.path.join(herd, "coordinator")
+    if not os.path.islink(coord):
+        if not os.path.isdir(coord):
+            try:
+                os.mkdir(coord, 0o700)
+            except OSError:
+                pass
+        log_reprompt(coord, w, now, "resubmitted")
     return True
 
 
@@ -1775,6 +1892,7 @@ def main_once():
             continue
         pane = panes[w] = read[w] if w in read else read_pane(w)
         stuck(w, pane, watch)
+        resubmit(w, pane, herd, watch, now)            # a text an earlier pass typed, still in the bar
         if tabs is None or agents is None or has_report:
             continue
         if nudge(w, agent, tab, pane, herd, watch, now):

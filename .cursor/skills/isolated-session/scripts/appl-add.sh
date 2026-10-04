@@ -7,7 +7,7 @@
 #
 #   tools/appl-add.sh "<task>" [--from <harness:session>] [--repo <path>] [--branch <b>]
 #                     [--mail-id <digits>] [--mail-at <time>] [--mail-did <did>]
-#                     [--status new|question] [--solo]
+#                     [--status new|question] [--solo] [--mac A|B]
 #   tools/appl-add.sh -- "<task>" [options...]
 #
 # The task is the FIRST argument. When it may itself begin with `-` (a peer's mail body
@@ -31,6 +31,12 @@
 # --solo marks the item as a solo (records/config only, no test-author/implementer pair):
 # the header gets the line `solo: yes`. Without it there is no `solo:` line at all.
 # appl-backlog-pull.sh passes it for a `[solo]` line of docs/BACKLOG.md.
+#
+# --mac A|B names the Mac the item is meant to run on: the header gets the line
+# `mac: <A|B>`. Without it there is no `mac:` line at all. Any other value (lowercase,
+# empty, another word, a line break) is exit 2 with nothing written. appl-backlog-pull.sh
+# passes `--mac B` for a `## Next` line whose last tag is `[macB]`; appl-hook.sh mails a
+# `mac: B` intake to Mac B's coordinator instead of briefing it on Mac A.
 #
 # Writes $HERD_DIR/coordinator/intake/<YYYYMMDDTHHMMSSZ>-<slug>.md (HERD_DIR defaults to
 # ~/.cache/muretai-herd; intake/ is created when absent), prints that absolute path as
@@ -80,7 +86,7 @@ COORD_AGENT="dispatch-mac-a"
 START_LINE='bash .cursor/skills/isolated-session/scripts/herd-spawn.sh muretai-coordinator .cursor/skills/isolated-session/briefs/coordinator.md --profile coordinator --muretai-agent dispatch-mac-a --cwd ~/muretai-trunk'
 
 usage() {
-  echo "usage: appl-add.sh [--] \"<task in one or more sentences>\" [--from <harness:session>] [--repo <path>] [--branch <branch>] [--mail-id <digits>] [--mail-at <time>] [--mail-did <did>] [--status new|question] [--solo]" >&2
+  echo "usage: appl-add.sh [--] \"<task in one or more sentences>\" [--from <harness:session>] [--repo <path>] [--branch <branch>] [--mail-id <digits>] [--mail-at <time>] [--mail-did <did>] [--status new|question] [--solo] [--mac A|B]" >&2
   exit 2
 }
 
@@ -108,13 +114,14 @@ mail_at=""
 mail_did=""
 status="new"
 solo=0
+mac=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --solo)
       solo=1
       shift
       ;;
-    --from|--repo|--branch|--mail-id|--mail-at|--mail-did|--status)
+    --from|--repo|--branch|--mail-id|--mail-at|--mail-did|--status|--mac)
       [ $# -ge 2 ] || usage
       case "$1" in
         --from) from=$2 ;;
@@ -144,6 +151,12 @@ while [ $# -gt 0 ]; do
           case "$2" in
             new|question) status=$2 ;;
             *) echo "appl-add: --status takes new or question" >&2; usage ;;
+          esac
+          ;;
+        --mac)
+          case "$2" in
+            A|B) mac=$2 ;;
+            *) echo "appl-add: --mac takes A or B" >&2; usage ;;
           esac
           ;;
       esac
@@ -239,6 +252,7 @@ write_intake() {  # $1 path; fails when it already exists
       printf 'branch: %s\n' "$(oneline "$branch")"
       printf 'status: %s\n' "$status"
       [ "$solo" != "1" ] || printf 'solo: yes\n'
+      [ -z "$mac" ] || printf 'mac: %s\n' "$mac"
       [ -z "$mail_id" ] || printf 'mail-id: %s\n' "$mail_id"
       [ -z "$mail_did" ] || printf 'mail-did: %s\n' "$mail_did"
       [ -z "$mail_at" ] || printf 'mail-at: %s\n' "$(oneline "$mail_at")"

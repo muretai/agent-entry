@@ -17,6 +17,8 @@ Do these steps in this order. Do not skip or reorder them.
 
 Bash runs one command per call. Never chain with `&&` or `;`. Read exit codes from the tool result.
 
+For JavaScript tests (a `.mjs` file under conformance/ or tests/) the spelling is not a bare node run, which your rules deny, but `bash .cursor/skills/isolated-session/scripts/run-node.sh conformance/<file>.mjs` (or the same with `tests/<file>.mjs`): one path, nothing after it, run as its own command. A syntax check is `node --check <file>`, with a relative path inside the worktree.
+
 If you rewrite your branch with a cherry-pick sequence, end that sequence with `git cherry-pick --quit`, so no sequencer state is left behind for the next session. Files under .git are never removed by hand; if the sequencer state will not clear, stop and report.
 
 Rules: never push. Never run git commit/merge/switch/checkout/rebase in the primary checkout. Never use `--no-verify`, `-c core.hooksPath=`, or any `ISOLATED_SESSION_*` override. Do not edit tools/test_times.json or tools/units.json. Implementers do not edit docs/BACKLOG.md: the backlog pull's own records commit moves its lines. Do not run the full suite (`--all`); the landing runs the affected tests itself. Source is English-only, stdlib-only, Python 3.9 floor; shell scripts run on bash 3.2 and are ASCII-only. If you are blocked, say exactly what you need in the terminal and stop.

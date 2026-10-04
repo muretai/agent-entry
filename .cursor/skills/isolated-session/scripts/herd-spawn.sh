@@ -216,7 +216,8 @@
 # not folded: start succeeding means the process is in the pane, not that a brief
 # will be read. A spawn either hands the brief to an agent that took it, or fails.
 #
-# The agent runs on `opus` (HERD_SPAWN_MODEL overrides it: an alias or a model id) and
+# The agent runs on `opus`, or on the first `[harness.order]` entry of the machine file
+# for its profile (HERD_SPAWN_MODEL overrides either: an alias or a model id) and
 # in `auto` permission mode (HERD_SPAWN_PERMISSION_MODE overrides it,
 # and only with `auto`, `acceptEdits`, `manual` or `plan`: anything else -- a
 # `bypassPermissions`, a `dontAsk`, an empty string -- is exit 2 before herdr is asked
@@ -519,6 +520,31 @@ sys.exit(0 if any(isinstance(r, dict) and r.get("name") == sys.argv[1] for r in 
   fi
 }
 
+# bar_holds_line: the pane's LAST prompt row is exactly prompt_line -- typed, not submitted,
+# though `agent prompt` answered success (a pane busy with a background shell, or under a
+# banner, reads `working` to herdr while the Enter was lost). The same row rule as
+# stall_shape. Anything else in the bar (a prefix, more text, another line, a draft) is no.
+bar_holds_line() {
+  local screen
+  screen="$("$herdr" agent read "$name" --source recent-unwrapped --lines 80 2>/dev/null \
+            || "$herdr" agent read "$name" 2>/dev/null || true)"
+  [[ -n "$screen" ]] || return 1
+  printf '%s' "$screen" | python3 -I -c '
+import re, sys
+line = sys.argv[1]
+bar, mark = chr(0x2502), chr(0x276F)   # the box side bar and the other prompt mark, kept ASCII here
+text = sys.stdin.buffer.read().decode("utf-8", "replace")
+text = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?", "", text)
+text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b.", "", text)
+last = None
+for row in text.splitlines():
+    m = re.fullmatch(r"\s*" + bar + r"?\s*[>" + mark + r"](?: (.*?))?\s*" + bar + r"?\s*", row)
+    if m:
+        last = (m.group(1) or "").strip()
+sys.exit(0 if last is not None and last == line else 1)
+' "$prompt_line" 2>/dev/null
+}
+
 # deliver_brief: the agent is in the pane; wait for its input line, hand over the pair's
 # lock, type the one line, and only then print the worker= line. Reads name, herdr, pane,
 # tab_id, cwd, pair_key, prompt_line, report, harness, model and wall_state.
@@ -565,6 +591,7 @@ deliver_brief() {
   # to the line still in the prompt). A pane the nudge does not recognize keeps the loop.
   prompt_err="$(mktemp "${TMPDIR:-/tmp}/herd-spawn-prompt.XXXXXX")"
   prompted=no
+  enter_sent=no
   nudge_done=no
   nudge_said=""
   prompt_deadline=$(( $(date +%s) + agent_ready_secs ))
@@ -589,6 +616,7 @@ deliver_brief() {
           break
           ;;
         typed)
+          enter_sent=yes
           if "$herdr" agent send-keys "$name" enter >/dev/null 2>&1 &&
              "$herdr" agent wait "$name" --until working --until blocked --timeout "$ready_ms" >/dev/null 2>&1; then
             prompted=yes
@@ -626,6 +654,19 @@ deliver_brief() {
     half_fail 1 "'herdr agent prompt' kept stalling for ${name} (pane ${pane}, tab ${tab_id}) past ${agent_ready_secs}s: ${prompt_reason}; the agent had started" keep
   fi
   rm -f "$prompt_err"
+  # A success is not proof the line was submitted: with a background shell running or a
+  # banner up, the Enter `agent prompt` pressed was lost and herdr still read the pane as
+  # `working` (three of four such cases raised no agent_prompt_stalled). The pane is read
+  # once; when its last prompt row is exactly the line, ONE Enter -- never a re-typed line
+  # (a second copy would be appended to the one in the bar), never a second Enter, and none
+  # after the stall nudge's own Enter. Nothing read from the pane is typed.
+  if [[ "$enter_sent" == "no" ]] && bar_holds_line; then
+    if "$herdr" agent send-keys "$name" enter >/dev/null 2>&1; then
+      echo "herd-spawn: the line sat typed but unsubmitted in ${name}'s prompt bar after herdr took it; one Enter was pressed" >&2
+    else
+      echo "herd-spawn: the line sat typed but unsubmitted in ${name}'s prompt bar after herdr took it, and the one Enter was refused; check the pane" >&2
+    fi
+  fi
   brief_ours=no          # the worker has been told to read it: it stays
   # The honest half, said out loud where the person spawning the worker reads it: on codex
   # the allow/deny lists this script computed are recorded, not applied. A file nobody opens
@@ -1011,7 +1052,234 @@ unset HERD_SPAWN_PERMISSION_MODE
 # so the sandbox and the approval policy are the whole wall, `worker` is the only profile,
 # and the config home is the spawn's. Grok's wall is one `--allow` per allow rule and one
 # `--deny` per deny rule on the grok argv; the header says the rest.
-harness="${HERD_SPAWN_HARNESS-claude}"
+#
+# THE MACHINE FILE'S ORDER. The one per-Mac file, `$APPL_MACHINE_CONFIG` (default
+# `$HOME/.config/appl/machine.toml`, TOML), may carry an ordered list of harnesses per
+# profile, each entry a table with `harness` and `model`:
+#
+#     [[harness.order.worker]]
+#     harness = "claude"
+#     model = "opus"
+#
+# The worker and coordinator profiles take the FIRST entry of their own list (the reviewer
+# profile reads none). HERD_SPAWN_HARNESS, when set, beats the entry's harness, and
+# HERD_SPAWN_MODEL the entry's model; each override wins its own field. The entry's model
+# is used only while the harness is the entry's own: a model named for cursor means
+# nothing to claude. No file, or a file with no `[harness.order]` at all, is the spawn as
+# before (claude, opus). A `[harness.order]` whose list for this profile is missing, empty,
+# or opens with an entry that is not a table, has no known harness or no model, is refused
+# here, before herdr is asked anything. Trying the later entries is not done here.
+# machine.example.toml beside this script is the shape. The reader is a stdlib TOML subset
+# (Python 3.9 has no tomllib): headers, `key = value` with a one-line string, integer,
+# boolean or one-line array of those; only the `harness` tables are read, every other
+# section is skipped unread.
+order_read() {
+  python3 -I - "$1" "$2" "$name" <<'PY'
+import os, re, sys
+
+path, profile, worker = sys.argv[1], sys.argv[2], sys.argv[3]
+HARNESSES = ("claude", "cursor", "codex", "grok")
+MODEL = re.compile(r"^[a-z][a-z0-9.=,\[\]-]{0,79}\Z")
+KEY = re.compile(r"^[A-Za-z0-9_-]+\Z")
+SCALAR = re.compile(r"true\b|false\b|[+-]?[0-9][0-9_]*")
+
+
+class Refused(Exception):
+    pass
+
+
+def refuse(why):
+    raise Refused(why)
+
+
+def scalar(s, i, where):
+    c = s[i]
+    if c == "\"":
+        j = i + 1
+        while s[j] != "\"":
+            if s[j] == "\\":
+                refuse("%s: escapes in strings are not read" % where)
+            j += 1
+        return s[i + 1:j], j + 1
+    if c == "'":
+        j = s.index("'", i + 1)
+        return s[i + 1:j], j + 1
+    m = SCALAR.match(s, i)
+    if not m:
+        refuse("%s: a value this reader does not read: %r" % (where, s[i:]))
+    w = m.group(0)
+    return (w == "true") if w in ("true", "false") else int(w.replace("_", "")), m.end()
+
+
+def value(s, where):
+    s = s.strip()
+    try:
+        if s.startswith("["):
+            items, i = [], 1
+            while True:
+                while s[i] in " \t":
+                    i += 1
+                if s[i] == "]":
+                    i += 1
+                    break
+                v, i = scalar(s, i, where)
+                items.append(v)
+                while s[i] in " \t":
+                    i += 1
+                if s[i] == ",":
+                    i += 1
+                elif s[i] == "]":
+                    i += 1
+                    break
+                else:
+                    refuse("%s: expected , or ] in the array" % where)
+            v = items
+        else:
+            v, i = scalar(s, 0, where)
+    except (IndexError, ValueError):
+        refuse("%s: an unterminated or multi-line value is not read" % where)
+    rest = s[i:].strip()
+    if rest and not rest.startswith("#"):
+        refuse("%s: unexpected text after the value: %r" % (where, rest))
+    return v
+
+
+def header(line, where):
+    double = line.startswith("[[")
+    close = "]]" if double else "]"
+    end = line.find(close)
+    if end < 0:
+        refuse("%s: unterminated table header" % where)
+    rest = line[end + len(close):].strip()
+    if rest and not rest.startswith("#"):
+        refuse("%s: unexpected text after the table header" % where)
+    parts = [p.strip() for p in line[len(close):end].split(".")]
+    if not all(KEY.match(p) for p in parts):
+        refuse("%s: a table name this reader does not read" % where)
+    return double, parts
+
+
+def parse(text):
+    root, arrays, defined = {}, set(), set()
+    cur = None
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        where = "line %d" % n
+        if line.startswith("["):
+            inner = line[2:] if line.startswith("[[") else line[1:]
+            if inner.split("]", 1)[0].split(".")[0].strip() != "harness":
+                cur = None
+                continue
+            double, parts = header(line, where)
+            node = root
+            for p in parts[:-1]:
+                node = node.setdefault(p, {})
+                if isinstance(node, list) and id(node) in arrays:
+                    node = node[-1]
+                if not isinstance(node, dict):
+                    refuse("%s: %s is not a table" % (where, ".".join(parts)))
+            last = parts[-1]
+            if double:
+                lst = node.setdefault(last, [])
+                if not isinstance(lst, list) or (lst and id(lst) not in arrays):
+                    refuse("%s: %s is given twice" % (where, ".".join(parts)))
+                arrays.add(id(lst))
+                cur = {}
+                lst.append(cur)
+            else:
+                name = ".".join(parts)
+                if name in defined:
+                    refuse("%s: [%s] is given twice" % (where, name))
+                defined.add(name)
+                cur = node.setdefault(last, {})
+                if not isinstance(cur, dict):
+                    refuse("%s: %s is given twice" % (where, name))
+            continue
+        if cur is None:
+            continue
+        key, eq, rest = line.partition("=")
+        key = key.strip()
+        if not eq or not KEY.match(key):
+            refuse("%s: expected key = value" % where)
+        if key in cur:
+            refuse("%s: %s is given twice" % (where, key))
+        cur[key] = value(rest, where)
+    return root
+
+
+def pick():
+    if not os.path.lexists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        refuse("the file cannot be read (%s)" % e.__class__.__name__)
+    harness = parse(text).get("harness")
+    if harness is None:
+        return None
+    if not isinstance(harness, dict):
+        refuse("harness is not a table")
+    if "order" not in harness:
+        return None
+    order = harness["order"]
+    if not isinstance(order, dict):
+        refuse("harness.order is not a table of per-profile lists")
+    if profile not in order:
+        refuse("harness.order has no %s list" % profile)
+    lst = order[profile]
+    if not isinstance(lst, list):
+        refuse("harness.order.%s is not a list" % profile)
+    if not lst:
+        refuse("harness.order.%s is empty" % profile)
+    entry = lst[0]
+    if not isinstance(entry, dict):
+        refuse("the first harness.order.%s entry is not a table with harness and model" % profile)
+    h = entry.get("harness")
+    if h not in HARNESSES:
+        refuse("the first harness.order.%s entry names no known harness (one of %s)"
+               % (profile, ", ".join(HARNESSES)))
+    m = entry.get("model")
+    if not isinstance(m, str) or not MODEL.match(m):
+        refuse("the first harness.order.%s entry has no model alias or id" % profile)
+    if h == "codex" and ("[" in m or "]" in m):
+        refuse("the first harness.order.%s entry gives codex a bracketed model" % profile)
+    return h, m
+
+
+try:
+    got = pick()
+except Refused as e:
+    sys.stderr.write("herd-spawn: harness.order for the %s profile in %s is refused: %s;"
+                     " the worker %s was not started\n" % (profile, path, e, worker))
+    sys.exit(3)
+if got:
+    sys.stdout.write("%s %s\n" % got)
+PY
+}
+order_harness=""
+order_model=""
+if [[ "$profile" == "worker" || "$profile" == "coordinator" ]]; then
+  machine_file="${APPL_MACHINE_CONFIG:-}"
+  [[ -n "$machine_file" || -z "${HOME:-}" ]] || machine_file="${HOME}/.config/appl/machine.toml"
+  if [[ -n "$machine_file" ]]; then
+    order_rc=0
+    order_pick="$(order_read "$machine_file" "$profile")" || order_rc=$?
+    if [[ "$order_rc" -eq 3 ]]; then
+      exit 2
+    elif [[ "$order_rc" -ne 0 ]]; then
+      echo "herd-spawn: harness.order for the ${profile} profile could not be read from ${machine_file} (exit ${order_rc}); the worker ${name} was not started" >&2
+      exit 2
+    fi
+    if [[ -n "$order_pick" ]]; then
+      order_harness="${order_pick%% *}"
+      order_model="${order_pick#* }"
+    fi
+  fi
+fi
+harness="${HERD_SPAWN_HARNESS-${order_harness:-claude}}"
 case "$harness" in
   claude|cursor|codex|grok) ;;
   *)
@@ -1096,6 +1364,9 @@ if [[ -n "${HERD_SPAWN_MODEL+set}" ]]; then
     echo "herd-spawn: HERD_SPAWN_MODEL carries a bracket, which is Cursor's override spelling and not part of any codex model id (got '${model}'); the worker ${name} was not started" >&2
     exit 2
   fi
+elif [[ -n "$order_model" && "$harness" == "$order_harness" ]]; then
+  # the machine file's first entry, checked by order_read with the same pattern
+  model="$order_model"
 fi
 [[ -n "$model" || "$harness" != "claude" ]] || model="opus"
 unset HERD_SPAWN_MODEL
@@ -1191,7 +1462,11 @@ unset HERD_WALL HERD_WALL_EGRESS HERD_WALL_CPU_SECS HERD_WALL_MEM_MB HERD_WALL_P
 # rotation (a refresh token is single-use). When $HOME/.muretai/herd/oauth-token passes
 # iso_herd_oauth_token (a regular 0600-style file of the caller's, not a symlink), a claude
 # pane gets it as CLAUDE_CODE_OAUTH_TOKEN on `herdr tab create` and never touches that file.
-# Anything else is an absent file, silently: today's spawn, on the shared login. The FILE
+# Anything else is an absent file: today's spawn, on the shared login. A file present but
+# rejected says so by its reason word alone (mode, owner, symlink, charset, size, from
+# iso_herd_oauth_token_judged): one stderr line here and one `oauth-token rejected <why>`
+# line in coordinator.log once HERD_DIR is judged ours. An absent, empty, whitespace-only
+# or unreadable file, and an honored one, say nothing. The FILE
 # is the only source -- a CLAUDE_CODE_OAUTH_TOKEN this process inherited is dropped here, so
 # no caller smuggles one past the mode and symlink check, and nothing this spawn runs
 # inherits it. The value lives in this shell variable only: it is written to no file (not
@@ -1200,8 +1475,18 @@ unset HERD_WALL HERD_WALL_EGRESS HERD_WALL_CPU_SECS HERD_WALL_MEM_MB HERD_WALL_P
 # alone), so the value is in the process table while that one call runs:
 # ISSUE(herd-oauth-token-rides-tab-create-argv). Cursor and codex do not read it and get none.
 oauth_token=""
+oauth_why=""
 if [[ "$harness" == "claude" ]]; then
-  oauth_token="$(iso_herd_oauth_token 2>/dev/null)" || oauth_token=""
+  oauth_said="$(iso_herd_oauth_token_judged 2>/dev/null)" || true
+  case "$oauth_said" in
+    "honored "?*) oauth_token="${oauth_said#honored }" ;;
+    "rejected mode"|"rejected owner"|"rejected symlink"|"rejected charset"|"rejected size")
+      oauth_why="${oauth_said#rejected }" ;;
+  esac
+  oauth_said=""
+  if [[ -n "$oauth_why" ]]; then
+    echo "herd-spawn: oauth-token file present but rejected: ${oauth_why}" >&2
+  fi
 fi
 unset CLAUDE_CODE_OAUTH_TOKEN
 
@@ -1571,6 +1856,25 @@ spawn_repo="$(iso_primary_of "$cwd" 2>/dev/null)" && [[ "$spawn_repo" == /* ]] |
   echo "herd-spawn: ${cwd} is not inside a git repository, so there is no repository to verify the worker's report in; the worker ${name} was not started" >&2
   exit 2
 }
+# A cursor worker (and a grok one, refused outright above) never starts in a primary: the
+# rules file and instruction files live in the directory it opens. `iso_primary_of "$cwd"
+# == "$cwd"` alone admitted <primary>/<subdir> (finding 2 of secrev-add-grok-harness-to-bb14),
+# so the cwd is held to the codex form: a .git file, its `pwd -P` its own worktree top
+# level, and that resolved path not the primary. Judged here, before the hold hand-over,
+# before anything is written under HERD_DIR and before herdr is asked anything. A cursor
+# coordinator's cwd is the primary by design and is not judged here.
+if { [[ "$harness" == "cursor" && "$profile" != "coordinator" ]] || [[ "$harness" == "grok" ]]; }; then
+  cwd_real="$(cd "$cwd" && pwd -P)" || cwd_real=""
+  cwd_top="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)" &&
+    cwd_top="$(cd "$cwd_top" && pwd -P)" || cwd_top=""
+  cwd_primary="$(iso_primary_of "$cwd" 2>/dev/null)" &&
+    cwd_primary="$(cd "$cwd_primary" && pwd -P)" || cwd_primary=""
+  if [[ ! -f "$cwd/.git" || -z "$cwd_real" || "$cwd_top" != "$cwd_real" ||
+        -z "$cwd_primary" || "$cwd_primary" == "$cwd_real" ]]; then
+    echo "herd-spawn: a ${harness} session starts only at the root of a linked worktree, never in a primary checkout or a subdirectory of one (${cwd}): its rules and instruction files live in the directory it opens; pass --cwd <worktree>; the worker ${name} was not started" >&2
+    exit 2
+  fi
+fi
 
 # --- herdr: on PATH (or HERD_SPAWN_BIN) and its server up, else exit 3 ---------------
 find_herdr
@@ -1604,6 +1908,22 @@ fi
 if ! open_dir="$(iso_private_path "$cwd")"; then
   echo "herd-spawn: ${open_dir}, at or above the cwd ${cwd}, is writable by others; a CLAUDE.md there would reach the worker; the worker ${name} was not started" >&2
   exit 2
+fi
+# the rejected oauth-token file's reason word (fixed vocabulary, never the value) in the
+# coordinator's log: appended, never through a link, and only into a coordinator
+# directory that already exists -- a missing one is not made here, and a log line that
+# cannot be written costs the spawn nothing (stderr already said it)
+if [[ -n "$oauth_why" ]]; then
+  python3 -I - "$herd_dir/coordinator" "$oauth_why" <<'PY' 2>/dev/null || true
+import os, stat, sys, time
+coord, why = sys.argv[1], sys.argv[2]
+st = os.lstat(coord)
+if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid():
+    fd = os.open(os.path.join(coord, "coordinator.log"),
+                 os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "a", encoding="ascii") as f:
+        f.write(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + " oauth-token rejected " + why + "\n")
+PY
 fi
 # the key a live worker holds is not handed to a second one. With --open-worktree this is
 # judged after the open: ensure-worktree.sh already refuses a lock handed to another worker
@@ -2541,12 +2861,22 @@ PY
 # only that branch's ref -- never the whole common directory.
 wall_branch="$(git -C "$cwd" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
 wall_gitdir="$(git -C "$cwd" rev-parse --path-format=absolute --git-dir 2>/dev/null || true)"
+# herdr's control socket, as herdr itself reports it (the `socket:` line of `herdr status
+# server`), never a path built from HOME or herdr's config. The wall denies writes, and a
+# connect is not a write: a worker that reaches this socket can start an unwalled pane or
+# type into any other, the coordinator's included. Every scope but the coordinator's (which
+# drives herdr) gets a deny-connect line for it. No socket line, or a failing herdr, is no
+# line -- find_herdr above already refused a herdr whose server is down.
+wall_herdr_sock=""
+if [[ "$wall_scope" != "coordinator" ]]; then
+  wall_herdr_sock="$("$herdr" status server 2>/dev/null | sed -n 's/^socket:[[:space:]]*//p' | head -n 1)" || wall_herdr_sock=""
+fi
 # (`if !` rather than `<<'PY' || exit 2`: the here-document line ends in <<'PY', the shape
 # tests/test_nested_gate_slot.py reads this program by.)
 if ! HS_WALL_DIR="$wall_dir" HS_WALLS="$walls_dir" HS_CWD="$cwd" HS_HERD="$herd_dir" HS_NAME="$name" \
   HS_PRIMARY="$wall_primary" HS_COMMON="$wall_common" HS_PLUG="$here/walls/${wall_os}.sh" \
   HS_AGENT_CMD="$agent_cmd" HS_RUN_SRC="$wall_run_src" \
-  HS_BRANCH="$wall_branch" HS_GITDIR="$wall_gitdir" \
+  HS_BRANCH="$wall_branch" HS_GITDIR="$wall_gitdir" HS_HERDR_SOCK="$wall_herdr_sock" \
   python3 -I - <<'PY'
 import os, shutil, stat, sys
 wd, walls, cwd, herd, name = (os.environ[k] for k in ("HS_WALL_DIR", "HS_WALLS", "HS_CWD", "HS_HERD", "HS_NAME"))
@@ -2684,6 +3014,12 @@ for s in slots:
     for p in sorted({os.path.abspath(s), real(s)}):
         if ("deny-read " + p) not in lines:
             lines += ["deny-write " + p, "deny-read " + p]
+# herdr's control socket (read above, empty for the coordinator): the path herdr reported,
+# and its resolved path too when a symlink stands in it -- the kernel checks the latter.
+sock = os.environ.get("HS_HERDR_SOCK", "").strip()
+if sock.startswith("/"):
+    for p in sorted({sock, real(sock)}):
+        lines.append("deny-connect " + p)
 write("profile", "\n".join(lines) + "\n")
 write("run.py", os.environ["HS_RUN_SRC"])
 if os.path.isfile(plug) and not os.path.islink(plug):
@@ -3375,8 +3711,10 @@ if [[ "$profile" == "coordinator" ]]; then
   # by its exact path (both spellings, like the spawner: never a directory or an `appl-*`
   # glob, which would run whatever a diff drops beside them), and the Agent tool for its
   # four small-model subagents only. appl-hook.sh is not here: the hook runs it, the
-  # model never needs to.
-  for s in appl-verify.sh appl-status.sh appl-hydrate.sh appl-role-of.sh appl-close.sh; do
+  # model never needs to. appl-split-check.sh is the split check's wrapper: the
+  # checker reads stdin, and a `python3 ... < file` redirect never matches a prefix rule.
+  for s in appl-verify.sh appl-status.sh appl-hydrate.sh appl-role-of.sh appl-close.sh \
+      appl-split-check.sh; do
     allow+=("Bash(bash .cursor/skills/isolated-session/scripts/${s}:*)")
     if [[ -n "${spawner_primary:-}" ]]; then
       allow+=("Bash(bash ${spawner_primary}/.cursor/skills/isolated-session/scripts/${s}:*)")
@@ -3424,6 +3762,12 @@ if [[ "$profile" == "worker" ]]; then
   allow+=("Bash(muretai op --as * coord * deliver *)")
   allow+=("Bash(muretai op --as * dm *)")
   allow+=("Bash(bash .cursor/skills/isolated-session/scripts/dispatch-capacity.sh:*)")
+  # The JavaScript test-run spelling the briefs name (intake 20261003T215502Z): run-node.sh
+  # runs node on ONE regular file under the repository's conformance/ or tests/ (symlinks
+  # resolved) with NODE_OPTIONS unset, and refuses everything else, so this one fixed shape
+  # is safe in every repository -- and a brief naming it must not stop a worker where node
+  # is not the test runner (tests/test_claude_worker_profile_runs_briefs.py).
+  allow+=("Bash(bash .cursor/skills/isolated-session/scripts/run-node.sh:*)")
 fi
 # The SAME commands in the isolated spelling. The tab above carries PYTHONNOUSERSITE=1 and
 # every brief instructs `python3 -I`, so a list that granted only the bare spelling would
@@ -3472,6 +3816,127 @@ fi
 allow+=("Bash(python3 -I tests/*.py)")
 # the brief's own --allow rules (judged above), after the profile's
 allow+=(${extra_allow[@]+"${extra_allow[@]}"})
+# THE CLAUDE WORKER PROFILE, re-spelled for the matcher Claude Code really runs (intake
+# 20261003T000031Z part B; notes/2026-10-03-walled-run-denials-claude.md). On a live walled
+# claude pane every brief command was refused before it ran: deny beats allow, and the
+# stdin-script deny `Bash(python3 -:*)` matched `python3 -I ...` (the prefix read up to a
+# word boundary, not up to a space), shadowing the whole family the allow list grants;
+# `bash -n <path>` and a read-only `grep` had no allow and fell to `Bash(bash -*)` and
+# `Bash(grep:*)`. For a claude (and codex) worker only (the reviewer, the coordinator and
+# the other harnesses keep the static list) each of those three rules is replaced IN PLACE, so the
+# deny list keeps its order:
+#   * `Bash(python3 -:*)` -> `Bash(python3 -)` and `Bash(python3 - *)`: a literal `python3 -`
+#     as a whole word, never a prefix that reaches `python3 -I`;
+#   * `Bash(bash -*)` -> every dash option but `-n` (letter by letter, like the python shape
+#     rules), a cluster that continues `-n`, a second flag after it, `bash -` (stdin), a long
+#     option and a `+` option; and `bash -n` aimed out of the worktree (an absolute path,
+#     `..`, `~`, `$`) or through a redirect;
+#   * `Bash(grep:*)` -> a grep that leaves the worktree (an absolute path, `=/`, `-f/`, `..`,
+#     `~`, `$`), follows symlinks out of it (`-R`), or redirects.
+# The allows are NARROW: `bash -n <path>`; a grep whose last operand is a top-level entry of
+# the cwd as it stands at spawn (a real directory or file, a plain name, never .git, keys or
+# a symlink), so no allow rule matches a grep of `/etc`; `git cherry-pick --quit` (both briefs
+# end a cherry-pick sequence with it); and finish-worktree.sh by the PRIMARY's absolute path
+# (the implementer brief's step 7, as the cursor worker allows it). `cat` stays denied and no
+# allow names it. Pinned by tests/test_claude_worker_profile_runs_briefs.py.
+# The codex worker goes through this SAME block (intake 20261003T221152Z): its
+# rules.unenforced.json is the wall a claude worker of this profile is held to, so both
+# are derived from these lists and cannot drift apart again. Only the worktree-grep allows
+# stay claude-only (pinned by tests/test_codex_worker_allow_parity.py).
+if [[ ( "$harness" == "claude" || "$harness" == "codex" ) && "$profile" == "worker" ]]; then
+  cw_bash=("Bash(bash -)" "Bash(bash - *)" "Bash(bash --*)" "Bash(bash +*)"
+           "Bash(bash -n -*)" "Bash(bash -n +*)" "Bash(bash -n  *)"
+           "Bash(bash -n /*)" "Bash(bash -n * /*)" "Bash(bash -n *..*)" "Bash(bash -n ~*)" "Bash(bash -n *~*)"
+           "Bash(bash -n *\$*)" "Bash(bash -n *>*)" "Bash(bash -n *<*)")
+  for cw_flag in a b c d e f g h i j k l m n o p q r s t u v w x y z \
+                 A B C D E F G H I J K L M N O P Q R S T U V W X Y Z; do
+    [[ "$cw_flag" == "n" ]] || cw_bash+=("Bash(bash -${cw_flag}*)")
+    cw_bash+=("Bash(bash -n${cw_flag}*)")
+  done
+  cw_grep=("Bash(grep /*)" "Bash(grep * /*)" "Bash(grep *=/*)" "Bash(grep *-f/*)" "Bash(grep *..*)"
+           "Bash(grep ~*)" "Bash(grep *~*)" "Bash(grep *\$*)" "Bash(grep *-R*)"
+           "Bash(grep *--dereference-recursive*)" "Bash(grep *>*)" "Bash(grep *<*)")
+  # A NODE-TESTED repository (intake 20261003T215502Z): the cwd holds a package.json, or its
+  # appl.toml's [tests] command starts with node, npm or npx. There a fourth static rule,
+  # `Bash(node:*)`, is replaced in place so `node --check <relative path>` (a syntax check,
+  # nothing runs) can be allowed; every other node line stays denied, under the documented
+  # and the word-boundary reading alike (no rule here is a `:*` prefix):
+  #   * a bare `node`, and a first operand that is not an option (`node <file>`: the run
+  #     goes through run-node.sh, allowed above for every worker);
+  #   * every dash option, letter by letter -- `-e`, `-p`, `-r`, ... -- and every long option
+  #     but `--check`: `--eval`, `--print`, `--loader`, `--experimental-loader`, `--import`,
+  #     `--experimental-network-imports`, `--inspect`, `--require`, ...;
+  #   * `node --check` followed by a flag, or by a path that leaves the worktree (an absolute
+  #     path, `..`, `~`, `$`) or a redirect.
+  # Elsewhere `Bash(node:*)` stays as it is, byte for byte (tests/test_herd_spawn.py).
+  cw_node=""
+  if [[ -f "$cwd/package.json" && ! -L "$cwd/package.json" ]]; then
+    cw_node=1
+  elif [[ -f "$cwd/appl.toml" && ! -L "$cwd/appl.toml" ]]; then
+    cw_sect=""
+    cw_re='^command[[:space:]]*=[[:space:]]*"(node|npm|npx)[[:space:]]'
+    while IFS= read -r cw_line || [[ -n "$cw_line" ]]; do
+      case "$cw_line" in
+        "["*) cw_sect="$cw_line" ;;
+        *) if [[ "$cw_sect" == "[tests]" && "$cw_line" =~ $cw_re ]]; then cw_node=1; fi ;;
+      esac
+    done < "$cwd/appl.toml"
+  fi
+  cw_nodes=("Bash(node)" "Bash(node  *)" "Bash(node -)" "Bash(node - *)" "Bash(node --)" "Bash(node -- *)"
+            "Bash(node .*)" "Bash(node /*)" "Bash(node ~*)" "Bash(node \$*)" "Bash(node _*)"
+            "Bash(node \"*)" "Bash(node '*)"
+            "Bash(node --check=*)" "Bash(node --check  *)" "Bash(node --check -*)" "Bash(node --check * -*)"
+            "Bash(node --check /*)" "Bash(node --check * /*)" "Bash(node --check *..*)"
+            "Bash(node --check ~*)" "Bash(node --check *~*)" "Bash(node --check *\$*)"
+            "Bash(node --check *>*)" "Bash(node --check *<*)")
+  for cw_flag in a b c d e f g h i j k l m n o p q r s t u v w x y z \
+                 A B C D E F G H I J K L M N O P Q R S T U V W X Y Z 0 1 2 3 4 5 6 7 8 9; do
+    cw_nodes+=("Bash(node ${cw_flag}*)")
+    case "$cw_flag" in
+      [0-9]) continue ;;
+    esac
+    cw_nodes+=("Bash(node -${cw_flag}*)")
+    [[ "$cw_flag" == "c" ]] || cw_nodes+=("Bash(node --${cw_flag}*)")
+    [[ "$cw_flag" == "h" ]] || cw_nodes+=("Bash(node --c${cw_flag}*)")
+  done
+  cw_deny=()
+  for rule in "${deny[@]}"; do
+    case "$rule" in
+      "Bash(python3 -:*)") cw_deny+=("Bash(python3 -)" "Bash(python3 - *)") ;;
+      "Bash(bash -*)") cw_deny+=("${cw_bash[@]}") ;;
+      "Bash(grep:*)") cw_deny+=("${cw_grep[@]}") ;;
+      "Bash(node:*)")
+        if [[ -n "$cw_node" ]]; then
+          cw_deny+=("${cw_nodes[@]}")
+        else
+          cw_deny+=("$rule")
+        fi ;;
+      *) cw_deny+=("$rule") ;;
+    esac
+  done
+  deny=("${cw_deny[@]}")
+  allow+=("Bash(bash -n:*)" "Bash(git cherry-pick --quit)")
+  if [[ -n "$cw_node" ]]; then
+    allow+=("Bash(node --check *)")
+  fi
+  for cw_entry in "$cwd"/* "$cwd"/.[!.]*; do
+    [[ "$harness" == "claude" ]] || break
+    [[ -e "$cw_entry" && ! -L "$cw_entry" ]] || continue
+    cw_entry="${cw_entry##*/}"
+    case "$cw_entry" in
+      .git|keys|cat|*[!A-Za-z0-9._-]*) continue ;;
+    esac
+    allow+=("Bash(grep * ${cw_entry})" "Bash(grep * ${cw_entry}/*)")
+  done
+  cw_roots=()
+  for cw_root in "${brief_primary:-}" "$(iso_primary_of "$cwd" 2>/dev/null || true)"; do
+    [[ -n "$cw_root" && "$cw_root" == /* ]] || continue
+    case " ${cw_roots[*]+${cw_roots[*]}} " in *" ${cw_root} "*) continue ;; esac
+    cw_roots+=("$cw_root")
+    allow+=("Bash(bash ${cw_root}/.cursor/skills/isolated-session/scripts/finish-worktree.sh:*)")
+  done
+  unset cw_bash cw_grep cw_deny cw_flag cw_entry cw_roots cw_root cw_node cw_nodes cw_sect cw_re cw_line
+fi
 # `git ls-files` reads tracked content only (never keys/, which is not tracked).
 # `git grep -O` / `--open-files-in-pager` runs a program, and `git blame --contents`
 # reads any file the uid can read, so those two are not on the allowlist: a session
@@ -3730,6 +4195,8 @@ def cursor_worker_allow(primary, brief_primary, herd, name):
         "Shell(bash:" + scripts + "/ensure-worktree.sh *)",
         "Shell(bash:" + scripts + "/assert-head.sh *)",
         "Shell(bash:" + scripts + "/vendor.sh check)",
+        # the JS test-run spelling; run-node.sh itself refuses all but one conformance/ or tests/ file
+        "Shell(bash:" + scripts + "/run-node.sh *)",
         "Shell(git:add)",
         "Shell(git:add *)",
         "Shell(git:commit -m *)",

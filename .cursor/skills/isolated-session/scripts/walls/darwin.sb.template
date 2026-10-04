@@ -4,7 +4,7 @@
 ; other line is copied as it stands. In this language a LATER rule wins over an earlier
 ; one, so the order is the policy: allow everything, take every write away, give back the
 ; worker's own places, take back the few paths inside them it must not write, then deny
-; the reads it must never make.
+; the reads it must never make and the unix sockets it must never connect to.
 ;
 ; Wall v1 permits the network. The ONE place wall v2 puts an egress policy is the last
 ; marker line below (the egress marker appears once in this file and in no other file under
@@ -16,4 +16,5 @@
 @@ALLOW_WRITE@@
 @@DENY_WRITE@@
 @@DENY_READ@@
+@@DENY_CONNECT@@
 @@EGRESS_POLICY@@

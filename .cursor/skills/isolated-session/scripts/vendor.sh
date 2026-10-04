@@ -26,6 +26,9 @@
 # moved on or is dirty. A pull without --ref exits 2 and writes nothing. The ref must be a
 # tag of the home (refs/tags/<ref>) or the literal `main` (refs/heads/main); a branch, a
 # commit sha, HEAD or a revision expression is refused, named, before anything is written.
+# The ref is resolved only in the home -- never in the consumer or the cwd, whatever
+# same-named tag or branch they carry -- and every git call runs with the inherited
+# repository variables (GIT_DIR, GIT_WORK_TREE, ...) cleared, so a pull from a hook works.
 #
 # What is copied is the explicit FILES list below -- the reviewed contract -- and its
 # CLOSURE: every sibling a copied script reaches (`$here/<name>`, a `source` of
@@ -105,7 +108,7 @@ else
 fi
 
 VENDOR_MODE="$mode" VENDOR_REF="$ref" VENDOR_REPO="$repo" VENDOR_HOME="$home_repo" VENDOR_HOME_FROM="$home_from" python3 - <<'PY'
-import hashlib, json, os, pathlib, posixpath, re, shutil, subprocess, sys, tempfile, datetime
+import hashlib, json, os, pathlib, posixpath, re, shlex, shutil, subprocess, sys, tempfile, datetime
 
 mode = os.environ["VENDOR_MODE"]
 ref = os.environ["VENDOR_REF"]
@@ -185,6 +188,19 @@ ENTRY_POINTS = (
     ".cursor/rules/appl.mdc",
 )
 pin = repo / skill / "VENDOR.json"
+
+# Every git call here names its repository with -C, and git would still obey a repository
+# inherited through the environment: a pull run from a consumer's hook carries GIT_DIR
+# (and friends) naming the consumer, so `git -C <home>` read the consumer, saw home and
+# consumer as one repository, and would have resolved the consumer's same-named tag. The
+# list is git's own (`git rev-parse --local-env-vars`).
+GIT_REPO_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+                 "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE",
+                 "GIT_PREFIX", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+                 "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_GRAFT_FILE",
+                 "GIT_IMPLICIT_WORK_TREE", "GIT_INTERNAL_SUPER_PREFIX", "GIT_NO_REPLACE_OBJECTS",
+                 "GIT_REPLACE_REF_BASE", "GIT_SHALLOW_FILE", "GIT_QUARANTINE_PATH")
+GIT_ENV = {k: v for k, v in os.environ.items() if k not in GIT_REPO_VARS}
 
 def sha(p: pathlib.Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
@@ -271,7 +287,7 @@ def tracked(root: pathlib.Path) -> set:
     """Skill-relative paths the repository at `root` tracks; what is on disk when git cannot say."""
     try:
         out = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", skill],
-                             capture_output=True, check=True).stdout
+                             capture_output=True, check=True, env=GIT_ENV).stdout
     except (subprocess.CalledProcessError, OSError):
         return on_disk(root / skill)
     return in_skill(p.decode("utf-8", "surrogateescape") for p in out.split(b"\0") if p)
@@ -361,7 +377,7 @@ def primary_of(p: pathlib.Path) -> pathlib.Path:
     """The primary checkout behind a path -- a worktree of the home is still the home."""
     try:
         common = subprocess.run(["git", "-C", str(p), "rev-parse", "--git-common-dir"],
-                                capture_output=True, text=True, check=True).stdout.strip()
+                                capture_output=True, text=True, check=True, env=GIT_ENV).stdout.strip()
     except (subprocess.CalledProcessError, OSError):
         return p.resolve()
     common_path = pathlib.Path(common) if pathlib.Path(common).is_absolute() else p / common
@@ -417,7 +433,7 @@ if bad:
 def git(*a):
     """Run git in the home: (returncode, stdout bytes)."""
     try:
-        r = subprocess.run(["git", "-C", str(home)] + list(a), capture_output=True)
+        r = subprocess.run(["git", "-C", str(home)] + list(a), capture_output=True, env=GIT_ENV)
     except OSError:
         return 1, b""
     return r.returncode, r.stdout
@@ -432,6 +448,13 @@ full = "refs/heads/main" if ref == "main" else "refs/tags/" + ref
 rc, out = git("rev-parse", "--verify", "--quiet", full + "^{commit}")
 if (rc != 0 or ref.startswith("-") or git("check-ref-format", full)[0] != 0
         or git("show-ref", "--verify", "--quiet", full)[0] != 0):
+    # a ref that names nothing in the home gets its own sentence; existence is asked of the
+    # home alone (GIT_ENV, no fetch), so a consumer's tag or the home's remote never counts
+    if (not ref.startswith("-")
+            and git("rev-parse", "--verify", "--quiet", ref + "^{commit}")[0] != 0):
+        print(f"vendor: refusing to pull: --ref {shlex.quote(ref)} does not exist in the home at {home} "
+              f"-- name a tag it has (git -C {home} tag --list) or --ref main", file=sys.stderr)
+        sys.exit(1)
     print(f"vendor: refusing to pull: --ref {ref} is neither a release tag of the home at {home} "
           f"nor main -- name a tag (git -C {home} tag --list) or --ref main", file=sys.stderr)
     sys.exit(1)
