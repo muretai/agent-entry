@@ -11,3 +11,7 @@ node_modules/
 var/
 generated/
 /.cursor/cli.json
+
+# Plans, backlog and reviews live in the private ~/agent-entry-plan, never here (owner 2026-10-04)
+/docs/BACKLOG.md
+/notes/
