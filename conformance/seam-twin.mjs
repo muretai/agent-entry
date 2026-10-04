@@ -9,7 +9,8 @@
  * copy that `scripts/vendor-seam.mjs` took at one commit and pinned in
  * vendor/agent-seam/VENDOR.json. Two copies of one contract drift, and a drift here is silent
  * on the wire: nothing throws, signatures simply stop verifying for everyone else. This is the
- * alarm on this side of the copy, and it needs NOTHING outside this repository to sound.
+ * alarm on this side of the copy. In a source checkout it also reads (never writes) the
+ * agent-seam checkout, so the pin is held to the commit it names; see `sibling` below.
  *
  * WHAT IT COMPARES
  *   pin        every file under vendor/agent-seam/ is the one VENDOR.json names, at the sha256
@@ -23,9 +24,14 @@
  *   derived    conformance/vectors.json is exactly what scripts/build-vectors.mjs derives from
  *              the vendored vectors (source checkout only)
  *   readme     what the npm page must keep saying (source checkout only; see below)
- *   sibling    ONLY when an agent-seam checkout is beside this one: the recorded commit really
- *              produces every vendored byte (`git show <commit>:<path>`), so a pin cannot name
- *              a commit it was not taken from; and how far behind that checkout's HEAD it is
+ *   sibling    the agent-seam checkout beside the PRIMARY checkout (found through
+ *              `git rev-parse --git-common-dir`, so a linked worktree under .worktrees/ finds the
+ *              same one and runs the same rows), or the one MURETAI_AGENT_SEAM names: the
+ *              recorded commit really produces every vendored byte (`git show <commit>:<path>`),
+ *              so a pin cannot name a commit it was not taken from; and how far behind that
+ *              checkout's HEAD it is. Not found, or a MURETAI_AGENT_SEAM naming a missing path or
+ *              a non-directory, is a FAILURE: a skip let a worktree run report 72 checks where
+ *              the primary reported 78, and nobody saw the six that did not run (2026-09-20).
  *
  * THREE THINGS THIS FILE LEARNED THE HARD WAY, each from an attack that made an earlier cut
  * of it print OK while the bytes differed:
@@ -52,11 +58,11 @@
  *       MURETAI_AGENT_SEAM=/path/to/agent-seam npm test   (sibling rows against that checkout)
  */
 
-import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import process from 'node:process';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -351,9 +357,37 @@ if (SOURCE_CHECKOUT) {
   check(readme.includes('observer'), 'readme/documents-the-observer-slot', '');
 }
 
-// ---------------------------------------------------------------- the sibling, when it is there
-const siblingRoot = resolve(ROOT, process.env.MURETAI_AGENT_SEAM || '../agent-seam');
-if (pin && existsSync(join(siblingRoot, '.git'))) {
+// ---------------------------------------------------------------- the sibling
+/** Where agent-seam is checked out: MURETAI_AGENT_SEAM if set, else `agent-seam` beside the
+ *  PRIMARY checkout. `../agent-seam` from ROOT was right only in the primary; from a linked
+ *  worktree it named .worktrees/agent-seam, which never exists, and the rows quietly skipped.
+ *  Returns { root } or { why } — every way of not finding it is named. */
+function findSeam() {
+  const named = process.env.MURETAI_AGENT_SEAM;
+  if (named) {
+    const p = resolve(ROOT, named);
+    let st = null;
+    try { st = statSync(p); } catch { /* missing */ }
+    if (st === null) return { why: `MURETAI_AGENT_SEAM names ${p}, which does not exist` };
+    if (!st.isDirectory()) return { why: `MURETAI_AGENT_SEAM names ${p}, which is not a directory` };
+    if (!existsSync(join(p, '.git'))) return { why: `MURETAI_AGENT_SEAM names ${p}, which is not a git checkout (no .git)` };
+    return { root: p };
+  }
+  let common;
+  try {
+    common = resolve(ROOT, execFileSync('git', ['-C', ROOT, 'rev-parse', '--git-common-dir'], { stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim());
+  } catch (e) {
+    return { why: `cannot find this repository's primary checkout (git rev-parse --git-common-dir failed in ${ROOT}: ${String(e.stderr || e.message).trim()}) — set MURETAI_AGENT_SEAM` };
+  }
+  if (basename(common) !== '.git') return { why: `git's common dir is ${common}, not a checkout's .git — set MURETAI_AGENT_SEAM` };
+  const primary = dirname(common);
+  const p = join(dirname(primary), 'agent-seam');
+  if (!existsSync(join(p, '.git'))) return { why: `no agent-seam checkout beside the primary checkout ${primary} (looked for ${p}) — clone it there, or set MURETAI_AGENT_SEAM` };
+  return { root: p };
+}
+const seamCheckout = findSeam();
+const siblingRoot = seamCheckout.root;
+if (check(siblingRoot !== undefined, 'sibling/agent-seam-checkout-found', seamCheckout.why) && pin) {
   const git = (...a) => execFileSync('git', ['-C', siblingRoot, ...a], { stdio: ['ignore', 'pipe', 'pipe'] });
   let known = true;
   try { git('cat-file', '-e', `${pin.commit}^{commit}`); } catch { known = false; }
@@ -380,8 +414,6 @@ if (pin && existsSync(join(siblingRoot, '.git'))) {
     const head = git('rev-parse', '--short', 'HEAD').toString().trim();
     console.log(`  sibling: ${siblingRoot} — pin ${pin.ref} (${pin.commit.slice(0, 7)}) is ${behind} commit(s) behind its HEAD ${head}`);
   }
-} else {
-  console.log(`  skip: no agent-seam checkout at ${siblingRoot} — the pin was verified by digest only (set MURETAI_AGENT_SEAM to check the recorded commit too)`);
 }
 
 report();
@@ -395,7 +427,9 @@ function report() {
     process.exit(1);
   }
   // A count nobody asserts is a count that can quietly fall.
-  const FLOOR = 2 + 3 + 6 + 4 + 2 + 2 + EXPECTED_SECTIONS.length + 1 + 1 + 1 + EXPECTED_PINNED.length * 2 + 3;
+  // The sibling rows count too (found, commit exists, each vendored file, version): a run that
+  // skipped them is the one this floor exists to catch.
+  const FLOOR = 2 + 3 + 6 + 4 + 2 + 2 + EXPECTED_SECTIONS.length + 1 + 1 + 1 + EXPECTED_PINNED.length * 2 + 3 + 1 + 1 + VENDORED.length + 1;
   if (pass < FLOOR) {
     console.log(`\nFAILED — only ${pass} checks ran, and at least ${FLOOR} were expected. Read the rows above.\n`);
     process.exit(1);
