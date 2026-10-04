@@ -32,6 +32,11 @@ Ideas that are not yet lines here go to the inbox with `.cursor/skills/isolated-
   line; `[solo]` marks a records/config item; `[skeleton]`, only as the last tag, marks a skeleton item.
   `###` group headings under "Next" are not items. The pull files one eligible line at a time by class
   (skeleton before polish), then priority (the title's leading P0..P3 word, P2 without one), then file order.
+- OSS / product boundary (owner, 2026-10-04): this repository is the OSS door (MIT) and holds what runs at the shop and
+  completes with no Muretai account; what Muretai operates (Catalog, Claim Desk, hosted door, hosted ledger and
+  dashboards, the answering AI, billing) lives in muretai-trunk. No Muretai-specific name is hard-coded here: a
+  Muretai service is one configured value of a generic feature. A separate product repository is cut only when the
+  hosted product deploys and bills apart from trunk.
 - A split chain is ONE line here, carrying the chain's TAIL intake id (the last member): the pull moves a line to Done when
   its id lands, so a head id would retire the line after the first member (happened to S6a/S6b on 2026-10-03, b4eca84).
   The Now paragraph names the member in flight; the dashboard's Now cannot show a same-second id (`<stamp>-N`).
@@ -64,6 +69,10 @@ S6a 215207Z (landed) -> 215208Z (impl) -> 215208Z-2 -> 215209Z; S6b 215209Z-2 (l
 - P1 S6a entry.counts hosted counts URL: the chain S6a-2 (door posts the AT-14 body to the counts URL, impl) -> S6a-3 (page runtime posts the same body) -> S6a-4 (README, CHANGELOG, docs.mjs needle, the "NOT YET ACCEPTED" drift); S6a-1 landed 4a6617b. Tail id. [20261002T215209Z] [skeleton]
 
 ### 1. Polish (each waits for its frame member; filed only when the frame test is green)
+
+- P2 OSS boundary document: docs/OSS_BOUNDARY.md states the line in one table (OSS here: door, spec, conformance, declaration and Woo generator, one-file plugin, decide / track / receipts, local counts, fileSink and gaSink, knock and the visitor skill; product in trunk: Catalog, Claim Desk, hosted door, hosted ledger and dashboards, answering AI, billing), the rule that no Muretai-specific name is hard-coded in the OSS door, and when a separate product repository is cut; README links it from "What this is part of". [none] [solo]
+- P2 claim proof becomes a generic index proof: `publish --claim` stops hard-coding Muretai's path and body; the door serves any index's proof from configuration (`entry.claim: {path, body}` or `--claim-path` / `--claim-body`, path under /.well-known/, body one line, both refused by name when malformed), with the Muretai Catalog's `/.well-known/muretai-catalog-claim.txt` + `muretai-catalog-claim=<32 hex>` as a documented preset (`--claim muretai:<code>`), byte-identical to today's output for that preset; conformance/cli.mjs pins the preset bytes and a second, non-Muretai index. [none] [after P0 FRAME Claim-2 publish --claim serves the Catalog's proof file]
+- P2 counts URL documented as any collector: README, CHANGELOG and spec/tools-v1.md describe `entry.counts` as "a collector URL you choose (for example a Muretai hosted door)", never as a Muretai-only endpoint; the createAgentEntry doc comment stops saying it ships no sink and names no vendor; conformance/docs.mjs pins the wording. Folds into S6a-4 if that member is still open. [none] [solo]
 
 - P1 claim proof checks on the door: `doctor --claim` checks what trunk's catalog/verify.py checks (both card files 200, signature valid, under 6 h old, card.url names the origin) and the DNS TXT form is verified against a resolver; conformance/cli.mjs pins both forms. [20261003T225305Z] [after P0 FRAME Claim-2 publish --claim serves the Catalog's proof file]
 - P1 analytics time and funnel: `counts --since <days>` and per-day tables for knocks, page events, receipts and refusals; the per-offer table becomes a funnel (page: started -> succeeded / failed / ask_denied -> handoff; door: asked -> completed / refused by code -> receipt), the handoff -> door join is a count comparison only; the beacon's random `session` joins SINK_FIELDS for a within-visit funnel. [none] [after P1 FRAME Analytics-1 counts coverage header and who in three tiers]
