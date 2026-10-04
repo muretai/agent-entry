@@ -165,7 +165,7 @@ is PRODUCT and lives in trunk by the boundary rule; the OSS items here are its t
 
 ## Dependencies on other repositories (tracked there, named here)
 
-- product (trunk), proposed 2026-10-04, owner decision pending: the Site FDE, an LLM service Muretai runs that audits a site (init --scan --render plus a model), proposes offers with evidence, integrates by PR / WordPress plugin config / tag snippet (never holds production credentials, never deploys), proves it with doctor --browser, re-scans nightly and opens fix PRs, and proposes new offers from counts. Design: briefs/agent-entry-sodium-superset-and-site-fde.md.
+- product (trunk), proposed 2026-10-04, owner decision pending: the Site FDE, an LLM service Muretai runs that audits a site (init --scan --render plus a model), proposes offers with evidence, integrates by PR / WordPress plugin config / tag snippet (never holds production credentials, never deploys), proves it with doctor --browser, re-scans nightly and opens fix PRs, and proposes new offers from counts. Design: briefs/agent-entry-superset-and-site-fde.md.
 - trunk FRAME Hosted-1 [20261003T131712Z]: the hosted shop door takes an agent-entry.json declaration and answers find / ask /
   hold with the Suite's default replies (today it has none: free text by the brain). Without it a claimed shop that installs
   nothing has no answering surface.
