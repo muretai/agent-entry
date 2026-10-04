@@ -37,6 +37,8 @@ Ideas that are not yet lines here go to the inbox with `.cursor/skills/isolated-
   dashboards, the answering AI, billing) lives in muretai-trunk. No Muretai-specific name is hard-coded here: a
   Muretai service is one configured value of a generic feature. A separate product repository is cut only when the
   hosted product deploys and bills apart from trunk.
+- Naming (owner, 2026-10-04): no other product's file or brand name is used as an Agent Entry name, flag, file or
+  test fixture (e.g. no `sodium.json`); competitors are described generically in plans and never named in the package.
 - A split chain is ONE line here, carrying the chain's TAIL intake id (the last member): the pull moves a line to Done when
   its id lands, so a head id would retire the line after the first member (happened to S6a/S6b on 2026-10-03, b4eca84).
   The Now paragraph names the member in flight; the dashboard's Now cannot show a same-second id (`<stamp>-N`).
@@ -97,11 +99,11 @@ Rules for this section: one observer row, many destinations; every sink is an ad
 - P2 segmentSink: Segment HTTP Tracking API (`/v1/track`, write key), anonymousId random per sink, properties = allowlisted fields; Segment then fans out to whatever the site has wired there, which covers the long tail of services. [none]
 - P2 README "Counting visits" becomes a table of destinations (own DB, file, GA, PostHog, Plausible, Matomo, Mixpanel, Amplitude, Segment, any endpoint), each row: what is sent, what is never sent, the one-line setup, and the custom dimensions or properties to register; written only for sinks that have landed and been tested. [none] [after P1 compose sinks]
 
-### 0d. A strict superset of Sodium (owner 2026-10-04; design record ~/.cache/muretai-herd/coordinator/briefs/agent-entry-sodium-superset-and-site-fde.md)
+### 0d. A strict superset of the WebMCP tool services (owner 2026-10-04; design record ~/.cache/muretai-herd/coordinator/briefs/agent-entry-superset-and-site-fde.md)
 
-Sodium (read 2026-10-04): init detects the framework and wires its SDK, tools are declared by hand in sodium.json, deploy
+The WebMCP tool services (read 2026-10-04): init detects the framework and wires an SDK, tools are declared by hand in a config file, deploy
 is signed and versioned, doctor checks config, the dashboard shows calls, success rate, P95 latency and answer-engine
-referrals. Every row below closes one Sodium row Agent Entry lacks; the differentiation (door, DIDs, accounts, receipts,
+referrals. Every row below closes one such capability Agent Entry lacks; the differentiation (door, DIDs, accounts, receipts,
 claim, identification) is already ours. The Site FDE (an LLM service that integrates and maintains this for a business)
 is PRODUCT and lives in trunk by the boundary rule; the OSS items here are its tools.
 
@@ -109,12 +111,13 @@ is PRODUCT and lives in trunk by the boundary rule; the OSS items here are its t
 - P1 init detects the framework and wires the page runtime: Next.js, Nuxt, SvelteKit, Astro, Angular, Vite, plain HTML and WordPress are detected from the project files and get the runtime wired (script tag, layout component or plugin hook) with a printed diff before any write; an unknown project gets the one-line snippet. [none] [skeleton]
 - P1 doctor in a real browser: `doctor --browser` loads each page an offer lives on in a headless browser (an optional peer, never a dependency), checks the page runtime registered every offer as a WebMCP tool, and calls each one as an agent would (read-only ones for real, changing ones up to the ask floor), reporting per tool. [none] [skeleton]
 - P1 counts per tool: success rate, P95 latency, sessions per day, from the AT-14 events the runtime already sends (`ms`, offer_succeeded / offer_failed, session); the same numbers Sodium's dashboard shows, on the shop's own machine. [none] [after P1 FRAME Analytics-1 counts coverage header and who in three tiers]
-- P1 coding-agent skill: an Agent Skill (and an MCP server exposing the same verbs) that lets Claude Code, Cursor or Codex read the app, edit agent-entry.json, run init --scan / doctor, and publish, so "ask your AI to update the config" works with any coding agent; shipped in this package, versioned with it. [none]
+- P1 coding-agent skill: an Agent Skill (and an MCP server exposing the same verbs) that lets Claude Code, Cursor or Codex read the app, edit agent-entry.json, run init --scan / doctor, and publish, so a coding agent can maintain the declaration; shipped in this package, versioned with it. [none]
 - P2 rollback and diff: `publish --rollback <version>` re-signs a prior contract as the newest version, `publish --withdraw <version>` serves 410 for it, `publish --diff` prints what changes before signing. [none]
-- P1 steps page action moves up from P2 to P1 (multi-step interactions are a Sodium row); see the polish line. [none] [after P0 FRAME TEST the one test that walks the thin line]
+- P1 steps page action moves up from P2 to P1 (multi-step interactions are table stakes for WebMCP tool services); see the polish line. [none] [after P0 FRAME TEST the one test that walks the thin line]
 
 ### 1. Polish (each waits for its frame member; filed only when the frame test is green)
 
+- P1 drop the competitor-named converter: the shipped `init --from sodium.json` path (muretai-agent-entry.mjs, README, CHANGELOG, spec/tools-v1.md, conformance/cli.mjs and conformance/fixtures/cli/sodium-offers.expected.json) is renamed to a generic `init --from <config.json>` that accepts the same shape (name, routes, selectors, risk) without naming any product, or removed if the owner prefers; the fixture is renamed; README and CHANGELOG say 'converts a WebMCP tool config' and name no product. A breaking CLI change: the release notes say so. [none]
 - P2 OSS boundary document: docs/OSS_BOUNDARY.md states the line in one table (OSS here: door, spec, conformance, declaration and Woo generator, one-file plugin, decide / track / receipts, local counts, fileSink and gaSink, knock and the visitor skill; product in trunk: Catalog, Claim Desk, hosted door, hosted ledger and dashboards, answering AI, billing), the rule that no Muretai-specific name is hard-coded in the OSS door, and when a separate product repository is cut; README links it from "What this is part of". [20261004T132749Z] [solo]
 - P2 claim proof becomes a generic index proof: `publish --claim` stops hard-coding Muretai's path and body; the door serves any index's proof from configuration (`entry.claim: {path, body}` or `--claim-path` / `--claim-body`, path under /.well-known/, body one line, both refused by name when malformed), with the Muretai Catalog's `/.well-known/muretai-catalog-claim.txt` + `muretai-catalog-claim=<32 hex>` as a documented preset (`--claim muretai:<code>`), byte-identical to today's output for that preset; conformance/cli.mjs pins the preset bytes and a second, non-Muretai index. [20261004T132811Z] [after P0 FRAME Claim-2 publish --claim serves the Catalog's proof file]
 - P2 counts URL documented as any collector: README, CHANGELOG and spec/tools-v1.md describe `entry.counts` as "a collector URL you choose (for example a Muretai hosted door)", never as a Muretai-only endpoint; the createAgentEntry doc comment stops saying it ships no sink and names no vendor; conformance/docs.mjs pins the wording. Folds into S6a-4 if that member is still open. [20261004T132833Z] [solo]
