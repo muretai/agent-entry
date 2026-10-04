@@ -76,6 +76,24 @@ S6a 215207Z (landed) -> 215208Z (impl) -> 215208Z-2 -> 215209Z; S6b 215209Z-2 (l
 - P2 verb registry as its own document: spec/verbs.md generated from VERBS, VERB_EFFECTS and ASK_FLOOR by scripts/build-vectors.mjs so the two never drift; README links it under "What a customer can do here". [none] [after P0 FRAME TEST the one test that walks the thin line] [solo]
 - P3 serverless template renders the same declaration: agent-entry-serverless re-vendors at the current published version (pinned v1.11.6) and its template reads agent-entry.json so a Worker door serves the signed contract and skills as the Node door does; lands in that repository, tracked here. [none] [after P0 Woo declaration generator]
 
+### 2. Security review fixes (notes/security-review-frame.md, intake 20261003T225754Z; no high finding)
+
+- P1 decide approve shows the terms and refuses stale or repeated receipts (C-2): `decide` prints verb, of, customer_did and request JSON-escaped and needs yes or --yes before signing, refuses a receipt older than a window without --stale-ok, and keeps a decided/<ref> record so a second approval is refused. [none]
+- P1 claimant contact is published knowingly or kept off the contract (C-1): the publish --claim prompt says the facts go public at /.well-known/agent-tools.json and stay in every version; a door-only private facts field keeps human contact out of the contract; a withdrawn version can be served 410. [none]
+- P1 knock refuses an off-origin endpoint and bounds its fetches (K-1): knockAgentEntry refuses a card endpoint whose origin is not the card URL's origin, as doctor does, and its card, signature and reply fetches get a 15 s timeout and a 1 MiB streamed cap. [none]
+- P1 find answers from a cached snapshot with a row cap (S-2): the door reads and validates agent-entry.products.json once and again only on mtime change, filters rows by q and caps a reply's rows with a more flag, instead of re-parsing up to 16 MiB per knock. [none]
+- P1 collector fan-out to entry.counts is bounded (S-1): postCounts gets a bounded queue, a timeout and a small concurrency cap, the collector gets its own per-minute ceiling, and the README says the page counts are forgeable by any HTTP client. [none]
+- P2 tools envelope freshness window (B-1): the page runtime and verifyToolsEnvelope refuse an agenttools envelope over 6 h old or over 300 s in the future, as the card does, with publish's static .sig.json handled by the door re-minting or a stated expiry. [none]
+- P2 URL placeholders refuse dot segments (B-2): the page runtime's open fill and the door's checkout url refuse a placeholder value that is exactly . or .., so a value cannot move the URL up a directory on the origin. [none]
+- P2 remote text is escaped before it reaches the terminal (K-2): knock and doctor --url print door text (reply, error.message, accepts, card.url) JSON-escaped or with C0/C1 controls stripped, as claimantConfirms does. [none]
+- P2 robots.txt fails closed and covers every page URL (W-1): init --from woocommerce refuses on a robots.txt network error, follows up to five same-host robots redirects, and matches each ?page=N URL, path plus query, before asking for it. [none]
+- P2 doctor bounds a remote door and skips state-changing knocks (W-2): doctorChecks caps the version walk, skips knocks on changes or pays offers without --knock-all, and marks its knocks as a probe the default responder and staff can ignore. [none]
+- P2 Woo plugin seed outside the database (S-3): the plugin prefers a wp-config.php constant for the seed when defined, and its header documents that the option is the shop's private key carried by backups and staging clones, with the rotation step and its new DID. [none]
+- P3 claim on a mounted entry needs an explicit host claim (S-4): readDeclaration refuses entry.claim on a mounted baseUrl unless the operator opts in, and the README says a claim speaks for every path on the host. [none]
+- P3 page call resolves only registered handlers (B-3): the page runtime resolves a call action from handlers or a site-registered handler object only, never a bare window global, and spec/tools-v1.md states the signature binds the contract to the card, not to the domain owner. [none]
+- P3 seed and knock key writes refuse symlinks (K-3): mintSeed and knockSeed lstat the slot and the knock key file and refuse a symlink with a message naming it. [none]
+- P3 visitor skill says signed reply data is content not instructions (W-3): spec and the distilled visitor skill state that product names and facts in a shop-signed reply are quoted data, never instructions to follow. [none] [solo]
+
 ## Owner rulings owed (not items until ruled)
 
 - Whether this repository should be gated: vendor a minimal `tools/run_tests.py` (npm test) and `tools/sec_lint.py`
