@@ -774,9 +774,11 @@ def test_landing_is_ordered(tmp: Path) -> None:
         lock = primary / ".git" / "landing.lock"
         lock.write_text(f"owner={holder.pid}\nowner_pid={holder.pid}\nkind=landing\nbranch=feat/other\n"
                         f"started={int(datetime.datetime.now().timestamp())}\nstarted_iso=now\n")
-        r = script("finish-worktree.sh", branch, str(wt), cwd=primary, ISOLATED_SESSION_LAND_WAIT="1")
+        # LAND_WAIT=0: do not wait at all. Any other value queues behind a live holder with
+        # no time limit (tests/test_landing_queue_fifo.py), so the refusal is asked for here.
+        r = script("finish-worktree.sh", branch, str(wt), cwd=primary, ISOLATED_SESSION_LAND_WAIT="0")
         ok(r.returncode != 0 and "another landing holds" in r.stderr and str(holder.pid) in r.stderr,
-           "a live landing lock makes the second finish wait, then refuse by name")
+           "a live landing lock with ISOLATED_SESSION_LAND_WAIT=0 makes the second finish refuse by name")
         ok(lock.exists() and wt.exists(), "without touching the holder's lock or the waiting worktree")
         holder.kill()
         holder.wait()

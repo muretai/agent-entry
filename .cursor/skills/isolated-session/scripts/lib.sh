@@ -1353,6 +1353,180 @@ iso_land_lock_describe() {
     "$(iso_lock_get "$lock" owner_comm)" "$(iso_lock_liveness "$lock")" "$(iso_lock_get "$lock" started_iso)"
 }
 
+# --- the landing queue ------------------------------------------------------
+# One ticket per landing that finds the lock held by a live holder (or an earlier
+# live ticket already waiting). Files live in <git-common-dir>/landing.queue/, named
+# <stamp>-<pid>-<branch> so the stamp leads and lexical order is arrival order.
+# A ticket carries the lock's owner fields and is live by iso_lock_alive. The queue
+# directory is mode 700 when this call creates it. Nothing is written through a symlink:
+# the directory is refused when it is one, and the ticket is a temp file renamed into
+# place in that same directory.
+
+iso_land_queue_dir() {  # $1 primary (or any path in the checkout)
+  local gd
+  gd="$(git -C "$1" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  [[ "$gd" == /* ]] || gd="$(cd "$1" && cd "$gd" && pwd)"
+  printf '%s/landing.queue\n' "$gd"
+}
+
+# 0 when some live ticket must be served before $2 (a basename; empty means "before
+# anyone", so any live ticket blocks). A symlinked queue counts as blocking: a landing
+# that cannot see the real queue must not take the lock ahead of it. Stale tickets
+# (iso_lock_alive is false) and symlinks are skipped.
+iso_land_queue_blocked() {  # $1 primary, $2 my ticket basename, may be empty
+  local q f name mine="${2:-}"
+  q="$(iso_land_queue_dir "$1")" || return 1
+  if [[ -L "$q" ]]; then return 0; fi
+  [[ -d "$q" ]] || return 1
+  for f in "$q"/*; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    name="${f##*/}"
+    [[ "$name" == .* ]] && continue
+    if [[ -n "$mine" ]]; then
+      [[ "$name" == "$mine" ]] && continue
+      # only a name that sorts strictly earlier can be ahead of us
+      if [[ "$name" < "$mine" ]]; then
+        :
+      else
+        continue
+      fi
+    fi
+    if iso_lock_alive "$f"; then return 0; fi
+  done
+  return 1
+}
+
+# Publish one ticket. Prints its absolute path. Refuses a symlink at the queue
+# directory or at the ticket name, and never opens the final name for writing.
+iso_land_queue_enqueue() {  # $1 primary, $2 owner, $3 branch
+  local q stamp flat name tmp pid started comm kind now tries
+  q="$(iso_land_queue_dir "$1")" || return 1
+  if [[ -L "$q" ]]; then
+    echo "iso_land_queue_enqueue: refusing: the landing queue ${q} is a symlink; nothing is written through it" >&2
+    return 1
+  fi
+  if [[ ! -d "$q" ]]; then
+    mkdir -m 700 -- "$q" 2>/dev/null || true
+  fi
+  if [[ -L "$q" || ! -d "$q" ]]; then
+    echo "iso_land_queue_enqueue: refusing: the landing queue ${q} is not a directory" >&2
+    return 1
+  fi
+  stamp="$(python3 -I -c 'import time; print("%020d" % int(time.time() * 1000000))')" || return 1
+  [[ "$stamp" =~ ^[0-9]{20}$ ]] || return 1
+  flat="${3//\//-}"
+  if [[ -z "$flat" || "$flat" == *"/"* ]]; then
+    echo "iso_land_queue_enqueue: refusing: branch ${3} cannot be one queue-ticket name" >&2
+    return 1
+  fi
+  # $$ does not change in a command substitution, so two landings never share it.
+  # The stamp stays the first field: lexical order is arrival order.
+  name="${stamp}-$$-${flat}"
+  if iso_is_pid "$2"; then pid="$2"; else pid="$(iso_keyed_pid)"; fi
+  started="$(iso_proc_start "$pid" || true)"
+  comm="$(iso_proc_comm "$pid" || true)"
+  kind="$(iso_owner_kind "$2" "$pid" || true)"
+  now="$(date +%s)"
+  tmp="$(mktemp "$q/.ticket.XXXXXX")" || {
+    echo "iso_land_queue_enqueue: refusing: could not make a temporary file in ${q}" >&2
+    return 1
+  }
+  {
+    echo "owner=$2"
+    echo "owner_pid=$pid"
+    echo "owner_started=$started"
+    echo "owner_comm=$comm"
+    echo "owner_kind=$kind"
+    echo "owner_seen=$now"
+    echo "kind=landing"
+    echo "branch=$3"
+    echo "task=landing $3"
+    echo "started=$now"
+    echo "started_iso=$(date '+%Y-%m-%d %H:%M')"
+    echo "host=$(hostname)"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  tries=0
+  while :; do
+    if [[ -L "$q" || ! -d "$q" ]]; then
+      rm -f "$tmp"
+      echo "iso_land_queue_enqueue: refusing: the landing queue ${q} is not a directory" >&2
+      return 1
+    fi
+    if [[ -L "$q/$name" ]]; then
+      rm -f "$tmp"
+      echo "iso_land_queue_enqueue: refusing: ${q}/${name} is a symlink; nothing is written through it" >&2
+      return 1
+    fi
+    if [[ ! -e "$q/$name" ]]; then
+      # rename within the queue directory: a new name, so this does not replace a
+      # symlink, and the bytes were written to the temp file first
+      if mv "$tmp" "$q/$name" 2>/dev/null; then
+        printf '%s\n' "$q/$name"
+        return 0
+      fi
+    fi
+    tries=$((tries + 1))
+    if (( tries > 20 )); then
+      rm -f "$tmp"
+      echo "iso_land_queue_enqueue: refusing: could not place a ticket in ${q}" >&2
+      return 1
+    fi
+    stamp="$(printf '%020d' "$((10#$stamp + 1))")"
+    name="${stamp}-$$-${flat}"
+    rm -f "$tmp"
+    tmp="$(mktemp "$q/.ticket.XXXXXX")" || return 1
+    {
+      echo "owner=$2"
+      echo "owner_pid=$pid"
+      echo "owner_started=$started"
+      echo "owner_comm=$comm"
+      echo "owner_kind=$kind"
+      echo "owner_seen=$now"
+      echo "kind=landing"
+      echo "branch=$3"
+      echo "task=landing $3"
+      echo "started=$now"
+      echo "started_iso=$(date '+%Y-%m-%d %H:%M')"
+      echo "host=$(hostname)"
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+  done
+}
+
+# Refresh owner_seen so a key-owned ticket does not expire during a long wait.
+# The temporary file is a dotfile in the queue directory: the queue scan does not
+# serve it, and a failed rename removes it rather than leaving a second live ticket.
+iso_land_queue_touch() {  # $1 absolute ticket path
+  local ticket="${1:-}" dir tmp
+  [[ -n "$ticket" && -f "$ticket" && ! -L "$ticket" ]] || return 0
+  dir="$(dirname "$ticket")"
+  [[ -d "$dir" && ! -L "$dir" ]] || return 0
+  tmp="$(mktemp "$dir/.seen.XXXXXX")" || return 0
+  { grep -v '^owner_seen=' "$ticket" 2>/dev/null || true; echo "owner_seen=$(date +%s)"; } > "$tmp" || {
+    rm -f "$tmp"
+    return 0
+  }
+  if [[ -L "$ticket" ]] || ! mv -f "$tmp" "$ticket" 2>/dev/null; then
+    rm -f "$tmp"
+  fi
+  return 0
+}
+
+# Remove a ticket this landing wrote. A symlink is left in place (never followed).
+# An empty queue directory this call created is removed; a directory that still holds
+# another ticket is not.
+iso_land_queue_drop() {  # $1 absolute ticket path
+  local p="${1:-}" q
+  [[ -n "$p" ]] || return 0
+  if [[ -L "$p" ]]; then return 0; fi
+  rm -f -- "$p" 2>/dev/null || true
+  q="$(dirname "$p")"
+  if [[ -d "$q" && ! -L "$q" ]]; then
+    rmdir "$q" 2>/dev/null || true
+  fi
+  return 0
+}
+
 iso_seen_ago() {  # $1 lock file -> "3m ago"
   local seen now d
   seen="$(iso_lock_get "$1" owner_seen)"

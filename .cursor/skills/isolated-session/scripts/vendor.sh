@@ -17,8 +17,10 @@
 #                     In the home (no VENDOR.json) it is the release self-test: every FILES
 #                     entry stays under the skill, and FILES with its closure carries every
 #                     skill path tests/test_isolated_session.py reads, each missing one named;
-#                     and each COPIES entry (tools/appl-add.sh, tools/appl-backlog-add.sh)
-#                     is byte-identical to its copy under the skill's scripts/.
+#                     every scripts/ file herd-spawn.sh's worker allow rules or a brief
+#                     template names, each missing one named; and each COPIES entry
+#                     (tools/appl-add.sh, tools/appl-backlog-add.sh) is byte-identical to
+#                     its copy under the skill's scripts/.
 #
 # APPL is consumed by release tag, never by commit (owner ruling 2026-09-29). `pull` reads
 # the home's git objects at the ref (`git ls-tree` / `git cat-file`), never the home
@@ -137,6 +139,23 @@ FILES = [
     f"{skill}/scripts/session-guard.sh",
     f"{skill}/scripts/vendor.sh",
     f"{skill}/scripts/herd-spawn.sh",
+    # the path-first runners the briefs and the worker allow rules name. run-node.sh is
+    # the JavaScript spelling; run-test.sh is its Python twin. A consumer that never
+    # received them cannot run the pairs those briefs tell it to run.
+    f"{skill}/scripts/run-test.sh",
+    f"{skill}/scripts/run-node.sh",
+    # the path-first receipt writer the reviewer brief and the reviewer allow rule name.
+    # A consumer that never received it cannot run the receipt step that brief tells a
+    # reviewer to run.
+    f"{skill}/scripts/write-receipt.sh",
+    # the coordinator's own scripts the vendored brief names. A consumer runs its own
+    # coordinator, so the brief must name only scripts the pull carries. appl-answer.sh
+    # reaches appl-status.sh, and appl-split-check.sh reaches appl-split-check.py.
+    f"{skill}/scripts/appl-status.sh",
+    f"{skill}/scripts/appl-answer.sh",
+    f"{skill}/scripts/appl-close.sh",
+    f"{skill}/scripts/appl-split-check.sh",
+    f"{skill}/scripts/appl-split-check.py",
     # the landing the spawner copies beside the wall (herd-spawn.sh reaches it as `$here/land.sh`)
     f"{skill}/scripts/land.sh",
     # the worker wall's platform plug and its one profile template (herd-spawn.sh reaches
@@ -339,10 +358,37 @@ def contract_reads(text: str) -> set:
                 reads.update(p for p in chain(n, alias, loops) or [] if p)
     return reads
 
+# A scripts/ file the worker is told to run, as a basename. The cursor allow list is a
+# different spelling (Shell, the path split across a concatenation) and is not this rule.
+_ALLOW_SCRIPT = re.compile(
+    r"Bash\(bash [^)\"']*\.cursor/skills/isolated-session/scripts/([A-Za-z0-9_][A-Za-z0-9_.-]*)")
+_BRIEF_SCRIPT = re.compile(
+    r"\.cursor/skills/isolated-session/scripts/([A-Za-z0-9_][A-Za-z0-9_.-]*)")
+
+def scripts_the_worker_is_told():
+    """Skill-relative scripts/ paths the worker allow rules or a brief template name,
+    each with who names it. The allow scan is the bash `Bash(bash ... scripts/<file>)`
+    rules herd-spawn.sh grants a worker -- not the coordinator's `${s}` loop and not
+    the cursor list. A brief is every briefs/*.md template."""
+    named = {}
+    spawn = repo / skill / "scripts" / "herd-spawn.sh"
+    if spawn.is_file() and not spawn.is_symlink():
+        for name in _ALLOW_SCRIPT.findall(spawn.read_text(errors="replace")):
+            named.setdefault("scripts/" + name, set()).add("herd-spawn.sh worker allow rules")
+    briefs = repo / skill / "briefs"
+    if briefs.is_dir() and not briefs.is_symlink():
+        for brief in sorted(briefs.glob("*.md")):
+            if brief.is_symlink() or not brief.is_file():
+                continue
+            for name in _BRIEF_SCRIPT.findall(brief.read_text(errors="replace")):
+                named.setdefault("scripts/" + name, set()).add("briefs/" + brief.name)
+    return named
+
 def home_check():
     """The release self-test: FILES stays under the skill, and FILES with its closure carries
     every skill path the contract test reads (a directory read standing for every tracked
-    file under it) -- so a release whose consumers' contract test cannot pass is refused."""
+    file under it) and every scripts/ file the worker allow rules or a brief template names
+    -- so a release whose consumers cannot run what the briefs tell them to is refused."""
     bad = [f"{rel}: {why} -- FILES names only paths under {skill}" for rel in FILES
            for why in [not_plain(rel)] if why]
     contract = repo / CONTRACT
@@ -357,6 +403,10 @@ def home_check():
     carried = have | set(closure(repo / skill, have, paths | have))
     bad += [f"{skill}/{r}: read by {CONTRACT} but neither in vendor.sh FILES nor reached by it"
             for r in sorted(reads - carried)]
+    for rel, who in sorted(scripts_the_worker_is_told().items()):
+        if rel not in carried:
+            bad.append("%s/%s: named by %s but not carried by vendor.sh FILES"
+                       % (skill, rel, ", ".join(sorted(who))))
     # a home stand-in that holds only the skill and the contract test (the tests build
     # those) has no tools/ source to hold the copy to
     for dst, src in sorted(COPIES.items()):

@@ -33,6 +33,11 @@
 # receipt, and a non-zero exit is SEC=refused. Any other value is ignored and the lint scans.
 # The command replaces the diff verdict only: BASE's lint's per-commit refuse check runs
 # first either way, and a refuse-level finding in any commit is SEC=refused.
+# Its third, appl.toml's [ledger] command (APPL_LEDGER_COMMAND), is trusted the same
+# way: it runs in place of tools/ledger.py build, in the worktree, on the tip before
+# the fast-forward; LEDGER=<command> on the receipt, and a non-zero exit prints
+# LEDGER_REFUSAL=<code> and MERGED=no. Any other value is ignored and the inline build
+# runs. A repository with no tools/ledger.py stays LEDGER=none and the command does not run.
 #
 # The guards are BASE's, never the branch's. The branch's TESTS run by design; the gate
 # does not: this script re-runs itself from BASE's copy of this skill and of the gate
@@ -292,6 +297,11 @@ tests_command=""
 scan_command_asked="${APPL_SCAN_COMMAND-}"
 unset APPL_SCAN_COMMAND
 scan_command=""
+# And `[ledger] command` as APPL_LEDGER_COMMAND, the same way: a request that runs in
+# place of tools/ledger.py build only when it matches the primary's appl.toml.
+ledger_command_asked="${APPL_LEDGER_COMMAND-}"
+unset APPL_LEDGER_COMMAND
+ledger_command=""
 
 . "$here/lib.sh"
 iso_credless_arm
@@ -453,11 +463,12 @@ primary="$(dirname "$git_common")"
 
 # The requests above stand only when the launcher root's appl.toml -- the primary's, a
 # regular file, read by BASE's config.py -- names that very command. Anything else (no
-# file, a link, a refusal, no [tests]/[scan] command, a different one) falls back to
-# tools/run_tests.py / tools/sec_lint.py, and says so.
-if [[ -n "$tests_command_asked" || -n "$scan_command_asked" ]]; then
+# file, a link, a refusal, no [tests]/[scan]/[ledger] command, a different one) falls
+# back to tools/run_tests.py / tools/sec_lint.py / tools/ledger.py build, and says so.
+if [[ -n "$tests_command_asked" || -n "$scan_command_asked" || -n "$ledger_command_asked" ]]; then
   tc_configured=""
   sc_configured=""
+  lc_configured=""
   if [[ -f "$gate_config" && -f "${primary}/appl.toml" && ! -L "${primary}/appl.toml" ]]; then
     tc_handoff="$(finish_tmp)"
     if landing_python "$gate_config" handoff "${primary}/appl.toml" > "$tc_handoff" 2>/dev/null; then
@@ -466,6 +477,8 @@ if [[ -n "$tests_command_asked" || -n "$scan_command_asked" ]]; then
           tc_configured="$tc_value"
         elif [[ "$tc_name" == "APPL_SCAN_COMMAND" ]]; then
           sc_configured="$tc_value"
+        elif [[ "$tc_name" == "APPL_LEDGER_COMMAND" ]]; then
+          lc_configured="$tc_value"
         fi
       done < "$tc_handoff"
     fi
@@ -483,6 +496,13 @@ if [[ -n "$tests_command_asked" || -n "$scan_command_asked" ]]; then
       scan_command="$sc_configured"
     else
       echo "NOTE: ignoring APPL_SCAN_COMMAND -- it is not the [scan] command of ${primary}/appl.toml; tools/sec_lint.py judges" >&2
+    fi
+  fi
+  if [[ -n "$ledger_command_asked" ]]; then
+    if [[ -n "$lc_configured" && "$lc_configured" == "$ledger_command_asked" ]]; then
+      ledger_command="$lc_configured"
+    else
+      echo "NOTE: ignoring APPL_LEDGER_COMMAND -- it is not the [ledger] command of ${primary}/appl.toml; tools/ledger.py judges" >&2
     fi
   fi
 fi
@@ -1558,40 +1578,85 @@ fi
 # broken descriptor that buffer still HOLDS the refusal bash could not deliver, the
 # child flushes it into the pipe, and the "path" that comes back is the refusal with the
 # path glued to its end. `rm -f` then removes nothing and the landing lock stays owned by
-# a live pid -- 2700s of refusal for every other landing. Nothing fallible goes in front
-# of a release.
+# a live pid -- every other landing then waits with no time limit. Nothing fallible goes in front
+# of a release. A live holder is not a timeout: the landing takes a FIFO ticket and
+# waits its turn with no time limit. ISOLATED_SESSION_LAND_WAIT=0 still means do not
+# wait at all (refuse at once, leave no ticket). Any other value, including the
+# default, does not cap the wait.
 land_lock="$(iso_land_lock_path "$primary" 2>/dev/null || true)"
 owner="$(iso_owner)"
 land_wait="${ISOLATED_SESSION_LAND_WAIT:-2700}"
+land_poll="${ISOLATED_SESSION_LAND_POLL:-5}"
+land_progress="${ISOLATED_SESSION_LAND_PROGRESS:-600}"
+[[ "$land_poll" =~ ^[1-9][0-9]*$ ]] || land_poll=5
+[[ "$land_progress" =~ ^[1-9][0-9]*$ ]] || land_progress=600
 waited=0
+since_progress=0
 holding_land="no"
+land_ticket=""
+land_ticket_name=""
+# Exits during the wait (before on_exit exists) still remove this landing's ticket.
+# on_exit replaces this trap and cleanup removes the ticket again if it is still set.
+trap 'iso_land_queue_drop "${land_ticket:-}"; land_ticket=""; land_ticket_name=""' EXIT
 while :; do
-  case "$(iso_land_lock_state "$primary" "$owner")" in
-    free)
-      if iso_land_lock_take "$primary" "$owner" "$branch"; then holding_land="yes"; break; fi
-      ;;
+  state="$(iso_land_lock_state "$primary" "$owner")"
+  case "$state" in
     mine)
-      holding_land="yes"; break
+      iso_land_queue_drop "$land_ticket"
+      land_ticket=""
+      land_ticket_name=""
+      holding_land="yes"
+      break
       ;;
     dead)
       echo "note: a landing lock left by a session that is gone ($(iso_land_lock_describe "$primary")); taking it over" >&2
       iso_land_lock_release "$primary"
       ;;
-    other)
-      if (( waited >= land_wait )); then
-        {
-          echo "refusing to land ${branch}: another landing holds ${primary}"
-          echo "  $(iso_land_lock_describe "$primary")"
-          echo "Waited ${waited}s (ISOLATED_SESSION_LAND_WAIT). Run finish again when it is done."
-        } >&2
-        [[ -z "$prerun_tmp" ]] || rm -f "$prerun_tmp"
-        exit 1
+    free|other)
+      if [[ "$state" == "free" ]] && ! iso_land_queue_blocked "$primary" "$land_ticket_name"; then
+        if iso_land_lock_take "$primary" "$owner" "$branch"; then
+          iso_land_queue_drop "$land_ticket"
+          land_ticket=""
+          land_ticket_name=""
+          holding_land="yes"
+          break
+        fi
+      else
+        # LAND_WAIT=0: do not queue and do not sleep. The lock (or an earlier live
+        # ticket) is left as it is.
+        if [[ "$land_wait" == "0" ]]; then
+          iso_land_queue_drop "$land_ticket"
+          land_ticket=""
+          land_ticket_name=""
+          {
+            echo "refusing to land ${branch}: another landing holds ${primary}"
+            echo "  $(iso_land_lock_describe "$primary")"
+            echo "Waited ${waited}s (ISOLATED_SESSION_LAND_WAIT). Run finish again when it is done."
+          } >&2
+          [[ -z "$prerun_tmp" ]] || rm -f "$prerun_tmp"
+          exit 1
+        fi
+        if [[ -z "$land_ticket" ]]; then
+          land_ticket="$(iso_land_queue_enqueue "$primary" "$owner" "$branch")" || {
+            echo "refusing to land ${branch}: could not take a landing-queue ticket" >&2
+            [[ -z "$prerun_tmp" ]] || rm -f "$prerun_tmp"
+            exit 1
+          }
+          land_ticket_name="${land_ticket##*/}"
+        fi
+        if [[ -n "$land_ticket" ]]; then
+          iso_land_queue_touch "$land_ticket" || true
+        fi
+        if (( since_progress == 0 )); then
+          echo "waiting for the landing lock: $(iso_land_lock_describe "$primary")" >&2
+        fi
+        sleep "$land_poll"
+        waited=$(( waited + land_poll ))
+        since_progress=$(( since_progress + land_poll ))
+        if (( since_progress >= land_progress )); then
+          since_progress=0
+        fi
       fi
-      if (( waited % 30 == 0 )); then
-        echo "waiting for the landing lock: $(iso_land_lock_describe "$primary")" >&2
-      fi
-      sleep 5
-      waited=$(( waited + 5 ))
       ;;
   esac
 done
@@ -1655,6 +1720,11 @@ cleanup() {
         ${lease_epoch:+--epoch "$lease_epoch"} >/dev/null 2>&1 || true
     fi
   fi
+  if [[ -n "${land_ticket:-}" ]]; then
+    iso_land_queue_drop "$land_ticket"
+    land_ticket=""
+    land_ticket_name=""
+  fi
   if [[ "$holding_land" == "yes" ]]; then
     holding_land="no"
     [[ -n "$land_lock" ]] && rm -f "$land_lock" 2>/dev/null
@@ -1687,7 +1757,7 @@ on_exit() {
   # `cleanup` FIRST, and every print after it non-fatal. Under `set -euo pipefail` the
   # trap's echoes ran BEFORE the cleanup they wrapped, so one failed write -- a closed
   # stdout, SIGPIPE, a full disk -- aborted the trap: the landing lock stayed owned by a
-  # LIVE pid, every other landing then waited 2700s and refused, and an in-flight
+  # LIVE pid, every other landing then waits with no time limit, and an in-flight
   # tmp_merge worktree was left for the next landing to trip over. Releasing before
   # speaking costs nothing and cannot be talked out of.
   # (`cleanup` ends in an `if` that is false when nothing is held, so it can return 1
@@ -2088,13 +2158,24 @@ fi
 # A local session branch is rebased, so the tree the tests see is byte-identical to
 # the fast-forwarded BASE and BASE stays linear. A branch another checkout holds
 # (shared_line, asked before the lock above: origin, the bundle, another remote, another
-# worktree) is merged, never rewritten; a shared_line that is anything but "no" merges.
+# worktree) is merged, never rewritten. "not asked" is not a share signal: the branch
+# already contained BASE when that was checked, and BASE may have moved while this
+# landing waited for the lock. That one is rebased, so a queue of landings stays linear
+# and in ticket order. ISOLATED_SESSION_LAND_MERGE=1 merges too.
 # A conflict confined to the generated
 # files is resolved by taking BASE's copy -- the ledger is rebuilt below anyway; any
 # other conflict stops the landing with the steps to resolve it.
+integrate="rebase"
+case "$shared_line" in
+  no|not\ asked*) integrate="rebase" ;;
+  *) integrate="merge" ;;
+esac
+if [[ "${ISOLATED_SESSION_LAND_MERGE:-0}" == "1" ]]; then
+  integrate="merge"
+fi
 rebased="no-op"
 if ! git -C "$worktree" merge-base --is-ancestor "$base" "$branch"; then
-  if [[ "$shared_line" != "no" || "${ISOLATED_SESSION_LAND_MERGE:-0}" == "1" ]]; then
+  if [[ "$integrate" == "merge" ]]; then
     if ! git -C "$worktree" merge --no-edit "$base" >/dev/null 2>&1; then
       git -C "$worktree" merge --abort >/dev/null 2>&1 || true
       {
@@ -3029,19 +3110,49 @@ PY
 fi
 
 # --- the ledgers, regenerated on the tip ------------------------------------------
+# appl.toml's [ledger] command, delivered by bin/appl and matched against the primary's
+# appl.toml above, is the build IN PLACE OF tools/ledger.py build: run once with the
+# worktree as its cwd, walled like the branch's tests, and its exit code is the verdict.
+# A non-zero exit refuses the landing (LEDGER_REFUSAL=<code>, MERGED=no) and leaves main
+# and the worktree as they were. A root with no tools/ledger.py stays LEDGER=none and
+# the command does not run, trusted or not.
 ledger_line="none (no tools/ledger.py in this repository)"
 if [[ -f "$ledger_tool" ]]; then
-  build_out="$(landing_python "$ledger_tool" --into "$worktree" build 2>&1)" || {
-    echo "refusing to land ${branch}: tools/ledger.py build failed:" >&2
-    printf '%s\n' "$build_out" >&2
-    exit 1
-  }
-  if [[ -n "$(git -C "$worktree" status --porcelain)" ]]; then
-    git -C "$worktree" add -A -- $generated 2>/dev/null || git -C "$worktree" add -A
-    git -C "$worktree" commit -q -m "ledger: regenerate on landing ${branch}"
-    ledger_line="regenerated ($(git -C "$worktree" rev-parse --short HEAD))"
+  if [[ -n "$ledger_command" ]]; then
+    ledger_command_text="$(iso_safe_text "$ledger_command")"
+    echo "running appl.toml's [ledger] command for ${branch}: ${ledger_command_text}" >&2
+    set +e
+    ( cd "$worktree" && credless bash -c "$ledger_command" ) < /dev/null >&2
+    lc_rc=$?
+    set -e
+    if [[ "$lc_rc" != "0" ]]; then
+      {
+        echo "refusing to land ${branch}: appl.toml's [ledger] command exited ${lc_rc}"
+        echo "The worktree is untouched (already rebased onto ${base}); fix, commit, run finish again."
+      } >&2
+      echo "MERGED=no"
+      echo "LEDGER_REFUSAL=${lc_rc}"
+      exit 1
+    fi
+    if [[ -n "$(git -C "$worktree" status --porcelain)" ]]; then
+      git -C "$worktree" add -A -- $generated 2>/dev/null || git -C "$worktree" add -A
+      git -C "$worktree" commit -q -m "ledger: regenerate on landing ${branch}"
+    fi
+    # the safe text of a command with nothing to escape is the command itself
+    ledger_line="$ledger_command_text"
   else
-    ledger_line="current"
+    build_out="$(landing_python "$ledger_tool" --into "$worktree" build 2>&1)" || {
+      echo "refusing to land ${branch}: tools/ledger.py build failed:" >&2
+      printf '%s\n' "$build_out" >&2
+      exit 1
+    }
+    if [[ -n "$(git -C "$worktree" status --porcelain)" ]]; then
+      git -C "$worktree" add -A -- $generated 2>/dev/null || git -C "$worktree" add -A
+      git -C "$worktree" commit -q -m "ledger: regenerate on landing ${branch}"
+      ledger_line="regenerated ($(git -C "$worktree" rev-parse --short HEAD))"
+    else
+      ledger_line="current"
+    fi
   fi
 fi
 
@@ -3489,9 +3600,18 @@ publish_round() {
     fi
   fi
 
-  # the ledgers, rebuilt on the rebased tip
+  # the ledgers, rebuilt on the rebased tip. appl.toml's [ledger] command, when this
+  # landing trusted one, stands in for tools/ledger.py build, the same as the first build.
   if [[ -f "$gate_ledger" ]]; then
-    if ! landing_python "$gate_ledger" --into "$pr_wt" build >/dev/null 2>&1; then
+    if [[ -n "$ledger_command" ]]; then
+      pr_rc=0
+      ( cd "$pr_wt" && credless bash -c "$ledger_command" ) < /dev/null >/dev/null 2>&1 || pr_rc=$?
+      if [[ "$pr_rc" != "0" ]]; then
+        pw_why="appl.toml's [ledger] command failed on ${base} rebased onto ${remote_base} (${pr_onto:0:7}; exit ${pr_rc})"
+        cleanup_publish_wt
+        return 1
+      fi
+    elif ! landing_python "$gate_ledger" --into "$pr_wt" build >/dev/null 2>&1; then
       pw_why="tools/ledger.py build failed on the rebased tree"
       cleanup_publish_wt
       return 1

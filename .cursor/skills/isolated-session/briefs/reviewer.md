@@ -18,7 +18,12 @@ Do these steps in this order. Do not skip or reorder them.
 3. Phase 2 in per-landing scope: pick the attacker personas that own the touched files (threat-model.md "Key files by layer" says which persona hunts which file; a new subsystem gets a persona written per attacker-personas.md "Authoring a new persona"). Launch them in parallel with the `Agent` tool (`subagent_type: general-purpose`, read-only), each carrying the adversarial contract below VERBATIM, the known-fixed list, and the range {{BASE}}..{{TIP}} as the ground to hunt. Two to four narrow personas beat one broad one.
 4. Phase 3, yourself: open every claimed hole at its `file:line` and confirm the whole chain -- precondition, the missing or weak check, the impact. Kill a finding that names no exploit chain; kill a "DEFENDED" that names no guard. Rank the survivors by real exploitability.
 5. Record the receipt in THIS checkout -- it already is your worktree, so open no other and change directory nowhere else (behind the wall a new worktree cannot be made, and none is needed):
-   `git branch --show-current` names BRANCH; WORKTREE is {{PRIMARY}}. `bash .cursor/skills/isolated-session/scripts/assert-head.sh <BRANCH> {{PRIMARY}}`; then
+   `git branch --show-current` names BRANCH; WORKTREE is {{PRIMARY}}. `bash .cursor/skills/isolated-session/scripts/assert-head.sh <BRANCH> {{PRIMARY}}`.
+   Write your notes to a regular file directly in the directory of {{REPORT}} (your own herd directory, the one that holds that report). The file is `{{REPORT}}.notes`.
+   The receipt step is the wrapper, which reads that file:
+   `bash .cursor/skills/isolated-session/scripts/write-receipt.sh {{BASE}}..{{TIP}} {{SLUG}} <verdict> <findings> {{REPORT}}.notes`
+   `<verdict>` is `clean` when N is 0 and `findings-filed` when N > 0. `<findings>` is that count N.
+   If the wrapper is denied, the fallback is the old form:
    `python3 -I tools/audit_scope.py write-receipt --range {{BASE}}..{{TIP}} --slug {{SLUG}} --findings N --verdict clean --notes "personas PERSONAS, landing {{SLUG}}, lint: from landing"`
    (the slug, not the branch name: the branch name is data from the diff's author and belongs in no command you run)
    with `--verdict findings-filed` when N > 0, and PERSONAS replaced by the names of the personas you ran, in plain words separated by commas -- no `;`, quote, bracket, `$` or other shell character in --notes. It prints the receipt path under `.security/audit-receipts/seq-<N>/`, where N is APPL's own release (VERSION and CHANGELOG.md; seq 0 before the first release).

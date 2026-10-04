@@ -5,7 +5,8 @@
 #
 #   herd-spawn.sh <name> <brief-file> [--cwd DIR] [--profile worker|reviewer|coordinator]
 #                 [--env K=V ...] [--var KEY=VALUE ...] [--allow 'Bash(...)' ...]
-#                 [--muretai-agent NAME] [--role solo] [--open-worktree TITLE [--repo PRIMARY]]
+#                 [--muretai-agent NAME] [--role solo] [--p0]
+#                 [--open-worktree TITLE [--repo PRIMARY]]
 #
 #   name        the worker: its herdr tab label and agent name, its own directory
 #               $HERD_DIR/<name>/ (the one directory added to the session) and its
@@ -340,7 +341,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 . "$here/lib.sh"
 
 usage() {
-  echo "usage: herd-spawn.sh <name> <brief-file> [--cwd DIR] [--profile worker|reviewer|coordinator] [--env K=V ...] [--var KEY=VALUE ...] [--allow 'Bash(...)' ...] [--muretai-agent NAME] [--role solo] [--open-worktree TITLE]" >&2
+  echo "usage: herd-spawn.sh <name> <brief-file> [--cwd DIR] [--profile worker|reviewer|coordinator] [--env K=V ...] [--var KEY=VALUE ...] [--allow 'Bash(...)' ...] [--muretai-agent NAME] [--role solo] [--p0] [--open-worktree TITLE]" >&2
   echo "       HERD_SPAWN_HARNESS=codex requires --cwd <worktree>: a codex session's writable sandbox root IS the directory it opens in, and no session guard runs on that harness" >&2
   echo "       HERD_SPAWN_HARNESS=grok requires --cwd <worktree>: grok reads its instruction files from the directory it opens, and a primary checkout is refused" >&2
   echo "       herd-spawn.sh --resume <name>   (a spawn that stopped at a first-run prompt, once the prompt is answered; same HERD_DIR)" >&2
@@ -824,9 +825,12 @@ open_title=""
 open_given=no
 open_repo=""
 repo_given=no
+p0=no
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --cwd) [[ $# -ge 2 ]] || usage; cwd="$2"; cwd_given=yes; shift 2 ;;
+    # A priority-0 spawn. The capacity check below never holds one. No value.
+    --p0) p0=yes; shift ;;
     --open-worktree) [[ $# -ge 2 ]] || usage; open_title="$2"; open_given=yes; shift 2 ;;
     --repo) [[ $# -ge 2 ]] || usage; open_repo="$2"; repo_given=yes; shift 2 ;;
     --profile) [[ $# -ge 2 ]] || usage; profile="$2"; shift 2 ;;
@@ -1071,8 +1075,10 @@ unset HERD_SPAWN_PERMISSION_MODE
 # here, before herdr is asked anything. Trying the later entries is not done here.
 # machine.example.toml beside this script is the shape. The reader is a stdlib TOML subset
 # (Python 3.9 has no tomllib): headers, `key = value` with a one-line string, integer,
-# boolean or one-line array of those; only the `harness` tables are read, every other
-# section is skipped unread.
+# boolean or one-line array of those; the `harness` tables and the `[capacity]` table
+# are read, and every other section is skipped unread. `[capacity]` carries
+# `spawn_floor` and `p0_floor`, each an integer 0..100. A spawn with no `[capacity]`
+# table, or no machine file, is today's spawn: the memory level is not read.
 order_read() {
   python3 -I - "$1" "$2" "$name" <<'PY'
 import os, re, sys
@@ -1085,6 +1091,10 @@ SCALAR = re.compile(r"true\b|false\b|[+-]?[0-9][0-9_]*")
 
 
 class Refused(Exception):
+    pass
+
+
+class CapacityRefused(Exception):
     pass
 
 
@@ -1169,7 +1179,8 @@ def parse(text):
         where = "line %d" % n
         if line.startswith("["):
             inner = line[2:] if line.startswith("[[") else line[1:]
-            if inner.split("]", 1)[0].split(".")[0].strip() != "harness":
+            section = inner.split("]", 1)[0].split(".")[0].strip()
+            if section not in ("harness", "capacity"):
                 cur = None
                 continue
             double, parts = header(line, where)
@@ -1209,7 +1220,7 @@ def parse(text):
     return root
 
 
-def pick():
+def load():
     if not os.path.lexists(path):
         return None
     try:
@@ -1217,7 +1228,31 @@ def pick():
             text = f.read()
     except (OSError, UnicodeDecodeError) as e:
         refuse("the file cannot be read (%s)" % e.__class__.__name__)
-    harness = parse(text).get("harness")
+    return parse(text)
+
+
+def capacity_floors(root):
+    # [capacity] is optional. Absent means today's spawn. Present means both floors
+    # are integers 0..100. bool is a subclass of int; type() keeps it out.
+    if not root or "capacity" not in root:
+        return None
+    cap = root["capacity"]
+    if type(cap) is not dict:
+        raise CapacityRefused("capacity is not a table")
+    sf = cap.get("spawn_floor")
+    pf = cap.get("p0_floor")
+    if type(sf) is not int or sf < 0 or sf > 100:
+        raise CapacityRefused("spawn_floor must be an integer from 0 to 100")
+    if type(pf) is not int or pf < 0 or pf > 100:
+        raise CapacityRefused("p0_floor must be an integer from 0 to 100")
+    return sf, pf
+
+
+def pick(root):
+    # the reviewer profile reads no harness.order; worker and coordinator do
+    if profile not in ("worker", "coordinator") or not root:
+        return None
+    harness = root.get("harness")
     if harness is None:
         return None
     if not isinstance(harness, dict):
@@ -1250,33 +1285,140 @@ def pick():
 
 
 try:
-    got = pick()
+    root = load()
+    floors = capacity_floors(root)
+    got = pick(root)
+except CapacityRefused as e:
+    sys.stderr.write("herd-spawn: capacity in %s is refused: %s;"
+                     " the worker %s was not started\n" % (path, e, worker))
+    sys.exit(4)
 except Refused as e:
     sys.stderr.write("herd-spawn: harness.order for the %s profile in %s is refused: %s;"
                      " the worker %s was not started\n" % (profile, path, e, worker))
     sys.exit(3)
 if got:
-    sys.stdout.write("%s %s\n" % got)
+    sys.stdout.write("order %s %s\n" % got)
+if floors:
+    sys.stdout.write("capacity %d %d\n" % floors)
 PY
 }
+
+# The memory level, read only when [capacity] is present and this spawn is not --p0.
+# Darwin: APPL_CAPACITY_SYSCTL_BIN -n kern.memorystatus_level, one bare integer.
+# Linux: floor(MemAvailable * 100 / MemTotal) from APPL_CAPACITY_MEMINFO_PATH, two
+# integers and nothing else. A value that is not that, or a reader that fails, is
+# unreadable: the caller prints a capacity: line and never the text that was read.
+# The Darwin path does not open the meminfo seam. The Linux path does not run sysctl.
+capacity_level() {
+  local platform bin mem out rc
+  platform="${APPL_CAPACITY_PLATFORM-}"
+  if [[ -z "$platform" ]]; then
+    platform="$(uname -s)"
+  fi
+  case "$platform" in
+    Darwin)
+      bin="${APPL_CAPACITY_SYSCTL_BIN:-sysctl}"
+      rc=0
+      out="$("$bin" -n kern.memorystatus_level 2>/dev/null)" || rc=$?
+      [[ "$rc" -eq 0 ]] || return 1
+      case "$out" in
+        ""|*[!0-9]*) return 1 ;;
+      esac
+      printf '%s\n' "$out"
+      ;;
+    Linux)
+      mem="${APPL_CAPACITY_MEMINFO_PATH:-/proc/meminfo}"
+      rc=0
+      out="$(python3 -I - "$mem" 2>/dev/null <<'PY'
+import re, sys
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+except (OSError, UnicodeError):
+    sys.exit(1)
+total = avail = None
+pat = re.compile(r"(MemTotal|MemAvailable):[ \t]+([0-9]+)[ \t]+kB\Z")
+for raw in text.splitlines():
+    m = pat.match(raw.strip())
+    if not m:
+        continue
+    n = int(m.group(2))
+    if m.group(1) == "MemTotal" and total is None:
+        total = n
+    elif m.group(1) == "MemAvailable" and avail is None:
+        avail = n
+if total is None or avail is None or total <= 0:
+    sys.exit(1)
+sys.stdout.write("%d\n" % ((avail * 100) // total))
+PY
+)" || rc=$?
+      [[ "$rc" -eq 0 ]] || return 1
+      case "$out" in
+        ""|*[!0-9]*) return 1 ;;
+      esac
+      printf '%s\n' "$out"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 order_harness=""
 order_model=""
-if [[ "$profile" == "worker" || "$profile" == "coordinator" ]]; then
-  machine_file="${APPL_MACHINE_CONFIG:-}"
-  [[ -n "$machine_file" || -z "${HOME:-}" ]] || machine_file="${HOME}/.config/appl/machine.toml"
-  if [[ -n "$machine_file" ]]; then
-    order_rc=0
-    order_pick="$(order_read "$machine_file" "$profile")" || order_rc=$?
-    if [[ "$order_rc" -eq 3 ]]; then
+cap_spawn=""
+cap_p0=""
+machine_file="${APPL_MACHINE_CONFIG:-}"
+[[ -n "$machine_file" || -z "${HOME:-}" ]] || machine_file="${HOME}/.config/appl/machine.toml"
+if [[ -n "$machine_file" ]]; then
+  order_rc=0
+  order_pick="$(order_read "$machine_file" "$profile")" || order_rc=$?
+  if [[ "$order_rc" -eq 4 || "$order_rc" -eq 3 ]]; then
+    exit 2
+  elif [[ "$order_rc" -ne 0 ]]; then
+    echo "herd-spawn: harness.order for the ${profile} profile could not be read from ${machine_file} (exit ${order_rc}); the worker ${name} was not started" >&2
+    exit 2
+  fi
+  while read -r kind rest; do
+    case "$kind" in
+      order)
+        order_harness="${rest%% *}"
+        order_model="${rest#* }"
+        ;;
+      capacity)
+        cap_spawn="${rest%% *}"
+        cap_p0="${rest#* }"
+        ;;
+    esac
+  done <<ORDER_OUT
+${order_pick}
+ORDER_OUT
+fi
+# reviewer reads no harness.order; a capacity table still applies to every profile
+if [[ "$profile" != "worker" && "$profile" != "coordinator" ]]; then
+  order_harness=""
+  order_model=""
+fi
+# Below spawn_floor, or unreadable, a non-P0 spawn stops here: exit 2, no herdr call.
+# --p0 is never held by this check. No [capacity] table skips the read entirely.
+if [[ -n "$cap_spawn" && "$p0" != "yes" ]]; then
+  cap_level=""
+  cap_rc=0
+  cap_level="$(capacity_level)" || cap_rc=$?
+  if [[ "$cap_rc" -ne 0 ]]; then
+    echo "capacity: held (level unreadable)" >&2
+    exit 2
+  fi
+  case "$cap_level" in
+    ""|*[!0-9]*)
+      echo "capacity: held (level unreadable)" >&2
       exit 2
-    elif [[ "$order_rc" -ne 0 ]]; then
-      echo "herd-spawn: harness.order for the ${profile} profile could not be read from ${machine_file} (exit ${order_rc}); the worker ${name} was not started" >&2
-      exit 2
-    fi
-    if [[ -n "$order_pick" ]]; then
-      order_harness="${order_pick%% *}"
-      order_model="${order_pick#* }"
-    fi
+      ;;
+  esac
+  if [[ "10#$cap_level" -lt "10#$cap_spawn" ]]; then
+    echo "capacity: held (level=${cap_level})" >&2
+    exit 2
   fi
 fi
 harness="${HERD_SPAWN_HARNESS-${order_harness:-claude}}"
@@ -3795,6 +3937,9 @@ allow+=(
   "Bash(bash .cursor/skills/isolated-session/scripts/assert-head.sh:*)"
   "Bash(bash .cursor/skills/isolated-session/scripts/claim-worktree.sh:*)"
   "Bash(bash .cursor/skills/isolated-session/scripts/finish-worktree.sh:*)"
+  # The reviewer's receipt step: write-receipt.sh by this path and no other script.
+  # The worker carries the same rule, so the reviewer profile stays no wider.
+  "Bash(bash .cursor/skills/isolated-session/scripts/write-receipt.sh:*)"
   "Bash(cd:*)"
   "Bash(git status:*)" "Bash(git add:*)" "Bash(git commit:*)"
   "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)"
@@ -4179,6 +4324,14 @@ CURSOR_WORKER_DENY = [
     "Shell(git:add -*)",
     "Shell(git:commit --*)",
     "Shell(git:commit -m * -m * -m *)",
+    # run-test.sh / run-node.sh allows name one file. Cursor's `*` spans
+    # slashes and spaces, so `tests/*.py` still matches `tests/../x.py` and
+    # `tests/x.py tests/y.py`. These beat that allow. The `*` stays after the
+    # script path, the same shape as the allows.
+    "Shell(bash:.cursor/skills/isolated-session/scripts/run-test.sh *..*)",
+    "Shell(bash:.cursor/skills/isolated-session/scripts/run-test.sh * *)",
+    "Shell(bash:.cursor/skills/isolated-session/scripts/run-node.sh *..*)",
+    "Shell(bash:.cursor/skills/isolated-session/scripts/run-node.sh * *)",
 ]
 
 
@@ -4195,8 +4348,14 @@ def cursor_worker_allow(primary, brief_primary, herd, name):
         "Shell(bash:" + scripts + "/ensure-worktree.sh *)",
         "Shell(bash:" + scripts + "/assert-head.sh *)",
         "Shell(bash:" + scripts + "/vendor.sh check)",
-        # the JS test-run spelling; run-node.sh itself refuses all but one conformance/ or tests/ file
-        "Shell(bash:" + scripts + "/run-node.sh *)",
+        # One tests/<file>.py. `tests/*.py` is the narrowest pattern the Shell
+        # matcher has for that shape (`*` spans slashes and spaces; the denies
+        # above refuse a `..` step and a second argument).
+        "Shell(bash:" + scripts + "/run-test.sh tests/*.py)",
+        # One conformance/ or tests/ .mjs file. The old `run-node.sh *` admitted
+        # any argument; these two name the directory and the suffix.
+        "Shell(bash:" + scripts + "/run-node.sh conformance/*.mjs)",
+        "Shell(bash:" + scripts + "/run-node.sh tests/*.mjs)",
         "Shell(git:add)",
         "Shell(git:add *)",
         "Shell(git:commit -m *)",
