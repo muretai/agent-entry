@@ -3204,7 +3204,9 @@ export const INPUT_TYPES = Object.freeze(['string', 'integer', 'number', 'boolea
 const OFFER_SPELLING = /^[a-z][a-z0-9_]*$/;
 const INPUT_FIELD = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CALL_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
-const DECLARATION_KEYS = ['v', 'entry', 'offers', 'facts'];
+const DECLARATION_KEYS = ['v', 'entry', 'offers', 'facts', 'privateFacts'];
+/** A fact name `publish --fact` accepts: a plain identifier. */
+const FACT_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const ENTRY_KEYS = ['name', 'baseUrl', 'domains', 'prefer', 'catalog', 'counts'];
 const OFFER_KEYS = ['verb', 'of', 'about', 'input', 'effect', 'ask', 'then', 'page', 'door'];
 
@@ -3499,6 +3501,21 @@ function readDeclaration(declaration) {
       facts[key] = declaredString(value, `facts.${key.slice(0, 40)}`);
     }
   }
+  // Private facts are the owner's own: checked here, held by the door for privateFact(), and
+  // never compiled, signed, served or logged. A refusal names the key, never the value.
+  let privateFacts;
+  if (declaration.privateFacts !== undefined) {
+    if (!isPlainObject(declaration.privateFacts)) refuseDeclaration('privateFacts', 'must map a name to a string');
+    privateFacts = new Map();
+    for (const [key, value] of Object.entries(declaration.privateFacts)) {
+      declaredString(key, 'privateFacts');
+      const at = `privateFacts.${key.slice(0, 40)}`;
+      if (typeof value !== 'string' || value.length === 0) refuseDeclaration(at, 'must be a non-empty string');
+      if (LONE_SURROGATE.test(value)) refuseDeclaration(at, 'is not encodable UTF-8 (a lone surrogate)');
+      if (facts !== undefined && Object.hasOwn(facts, key)) refuseDeclaration(at, 'is also a public fact: keep one of the two');
+      privateFacts.set(key, value);
+    }
+  }
 
   if (!Array.isArray(declaration.offers) || declaration.offers.length === 0) {
     refuseDeclaration('offers', 'must be a non-empty list of what a customer can do here');
@@ -3511,7 +3528,7 @@ function readDeclaration(declaration) {
     ids.add(compiled.id);
     offers.push(compiled);
   });
-  return { name, origin, origins, prefer, offers, facts, counts };
+  return { name, origin, origins, prefer, offers, facts, privateFacts, counts };
 }
 
 /** Returns the declaration unchanged, or throws a TypeError naming the field (AT-2). */
@@ -3912,6 +3929,9 @@ function readCatalogFile(path, origin) {
  *                  The door answers GET of exactly `path` — one file name directly under
  *                  /.well-known/, at the ORIGIN whatever the mount — with `body` as text/plain,
  *                  byte for byte. Absent, no proof is served. Anything else throws TypeError.
+ *
+ * The returned `privateFact(key)` hands the embedding code a fact the declaration keeps under
+ * `privateFacts`; that value is never in the contract, the card, a reply or an observer event.
  */
 export function createAgentEntry({
   seedHex,
@@ -4000,8 +4020,10 @@ export function createAgentEntry({
   // not check out would otherwise publish something the operator did not write. Only an
   // ABSENT declaration means "none": `null` is a declaration that failed to load, and refused.
   let tools = null;
+  let privateFacts = null;
   if (declaration !== undefined) {
     const read = readDeclaration(declaration);
+    privateFacts = read.privateFacts ?? null;
     if (read.origin !== doorOrigin) {
       throw new TypeError(`createAgentEntry: the declaration's entry.baseUrl is ${read.origin} and this `
         + `entry answers at ${doorOrigin} — a contract is served only from an origin it names`);
@@ -5636,7 +5658,9 @@ export function createAgentEntry({
   // DID->count of WBA-verified fetches — all in-process only, like `ledger`.
   return { did, card, ledger, mount, stats, clientStats, vendorStats, wbaVisits,
     handleRequest, handleRequestAsync, listen,
-    cardEnvelope: () => JSON.parse(cardEnvelopeBytes().toString('utf8')) };
+    cardEnvelope: () => JSON.parse(cardEnvelopeBytes().toString('utf8')),
+    // The declaration's private fact `key`, for the embedding code only; undefined when absent.
+    privateFact: (key) => (privateFacts && typeof key === 'string' ? privateFacts.get(key) : undefined) };
 }
 
 /** The A2A text of a message: every `text` part, joined by newline (Message.from_a2a). */
@@ -6125,9 +6149,12 @@ const USAGE = {
     + `  the keys ${WOO_FACT_KEYS.join(', ')}\n`
     + '  (human_contact_email or human_contact_phone may be left out, not both); without --facts they are read\n'
     + '  from stdin, one line each in that order.',
-  publish: 'usage: agent-entry publish [--version <n>] [--json]   (alias: agent-entry deploy)\n'
+  publish: 'usage: agent-entry publish [--fact <key>=<value> [--private]]... [--version <n>] [--json]   (alias: agent-entry deploy)\n'
     + '  Validates agent-entry.json, compiles and signs it, and writes <static dir>/.well-known/agent-tools.json,\n'
     + '  agent-tools.sig.json and agent-tools/v<n>.json. A published version is never rewritten. No network.\n'
+    + '  --fact <key>=<value> (repeatable) sets a fact in agent-entry.json first; the key is a plain identifier.\n'
+    + '  --private marks the --fact just before it: that fact stays in agent-entry.json for the door\'s\n'
+    + '  privateFact(key) and is never published, signed, served or printed. A malformed --fact writes nothing.\n'
     + '  --claim is retired and refuses, writing nothing: serve a proof of ownership with\n'
     + '  agent-entry serve --proof-path <path> --proof-body <body> instead.',
   doctor: 'usage: agent-entry doctor [--url <site url> | --from woocommerce] [--json]\n'
@@ -7186,9 +7213,61 @@ const PUBLISH_RETIRED_ALIAS = '--claim is retired: publish no longer records a p
   + 'the ownership proof seam instead: agent-entry serve --proof-path <path> --proof-body <body> (or '
   + 'createAgentEntry({ ownershipProof })). Nothing was written.';
 
+/** `--fact <key>=<value> [--private]`, in order, taken out of `argv`: { rest, facts: [{key, value,
+ *  private}] }. Every --fact is checked here, before anything is read or written, and a refusal
+ *  names the key at fault but never repeats a value it was given. */
+function takeFactFlags(argv) {
+  const rest = [];
+  const facts = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--private') {
+      const last = facts[facts.length - 1];
+      if (!last || last.end !== i - 1 || last.private) throw new CliMisuse('--private marks the --fact just before it, and there is none');
+      last.private = true;
+      continue;
+    }
+    if (arg.startsWith('--private=')) throw new CliMisuse('--private takes no value');
+    if (arg !== '--fact' && !arg.startsWith('--fact=')) { rest.push(arg); continue; }
+    const given = arg === '--fact' ? argv[(i += 1)] : arg.slice('--fact='.length);
+    if (given === undefined || (arg === '--fact' && given.startsWith('--'))) throw new CliMisuse('--fact needs <key>=<value>');
+    const eq = given.indexOf('=');
+    if (eq < 0) throw new CliMisuse('--fact needs <key>=<value>, and this one has no "="');
+    const key = given.slice(0, eq);
+    const value = given.slice(eq + 1);
+    const named = JSON.stringify(key.slice(0, 60));
+    if (!key) throw new CliMisuse('--fact has an empty key: give <key>=<value>');
+    if (!FACT_KEY.test(key)) throw new CliMisuse(`--fact key ${named} is not a plain identifier (letters, digits and _, not starting with a digit)`);
+    if (facts.some((f) => f.key === key)) throw new CliMisuse(`--fact key ${named} is given more than once`);
+    if (!value) throw new CliMisuse(`--fact key ${named} has an empty value`);
+    if (LONE_SURROGATE.test(value)) throw new CliMisuse(`--fact key ${named} has a value that is not encodable UTF-8`);
+    facts.push({ key, value, private: false, end: i });
+  }
+  return { rest, facts };
+}
+
+/** `declaration` with `facts` set: a private one moves under `privateFacts`, a public one under
+ *  `facts`, and a key set one way leaves the other. Never mutates its input. */
+function withFacts(declaration, facts) {
+  if (!isPlainObject(declaration) || facts.length === 0) return declaration;
+  const out = JSON.parse(JSON.stringify(declaration));
+  for (const { key, value, private: hidden } of facts) {
+    const [into, from] = hidden ? ['privateFacts', 'facts'] : ['facts', 'privateFacts'];
+    if (out[into] === undefined) out[into] = {};
+    // Anything but an object is left for readDeclaration to refuse.
+    if (isPlainObject(out[into])) out[into][key] = value;
+    if (isPlainObject(out[from])) {
+      delete out[from][key];
+      if (from === 'privateFacts' && Object.keys(out[from]).length === 0) delete out[from];
+    }
+  }
+  return out;
+}
+
 async function publishMain(argv) {
   if (argv.some((arg) => arg === '--claim' || arg.startsWith('--claim='))) throw new CliRefusal(PUBLISH_RETIRED_ALIAS);
-  const flags = parseFlags(argv, { version: 'string', json: 'boolean' });
+  const { rest, facts: factFlags } = takeFactFlags(argv);
+  const flags = parseFlags(rest, { version: 'string', json: 'boolean' });
   let target = null;
   if (flags.version !== undefined) {
     if (!/^[1-9][0-9]{0,8}$/.test(flags.version)) throw new CliMisuse('--version must be a positive integer');
@@ -7199,6 +7278,9 @@ async function publishMain(argv) {
   if (!existsSync(declPath)) throw new CliRefusal(`no ${DECLARATION_FILE} here: run agent-entry init first`);
   let declaration;
   try { declaration = readJsonFile(declPath); } catch (e) { throw new CliRefusal(`${DECLARATION_FILE} is not JSON: ${shortError(e)}`); }
+  const before = JSON.stringify(declaration);
+  declaration = withFacts(declaration, factFlags);
+  const declarationChanged = JSON.stringify(declaration) !== before;
   let read;
   try { read = readDeclaration(declaration); } catch (e) { throw new CliRefusal(e.message); }
   const framework = detectFramework(root);
@@ -7237,6 +7319,8 @@ async function publishMain(argv) {
   const sigPath = join(wk, 'agent-tools.sig.json');
   const bytes = canonicalJSON(contract);
   let changed = false;
+  // Every refusal is behind us: the facts given land in the declaration, then the contract.
+  if (declarationChanged) writeAtomic(declPath, `${JSON.stringify(declaration, null, 2)}\n`);
   if (version > n) {
     mkdirSync(join(wk, 'agent-tools'), { recursive: true });
     writeFileSync(join(wk, 'agent-tools', `v${version}.json`), bytes, { flag: 'wx' });
