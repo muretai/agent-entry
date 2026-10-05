@@ -23,11 +23,12 @@
 //        (page 1, then ?page=2, each once) and never a page past x-wp-totalpages.
 //   2 the door (Suite S1, landed) started from that declaration serves the card and its signature,
 //        /.well-known/agent-tools.json and /.well-known/agent-tools.sig.json, all verifying.
-//   3 Claim-2 (20261003T131709Z-2)   `publish --claim <32 lowercase hex>` records the code in the
-//        door's config (agent-entry.json), and a door started from it serves
-//        /.well-known/muretai-catalog-claim.txt with the body exactly `muretai-catalog-claim=<code>`
-//        (trunk catalog/service.py:46-49), text/plain; 404 before. A code that is not 32 hex is
-//        refused and writes nothing.
+//   3 the ownership proof seam (OSS-seams chain item 1 landed 2201396; item 2 of 3, parent intake
+//        20261005T115429Z, drops the built-in claim workflow)   the door started from the project's
+//        agent-entry.json with `createAgentEntry({ownershipProof})` serves the proof path and body
+//        THIS TEST supplies, exactly, text/plain; 404 before. `publish --claim <code>` is only a
+//        deprecated alias now: it exits non-zero, names --proof-path and --proof-body, and writes
+//        nothing, valid code or not.
 //   4 AT-12/AT-13 at the door, S6b-1 (`knock --offer`, landed 9e58808)   `knock --offer find`,
 //        `ask`, `hold`: find answers see_catalog, ask answers the facts, hold answers
 //        pending_confirmation with a deal receipt signed by the shop for this customer.
@@ -103,9 +104,9 @@ const TLS = { key: RUNTIME_TLS.key, cert: RUNTIME_TLS.cert };
 const CHILD_TLS = { NODE_EXTRA_CA_CERTS: RUNTIME_TLS.caPath };
 
 const WOO_PRODUCTS = '/wp-json/wc/store/v1/products';
-const CLAIM_PATH = '/.well-known/muretai-catalog-claim.txt';
-const CLAIM_CODE = '3f9c2a7e1b4d8065c2e9a1f7b3d5c804';
-const CLAIM_MAX_BYTES = 4096;                       // trunk catalog/service.py CLAIM_FILE_MAX_BYTES
+const PROOF_PATH = '/.well-known/frame-shop-proof.txt';   // the test's own proof, not the door's
+const PROOF_BODY = 'frame-shop-proof=3f9c2a7e1b4d8065c2e9a1f7b3d5c804';
+const OLD_CODE = '3f9c2a7e1b4d8065c2e9a1f7b3d5c804';     // a value the retired --claim used to take
 const SEED_IN_FILE = /^[ \t]*(?:export[ \t]+)?AGENT_ENTRY_SEED_HEX[ \t]*=[ \t]*["']?([0-9a-f]{64})["']?[ \t]*\r?$/m;
 const CUSTOMER_DID = didFromSeedHex(SEEDS.customer);
 const DOOR_STAGES = new Set(['signed_post', 'anon_post', 'refused_post']);
@@ -290,8 +291,8 @@ function doorDeclaration(onDisk) {
   return declaration;
 }
 
-/** (Re)start the shop's door from agent-entry.json as it is on disk now. */
-function startDoorFromProject() {
+/** (Re)start the shop's door from agent-entry.json as it is on disk now; `seam` adds createAgentEntry options. */
+function startDoorFromProject(seam = {}) {
   const onDisk = readJson(join(state.project, 'agent-entry.json'));
   const declaration = doorDeclaration(onDisk);
   state.entry = createAgentEntry({
@@ -302,6 +303,7 @@ function startDoorFromProject() {
     store: createFileStore(storePath()),
     observer: fileSink(logPath()),
     vendorRanges: { [NETWORK_VENDOR]: ['127.0.0.0/8'] },
+    ...seam,
   });
   return state.entry;
 }
@@ -451,38 +453,51 @@ test('frame 2 [Suite S1 door, landed]: the door started from that declaration se
   assert.equal(canonicalJSON(verified), canonicalJSON(contract), 'the signed contract is the served one');
 });
 
-// ---------------------------------------------------------------- 3. Claim-2: the door is the claim
+// ---------------------------------------------------------------- 3. the door serves the shop's ownership proof
 
-test('frame 3 [Claim-2 20261003T131709Z-2]: publish --claim <32 hex> makes the door serve muretai-catalog-claim.txt', async () => {
+test('frame 3 [ownership proof seam, OSS-seams item 2 of 20261005T115429Z]: the door serves the proof this test supplies', async () => {
   ensureDeclaration();
+  const onDisk = readFileSync(join(state.project, 'agent-entry.json'));
   startDoorFromProject();
-  const before3 = await caFetch(`${state.shop.origin}${CLAIM_PATH}`);
-  assert.equal(before3.status, 404, 'no claim file before a code is set');
-  const run = await runCli(['publish', '--claim', CLAIM_CODE], { cwd: state.project });
-  assertStayedHome(run, 'publish --claim');
-  assert.equal(run.code, 0, `publish --claim <32 hex> succeeds: ${said(run)}`);
-  startDoorFromProject();
-  const res = await caFetch(`${state.shop.origin}${CLAIM_PATH}`, { headers: { accept: 'text/plain' } });
-  assert.equal(res.status, 200, `the door serves ${CLAIM_PATH} after publish --claim`);
+  const before3 = await caFetch(`${state.shop.origin}${PROOF_PATH}`);
+  assert.equal(before3.status, 404, 'no proof before the seam is given one');
+  assert.notEqual(before3.body, PROOF_BODY, 'no proof body before the seam is given one');
+  startDoorFromProject({ ownershipProof: { path: PROOF_PATH, body: PROOF_BODY } });
+  const res = await caFetch(`${state.shop.origin}${PROOF_PATH}`, { headers: { accept: 'text/plain' } });
+  assert.equal(res.status, 200, `the door serves ${PROOF_PATH} through the seam`);
   assert.match(String(res.headers['content-type']), /^text\/plain\b/, 'served as text/plain');
-  assert.equal(res.body, `muretai-catalog-claim=${CLAIM_CODE}`, 'the body is exactly the Catalog proof line');
-  assert.ok(Buffer.byteLength(res.body) <= CLAIM_MAX_BYTES, 'within the Catalog reader bound');
-  // trunk's reader (catalog/service.py _proof_file): lines, each stripped, one must equal the proof.
-  assert.ok(res.body.split(/\r?\n/).map((l) => l.trim()).includes(`muretai-catalog-claim=${CLAIM_CODE}`),
-    'the Catalog reader finds the proof line');
+  assert.equal(res.body, PROOF_BODY, 'the body is exactly the proof the test supplied, byte for byte');
+  const near = await caFetch(`${state.shop.origin}${PROOF_PATH}x`);
+  assert.equal(near.status, 404, 'only the exact proof path is served');
+  // The seam is the door's only proof: nothing in agent-entry.json made it, and nothing was written.
+  assert.ok(readFileSync(join(state.project, 'agent-entry.json')).equals(onDisk), 'agent-entry.json is untouched by the seam');
+  assert.ok(!Object.hasOwn(readJson(join(state.project, 'agent-entry.json')).entry, 'claim'), 'the declaration carries no claim field in its entry');
+  // Card and contract still verify with the seam in place.
+  const card = await getJson(cardUrl());
+  assert.ok(verifyCardEnvelope(await getJson(`${state.shop.origin}${AGENT_CARD_SIG_PATH}`), card.did), 'the card still verifies');
+  startDoorFromProject();
+  const after3 = await caFetch(`${state.shop.origin}${PROOF_PATH}`);
+  assert.equal(after3.status, 404, 'a door started without the seam serves no proof');
 });
 
-test('frame 3 refusals [Claim-2]: a claim code that is not 32 lowercase hex is refused and changes nothing', async () => {
+test('frame 3 refusals [OSS-seams item 2]: publish --claim is a deprecated alias that refuses, points at --proof-path/--proof-body, and writes nothing', async () => {
   ensureDeclaration();
   const path = join(state.project, 'agent-entry.json');
   const before3 = readFileSync(path);
-  for (const bad of ['3f9c2a7e1b4d8065c2e9a1f7b3d5c80', `${CLAIM_CODE}0`, CLAIM_CODE.toUpperCase(), 'not-a-claim-code-at-all-00000000']) {
-    const run = await runCli(['publish', '--claim', bad], { cwd: state.project });
-    assertStayedHome(run, `publish --claim ${bad}`);
-    assert.notEqual(run.code, 0, `publish --claim ${JSON.stringify(bad)} is refused: ${said(run)}`);
-    assert.match(run.stderr, /claim/i, 'the refusal names the claim code');
-    assert.ok(readFileSync(path).equals(before3), 'a refused code leaves agent-entry.json byte for byte');
+  for (const value of [OLD_CODE, OLD_CODE.toUpperCase(), 'not-a-code']) {
+    const run = await runCli(['publish', '--claim', value], { cwd: state.project });
+    assertStayedHome(run, `publish --claim ${value}`);
+    assert.notEqual(run.code, 0, `publish --claim ${JSON.stringify(value)} is refused: ${said(run)}`);
+    assert.ok(run.code !== null, `publish --claim ${JSON.stringify(value)} exits, not killed: ${said(run)}`);
+    assert.ok(run.stderr.includes('--proof-path'), `the refusal points at --proof-path: ${said(run)}`);
+    assert.ok(run.stderr.includes('--proof-body'), `the refusal points at --proof-body: ${said(run)}`);
+    assert.ok(!run.stdout.includes(value), `nothing is printed as if the value were recorded: ${said(run)}`);
+    assert.ok(readFileSync(path).equals(before3), 'a refused alias leaves agent-entry.json byte for byte');
   }
+  // The door from that project still serves no proof of its own.
+  startDoorFromProject();
+  const res = await caFetch(`${state.shop.origin}${PROOF_PATH}`);
+  assert.equal(res.status, 404, 'the retired alias left no proof behind');
 });
 
 // ---------------------------------------------------------------- 4. find, ask, hold at the door

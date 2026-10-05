@@ -66,15 +66,9 @@
 //                 knocks each door-bound offer of agent-entry.json at the door its entry.baseUrl names, and
 //                 only there; one row per offer, id `offer.<offer id>`, PASS or FAIL, every offer checked
 //                 even after one fails; never confirms a hold, never echoes a secret (section 11f).
-//   publish --claim <32 lowercase hex>  (FRAME Claim-2) records the code in agent-entry.json, prints
-//                 `_muretai-catalog.<host> TXT muretai-catalog-claim=<code>`, and the door serves
-//                 GET /.well-known/muretai-catalog-claim.txt: 200 text/plain `muretai-catalog-claim=<code>`
-//                 (no trailing newline), 404 without a code, GET in OPTIONS' Allow once claimed. Any
-//                 other code is refused naming 32/hex, and nothing is written.
-//   publish --claim <code> --address <text> --contact-name <text> [--contact-email <text>] [--contact-phone <text>]
-//                 (claim-lookup chain item 1) shows the entered values, asks the claimant to confirm on stdin,
-//                 and only on yes writes them as entered into agent-entry.json `facts` with `facts_source`
-//                 naming each "claimant"; no network at all (section 13).
+//   publish --claim <anything>  (OSS-seams chain item 2 of 3, parent intake 20261005T115429Z) is a
+//                 deprecated alias that refuses: non-zero, the refusal names --proof-path and --proof-body,
+//                 nothing written; the claimant flags are refused too (section 12).
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, createPrivateKey, X509Certificate } from 'node:crypto';
 import { createServer } from 'node:http';
@@ -2730,488 +2724,145 @@ await section('woo-doctor', async () => {
   } finally { await door.close(); await store.close(); await decoy.close(); }
 });
 
-// ---------------------------------------------------------------- 12. publish --claim: the Catalog's proof file
+// ---------------------------------------------------------------- 12. publish --claim: a retired alias for the proof seam
 //
-// WRITTEN BEFORE THE IMPLEMENTATION (test-first, P0 FRAME Claim-2, intake 20261003T131709Z-2).
-// `publish --claim <code>` with exactly 32 lowercase hex records the code in the door's config
-// (agent-entry.json, the one config the door reads: a door built from that file the way the wired
-// agent-entry.door.mjs builds it serves the claim), and prints the DNS TXT alternative as one line
-// `_muretai-catalog.<host> TXT muretai-catalog-claim=<code>`. The door then answers
-// GET /.well-known/muretai-catalog-claim.txt with 200, text/plain, body exactly
-// `muretai-catalog-claim=<code>` -- no trailing newline: trunk catalog/service.py hands the owner
-// `file_body = CLAIM_PREFIX + code` with none, and its reader (_proof_file) strips each line. Without
-// a code the path is 404 and not advertised; with one, OPTIONS on it is 204 with GET in Allow.
-// Any other code is refused by name (32 / hex), exit 1 or 2, and nothing is written.
+// WRITTEN BEFORE THE IMPLEMENTATION (test-first, OSS-seams chain item 2 of 3, parent intake
+// 20261005T115429Z). The door no longer carries a built-in claim workflow: the hard-coded claim path
+// and its prefix, the entry's claim field, and the claimant flags are gone (conformance/builtin-claim-removed.mjs
+// pins their absence). A site-ownership proof is served through the generic seam of item 1 instead:
+// `createAgentEntry({ownershipProof})` and `agent-entry serve --proof-path <path> --proof-body <body>`
+// (conformance/ownership-proof.mjs).
+//   - `publish --claim <anything>` is a deprecated alias that refuses: non-zero exit, the refusal names
+//     --proof-path and --proof-body, nothing in the project is written, and no proof line or DNS record
+//     is printed. A once-valid 32-hex code is refused exactly like any other value.
+//   - The claimant flags are refused with or without --claim, never confirmed, nothing written.
+//   - `publish --help` names no claimant flag; if it still names --claim it also names --proof-path.
+//   - A door built from the project's agent-entry.json serves the proof the TEST supplies through the
+//     seam, and a plain `publish` after a refused alias still works.
 
-const CLAIM_PATH = '/.well-known/muretai-catalog-claim.txt';
-const CLAIM_CODE = '0123456789abcdef0fedcba987654321';
-const CLAIM_CODE_2 = 'a'.repeat(16) + '5'.repeat(16);
-const BAD_CLAIMS = [
-  ['31-hex', CLAIM_CODE.slice(0, 31)],
-  ['33-hex', `${CLAIM_CODE}0`],
-  ['uppercase', CLAIM_CODE.toUpperCase()],
-  ['mixed-case', `${CLAIM_CODE.slice(0, 31)}F`],
-  ['non-hex', 'g'.repeat(32)],
-  ['64-hex', CLAIM_CODE.repeat(2)],
-  ['prefixed', `muretai-catalog-claim=${CLAIM_CODE}`],
-  ['trailing-space', `${CLAIM_CODE} `],
-  ['leading-space', ` ${CLAIM_CODE}`],
-  ['newline-injected', `${CLAIM_CODE}\nX-Evil: 1`],
-  ['trailing-newline', `${CLAIM_CODE}\n`],
+const RETIRED_VALUES = [
+  ['once-valid-32-hex', '0123456789abcdef0fedcba987654321'],
+  ['uppercase', '0123456789ABCDEF0FEDCBA987654321'],
+  ['31-hex', '0123456789abcdef0fedcba98765432'],
+  ['newline-injected', '0123456789abcdef0fedcba987654321\nX-Evil: 1'],
   ['path-traversal', '../../../../etc/passwd0123456789'],
   ['empty', ''],
 ];
-const CLAIM_REASON = /\b32\b|\bhex/i;
-const DNS_LINE = (code) => `_muretai-catalog.shop.example TXT muretai-catalog-claim=${code}`;
+const RETIRED_SHAPES = [/\/\.well-known\/[A-Za-z0-9._-]*claim/i, /[a-z0-9]-claim=/i, /\bTXT\b/];
+const SEAM_PATH = '/.well-known/cli-shop-proof.txt';
+const SEAM_BODY = 'cli-shop-proof-5521';
 
-/** A door built from the project's agent-entry.json the way the wired door module builds it. */
-function doorFromProject(dir) {
-  const declaration = JSON.parse(readFileSync(join(dir, 'agent-entry.json'), 'utf8'));
-  return createAgentEntry({ seedHex: PUBLISH_SEED, name: declaration.entry.name, baseUrl: declaration.entry.baseUrl,
-    declaration });
+/** Refused as the retired alias: non-zero, pointed at the seam's flags, nothing written, nothing printed as recorded. */
+function retiredRefusal(label, run, before, dir) {
+  guardClean(label, run);
+  check(run.code !== 0 && run.code !== null, `${label}/nonzero-exit`, `exit ${run.code}; stdout ${run.stdout.slice(0, 200)}`);
+  check(run.stderr.includes('--proof-path') && run.stderr.includes('--proof-body'), `${label}/points-at-the-proof-seam-flags`,
+    JSON.stringify(run.stderr.slice(0, 400)));
+  const said = `${run.stdout}${run.stderr}`;
+  for (const re of RETIRED_SHAPES) check(!re.test(said), `${label}/prints-no-retired-proof-line/${re.source}`, said.slice(0, 300));
+  check(!/\bclaimant\b/i.test(said), `${label}/asks-no-claimant`, said.slice(0, 300));
+  const diff = stateDiff(before, treeState(dir));
+  check(diff.length === 0, `${label}/writes-nothing`, JSON.stringify(diff.slice(0, 10)));
 }
 
-async function claimGet(entry, method = 'GET') {
-  const out = await entry.handleRequestAsync(method, CLAIM_PATH, { 'user-agent': 'muretai-catalog/1' }, Buffer.alloc(0),
-    { remoteAddress: '127.0.0.1' });
-  const headers = Object.fromEntries(Object.entries(out.headers || {}).map(([k, v]) => [k.toLowerCase(), String(v)]));
-  return { status: out.status, headers, body: Buffer.from(out.body || '') };
-}
-
-/** No claim served and none advertised. */
-async function checkNoClaim(label, dir) {
-  let entry = null;
-  try { entry = doorFromProject(dir); } catch (e) { check(false, `${label}/door-builds-from-agent-entry.json`, e.message); return; }
-  const get = await claimGet(entry);
-  check(get.status === 404, `${label}/claim-path-404`, `HTTP ${get.status} ${get.body.toString('utf8').slice(0, 120)}`);
-  check(!get.body.toString('utf8').includes('muretai-catalog-claim='), `${label}/no-proof-body`);
-  const opt = await claimGet(entry, 'OPTIONS');
-  check(!(opt.status === 204 && /\bGET\b/.test(opt.headers.allow || '')), `${label}/claim-path-not-advertised`,
-    `HTTP ${opt.status} Allow ${opt.headers.allow}`);
-}
-
-await section('publish-claim', async () => {
-  // Before any claim: 404, not advertised.
-  {
-    const dir = makePublishProject(DECL_V1);
-    const pub = await runCli(['publish', '--json'], { cwd: dir });
-    check(pub.code === 0, 'publish-claim/setup-publish', `exit ${pub.code}: ${pub.stderr.slice(0, 200)}`);
-    await checkNoClaim('publish-claim/unset', dir);
-  }
-
-  // The functional case.
-  {
-    const label = 'publish-claim/valid';
-    const dir = makePublishProject(DECL_V1);
-    const contractBefore = compileDeclaration(clone(DECL_V1), { version: 1 }).hash;
-    const run = await runCli(['publish', '--claim', CLAIM_CODE], { cwd: dir });
-    guardClean(label, run);
-    check(run.code === 0, `${label}/exit-0`, `exit ${run.code}: ${run.stderr.slice(0, 300)}`);
-    check(run.stdout.split('\n').map((l) => l.trim()).includes(DNS_LINE(CLAIM_CODE)), `${label}/prints-the-dns-txt-alternative`,
-      JSON.stringify(run.stdout.slice(0, 600)));
-    const declText = readText(join(dir, 'agent-entry.json')) || '';
-    check(declText.includes(CLAIM_CODE), `${label}/code-recorded-in-agent-entry.json`, declText.slice(0, 300));
-    check(!declText.includes(PUBLISH_SEED), `${label}/config-holds-no-seed`);
-    let decl = null;
-    try { decl = JSON.parse(declText); validateDeclaration(decl); passed += 1; } catch (e) {
-      check(false, `${label}/recorded-config-still-validates`, e.message);
-    }
-    if (decl) {
-      check(compileDeclaration(clone(decl), { version: 1 }).hash === contractBefore, `${label}/claim-does-not-change-the-contract`);
-    }
-
-    let entry = null;
-    try { entry = doorFromProject(dir); } catch (e) { check(false, `${label}/door-builds-from-agent-entry.json`, e.message); }
-    if (entry) {
-      const get = await claimGet(entry);
-      const want = Buffer.from(`muretai-catalog-claim=${CLAIM_CODE}`, 'utf8');
-      check(get.status === 200, `${label}/claim-path-200`, `HTTP ${get.status} ${get.body.toString('utf8').slice(0, 120)}`);
-      check(/^text\/plain(\s*;\s*charset=utf-8)?$/i.test(get.headers['content-type'] || ''), `${label}/content-type-text-plain`,
-        get.headers['content-type']);
-      check(get.body.equals(want), `${label}/body-exactly-the-proof-no-trailing-newline`, JSON.stringify(get.body.toString('utf8')));
-      if (get.headers['content-length'] !== undefined) {
-        check(Number(get.headers['content-length']) === want.length, `${label}/content-length-matches`, get.headers['content-length']);
-      }
-      const opt = await claimGet(entry, 'OPTIONS');
-      check(opt.status === 204 && /\bGET\b/.test(opt.headers.allow || ''), `${label}/options-advertises-get-on-the-claim-path`,
-        `HTTP ${opt.status} Allow ${opt.headers.allow}`);
-      check(/\bGET\b/.test(opt.headers['access-control-allow-methods'] || ''), `${label}/options-cors-methods-include-get`,
-        opt.headers['access-control-allow-methods']);
-      const post = await claimGet(entry, 'POST');
-      check(post.status === 405 && /\bGET\b/.test(post.headers.allow || ''), `${label}/post-is-405-with-allow`,
-        `HTTP ${post.status} Allow ${post.headers.allow}`);
-      const other = await entry.handleRequestAsync('GET', '/.well-known/muretai-catalog-claim.txt.bak', {}, Buffer.alloc(0),
-        { remoteAddress: '127.0.0.1' });
-      check(other.status === 404, `${label}/only-the-exact-path-is-served`, `HTTP ${other.status}`);
-    }
-
-    // A refused code on an already-claimed project changes nothing: the first claim still stands.
-    const before = treeState(dir);
-    const bad = await runCli(['publish', '--claim', CLAIM_CODE.toUpperCase()], { cwd: dir });
-    check(bad.code === 1 || bad.code === 2, `${label}/later-bad-code-refused`, `exit ${bad.code}`);
-    const diff = stateDiff(before, treeState(dir));
-    check(diff.length === 0, `${label}/later-bad-code-writes-nothing`, JSON.stringify(diff));
-    if (entry) {
-      const still = await claimGet(doorFromProject(dir));
-      check(still.body.toString('utf8') === `muretai-catalog-claim=${CLAIM_CODE}`, `${label}/first-claim-still-served`,
-        JSON.stringify(still.body.toString('utf8')));
-    }
-
-    // A second valid code replaces the first: one claim, the latest.
-    const again = await runCli(['publish', '--claim', CLAIM_CODE_2], { cwd: dir });
-    check(again.code === 0 && again.stdout.split('\n').map((l) => l.trim()).includes(DNS_LINE(CLAIM_CODE_2)),
-      `${label}/second-code-accepted-and-printed`, `exit ${again.code}: ${again.stderr.slice(0, 200)}`);
-    try {
-      const now = await claimGet(doorFromProject(dir));
-      check(now.status === 200 && now.body.toString('utf8') === `muretai-catalog-claim=${CLAIM_CODE_2}`,
-        `${label}/second-code-served`, JSON.stringify(now.body.toString('utf8')));
-    } catch (e) { check(false, `${label}/second-code-door-builds`, e.message); }
-  }
-
-  // Refusals: named, nothing recorded, nothing served, no DNS line printed.
-  for (const [tag, code] of BAD_CLAIMS) {
-    const label = `publish-claim/refuses-${tag}`;
+await section('publish-claim-retired', async () => {
+  for (const [tag, value] of RETIRED_VALUES) {
+    const label = `publish-claim-retired/${tag}`;
     const dir = makePublishProject(DECL_V1);
     const before = treeState(dir);
-    const run = await runCli(['publish', '--claim', code], { cwd: dir });
-    guardClean(label, run);
-    check(run.code === 1 || run.code === 2, `${label}/nonzero-exit`, `exit ${run.code}; stdout ${run.stdout.slice(0, 200)}`);
-    check(CLAIM_REASON.test(run.stderr) && /claim/i.test(run.stderr), `${label}/refusal-names-the-reason`,
-      JSON.stringify(run.stderr.slice(0, 300)));
-    check(!run.stdout.includes('_muretai-catalog.'), `${label}/prints-no-dns-line`, run.stdout.slice(0, 200));
-    const diff = stateDiff(before, treeState(dir));
-    check(diff.length === 0, `${label}/writes-nothing`, JSON.stringify(diff));
-    await checkNoClaim(label, dir);
+    const run = await runCli(['publish', '--claim', value], { cwd: dir });
+    retiredRefusal(label, run, before, dir);
   }
 
-  // Misuse: the flag without a value.
+  // With --json too: a refusal, not a success document.
+  {
+    const label = 'publish-claim-retired/json';
+    const dir = makePublishProject(DECL_V1);
+    const before = treeState(dir);
+    const run = await runCli(['publish', '--claim', RETIRED_VALUES[0][1], '--json'], { cwd: dir });
+    retiredRefusal(label, run, before, dir);
+  }
+
+  // The flag without a value is still refused and writes nothing.
   {
     const dir = makePublishProject(DECL_V1);
     const before = treeState(dir);
     const run = await runCli(['publish', '--claim'], { cwd: dir });
-    check(run.code === 2, 'publish-claim/flag-without-value-exit-2', `exit ${run.code}`);
-    check(stateDiff(before, treeState(dir)).length === 0, 'publish-claim/flag-without-value-writes-nothing');
+    guardClean('publish-claim-retired/no-value', run);
+    check(run.code !== 0 && run.code !== null, 'publish-claim-retired/no-value/nonzero-exit', `exit ${run.code}`);
+    check(stateDiff(before, treeState(dir)).length === 0, 'publish-claim-retired/no-value/writes-nothing');
   }
 
-  const help = await runCli(['publish', '--help']);
-  check(help.code === 0 && help.stdout.includes('--claim'), 'publish-claim/publish-help-names---claim', `exit ${help.code}`);
-});
-
-// ---------------------------------------------------------------- 13. publish --claim: address and human contact, confirmed
-//
-// WRITTEN BEFORE THE IMPLEMENTATION (test-first, skeleton item 1 of 5 of the claim-lookup chain,
-// intake 20261003T225243Z, parent intake 20261003T214139Z). The implementer may not edit this section.
-// This item adds STORAGE and the CONFIRMATION GATE only: no fetch, no normalisation, no geocoding,
-// no contact-page read (chain items 2-5). The facts keys are Woo-2's (1b0efb0), consumed as landed:
-// address, human_contact_name, human_contact_email, human_contact_phone.
-//
-// `publish --claim <code> --address <text> --contact-name <text> [--contact-email <text>]
-// [--contact-phone <text>]`, for a project `init --from woocommerce` wrote (a fixture Woo store) and
-// for a plain site's agent-entry.json alike:
-//   1. The human contact is checked first: a name (company or person), non-blank, AND at least one
-//      of email or phone, non-blank. Otherwise refused, exit 1, and the refusal names what is
-//      missing: human_contact_name for a missing name; human_contact_email and human_contact_phone
-//      for a contact with neither (the two refusals are not one generic message). Nothing written,
-//      and the claimant is never asked to confirm a refused contact.
-//   2. The entered values are SHOWN (stdout or stderr), escaped: a control character or a newline in
-//      a value is shown as its JSON escape (the value's JSON.stringify form, quotes aside), never raw.
-//   3. The claimant is asked to confirm, one line on stdin: `yes` (or `y`) confirms. Anything else,
-//      or stdin ending, declines: exit 1 and nothing written. Until the answer, the entered values
-//      are held pending, in memory: the project tree (agent-entry.json and the published files
-//      included) is byte for byte as before.
-//   4. On yes: agent-entry.json `facts` holds each entered value AS ENTERED (the same string: no
-//      trim, no case fold, no normalisation), as a JSON string; the declaration's other facts are
-//      unchanged; and `facts_source` (a top-level object beside `facts`, since a fact itself is a
-//      string by AT-1) maps each entered key to "claimant". No other facts key is invented. The
-//      claim code is recorded and the facts reach the published contract as today's publish does.
-// Entered values are data, never code: no shell, no eval; a `$(...)`, backticks or markup in a
-// value is stored as those characters and runs nothing. The whole flow dials NOTHING: every child
-// here also preloads fixtures/cli/no-dial.mjs (no socket, fetch, DNS or UDP, not even loopback),
-// and the fixture Woo store, still listening, is asked nothing.
-
-const NO_DIAL = join(FIX, 'no-dial.mjs');
-const CLAIMANT_KEYS = ['address', 'human_contact_name', 'human_contact_email', 'human_contact_phone'];
-const CLAIMANT_FLAGS = { address: '--address', human_contact_name: '--contact-name', human_contact_email: '--contact-email',
-  human_contact_phone: '--contact-phone' };
-const SHELLS = /(^|\/)(sh|bash|zsh|dash|ksh|cmd(\.exe)?|powershell(\.exe)?)$/i;
-const PAUSE_MS = 400;
-
-const claimantArgs = (entered) => Object.entries(entered).flatMap(([k, v]) => [CLAIMANT_FLAGS[k], v]);
-/** A value as the claimant must see it: its JSON escape, quotes aside (a plain value is itself). */
-const shownForm = (v) => JSON.stringify(v).slice(1, -1);
-const showsAll = (out, entered) => Object.values(entered).every((v) => out.includes(shownForm(v)));
-const pause = (ms) => new Promise((r) => { setTimeout(r, ms); });
-
-/** The bin with both guards preloaded and stdin held open: the caller reads what it shows, then answers. */
-function startClaimSession(args, { cwd, env = {}, timeout = 45000 } = {}) {
-  const log = join(tmp('ae-cli-guard-'), 'guard.jsonl');
-  const dialLog = join(tmp('ae-cli-nodial-'), 'no-dial.jsonl');
-  const child = spawn(process.execPath,
-    ['--import', pathToFileURL(GUARD).href, '--import', pathToFileURL(NO_DIAL).href, BIN, ...args], {
-      cwd, env: { ...baseEnv(HOME), ...env, AE_CLI_GUARD_LOG: log, AE_NO_DIAL_LOG: dialLog },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-  let stdout = '';
-  let stderr = '';
-  let timedOut = false;
-  let ended = false;
-  const waiters = [];
-  const poke = () => {
-    for (const w of [...waiters]) if (w.test(stdout + stderr)) { waiters.splice(waiters.indexOf(w), 1); w.resolve(true); }
-  };
-  const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeout);
-  child.stdout.on('data', (c) => { stdout += c.toString('utf8'); poke(); });
-  child.stderr.on('data', (c) => { stderr += c.toString('utf8'); poke(); });
-  child.stdin.on('error', () => { /* the child stopped reading */ });
-  const rows = (p) => {
-    try { return readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; }
-  };
-  const closed = new Promise((resolveRun) => {
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      ended = true;
-      for (const w of waiters.splice(0)) w.resolve(false);
-      resolveRun({ code, signal, stdout, stderr, guard: rows(log), dial: rows(dialLog), timedOut });
-    });
-  });
-  return {
-    output: () => stdout + stderr,
-    waitFor(test, ms = 20000) {
-      return new Promise((resolveWait) => {
-        if (test(stdout + stderr)) { resolveWait(true); return; }
-        if (ended) { resolveWait(false); return; }
-        const w = { test, resolve: resolveWait };
-        waiters.push(w);
-        setTimeout(() => { const i = waiters.indexOf(w); if (i !== -1) { waiters.splice(i, 1); resolveWait(false); } }, ms);
-      });
-    },
-    answer(text) { child.stdin.end(text); },
-    closed,
-  };
-}
-
-/** Nothing dialled (not even loopback), nothing run through a shell, no entered value on a child's command line. */
-function claimStayedHome(label, run, entered = {}) {
-  check(run.guard.some((r) => r.kind === 'loaded'), `${label}/loopback-guard-loaded`);
-  check(run.dial.some((r) => r.kind === 'loaded'), `${label}/no-dial-guard-loaded`, 'fixtures/cli/no-dial.mjs did not load');
-  const dialled = run.dial.filter((r) => r.kind !== 'loaded');
-  check(dialled.length === 0, `${label}/no-network-request-of-any-kind`, JSON.stringify(dialled.slice(0, 3)));
-  const nets = run.guard.filter((r) => r.kind === 'connect' || r.kind === 'fetch');
-  check(nets.length === 0, `${label}/no-connect-no-fetch`, JSON.stringify(nets.slice(0, 3)));
-  const spawns = run.guard.filter((r) => r.kind === 'spawn');
-  check(!spawns.some((r) => SHELLS.test(r.command)), `${label}/no-shell-spawned`, JSON.stringify(spawns.slice(0, 3)));
-  const values = Object.values(entered).filter((v) => v.trim() !== '');
-  check(!spawns.some((r) => values.some((v) => `${r.command} ${r.args.join(' ')}`.includes(v))),
-    `${label}/no-entered-value-on-a-child-command-line`, JSON.stringify(spawns.slice(0, 3)));
-  check(!run.timedOut, `${label}/finished`, 'timed out');
-}
-
-/** A plain site: the Vite fixture with a declaration that has no facts, published once. */
-async function plainClaimProject() {
-  const dir = makePublishProject(DECL_V1);
-  const pub = await runCli(['publish'], { cwd: dir });
-  check(pub.code === 0, 'claim-contact/setup-plain-publish', `exit ${pub.code}: ${pub.stderr.slice(0, 300)}`);
-  return dir;
-}
-
-/** A Woo project: `init --from woocommerce` against the fixture store with Woo-2's facts file, then published once. */
-async function wooClaimProject(store) {
-  const dir = makeRepo('vite');
-  const init = await runCli(['init', '--from', 'woocommerce', store.origin, '--facts', WOO_FACTS_FILE], { cwd: dir, env: WOO_ENV });
-  check(init.code === 0, 'claim-contact/setup-woo-init', `exit ${init.code}: ${init.stderr.slice(0, 300)}`);
-  writeFileSync(join(dir, '.env'), `AGENT_ENTRY_SEED_HEX=${PUBLISH_SEED}\n`);
-  const pub = await runCli(['publish'], { cwd: dir });
-  check(pub.code === 0, 'claim-contact/setup-woo-publish', `exit ${pub.code}: ${pub.stderr.slice(0, 300)}`);
-  return dir;
-}
-
-const readDecl = (dir) => { try { return JSON.parse(readFileSync(join(dir, 'agent-entry.json'), 'utf8')); } catch { return null; } };
-
-/** One confirmed claim: shown, pending (nothing written), then yes; every storage pin checked. */
-async function claimConfirmed(label, dir, entered, { store = null, home = null } = {}) {
-  const beforeTree = treeState(dir);
-  const beforeDecl = readDecl(dir);
-  const priorFacts = { ...(beforeDecl?.facts ?? {}) };
-  const hitsBefore = store ? store.hits.length : 0;
-  const homeBefore = home ? treeState(home) : null;
-  const session = startClaimSession(['publish', '--claim', CLAIM_CODE, ...claimantArgs(entered)], {
-    cwd: dir, env: home ? { HOME: home } : {} });
-
-  const shown = await session.waitFor((out) => showsAll(out, entered));
-  check(shown, `${label}/shows-the-entered-values-before-asking`, JSON.stringify(session.output().slice(0, 600)));
-  await pause(PAUSE_MS);
-  const pending = stateDiff(beforeTree, treeState(dir));
-  check(pending.length === 0, `${label}/nothing-written-before-confirmation`, JSON.stringify(pending.slice(0, 10)));
-  const midFacts = readDecl(dir)?.facts ?? {};
-  check(!Object.entries(entered).some(([k, v]) => midFacts[k] === v && priorFacts[k] !== v),
-    `${label}/facts-read-before-confirmation-do-not-show-the-entered-values`, JSON.stringify(midFacts).slice(0, 400));
-
-  session.answer('yes\n');
-  const run = await session.closed;
-  claimStayedHome(label, run, entered);
-  if (store) check(store.hits.length === hitsBefore, `${label}/the-store-is-asked-nothing`, JSON.stringify(store.hits.slice(hitsBefore)));
-  if (!check(run.code === 0, `${label}/exit-0-after-yes`, `exit ${run.code}; stdout ${run.stdout.slice(0, 300)}; stderr ${run.stderr.slice(0, 400)}`)) {
-    return null;
-  }
-  const decl = readDecl(dir);
-  if (!check(decl !== null, `${label}/agent-entry.json-is-json`)) return null;
-  try { validateDeclaration(decl); passed += 1; } catch (e) { check(false, `${label}/declaration-validates`, e.message); }
-  const facts = decl.facts ?? {};
-  const source = decl.facts_source ?? null;
-  for (const [k, v] of Object.entries(entered)) {
-    check(typeof facts[k] === 'string' && facts[k] === v, `${label}/facts.${k}-stored-as-entered`,
-      `${JSON.stringify(facts[k])} vs entered ${JSON.stringify(v)}`);
-    check(source !== null && typeof source === 'object' && source[k] === 'claimant', `${label}/facts_source.${k}-is-claimant`,
-      JSON.stringify(source));
-  }
-  check(Object.keys(facts).every((k) => CLAIMANT_KEYS.includes(k) || Object.hasOwn(priorFacts, k)),
-    `${label}/no-facts-key-invented`, JSON.stringify(Object.keys(facts)));
-  check(source === null || Object.keys(source).every((k) => CLAIMANT_KEYS.includes(k)), `${label}/facts_source-names-only-the-claimant-keys`,
-    JSON.stringify(source));
-  for (const [k, v] of Object.entries(priorFacts)) {
-    if (CLAIMANT_KEYS.includes(k)) continue;
-    check(facts[k] === v, `${label}/other-fact-${k}-unchanged`, `${JSON.stringify(facts[k])} vs ${JSON.stringify(v)}`);
-  }
-  check(decl.entry?.claim === CLAIM_CODE, `${label}/claim-code-recorded`, JSON.stringify(decl.entry));
-  // The entered strings reach the contract and the published file as JSON strings, byte for byte.
-  try {
-    const contract = compileDeclaration(clone(decl), { version: 1 });
-    check(Object.entries(entered).every(([k, v]) => contract.facts?.[k] === v), `${label}/contract-facts-carry-the-entered-strings`,
-      JSON.stringify(contract.facts).slice(0, 400));
-  } catch (e) { check(false, `${label}/declaration-compiles`, e.message); }
-  const published = readText(join(WELL_KNOWN(dir), 'agent-tools.json'));
-  let publishedFacts = null;
-  try { publishedFacts = JSON.parse(published).facts; } catch { /* checked below */ }
-  check(publishedFacts !== null && Object.entries(entered).every(([k, v]) => publishedFacts?.[k] === v),
-    `${label}/published-agent-tools.json-carries-the-entered-strings`, String(published).slice(0, 400));
-  if (homeBefore) {
-    const homeDiff = stateDiff(homeBefore, treeState(home)).filter((p) => /pwned/i.test(p));
-    check(homeDiff.length === 0, `${label}/nothing-ran-in-home`, JSON.stringify(homeDiff));
-  }
-  return { run, decl };
-}
-
-/** One declined or refused claim: nonzero (1), nothing written anywhere in the project, nothing dialled. */
-async function claimNotWritten(label, dir, entered, { answer = 'yes\n', waitShown = false, store = null } = {}) {
-  const beforeTree = treeState(dir);
-  const hitsBefore = store ? store.hits.length : 0;
-  const session = startClaimSession(['publish', '--claim', CLAIM_CODE, ...claimantArgs(entered)], { cwd: dir });
-  if (waitShown) {
-    const shown = await session.waitFor((out) => showsAll(out, entered));
-    check(shown, `${label}/shows-the-entered-values-before-asking`, JSON.stringify(session.output().slice(0, 600)));
-  }
-  session.answer(answer);
-  const run = await session.closed;
-  claimStayedHome(label, run, entered);
-  if (store) check(store.hits.length === hitsBefore, `${label}/the-store-is-asked-nothing`, JSON.stringify(store.hits.slice(hitsBefore)));
-  check(run.code === 1, `${label}/exit-1`, `exit ${run.code}; stdout ${run.stdout.slice(0, 300)}; stderr ${run.stderr.slice(0, 300)}`);
-  const diff = stateDiff(beforeTree, treeState(dir));
-  check(diff.length === 0, `${label}/writes-nothing`, JSON.stringify(diff.slice(0, 10)));
-  check(!run.stdout.includes('_muretai-catalog.'), `${label}/prints-no-dns-line`, run.stdout.slice(0, 200));
-  return run;
-}
-
-await section('claim-contact', async () => {
-  const ADDRESS = 'Unit 4,  12 Quay Street, Harbor Town  HT1 2AB';           // two double spaces: kept, never normalised
-  const NAME = 'Harbor Lamp Ltd.';
-  const EMAIL = 'Claims@Harbor-Lamp.example';                               // mixed case: kept, never folded
-  const PHONE = '+44 (0)20 7946-0001';
-
-  // ---- functional: a fixture Woo store (the project `init --from woocommerce` wrote).
-  const store = await startStore(wooStore(wooPage));
-  try {
-    for (const [tag, entered] of [
-      ['name-and-email', { address: ADDRESS, human_contact_name: NAME, human_contact_email: EMAIL }],
-      ['name-and-phone', { address: ADDRESS, human_contact_name: 'Ada Quay', human_contact_phone: PHONE }],
-    ]) {
-      const dir = await wooClaimProject(store);
-      await claimConfirmed(`claim-contact/woo/${tag}`, dir, entered, { store });
-    }
-
-    // Woo refusals and a Woo decline: the store, still listening, is asked nothing.
-    {
-      const dir = await wooClaimProject(store);
-      const run = await claimNotWritten('claim-contact/woo/refused-no-name', dir,
-        { address: ADDRESS, human_contact_email: EMAIL }, { store });
-      check(run.stderr.includes('human_contact_name'), 'claim-contact/woo/refused-no-name/names-human_contact_name',
-        JSON.stringify(run.stderr.slice(0, 400)));
-      await claimNotWritten('claim-contact/woo/declined', dir,
-        { address: ADDRESS, human_contact_name: NAME, human_contact_email: EMAIL }, { answer: 'no\n', waitShown: true, store });
-    }
-  } finally { await store.close(); }
-
-  // ---- functional: a plain site (no Woo adapter, no facts before the claim).
-  for (const [tag, entered] of [
-    ['name-and-email', { address: ADDRESS, human_contact_name: NAME, human_contact_email: EMAIL }],
-    ['name-and-phone', { address: ADDRESS, human_contact_name: 'Ada Quay', human_contact_phone: PHONE }],
-    ['name-email-and-phone', { address: 'Kaiserstraße 7, 60311 Frankfurt am Main', human_contact_name: NAME,
-      human_contact_email: EMAIL, human_contact_phone: PHONE }],
+  // The claimant flags: refused with or without --claim, never confirmed, nothing written.
+  const code = RETIRED_VALUES[0][1];
+  for (const [tag, args, viaAlias] of [
+    ['address', ['--address', '12 Quay Street'], false],
+    ['contact-name-and-email', ['--contact-name', 'Harbor Lamp Ltd.', '--contact-email', 'ada@harbor-lamp.example'], false],
+    ['contact-phone', ['--contact-phone', '+44 20 7946 0001'], false],
+    ['with-the-alias', ['--claim', code, '--address', '12 Quay Street', '--contact-name', 'Ada Quay',
+      '--contact-email', 'ada@harbor-lamp.example'], true],
   ]) {
-    const dir = await plainClaimProject();
-    await claimConfirmed(`claim-contact/plain/${tag}`, dir, entered);
+    const label = `publish-claim-retired/claimant-flags/${tag}`;
+    const dir = makePublishProject(DECL_V1);
+    const before = treeState(dir);
+    const run = await runCli(['publish', ...args], { cwd: dir });
+    if (viaAlias) { retiredRefusal(label, run, before, dir); continue; }
+    guardClean(label, run);
+    check(run.code !== 0 && run.code !== null, `${label}/nonzero-exit`, `exit ${run.code}; stderr ${run.stderr.slice(0, 200)}`);
+    check(!/\bclaimant\b/i.test(`${run.stdout}${run.stderr}`), `${label}/asks-no-claimant`, run.stderr.slice(0, 300));
+    check(!/needs --claim/.test(run.stderr), `${label}/not-tied-to-the-alias`, run.stderr.slice(0, 300));
+    const diff = stateDiff(before, treeState(dir));
+    check(diff.length === 0, `${label}/writes-nothing`, JSON.stringify(diff.slice(0, 10)));
   }
 
-  // ---- data, never code: shell, script and markup in the entered values are stored as characters.
+  // Functional: a plain publish after a refused alias still works, and publishes no retired proof file.
   {
-    const label = 'claim-contact/plain/entered-values-are-data';
-    const dir = await plainClaimProject();
-    const home = tmp('ae-cli-claim-home-');
-    writeFileSync(join(home, '.gitconfig-empty'), '');
-    const entered = {
-      address: '12 Quay St.\nINJECTED-LINE \u001b[2J$(touch PWNED-ADDR) `touch PWNED-TICK` <script>alert(1)</script> "; process.exit(7); //',
-      human_contact_name: 'Ada <img src=x onerror=alert(1)> & Co; touch PWNED-NAME',
-      human_contact_email: "ada@harbor-lamp.example'; require('child_process').execSync('touch PWNED-EVAL'); '",
-      human_contact_phone: '+44 20 7946 0000 && touch PWNED-PHONE | ${HOME}',
+    const label = 'publish-claim-retired/plain-publish-after';
+    const dir = makePublishProject(DECL_V1);
+    await runCli(['publish', '--claim', code], { cwd: dir });
+    const run = await runCli(['publish'], { cwd: dir });
+    guardClean(label, run);
+    check(run.code === 0, `${label}/exit-0`, `exit ${run.code}: ${run.stderr.slice(0, 300)}`);
+    const published = existsSync(WELL_KNOWN(dir)) ? walk(WELL_KNOWN(dir)) : [];
+    check(!published.some((p) => /claim/i.test(p)), `${label}/no-claim-file-published`, JSON.stringify(published));
+    const decl = JSON.parse(readText(join(dir, 'agent-entry.json')) || 'null');
+    check(decl !== null && !Object.hasOwn(decl.entry || {}, 'claim'), `${label}/no-claim-field-recorded`, JSON.stringify(decl?.entry));
+  }
+
+  // Functional: the door from that project serves the proof the test supplies, through the seam only.
+  {
+    const label = 'publish-claim-retired/seam-serves-the-test-proof';
+    const dir = makePublishProject(DECL_V1);
+    const declaration = JSON.parse(readFileSync(join(dir, 'agent-entry.json'), 'utf8'));
+    const build = (extra) => createAgentEntry({ seedHex: PUBLISH_SEED, name: declaration.entry.name,
+      baseUrl: declaration.entry.baseUrl, declaration: clone(declaration), ...extra });
+    const ask = async (entry, path, method = 'GET') => {
+      const out = await entry.handleRequestAsync(method, path, {}, Buffer.alloc(0), { remoteAddress: '127.0.0.1' });
+      const headers = Object.fromEntries(Object.entries(out.headers || {}).map(([k, v]) => [k.toLowerCase(), String(v)]));
+      return { status: out.status, headers, body: Buffer.from(out.body || '').toString('utf8') };
     };
-    const out = await claimConfirmed(label, dir, entered, { home });
-    const pwned = [...walk(dir), ...walk(home)].filter((p) => /pwned/i.test(p));
-    check(pwned.length === 0, `${label}/nothing-in-a-value-ran`, JSON.stringify(pwned));
-    if (out) {
-      const said = `${out.run.stdout}${out.run.stderr}`;
-      check(!said.includes('\u001b'), `${label}/control-character-never-shown-raw`, JSON.stringify(said.slice(0, 400)));
-      check(!said.split(/\r?\n/).some((l) => l.trimStart().startsWith('INJECTED-LINE')), `${label}/newline-in-a-value-never-starts-a-line`,
-        JSON.stringify(said.slice(0, 400)));
-      check(said.includes(shownForm(entered.address)), `${label}/address-shown-json-escaped`, JSON.stringify(said.slice(0, 400)));
-    }
+    const without = await ask(build({}), SEAM_PATH);
+    check(without.status === 404, `${label}/no-seam-no-proof`, `HTTP ${without.status}`);
+    const entry = build({ ownershipProof: { path: SEAM_PATH, body: SEAM_BODY } });
+    const got = await ask(entry, SEAM_PATH);
+    check(got.status === 200, `${label}/status-200`, `HTTP ${got.status}`);
+    check(got.body === SEAM_BODY, `${label}/body-exactly-the-test-proof`, JSON.stringify(got.body));
+    check(/^text\/plain\b/i.test(got.headers['content-type'] || ''), `${label}/text-plain`, got.headers['content-type']);
+    const near = await ask(entry, `${SEAM_PATH}.bak`);
+    check(near.status === 404, `${label}/only-the-exact-path`, `HTTP ${near.status}`);
   }
-
-  // ---- the gate: declining, or stdin ending, writes nothing.
-  {
-    const entered = { address: ADDRESS, human_contact_name: NAME, human_contact_email: EMAIL };
-    for (const [tag, answer] of [['no', 'no\n'], ['empty-line', '\n'], ['not-a-yes', 'yess\n'], ['stdin-ends', '']]) {
-      const dir = await plainClaimProject();
-      await claimNotWritten(`claim-contact/plain/declined-${tag}`, dir, entered, { answer, waitShown: answer !== '' });
-    }
-  }
-
-  // ---- refusals: the human contact, each named by what is missing, before any confirmation.
-  const refusals = {};
-  for (const [tag, entered, names] of [
-    ['no-name-email-given', { address: ADDRESS, human_contact_email: EMAIL }, ['human_contact_name']],
-    ['no-name-phone-given', { address: ADDRESS, human_contact_phone: PHONE }, ['human_contact_name']],
-    ['no-name-both-given', { address: ADDRESS, human_contact_email: EMAIL, human_contact_phone: PHONE }, ['human_contact_name']],
-    ['blank-name', { address: ADDRESS, human_contact_name: '   ', human_contact_email: EMAIL }, ['human_contact_name']],
-    ['neither-email-nor-phone', { address: ADDRESS, human_contact_name: NAME }, ['human_contact_email', 'human_contact_phone']],
-    ['blank-email-and-phone', { address: ADDRESS, human_contact_name: NAME, human_contact_email: '', human_contact_phone: ' ' },
-      ['human_contact_email', 'human_contact_phone']],
-    ['no-contact-at-all', { address: ADDRESS }, ['human_contact_name', 'human_contact_email', 'human_contact_phone']],
-  ]) {
-    const label = `claim-contact/plain/refused-${tag}`;
-    const dir = await plainClaimProject();
-    // A `yes` already waiting on stdin must not carry a refused contact through.
-    const run = await claimNotWritten(label, dir, entered, { answer: 'yes\n' });
-    for (const name of names) {
-      check(run.stderr.includes(name), `${label}/refusal-names-${name}`, JSON.stringify(run.stderr.slice(0, 400)));
-    }
-    refusals[tag] = run.stderr;
-  }
-  check(typeof refusals['no-name-email-given'] === 'string' && refusals['no-name-email-given'] !== refusals['neither-email-nor-phone'],
-    'claim-contact/refusals/missing-name-and-missing-email-and-phone-are-told-apart',
-    JSON.stringify([refusals['no-name-email-given'], refusals['neither-email-nor-phone']].map((s) => String(s).slice(0, 200))));
 
   const help = await runCli(['publish', '--help']);
-  check(help.code === 0 && ['--address', '--contact-name', '--contact-email', '--contact-phone'].every((f) => help.stdout.includes(f)),
-    'claim-contact/publish-help-names-the-claimant-flags', `exit ${help.code}`);
+  check(help.code === 0, 'publish-claim-retired/help-exit-0', `exit ${help.code}`);
+  for (const flag of ['--address', '--contact-name', '--contact-email', '--contact-phone']) {
+    check(!help.stdout.includes(flag), `publish-claim-retired/help-names-no-claimant-flag/${flag}`, help.stdout.slice(0, 400));
+  }
+  check(!/\bclaimant\b/i.test(help.stdout), 'publish-claim-retired/help-names-no-claimant', help.stdout.slice(0, 400));
+  for (const re of RETIRED_SHAPES.slice(0, 2)) {
+    check(!re.test(help.stdout), `publish-claim-retired/help-names-no-retired-proof/${re.source}`, help.stdout.slice(0, 400));
+  }
+  check(!help.stdout.includes('--claim') || help.stdout.includes('--proof-path'), 'publish-claim-retired/help-alias-points-at-the-seam',
+    help.stdout.slice(0, 400));
 });
 
 // ---------------------------------------------------------------- the runner itself never dialled out
