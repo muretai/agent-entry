@@ -489,6 +489,15 @@ rewritten: the next publish is the next version. `agent-entry <command> --help` 
 one, and on `init`, `publish`, `doctor` and `counts`, `--json` prints one machine-readable
 document instead of text.
 
+To serve a site-ownership proof file, pass `ownershipProof: { path, body }` (or a function
+returning that shape) to `createAgentEntry`: the door answers GET of exactly `path`, one file
+name directly under `/.well-known/`, with `body` as `text/plain`, and refuses to start on any
+other shape. To try one on your own machine:
+
+```bash
+npx @muretai/agent-entry serve --proof-path /.well-known/proof.txt --proof-body <text>   # 127.0.0.1 only
+```
+
 ### Install by hand
 
 ```bash

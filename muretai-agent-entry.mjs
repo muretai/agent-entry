@@ -3223,6 +3223,43 @@ export const TOOLS_SIG_PATH = '/.well-known/agent-tools.sig.json';
 export const TOOLS_EVENTS_PATH = '/.well-known/agent-tools/events';
 const TOOLS_VERSION_ROUTE = /^\/\.well-known\/agent-tools\/v([1-9][0-9]{0,8})\.json$/;
 const TOOLS_ENVELOPE_VERSION = 1;
+
+/** The ownership proof seam: the one prefix a proof may live under, and the one file name shape
+ *  it may take there — a single segment of unreserved characters, so no dot segment, no percent
+ *  escape, no query, fragment, slash or control character survives to the router. */
+const OWNERSHIP_PROOF_PREFIX = '/.well-known/';
+const OWNERSHIP_PROOF_FILE = /^[A-Za-z0-9._~-]{1,200}$/;
+/** Paths this door already answers at the origin; a proof there would silently lose to them. */
+const OWNERSHIP_PROOF_TAKEN = new Set([AGENT_CARD_PATH, AGENT_CARD_PATH_LEGACY, AGENT_CARD_SIG_PATH,
+  CATALOG_CLAIM_PATH, TOOLS_PATH, TOOLS_SIG_PATH]);
+
+/** `ownershipProof` -> { path, body: Buffer }, or null when absent. A function is called ONCE,
+ *  here, and its result checked exactly as an object would be; what it throws is not repeated,
+ *  so nothing it carried reaches a log line or a response. Anything else is a TypeError naming
+ *  the seam, so a bad seam refuses to start rather than answer as something else. */
+function ownershipProofSpec(ownershipProof) {
+  if (ownershipProof === undefined) return null;
+  const refuse = (why) => new TypeError(`createAgentEntry: ownershipProof ${why}`);
+  let spec = ownershipProof;
+  if (typeof ownershipProof === 'function') {
+    try { spec = ownershipProof(); } catch { throw refuse('function threw'); }
+    if (isThenable(spec)) throw refuse('function must return { path, body }, not a Promise');
+  }
+  if (spec === null || typeof spec !== 'object' || Array.isArray(spec)) {
+    throw refuse('must be { path, body } or a function returning it');
+  }
+  const { path, body } = spec;
+  if (typeof path !== 'string' || !path.startsWith(OWNERSHIP_PROOF_PREFIX)
+    || !OWNERSHIP_PROOF_FILE.test(path.slice(OWNERSHIP_PROOF_PREFIX.length))
+    || /^\.+$/.test(path.slice(OWNERSHIP_PROOF_PREFIX.length))) {
+    throw refuse(`path must be one file name directly under ${OWNERSHIP_PROOF_PREFIX} (letters, digits, . _ ~ -)`);
+  }
+  if (OWNERSHIP_PROOF_TAKEN.has(path)) {
+    throw refuse('path is one this door already serves');
+  }
+  if (typeof body !== 'string' || !body) throw refuse('body must be a non-empty string');
+  return { path, body: Buffer.from(body, 'utf8') };
+}
 /** A NEW envelope type: an `agenttools` signature can never be replayed as an `agentcard` one,
  *  because `typ` is inside the signed bytes of both. */
 const TOOLS_ENVELOPE_TYPE = 'agenttools';
@@ -3893,6 +3930,10 @@ function readCatalogFile(path, origin) {
  *                  A door-bound `catalog` offer then replies its rows as `products`, read from
  *                  this file at reply time; nothing is requested of the store. Rows whose
  *                  permalink is not https on this door's origin are left out.
+ *   ownershipProof { path, body }, or a function returning that shape (called once, at start).
+ *                  The door answers GET of exactly `path` — one file name directly under
+ *                  /.well-known/, at the ORIGIN whatever the mount — with `body` as text/plain,
+ *                  byte for byte. Absent, no proof is served. Anything else throws TypeError.
  */
 export function createAgentEntry({
   seedHex,
@@ -3921,9 +3962,12 @@ export function createAgentEntry({
   declaration = undefined,
   toolsHistory = null,
   catalogFile = null,
+  ownershipProof = undefined,
 } = {}) {
   if (!seedHex) throw new TypeError('createAgentEntry: seedHex is required');
   if (!baseUrl) throw new TypeError('createAgentEntry: baseUrl is required (it is signed into the card)');
+  // Checked before anything else is built: a proof the seam cannot serve exactly refuses to start.
+  const proof = ownershipProofSpec(ownershipProof);
   // The ONE string this entry publishes as its card url. Canonicalised, not echoed: it must
   // equal what a visitor's Outbox.card_scope computes for the url they dialled, or the card
   // fails verification on THEIR machine with nothing on ours.
@@ -5230,6 +5274,11 @@ export function createAgentEntry({
     return Boolean(tools && tools.claim) && pathname === CATALOG_CLAIM_PATH;
   }
 
+  /** The ownership proof seam's one path, at the ORIGIN like the claim; never without a seam. */
+  function isProofPath(pathname) {
+    return proof !== null && pathname === proof.path;
+  }
+
   // session -> events counted. Bounded by COLLECTOR_MAX_SESSIONS, oldest forgotten first.
   const collectorSessions = new Map();
 
@@ -5317,7 +5366,7 @@ export function createAgentEntry({
    *  never do. Whatever the GET route does for an address we do not own (404), OPTIONS and
    *  the method table do the same. */
   function allowFor(pathname) {
-    if (isClaimPath(pathname)) return ALLOW_CARD;
+    if (isClaimPath(pathname) || isProofPath(pathname)) return ALLOW_CARD;
     const resource = toolsResource(pathname);
     if (resource) return resource.kind === 'events' ? ALLOW_DOOR : ALLOW_CARD;
     if (CARD_ROUTES.has(pathname) || SIG_ROUTES.has(pathname)) return ALLOW_CARD;
@@ -5392,6 +5441,13 @@ export function createAgentEntry({
           headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Content-Length': String(tools.claim.length), ...CORS_HEADERS },
           body: tools.claim };
       }
+      // The ownership proof, the bytes the seam was handed and nothing else.
+      if (isProofPath(pathname)) {
+        return { status: 200,
+          headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Content-Length': String(proof.body.length),
+            'X-Content-Type-Options': 'nosniff', ...CORS_HEADERS },
+          body: proof.body };
+      }
       // The human notice — NOT served on a guest mount, where GET belongs to the site (E3).
       // Falling through to 404 is deliberate and is the same non-disclosure the POST route
       // already makes: an entry beside other agents does not confirm what lives at an
@@ -5441,7 +5497,9 @@ export function createAgentEntry({
         if (resource.kind === 'events') return collect(headers, bodyBuffer || Buffer.alloc(0), family, seen);
         return jsonResponse(405, { error: 'method not allowed' }, allowHeaders(ALLOW_CARD));
       }
-      if (isClaimPath(pathname)) return jsonResponse(405, { error: 'method not allowed' }, allowHeaders(ALLOW_CARD));
+      if (isClaimPath(pathname) || isProofPath(pathname)) {
+        return jsonResponse(405, { error: 'method not allowed' }, allowHeaders(ALLOW_CARD));
+      }
       // EXACTLY the address the card names. A POST anywhere else is not this contract —
       // and when this entry is mounted under a path, "anywhere else" INCLUDES the bare
       // host, which belongs to the site (or to the neighbour agent) and not to us.
@@ -6123,8 +6181,11 @@ const USAGE = {
   decide: 'usage: agent-entry decide <receipt file> approve\n'
     + '  The owner\'s approval of a pending receipt the door signed: prints the signed message/send follow-up\n'
     + '  (confirmReceipt\'s confirmed reply) from this site\'s DID to the receipt\'s customer_did. Nothing is sent.',
+  serve: 'usage: agent-entry serve --proof-path /.well-known/<file> --proof-body <text> [--port <p>] [--host 127.0.0.1]\n'
+    + '  Runs this site\'s door on 127.0.0.1 only and serves the ownership proof: GET of exactly --proof-path\n'
+    + `  answers --proof-body as text/plain. The seed is ${SEED_NAME}, from the project's env files or the environment.`,
 };
-const CLI_USAGE = 'usage: agent-entry <init|publish|deploy|doctor|counts|decide|knock> ... (agent-entry <verb> --help)';
+const CLI_USAGE = 'usage: agent-entry <init|publish|deploy|doctor|counts|decide|serve|knock> ... (agent-entry <verb> --help)';
 
 /** Flags per verb: 'string' takes a value, 'boolean' does not. Unknown flags are misuse. A bare
  *  argument is misuse too, unless the verb passes `positionals` to collect them in. */
@@ -7958,6 +8019,51 @@ async function countsMain(argv) {
   });
 }
 
+// ------------------------------------------ serve
+
+/** A free loopback port, asked of the OS: the card signs its own url, so the port is known first. */
+function freeLoopbackPort() {
+  return new Promise((resolvePort, reject) => {
+    const probe = createServer();
+    probe.on('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolvePort(port));
+    });
+  });
+}
+
+/** `serve --proof-path <path> --proof-body <body>`: this site's door on 127.0.0.1 with the
+ *  ownership proof seam filled in. Loopback only, refused before anything binds. */
+async function serveMain(argv) {
+  const flags = parseFlags(argv, { 'proof-path': 'string', 'proof-body': 'string', port: 'string', host: 'string' });
+  const asked = flags.host ?? '127.0.0.1';
+  if (asked !== '127.0.0.1') throw new CliRefusal(`serve binds 127.0.0.1 only, not ${asked.slice(0, 60)}`);
+  if (typeof flags['proof-path'] !== 'string') throw new CliMisuse('--proof-path is required');
+  if (typeof flags['proof-body'] !== 'string') throw new CliMisuse('--proof-body is required');
+  if (flags.port !== undefined && !/^\d{1,5}$/.test(flags.port)) throw new CliMisuse('--port must be a number from 0 to 65535');
+  const ownershipProof = { path: flags['proof-path'], body: flags['proof-body'] };
+  // The seam's own check, before anything binds; the same words createAgentEntry would throw.
+  try { ownershipProofSpec(ownershipProof); } catch (e) { throw new CliRefusal(shortError(e)); }
+  const root = process.cwd();
+  const seed = findSeed(root, detectFramework(root));
+  if (!seed.hex) {
+    throw new CliRefusal(`no seed: ${SEED_NAME} is in none of this project's env files nor in the environment. `
+      + 'Run agent-entry init, which mints it into a git-ignored file.');
+  }
+  let port = flags.port === undefined ? 0 : Number(flags.port);
+  if (port > 65535) throw new CliMisuse('--port must be a number from 0 to 65535');
+  if (port === 0) port = await freeLoopbackPort();
+  const entry = createAgentEntry({ seedHex: seed.hex, baseUrl: `http://127.0.0.1:${port}`, ownershipProof });
+  return new Promise((resolveServe) => {
+    const server = entry.listen(port, '127.0.0.1', () => console.log(`serve: http://127.0.0.1:${port}/`));
+    server.on('error', (e) => { console.error(`serve: ${shortError(e)}`); resolveServe(1); });
+    const stop = () => server.close(() => resolveServe(0));
+    process.once('SIGINT', stop);
+    process.once('SIGTERM', stop);
+  });
+}
+
 // ------------------------------------------ decide
 
 /** The most of a receipt file `decide` reads. */
@@ -8005,7 +8111,8 @@ function emit(json, doc, lines) {
 
 async function cliMain(argv) {
   const [verb, ...rest] = argv;
-  const verbs = { init: initMain, publish: publishMain, deploy: publishMain, doctor: doctorMain, counts: countsMain, decide: decideMain };
+  const verbs = { init: initMain, publish: publishMain, deploy: publishMain, doctor: doctorMain, counts: countsMain, decide: decideMain,
+    serve: serveMain };
   if (verb === 'knock') return knockMain(argv);
   if (!Object.hasOwn(verbs, verb)) {
     console.error(CLI_USAGE);
