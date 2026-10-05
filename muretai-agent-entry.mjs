@@ -3204,17 +3204,8 @@ export const INPUT_TYPES = Object.freeze(['string', 'integer', 'number', 'boolea
 const OFFER_SPELLING = /^[a-z][a-z0-9_]*$/;
 const INPUT_FIELD = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CALL_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
-const DECLARATION_KEYS = ['v', 'entry', 'offers', 'facts', 'facts_source'];
-/** Who gave a fact, in `facts_source` beside `facts` (a fact itself is a string, AT-1). Metadata:
- *  it never enters the contract. */
-const FACT_SOURCES = Object.freeze(['claimant']);
-const ENTRY_KEYS = ['name', 'baseUrl', 'domains', 'prefer', 'catalog', 'counts', 'claim'];
-/** FRAME Claim-2: the Catalog's claim code, exactly 32 lowercase hex, as the Catalog issues it. */
-const CATALOG_CLAIM = /^[0-9a-f]{32}$/;
-const CATALOG_CLAIM_RULE = 'must be the Catalog\'s claim code: exactly 32 lowercase hex characters';
-/** Where the door serves the claim proof, at the ORIGIN (the Catalog proves a host, not a mount). */
-export const CATALOG_CLAIM_PATH = '/.well-known/muretai-catalog-claim.txt';
-const CATALOG_CLAIM_PREFIX = 'muretai-catalog-claim=';
+const DECLARATION_KEYS = ['v', 'entry', 'offers', 'facts'];
+const ENTRY_KEYS = ['name', 'baseUrl', 'domains', 'prefer', 'catalog', 'counts'];
 const OFFER_KEYS = ['verb', 'of', 'about', 'input', 'effect', 'ask', 'then', 'page', 'door'];
 
 /** Where the contract, its signature and the collector live, under the entry's mount. */
@@ -3231,7 +3222,7 @@ const OWNERSHIP_PROOF_PREFIX = '/.well-known/';
 const OWNERSHIP_PROOF_FILE = /^[A-Za-z0-9._~-]{1,200}$/;
 /** Paths this door already answers at the origin; a proof there would silently lose to them. */
 const OWNERSHIP_PROOF_TAKEN = new Set([AGENT_CARD_PATH, AGENT_CARD_PATH_LEGACY, AGENT_CARD_SIG_PATH,
-  CATALOG_CLAIM_PATH, TOOLS_PATH, TOOLS_SIG_PATH]);
+  TOOLS_PATH, TOOLS_SIG_PATH]);
 
 /** `ownershipProof` -> { path, body: Buffer }, or null when absent. A function is called ONCE,
  *  here, and its result checked exactly as an object would be; what it throws is not repeated,
@@ -3462,12 +3453,12 @@ function readOffer(offer, i, hasFacts) {
 
 /** The whole declaration, validated and compiled to everything but `version` and `hash`. */
 function readDeclaration(declaration) {
-  if (!isPlainObject(declaration)) refuseDeclaration('declaration', 'must be an object: {v, entry, offers, facts?, facts_source?}');
+  if (!isPlainObject(declaration)) refuseDeclaration('declaration', 'must be an object: {v, entry, offers, facts?}');
   onlyKeys(declaration, DECLARATION_KEYS, 'declaration');
   if (declaration.v !== 1) refuseDeclaration('v', 'must be 1');
 
   const entry = declaration.entry;
-  if (!isPlainObject(entry)) refuseDeclaration('entry', 'must be an object: {name, baseUrl, domains?, prefer?, catalog?, counts?, claim?}');
+  if (!isPlainObject(entry)) refuseDeclaration('entry', 'must be an object: {name, baseUrl, domains?, prefer?, catalog?, counts?}');
   onlyKeys(entry, ENTRY_KEYS, 'entry');
   const name = declaredString(entry.name, 'entry.name');
   if (typeof entry.baseUrl !== 'string') refuseDeclaration('entry.baseUrl', 'must be the URL visitors dial');
@@ -3498,10 +3489,6 @@ function readDeclaration(declaration) {
   }
   if (entry.catalog !== undefined && typeof entry.catalog !== 'boolean') refuseDeclaration('entry.catalog', 'must be true or false');
   const counts = entry.counts === undefined ? null : countsUrl(entry.counts);
-  if (entry.claim !== undefined && (typeof entry.claim !== 'string' || !CATALOG_CLAIM.test(entry.claim))) {
-    refuseDeclaration('entry.claim', CATALOG_CLAIM_RULE);
-  }
-  const claim = entry.claim ?? null;
 
   let facts;
   if (declaration.facts !== undefined) {
@@ -3510,15 +3497,6 @@ function readDeclaration(declaration) {
     for (const [key, value] of Object.entries(declaration.facts)) {
       declaredString(key, 'facts');
       facts[key] = declaredString(value, `facts.${key.slice(0, 40)}`);
-    }
-  }
-  if (declaration.facts_source !== undefined) {
-    if (!isPlainObject(declaration.facts_source)) refuseDeclaration('facts_source', 'must map a fact name to who gave it');
-    for (const [key, value] of Object.entries(declaration.facts_source)) {
-      if (facts === undefined || !Object.hasOwn(facts, key)) {
-        refuseDeclaration(`facts_source.${key.slice(0, 40)}`, 'names a fact that facts does not hold');
-      }
-      if (!FACT_SOURCES.includes(value)) refuseDeclaration(`facts_source.${key.slice(0, 40)}`, `must be one of ${FACT_SOURCES.join(', ')}`);
     }
   }
 
@@ -3533,7 +3511,7 @@ function readDeclaration(declaration) {
     ids.add(compiled.id);
     offers.push(compiled);
   });
-  return { name, origin, origins, prefer, offers, facts, counts, claim };
+  return { name, origin, origins, prefer, offers, facts, counts };
 }
 
 /** Returns the declaration unchanged, or throws a TypeError naming the field (AT-2). */
@@ -4074,7 +4052,6 @@ export function createAgentEntry({
       byVerb,
       offerIds: new Set(contract.offers.map((o) => o.id)),
       counts: read.counts,
-      claim: read.claim === null ? null : Buffer.from(`${CATALOG_CLAIM_PREFIX}${read.claim}`, 'utf8'),
     };
   } else if (toolsHistory !== null && toolsHistory !== undefined) {
     throw new TypeError('createAgentEntry: toolsHistory needs the declaration it precedes');
@@ -5267,14 +5244,8 @@ export function createAgentEntry({
     return null;
   }
 
-  /** FRAME Claim-2: the Catalog's proof file, at the ORIGIN's well-known path whatever the
-   *  mount (the Catalog proves a host). Only when the declaration carries a claim: without
-   *  one the path is the ordinary unowned 404, and nothing advertises it. */
-  function isClaimPath(pathname) {
-    return Boolean(tools && tools.claim) && pathname === CATALOG_CLAIM_PATH;
-  }
-
-  /** The ownership proof seam's one path, at the ORIGIN like the claim; never without a seam. */
+  /** The ownership proof seam's one path, at the ORIGIN whatever the mount (a proof is about a
+   *  host); never without a seam. */
   function isProofPath(pathname) {
     return proof !== null && pathname === proof.path;
   }
@@ -5366,7 +5337,7 @@ export function createAgentEntry({
    *  never do. Whatever the GET route does for an address we do not own (404), OPTIONS and
    *  the method table do the same. */
   function allowFor(pathname) {
-    if (isClaimPath(pathname) || isProofPath(pathname)) return ALLOW_CARD;
+    if (isProofPath(pathname)) return ALLOW_CARD;
     const resource = toolsResource(pathname);
     if (resource) return resource.kind === 'events' ? ALLOW_DOOR : ALLOW_CARD;
     if (CARD_ROUTES.has(pathname) || SIG_ROUTES.has(pathname)) return ALLOW_CARD;
@@ -5435,12 +5406,6 @@ export function createAgentEntry({
           : tools.versions[(resource.kind === 'version' ? resource.n : tools.versions.length) - 1];
         return { status: 200, headers: cardHeaders(body.length), body };
       }
-      // The claim proof, byte-exact as the Catalog issued it: no trailing newline.
-      if (isClaimPath(pathname)) {
-        return { status: 200,
-          headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Content-Length': String(tools.claim.length), ...CORS_HEADERS },
-          body: tools.claim };
-      }
       // The ownership proof, the bytes the seam was handed and nothing else.
       if (isProofPath(pathname)) {
         return { status: 200,
@@ -5497,7 +5462,7 @@ export function createAgentEntry({
         if (resource.kind === 'events') return collect(headers, bodyBuffer || Buffer.alloc(0), family, seen);
         return jsonResponse(405, { error: 'method not allowed' }, allowHeaders(ALLOW_CARD));
       }
-      if (isClaimPath(pathname) || isProofPath(pathname)) {
+      if (isProofPath(pathname)) {
         return jsonResponse(405, { error: 'method not allowed' }, allowHeaders(ALLOW_CARD));
       }
       // EXACTLY the address the card names. A POST anywhere else is not this contract —
@@ -6160,16 +6125,11 @@ const USAGE = {
     + `  the keys ${WOO_FACT_KEYS.join(', ')}\n`
     + '  (human_contact_email or human_contact_phone may be left out, not both); without --facts they are read\n'
     + '  from stdin, one line each in that order.',
-  publish: 'usage: agent-entry publish [--version <n>] [--claim <code>] [--json]   (alias: agent-entry deploy)\n'
+  publish: 'usage: agent-entry publish [--version <n>] [--json]   (alias: agent-entry deploy)\n'
     + '  Validates agent-entry.json, compiles and signs it, and writes <static dir>/.well-known/agent-tools.json,\n'
-    + '  agent-tools.sig.json and agent-tools/v<n>.json. A published version is never rewritten.\n'
-    + '  --claim <32 lowercase hex> records the Catalog\'s claim code in agent-entry.json (the door then serves\n'
-    + `  ${CATALOG_CLAIM_PATH}) and prints the DNS TXT record that proves the host instead.\n`
-    + '       agent-entry publish --claim <code> --address <text> --contact-name <text> [--contact-email <text>]\n'
-    + '                           [--contact-phone <text>] [--version <n>] [--json]\n'
-    + '  The claimant\'s address and human contact (a name, and an email or a phone): shown, then confirmed\n'
-    + '  with `yes` on stdin, and only then written as entered into agent-entry.json facts, with facts_source\n'
-    + '  naming each one "claimant". Anything but yes writes nothing. No network.',
+    + '  agent-tools.sig.json and agent-tools/v<n>.json. A published version is never rewritten. No network.\n'
+    + '  --claim is retired and refuses, writing nothing: serve a proof of ownership with\n'
+    + '  agent-entry serve --proof-path <path> --proof-body <body> instead.',
   doctor: 'usage: agent-entry doctor [--url <site url> | --from woocommerce] [--json]\n'
     + '  Local: seed kept out of git, contract published and verifying, door module and page tag wired, and\n'
     + '  one in-process knock per door-bound offer. --url: the same against the live site, over the network.\n'
@@ -6732,8 +6692,6 @@ function doorModuleSource(framework) {
     '',
     '/** True for a request the door answers: its well-known paths, and POST / OPTIONS at its url. */',
     'export function isDoorRequest(method, pathname) {',
-    '  // The Catalog claim proof lives at the ORIGIN, and is the door\'s only once agent-entry.json holds a claim.',
-    `  if (pathname === ${JSON.stringify(CATALOG_CLAIM_PATH)}) return typeof declaration.entry.claim === 'string';`,
     "  if (pathname === (MOUNT || '/') || pathname === MOUNT + '/') return MOUNT !== '' || method === 'POST' || method === 'OPTIONS';",
     '  if (MOUNT && !pathname.startsWith(MOUNT + \'/\')) return false;',
     '  const rest = pathname.slice(MOUNT.length);',
@@ -7222,60 +7180,15 @@ function writeAtomic(path, bytes) {
   renameSync(tmpPath, path);
 }
 
-/** The claimant's flags and the facts each one fills. */
-const CLAIMANT_FLAGS = Object.freeze({ address: 'address', 'contact-name': 'human_contact_name',
-  'contact-email': 'human_contact_email', 'contact-phone': 'human_contact_phone' });
-/** The human contact a claim replaces as a whole: a key the claimant left out is removed. */
-const CLAIMANT_CONTACT_KEYS = Object.freeze(['human_contact_name', 'human_contact_email', 'human_contact_phone']);
-
-/** The claimant's facts, as entered, or null when no claimant flag was given. The human contact
- *  is checked first, then the address; each refusal names what is missing. A blank email or phone
- *  beside a given other counts as left out. Values are never trimmed, folded or echoed here. */
-function claimantFacts(flags) {
-  const given = Object.keys(CLAIMANT_FLAGS).filter((f) => flags[f] !== undefined);
-  if (given.length === 0) return null;
-  if (flags.claim === undefined) throw new CliMisuse(`--${given[0]} is the claimant's, and needs --claim <code>`);
-  const filled = (f) => typeof flags[f] === 'string' && flags[f].trim() !== '';
-  const missing = [];
-  if (!filled('contact-name')) {
-    missing.push('the human contact has no name: give --contact-name (human_contact_name), a company or a person');
-  }
-  if (!filled('contact-email') && !filled('contact-phone')) {
-    missing.push('the human contact has no way to reach them: give --contact-email (human_contact_email) '
-      + 'or --contact-phone (human_contact_phone), or both');
-  }
-  if (!filled('address')) missing.push('there is no address: give --address (address)');
-  if (missing.length) throw new CliRefusal(`claim refused, ${missing.join('; ')}. Nothing was written.`);
-  const facts = {};
-  for (const [flag, key] of Object.entries(CLAIMANT_FLAGS)) if (filled(flag)) facts[key] = flags[flag];
-  return facts;
-}
-
-/** Shows the claimant's facts JSON-escaped (no raw control character or newline reaches the
- *  terminal) and reads one line from stdin: true only for `yes` or `y`. Stdin ending declines. */
-async function claimantConfirms(facts) {
-  const width = Math.max(...Object.keys(facts).map((k) => k.length));
-  process.stderr.write(['The claimant entered these facts, to be stored exactly as shown:',
-    ...Object.entries(facts).map(([k, v]) => `  ${k.padEnd(width)}  ${JSON.stringify(v)}`),
-    'Store them in agent-entry.json? Type yes to confirm: '].join('\n'));
-  const rl = createInterface({ input: process.stdin, terminal: false, crlfDelay: Infinity });
-  try {
-    const step = await rl[Symbol.asyncIterator]().next();
-    process.stderr.write('\n');
-    return !step.done && ['yes', 'y'].includes(step.value.trim().toLowerCase());
-  } finally {
-    rl.close();
-  }
-}
+/** `publish --claim` is a retired alias: it refuses whatever follows it, before any other flag is
+ *  read and before anything is read or written, and its value is never echoed. */
+const PUBLISH_RETIRED_ALIAS = '--claim is retired: publish no longer records a proof of ownership. Serve one through '
+  + 'the ownership proof seam instead: agent-entry serve --proof-path <path> --proof-body <body> (or '
+  + 'createAgentEntry({ ownershipProof })). Nothing was written.';
 
 async function publishMain(argv) {
-  const flags = parseFlags(argv, { version: 'string', json: 'boolean', claim: 'string', address: 'string',
-    'contact-name': 'string', 'contact-email': 'string', 'contact-phone': 'string' });
-  // Refused before anything is read or written, and never echoed: the value may carry anything.
-  if (flags.claim !== undefined && !CATALOG_CLAIM.test(flags.claim)) {
-    throw new CliRefusal(`--claim ${CATALOG_CLAIM_RULE}, as the Catalog issued it (no prefix, no spaces)`);
-  }
-  const claimant = claimantFacts(flags);
+  if (argv.some((arg) => arg === '--claim' || arg.startsWith('--claim='))) throw new CliRefusal(PUBLISH_RETIRED_ALIAS);
+  const flags = parseFlags(argv, { version: 'string', json: 'boolean' });
   let target = null;
   if (flags.version !== undefined) {
     if (!/^[1-9][0-9]{0,8}$/.test(flags.version)) throw new CliMisuse('--version must be a positive integer');
@@ -7286,18 +7199,6 @@ async function publishMain(argv) {
   if (!existsSync(declPath)) throw new CliRefusal(`no ${DECLARATION_FILE} here: run agent-entry init first`);
   let declaration;
   try { declaration = readJsonFile(declPath); } catch (e) { throw new CliRefusal(`${DECLARATION_FILE} is not JSON: ${shortError(e)}`); }
-  // FRAME Claim-2: the claim rides in entry.claim, outside the contract, so it never moves the hash.
-  const claimChanged = flags.claim !== undefined && isPlainObject(declaration?.entry) && declaration.entry.claim !== flags.claim;
-  if (claimChanged) declaration.entry.claim = flags.claim;
-  // The claimant's facts are held here, in memory, until they confirm: the claimant replaces the
-  // human contact as a whole, and facts_source names exactly the keys they wrote.
-  if (claimant !== null && isPlainObject(declaration)) {
-    const facts = isPlainObject(declaration.facts) ? { ...declaration.facts } : {};
-    for (const key of CLAIMANT_CONTACT_KEYS) delete facts[key];
-    declaration.facts = { ...facts, ...claimant };
-    declaration.facts_source = Object.fromEntries(Object.keys(claimant).map((k) => [k, 'claimant']));
-  }
-  const declarationChanged = claimChanged || claimant !== null;
   let read;
   try { read = readDeclaration(declaration); } catch (e) { throw new CliRefusal(e.message); }
   const framework = detectFramework(root);
@@ -7331,10 +7232,6 @@ async function publishMain(argv) {
   }
 
   const contract = version <= n ? prior[version - 1] : compileDeclaration(declaration, { version });
-  if (claimant !== null && !await claimantConfirms(claimant)) {
-    throw new CliRefusal('the claimant did not confirm (only yes or y does). Nothing was written.');
-  }
-  if (declarationChanged) writeAtomic(declPath, `${JSON.stringify(declaration, null, 2)}\n`);
   const wk = join(root, wkRel);
   const current = join(wk, 'agent-tools.json');
   const sigPath = join(wk, 'agent-tools.sig.json');
@@ -7355,16 +7252,6 @@ async function publishMain(argv) {
   const lines = [changed
     ? `Published v${version} (sha256 ${contract.hash.slice(0, 16)}…) to ${wkRel}/agent-tools.json, .sig.json and agent-tools/v${version}.json.`
     : `v${version} is already published with this content; nothing to do.`];
-  if (flags.claim !== undefined) {
-    const dns = `_muretai-catalog.${new URL(read.origin).hostname} TXT ${CATALOG_CLAIM_PREFIX}${flags.claim}`;
-    Object.assign(doc, { claim: flags.claim, claimPath: CATALOG_CLAIM_PATH, dns });
-    lines.push(`Recorded the Catalog claim in ${DECLARATION_FILE}; the door serves it at ${CATALOG_CLAIM_PATH}.`,
-      'Or prove the host by DNS instead, with this TXT record:', dns);
-  }
-  if (claimant !== null) {
-    doc.claimant = Object.keys(claimant);
-    lines.push(`Stored the claimant's ${Object.keys(claimant).join(', ')} in ${DECLARATION_FILE} facts, as entered.`);
-  }
   emit(flags.json, doc, lines);
   return 0;
 }
