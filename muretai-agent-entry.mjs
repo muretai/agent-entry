@@ -2549,7 +2549,8 @@ function then1(x, f) {
  */
 function asStore(store) {
   const REQUIRED = ['seenMessage', 'getAccount', 'putAccount', 'getDeviceOwner',
-    'putDeviceOwner', 'getKeyState', 'putKeyState'];
+    'putDeviceOwner', 'getKeyState', 'putKeyState',
+    'getReceipt', 'putReceipt', 'listUndecidedReceipts'];
   const missing = REQUIRED.filter((m) => typeof store[m] !== 'function');
   if (missing.length) {
     throw new TypeError(
@@ -2558,6 +2559,78 @@ function asStore(store) {
       + 'rather than loudly.');
   }
   return store;
+}
+
+/** The receipts cap, shared by both built-in stores: the refs to drop from `[ref, row]` pairs
+ *  (oldest put first) to come back under `cap`, taking the oldest DECIDED rows only. An
+ *  undecided row is the owner's pending list and is never evicted, so the section may stay
+ *  over the cap while every row in it is undecided. */
+function decidedOverCap(pairs, cap) {
+  const drop = new Set();
+  let over = pairs.length - cap;
+  for (const [ref, r] of pairs) {
+    if (over <= 0) break;
+    if (r && r.decision !== null) { drop.add(ref); over -= 1; }
+  }
+  return drop;
+}
+
+/**
+ * The door's own in-memory state seam: what `createAgentEntry` uses when no `store` is given.
+ *
+ * Synchronous on purpose, so the no-store path keeps `handleRequest` (the sync entry point)
+ * working. Every key lives in a Map, so a hostile DID, messageId or ref is data and never an
+ * object key that reaches a prototype. Exported so a caller (or a test) can hold the store it
+ * hands the door and read its `receipts` section back.
+ */
+export function createMemoryStore({ maxAccounts = 50000, maxReceipts = 5000 } = {}) {
+  return memoryStoreOver(new Map(), { maxAccounts, maxReceipts });
+}
+
+/** createMemoryStore over a given account ledger: the door passes the Map it also returns as
+ *  `ledger`, so that field keeps reading the default store's customer list. */
+function memoryStoreOver(ledger, { maxAccounts, maxReceipts }) {
+  const receiptCap = Math.max(1, Number(maxReceipts) || 1);
+  // device DID -> owner DID, the in-process TOFU pin (T102). The first VALID binding pins a
+  // device to its owner; a later binding for the same device naming a DIFFERENT owner is
+  // refused. Per-process on purpose for v1.5 — persisting it (and the fold) is RECOMMENDED,
+  // not required: without it the conflict rule resets to trust-on-first-use every restart.
+  // Unlike the ledger it is READ on every message, so only a real store can carry it.
+  const deviceOwner = new Map();
+  // root DID -> the newest root-signed KeyState this door accepted. Unlike an inline record,
+  // this half was not selected by the current sender, so it gives revokedOps and epoch their
+  // teeth on a returning visit.
+  const keyStates = new Map();
+  // deal ref -> {ref, offer, partyB, issued_ts, pending_text, decision}: the receipts this door
+  // issued pending (AT-28), the shop's own pending list. Insertion order is last-put order.
+  const receipts = new Map();
+  const replay = new ReplayGuard();
+  return {
+    seenMessage: (messageId) => replay.checkAndRemember(messageId),
+    getAccount: (did) => ledger.get(did) ?? null,
+    putAccount: (did, row) => {
+      if (row === null) { ledger.delete(did); return; }
+      ledger.set(did, row);
+      while (ledger.size > maxAccounts) {
+        const oldest = ledger.keys().next();
+        if (oldest.done) break;
+        ledger.delete(oldest.value);
+      }
+    },
+    getDeviceOwner: (deviceDid) => deviceOwner.get(deviceDid) ?? null,
+    putDeviceOwner: (deviceDid, ownerDid) => { deviceOwner.set(deviceDid, ownerDid); },
+    getKeyState: (rootDid) => keyStates.get(rootDid) ?? null,
+    putKeyState: (rootDid, keyState) => { keyStates.set(rootDid, keyState); },
+    getReceipt: (ref) => receipts.get(ref) ?? null,
+    putReceipt: (ref, row) => {
+      receipts.delete(ref);
+      receipts.set(ref, row);
+      if (receipts.size > receiptCap) {
+        for (const gone of decidedOverCap([...receipts], receiptCap)) receipts.delete(gone);
+      }
+    },
+    listUndecidedReceipts: () => [...receipts.values()].filter((r) => r && r.decision === null),
+  };
 }
 
 /**
@@ -2569,15 +2642,16 @@ function asStore(store) {
  * hostile DID or messageId can never become `__proto__`, and replay ids are hashed before
  * storage so the body ceiling cannot become a disk-key ceiling.
  */
-export function createFileStore(filePath, { maxAccounts = 50000, maxMessages = 20000 } = {}) {
+export function createFileStore(filePath, { maxAccounts = 50000, maxMessages = 20000, maxReceipts = 5000 } = {}) {
   if (typeof filePath !== 'string' || !filePath) {
     throw new TypeError('createFileStore: filePath is required');
   }
   const path = resolve(filePath);
   const accountCap = Math.max(1, Number(maxAccounts) || 1);
   const messageCap = Math.max(1, Number(maxMessages) || 1);
+  const receiptCap = Math.max(1, Number(maxReceipts) || 1);
   const empty = () => ({
-    v: 1, messages: [], accounts: [], deviceOwners: [], keyStates: [],
+    v: 1, messages: [], accounts: [], deviceOwners: [], keyStates: [], receipts: [],
   });
   const pairs = (value) => Array.isArray(value)
     ? value.filter((row) => Array.isArray(row) && row.length === 2) : [];
@@ -2598,6 +2672,8 @@ export function createFileStore(filePath, { maxAccounts = 50000, maxMessages = 2
       accounts: pairs(doc.accounts),
       deviceOwners: pairs(doc.deviceOwners),
       keyStates: pairs(doc.keyStates),
+      // Absent in a state file written before AT-28: it opens with no receipts.
+      receipts: pairs(doc.receipts),
     };
   };
   const save = (doc) => {
@@ -2658,6 +2734,19 @@ export function createFileStore(filePath, { maxAccounts = 50000, maxMessages = 2
       const doc = load();
       doc.keyStates = put(doc.keyStates, rootDid, keyState);
       save(doc);
+    },
+    getReceipt(ref) { return get(load().receipts, ref); },
+    putReceipt(ref, row) {
+      const doc = load();
+      doc.receipts = put(doc.receipts, ref, row);
+      if (doc.receipts.length > receiptCap) {
+        const drop = decidedOverCap(doc.receipts, receiptCap);
+        doc.receipts = doc.receipts.filter((pair) => !drop.has(pair[0]));
+      }
+      save(doc);
+    },
+    listUndecidedReceipts() {
+      return load().receipts.map((pair) => pair[1]).filter((r) => r && r.decision === null);
     },
   };
 }
@@ -3951,6 +4040,7 @@ export function createAgentEntry({
   basePath = null,
   guest = false,
   maxAccounts = 50000,
+  maxReceipts = 5000,
   howToUrl = FIRST_KNOCK_URL,
   observer = null,
   wbaVerifiers = null,
@@ -4182,28 +4272,18 @@ export function createAgentEntry({
   // RECOMMENDED: it is the customer list (recognise a returning account, contact it again
   // later). An analytics sink records visits too, but can never be read back.
   const ledger = new Map();
-  // device DID -> owner DID, the in-process TOFU pin (T102). The first VALID binding pins a
-  // device to its owner; a later binding for the same device naming a DIFFERENT owner is
-  // refused. Per-process on purpose for v1.5 — persisting it (and the fold) is RECOMMENDED,
-  // not required: without it the conflict rule resets to trust-on-first-use every restart.
-  // Unlike the ledger it is READ on every message, so only a real store can carry it.
-  const deviceOwner = new Map();
-  // root DID -> the newest root-signed KeyState this door accepted. Unlike an inline record,
-  // this half was not selected by the current sender, so it gives revokedOps and epoch their
-  // teeth on a returning visit.
-  const keyStates = new Map();
-  const replay = new ReplayGuard();
 
   // ---------------------------------------------------------------- the state seam (T105)
   //
-  // WHY. The four structures above live in CLOSURE MEMORY, and a serverless instance keeps
-  // none of them between requests. The round-trip shape suits those platforms perfectly —
+  // WHY. The structures of the default store (createMemoryStore: the account ledger, the
+  // device pins, the KeyState ratchet, the replay set and the receipts) live in CLOSURE
+  // MEMORY, and a serverless instance keeps none of them between requests. The round-trip shape suits those platforms perfectly —
   // one signed POST in, one signed reply out, nothing to keep awake — so what blocks them is
   // not the shape but the STATE. Losing `replay` re-opens every message inside the freshness
   // window to replay; losing `deviceOwner` resets the no-re-ownership rule to
   // trust-on-first-use at every cold start.
   //
-  // `store` is an OPTIONAL duck-typed object whose seven methods may each return a value or a
+  // `store` is an OPTIONAL duck-typed object whose ten methods may each return a value or a
   // promise:
   //
   //   seenMessage(messageId, ttlSeconds) -> bool   TRUE when the id was NEW (and is now
@@ -4215,34 +4295,20 @@ export function createAgentEntry({
   //   putDeviceOwner(dev, own) -> void
   //   getKeyState(rootDid)      -> KeyState | null
   //   putKeyState(rootDid, ks)  -> void
+  //   getReceipt(ref)           -> row | null      the receipts section (AT-28): each pending
+  //   putReceipt(ref, row)      -> void            reply with a deal this door issued, keyed by
+  //   listUndecidedReceipts()   -> row[]           the deal's ref; the rows whose decision is null
   //
   // Rate counters are deliberately NOT in this interface, and that is the approved design,
   // not an omission: a bound that costs a store write per request is its own denial of
   // service, and losing one fails open for a single minute — a bounded loss, unlike a lost
   // replay set or a lost pin.
   //
-  // WITH NO STORE the default below is SYNCHRONOUS and wraps exactly the Maps above, so the
+  // WITH NO STORE the default is createMemoryStore(), which is SYNCHRONOUS, so the
   // no-store path stays byte-identical and `handleRequest` (the sync entry point) keeps
   // working. With a store the message path returns a promise, which `route()` already
   // propagates and `handleRequestAsync` already awaits.
-  const memoryStore = {
-    seenMessage: (messageId) => replay.checkAndRemember(messageId),
-    getAccount: (did) => ledger.get(did) ?? null,
-    putAccount: (did, row) => {
-      if (row === null) { ledger.delete(did); return; }
-      ledger.set(did, row);
-      while (ledger.size > maxAccounts) {
-        const oldest = ledger.keys().next();
-        if (oldest.done) break;
-        ledger.delete(oldest.value);
-      }
-    },
-    getDeviceOwner: (deviceDid) => deviceOwner.get(deviceDid) ?? null,
-    putDeviceOwner: (deviceDid, ownerDid) => { deviceOwner.set(deviceDid, ownerDid); },
-    getKeyState: (rootDid) => keyStates.get(rootDid) ?? null,
-    putKeyState: (rootDid, keyState) => { keyStates.set(rootDid, keyState); },
-  };
-  const state = store ? asStore(store) : memoryStore;
+  const state = store ? asStore(store) : memoryStoreOver(ledger, { maxAccounts, maxReceipts });
   const storeIsExternal = Boolean(store);
   const anonRate = new RateBound(anonRatePerMin);
   // A tier is ON unless its ceiling is a non-positive or non-finite number. Constructed
@@ -5207,8 +5273,22 @@ export function createAgentEntry({
       } catch {
         return rpcError(reqId, ERRORS.INTERNAL_ERROR, 'the door failed to answer this offer');
       }
-      return finishReply(reqId, text, { inbound: { contextId: msg.contextId ?? null,
+      const finish = () => finishReply(reqId, text, { inbound: { contextId: msg.contextId ?? null,
         messageId: msg.messageId ?? null }, toDid });
+      if (!(chosen.door.reply === 'pending' && chosen.door.receipt && toDid)) return finish();
+      // AT-28: a pending reply with a deal is the shop's to decide, so the door keeps it in its
+      // own pending list under the deal's ref (the knock's messageId), the text exactly as it is
+      // about to be signed. Written before the reply is: a receipt the owner cannot see is never
+      // issued, so a store that fails here refuses the knock rather than answering it.
+      const failed = () => rpcError(reqId, ERRORS.INTERNAL_ERROR, 'the door failed to record this receipt');
+      let wrote;
+      try {
+        wrote = state.putReceipt(msg.messageId, { ref: msg.messageId, offer: chosen.verb, partyB: toDid,
+          issued_ts: nowEpoch(), pending_text: text, decision: null });
+      } catch {
+        return failed();
+      }
+      return isThenable(wrote) ? wrote.then(finish, failed) : finish();
     }
     let answer;
     try {

@@ -996,9 +996,13 @@ and it is not one. It is the upgrade path:
   roll its owner backwards, a message is never accepted twice — survive restarts as well;
   those are read on every message, so only a real store can carry them. An external store
   implements `seenMessage`, `getAccount` / `putAccount`, `getDeviceOwner` /
-  `putDeviceOwner`, and `getKeyState` / `putKeyState`. For one Node process, the exported
+  `putDeviceOwner`, `getKeyState` / `putKeyState`, and the receipts section
+  `getReceipt` / `putReceipt` / `listUndecidedReceipts` — every pending reply with a deal
+  the door issued, keyed by the deal's ref, so the shop has its own list of what waits
+  (`maxReceipts`, default 5000; only decided rows are ever evicted). A store missing any of
+  these is refused at start, by name. For one Node process, the exported
   `createFileStore(path)` is the zero-dependency restart-safe adapter; do not open one file
-  from several processes.
+  from several processes. `createMemoryStore()` is the in-memory default, exported.
 - **Statistics without a store: an analytics sink.** Nothing in the entry reads the
   ledger back to gate, greet or rate-limit, so a fire-and-forget sink records visiting
   agents with no database anywhere. Use `observer` for it, never your responder: watching
