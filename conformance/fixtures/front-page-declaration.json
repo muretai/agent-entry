@@ -1,0 +1,35 @@
+{
+  "v": 1,
+  "entry": { "name": "Harbor Lamp", "baseUrl": "https://shop.example" },
+  "offers": [
+    {
+      "verb": "find",
+      "of": "products",
+      "about": "Find lamps by words or hue.",
+      "input": { "query": "string", "hue": "string" },
+      "page": { "on": ["/shop"], "do": { "open": "/shop?q={query}" } },
+      "door": { "reply": "catalog" }
+    },
+    {
+      "verb": "hold",
+      "of": "item",
+      "about": "Hold one lamp for pickup within 48 hours.",
+      "input": { "sku": "string" },
+      "door": { "reply": "pending" }
+    },
+    {
+      "verb": "ask",
+      "of": "shop",
+      "about": "Ask the shop about hours and shipping.",
+      "input": { "question": "string" },
+      "door": { "reply": "human" }
+    },
+    {
+      "verb": "book",
+      "of": "table",
+      "about": "Book a table for a party.",
+      "input": { "party_size": "integer", "when_local": "string" },
+      "page": { "on": ["/book"], "do": { "open": "/book?n={party_size}&when={when_local}" } }
+    }
+  ]
+}
