@@ -169,11 +169,18 @@ function mae_restaurant_card() {
             'muretai' => $requirement,
         )),
         'security' => array(array('did-key-ed25519' => array())),
-        'supportedInterfaces' => array(array(
-            'url' => $base . '/',
-            'protocolBinding' => 'JSONRPC',
-            'protocolVersion' => '0.2',
-        )),
+        'supportedInterfaces' => array(
+            array(
+                'url' => $base . '/',
+                'protocolBinding' => 'JSONRPC',
+                'protocolVersion' => '0.2',
+            ),
+            array(
+                'url' => $base . '/',
+                'protocolBinding' => 'HTTP+JSON',
+                'protocolVersion' => '1.0',
+            ),
+        ),
     );
 }
 

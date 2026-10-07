@@ -2519,6 +2519,159 @@ function baseRpcError(id, error, data) {
   return jsonResponse(200, { jsonrpc: '2.0', id: id ?? null, error: err });
 }
 
+// A2A 1.0 HTTP+JSON, beside JSON-RPC. The binding is a face: it translates a
+// message:send body into the JSON-RPC shape, runs that one ladder, and translates
+// the answer back. The six signed fields are verified once, in verifyEnvelope.
+const HTTP_JSON_MEDIA = 'application/a2a+json';
+const HTTP_JSON_VERSION = '1.0';
+const ROLE_AGENT = 'ROLE_AGENT';
+const AIP_ERROR_INFO = 'type.googleapis.com/google.rpc.ErrorInfo';
+const AIP_ERROR_DOMAIN = 'a2a-protocol.org';
+const ISSUER_HOST = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+const TASK_ROUTE = /^\/tasks(?:\/[^/]+(?::cancel|:subscribe|\/pushNotificationConfigs(?:\/[^/]+)?)?)?$/;
+
+function issuerHostToken(value) {
+  return typeof value === 'string' && value.length <= 253 && ISSUER_HOST.test(value);
+}
+
+/** The host of a Bearer token's iss, or null. The token itself is never returned. An
+ *  unreadable token, a non-URL iss, and a missing header are the same answer: nothing. */
+function bearerIssuerHost(headers) {
+  const header = wbaHeaderGet(headers, 'authorization');
+  if (!header) return null;
+  const match = /^Bearer[ \t]+(\S+)\s*$/i.exec(header.trim());
+  if (!match) return null;
+  const token = match[1];
+  const first = token.indexOf('.');
+  const second = first === -1 ? -1 : token.indexOf('.', first + 1);
+  if (first <= 0 || second === -1) return null;
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(token.slice(first + 1, second), 'base64url').toString('utf8'));
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload) || typeof payload.iss !== 'string') {
+    return null;
+  }
+  let url;
+  try { url = new URL(payload.iss); } catch { return null; }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
+  return issuerHostToken(url.hostname) ? url.hostname : null;
+}
+
+function httpJsonPartText(msg) {
+  const parts = Array.isArray(msg.parts) ? msg.parts : [];
+  return parts
+    .filter((p) => p && typeof p === 'object' && typeof p.text === 'string')
+    .map((p) => p.text)
+    .join('\n');
+}
+
+/** HTTP+JSON `{message}` into the JSON-RPC body the one ladder already verifies.
+ *  The six signed fields come from message.metadata; text rides in the part the
+ *  ladder signs, so a tampered metadata.text fails the same signature check. */
+function httpJsonToRpcBuffer(bodyBuffer) {
+  const buf = Buffer.isBuffer(bodyBuffer) ? bodyBuffer
+    : Buffer.from(String(bodyBuffer ?? ''), 'utf8');
+  if (buf.length > MAX_BODY_BYTES) return buf;
+  let doc;
+  try {
+    doc = JSON.parse(jsonRpcBodyText(buf));
+  } catch {
+    return buf;
+  }
+  const msg = doc && typeof doc === 'object' && !Array.isArray(doc) ? doc.message : null;
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return buf;
+  const meta = (msg.metadata && typeof msg.metadata === 'object' && !Array.isArray(msg.metadata))
+    ? msg.metadata : {};
+  const text = typeof meta.text === 'string' ? meta.text : httpJsonPartText(msg);
+  const messageId = typeof meta.messageId === 'string' ? meta.messageId : msg.messageId;
+  const contextId = Object.hasOwn(meta, 'contextId') ? meta.contextId
+    : (msg.contextId === undefined ? null : msg.contextId);
+  const rpcMeta = {};
+  for (const key of Object.keys(meta)) {
+    if (key === 'text' || key === 'messageId' || key === 'contextId') continue;
+    rpcMeta[key] = meta[key];
+  }
+  return Buffer.from(JSON.stringify({
+    jsonrpc: '2.0',
+    id: messageId ?? null,
+    method: 'message/send',
+    params: {
+      message: {
+        kind: 'message',
+        role: 'user',
+        messageId,
+        contextId,
+        parts: [{ kind: 'text', text }],
+        metadata: rpcMeta,
+      },
+    },
+  }), 'utf8');
+}
+
+function a2aJson(status, obj) {
+  const body = Buffer.from(JSON.stringify(obj), 'utf8');
+  return {
+    status,
+    headers: {
+      'Content-Type': `${HTTP_JSON_MEDIA}; charset=utf-8`,
+      'Content-Length': String(body.length),
+      ...CORS_HEADERS,
+    },
+    body,
+  };
+}
+
+function aipUnauthenticated(message, data, jsonRpcCode) {
+  const error = {
+    code: 401,
+    message,
+    status: 'UNAUTHENTICATED',
+    details: [{
+      '@type': AIP_ERROR_INFO,
+      reason: 'UNAUTHENTICATED',
+      domain: AIP_ERROR_DOMAIN,
+      metadata: { jsonRpcCode },
+    }],
+  };
+  if (data) error.data = data;
+  return a2aJson(401, { error });
+}
+
+function taskNotFoundResponse() {
+  return a2aJson(404, {
+    error: {
+      code: 404,
+      message: 'Task not found',
+      status: 'NOT_FOUND',
+      details: [{
+        '@type': AIP_ERROR_INFO,
+        reason: 'TASK_NOT_FOUND',
+        domain: AIP_ERROR_DOMAIN,
+      }],
+    },
+  });
+}
+
+function presentHttpJson(out) {
+  let doc;
+  try { doc = JSON.parse(Buffer.from(out.body).toString('utf8')); } catch { return out; }
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return out;
+  if (doc.result && typeof doc.result === 'object' && !Array.isArray(doc.result)) {
+    return a2aJson(200, { message: { ...doc.result, role: ROLE_AGENT } });
+  }
+  if (doc.error && typeof doc.error === 'object' && doc.error.code === ERRORS.UNAUTHENTICATED.code) {
+    return aipUnauthenticated(doc.error.message, doc.error.data, doc.error.code);
+  }
+  return out;
+}
+
+function isTaskPath(rest) {
+  return typeof rest === 'string' && TASK_ROUTE.test(rest);
+}
+
 function isThenable(v) {
   return v !== null && typeof v === 'object' && typeof v.then === 'function';
 }
@@ -4302,6 +4455,7 @@ export function createAgentEntry({
   // publishes keeps its bytes AND its position.
   card.supportedInterfaces = [
     { url: doorUrl, protocolBinding: 'JSONRPC', protocolVersion: PROTOCOL_VERSION },
+    { url: doorUrl, protocolBinding: 'HTTP+JSON', protocolVersion: HTTP_JSON_VERSION },
   ];
 
   const cardBytes = Buffer.from(JSON.stringify(card), 'utf8');   // identical bytes on both paths
@@ -4866,6 +5020,10 @@ export function createAgentEntry({
    *  never read by the ladder. Bounded values only: the address it came from is gone. */
   let pendingLook = { ip_vendor: null, country: null };
 
+  /** Host of a Bearer iss on the HTTP+JSON face only. An observation, never an account.
+   *  Null on the JSON-RPC face and whenever the token did not name a host. */
+  let pendingBearerHost = null;
+
   /** Shadows the module-level `rpcError` for the whole entry: same return value, and it
    *  remembers the code on the way out. A local alias rather than seventeen edits, and rather
    *  than a parameter every refusal site would have to remember to pass. */
@@ -4894,8 +5052,13 @@ export function createAgentEntry({
    *  A refusal hands the watcher only what was actually established: `refused` carries the
    *  JSON-RPC code and the DIDs are null, because a walk-in that named nobody named nobody. The
    *  watcher still cannot matter — same swallowed throw, same discarded return. */
-  function handlePost(rawBody, reqHeaders, seen) {
+  function bearerObservation() {
+    return pendingBearerHost ? { bearer_issuer: pendingBearerHost } : {};
+  }
+
+  function handlePost(rawBody, reqHeaders, seen, bearerHost = null) {
     lastRefusal = null;
+    pendingBearerHost = bearerHost;
     // The stage a POST reaches is decided by whether it CARRIED a signature, which is knowable
     // from the request alone — so it is settled here, before the ladder answers, and read by
     // whichever observation point fires. `tally()` computes the same thing afterwards from the
@@ -4921,7 +5084,7 @@ export function createAgentEntry({
               // A refusal establishes no transport signer, so it names none: `wba_did` is
               // null here and so is its label, and a refused flood never costs a verify.
               ip_vendor: pendingLook.ip_vendor, country: pendingLook.country,
-              signature_agent: null });
+              signature_agent: null, ...bearerObservation() });
   }
 
   /** Did this POST body carry a signature? That is the whole difference between a keyless
@@ -5304,6 +5467,7 @@ export function createAgentEntry({
               identified: env && env.peer_did ? 1 : 0,
               ip_vendor: pendingLook.ip_vendor, country: pendingLook.country,
               signature_agent: env && env.wba_did ? (wbaVendorOf.get(env.wba_did) ?? null) : null,
+              ...bearerObservation(),
               ...(chosen ? { reply: chosen.door.reply,
                 receipt: Boolean(chosen.door.receipt && toDid && chosen.door.reply !== 'brain') } : {}) });
     if (chosen && chosen.door.reply !== 'brain') {
@@ -5499,6 +5663,34 @@ export function createAgentEntry({
     return { Allow: allow, 'Access-Control-Allow-Methods': allow };
   }
 
+  function taskRest(pathname) {
+    if (!mount) return pathname;
+    if (!pathname.startsWith(`${mount}/`)) return null;
+    return pathname.slice(mount.length);
+  }
+
+  function isTaskRoute(pathname) {
+    return isTaskPath(taskRest(pathname));
+  }
+
+  function isHttpJsonSend(pathname) {
+    return pathname === `${mount}/message:send`;
+  }
+
+  /** POST <mount>/message:send. Same ladder as JSON-RPC, then the HTTP+JSON face. */
+  function handleHttpJson(bodyBuffer, headers, seen, family) {
+    const buf = bodyBuffer || Buffer.alloc(0);
+    const rpcBody = httpJsonToRpcBuffer(buf);
+    const out = handlePost(rpcBody, headers, seen, bearerIssuerHost(headers));
+    const counted = { ...seen, signature_agent: null };
+    const present = (o) => {
+      tally(family, postStage(rpcBody, o), counted);
+      return presentHttpJson(o);
+    };
+    if (isThenable(out)) return out.then(present);
+    return present(out);
+  }
+
   function route(method, path, bodyBuffer, headers, conn) {
     // Classified ONCE per request, used only to count and to signpost. Everything the
     // ladder decides is decided exactly as if this line did not exist.
@@ -5594,6 +5786,7 @@ export function createAgentEntry({
       if (getAllow !== null) {
         return jsonResponse(405, { error: 'method not allowed' }, allowHeaders(getAllow));
       }
+      if (method === 'GET' && isTaskRoute(pathname)) return taskNotFoundResponse();
       return jsonResponse(404, { error: 'not found' });
     }
     if (method === 'POST') {
@@ -5607,6 +5800,8 @@ export function createAgentEntry({
       if (isProofPath(pathname)) {
         return jsonResponse(405, { error: 'method not allowed' }, allowHeaders(ALLOW_CARD));
       }
+      if (isHttpJsonSend(pathname)) return handleHttpJson(bodyBuffer, headers, seen, family);
+      if (isTaskRoute(pathname)) return taskNotFoundResponse();
       // EXACTLY the address the card names. A POST anywhere else is not this contract —
       // and when this entry is mounted under a path, "anywhere else" INCLUDES the bare
       // host, which belongs to the site (or to the neighbour agent) and not to us.
@@ -5641,6 +5836,7 @@ export function createAgentEntry({
       tally(family, postStage(buf, out), counted);
       return out;
     }
+    if (method === 'DELETE' && isTaskRoute(pathname)) return taskNotFoundResponse();
     // Everything below answers for a RESOURCE, so an address this entry does not own is a
     // 404 first — the same answer GET and POST give it. Before this, OPTIONS 204'd for
     // EVERY path (a guest mount would have spoken for the site's front page one verb over)
@@ -5833,7 +6029,10 @@ export function fileSink(filePath) {
     try {
       const fields = sinkFields(env);
       if (!fields.stage) return;
-      appendFileSync(path, `${JSON.stringify({ t: nowEpoch(), ...fields })}\n`, { mode: 0o600 });
+      const row = { t: nowEpoch(), ...fields };
+      // The issuer host only. gaSink never sees this key: it is not in SINK_FIELDS.
+      if (issuerHostToken(env && env.bearer_issuer)) row.bearer_issuer = env.bearer_issuer;
+      appendFileSync(path, `${JSON.stringify(row)}\n`, { mode: 0o600 });
     } catch { /* a watcher never changes what the door does */ }
   };
 }
@@ -6284,7 +6483,8 @@ const USAGE = {
     + '  a hold is probed, never confirmed. One PASS/FAIL row per offer; exit 1 if any failed.',
   counts: 'usage: agent-entry counts --log <fileSink log> [--store <file store>] [--json] [--serve [--port <p>] [--host 127.0.0.1|::1]]\n'
     + '  Per offer: asked on the page, asked at the door, completed, receipts; referrals by engine; returning\n'
-    + '  customers (a count); door knocks by stage and client class. --serve renders one page on loopback only.',
+    + '  customers (a count); door knocks by stage and client class; platforms, the bearer issuer hosts.\n'
+    + '  --serve renders one page on loopback only.',
   decide: 'usage: agent-entry decide <receipt file> approve\n'
     + '  The owner\'s approval of a pending receipt the door signed: prints the signed message/send follow-up\n'
     + '  (confirmReceipt\'s confirmed reply) from this site\'s DID to the receipt\'s customer_did. Nothing is sent.',
@@ -7936,7 +8136,7 @@ async function doctorMain(argv) {
 
 // ------------------------------------------ counts
 
-const LOG_ROW_KEYS = new Set(['t', ...SINK_FIELDS]);
+const LOG_ROW_KEYS = new Set(['t', ...SINK_FIELDS, 'bearer_issuer']);
 const isVendor = (v) => typeof v === 'string' && VENDOR_INDEX.has(v);
 
 /** A row fileSink could have written: a JSON object of `t` plus SINK_FIELDS keys, with no
@@ -7958,6 +8158,7 @@ function tallyCounts(lines, accounts, storePresent) {
   const signed = new Map();
   const declared = new Map();
   const network = new Map();
+  const platforms = new Map();
   let stealth = 0;
   let none = 0;
   let dropped = 0;
@@ -7971,6 +8172,7 @@ function tallyCounts(lines, accounts, storePresent) {
   };
   for (const e of lines) {
     if (!isSinkRow(e)) { dropped += 1; continue; }
+    if (issuerHostToken(e.bearer_issuer)) bump(platforms, e.bearer_issuer);
     // Only a `t` a Date can hold moves the range: toISOString throws past ±8.64e15 ms.
     if (typeof e.t === 'number' && Math.abs(e.t) <= 8.64e12) {
       if (from === null || e.t < from) from = e.t;
@@ -8011,6 +8213,7 @@ function tallyCounts(lines, accounts, storePresent) {
     knocks: { by_stage: Object.fromEntries(byStage), by_class: Object.fromEntries(byClass) },
     who: { signed: Object.fromEntries(signed), declared: Object.fromEntries(declared), network: Object.fromEntries(network),
       'stealth-agent': stealth, none },
+    platforms: Object.fromEntries(platforms),
   };
 }
 
@@ -8042,6 +8245,7 @@ function countsText(c) {
     `returning customers: ${c.returning_customers}`,
     `door knocks by stage: ${pairs(c.knocks.by_stage)}`,
     `door knocks by client class: ${pairs(c.knocks.by_class)}`,
+    `platforms: ${pairs(c.platforms)}`,
   ];
 }
 
@@ -8065,6 +8269,7 @@ ${Object.entries(c.offers).map(([id, o]) => `<tr>${cells([id, o.page_asked, o.do
 <h2>Returning customers</h2><p>${escapeHtml(c.returning_customers)}</p>
 <h2>Door knocks by stage</h2><ul>${list(c.knocks.by_stage)}</ul>
 <h2>Door knocks by client class</h2><ul>${list(c.knocks.by_class)}</ul>
+<h2>platforms</h2><ul>${list(c.platforms)}</ul>
 <p>Counts only: no key, no message and no address is kept here.</p></body></html>
 `;
 }

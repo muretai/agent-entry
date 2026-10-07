@@ -358,7 +358,11 @@ async function get(entry, method, path, headers = {}, body = Buffer.alloc(0)) {
       'door/legacy-muretai-alias-carries-no-tools');
     check(canonicalJSON(card.skills) === canonicalJSON(harbor.skills),
       'door/card-skills-regenerated-from-offers', canonicalJSON(card.skills));
-    check(card.supportedInterfaces?.length === 1, 'door/still-one-interface');
+    check(card.supportedInterfaces?.length === 2
+        && card.supportedInterfaces[0].protocolBinding === 'JSONRPC'
+        && card.supportedInterfaces[1].protocolBinding === 'HTTP+JSON'
+        && card.supportedInterfaces[1].protocolVersion === '1.0',
+      'door/jsonrpc-then-http-json');
     const inner = verifyCardEnvelope(entry.cardEnvelope(), entry.did);
     check(inner && inner.agentEntry?.tools === card.agentEntry?.tools
         && canonicalJSON(inner.skills) === canonicalJSON(card.skills),

@@ -239,9 +239,11 @@ const harbor = vector('harbor-lamp-every-reply-kind-and-facts');
     checkNoDeal(human, 'reply/human');
 
     // The one-method invariant: page tools and verbs are never A2A methods.
-    check(entry.card.supportedInterfaces?.length === 1
-        && entry.card.supportedInterfaces[0].protocolBinding === 'JSONRPC',
-      'one-method/card-has-one-interface');
+    check(entry.card.supportedInterfaces?.length === 2
+        && entry.card.supportedInterfaces[0].protocolBinding === 'JSONRPC'
+        && entry.card.supportedInterfaces[1].protocolBinding === 'HTTP+JSON'
+        && entry.card.supportedInterfaces[1].protocolVersion === '1.0',
+      'one-method/card-has-jsonrpc-then-http-json');
     for (const method of ['hold_item', 'hold', 'find_products', 'tools/call', 'tools/list', 'offers/list',
       'offers/hold', 'message/stream', 'tasks/send', 'agenttools/get']) {
       const k = await knock(entry, { method, offer: 'hold', text: 'Hold sku L-12' });

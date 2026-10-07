@@ -674,7 +674,10 @@ function mae_woo_card($declaration, $did) {
             'muretai' => $requirement,
         )),
         'security' => array(array(MAE_WOO_SCHEME => array())),
-        'supportedInterfaces' => array(array('url' => $door_url, 'protocolBinding' => 'JSONRPC', 'protocolVersion' => '0.2')),
+        'supportedInterfaces' => array(
+            array('url' => $door_url, 'protocolBinding' => 'JSONRPC', 'protocolVersion' => '0.2'),
+            array('url' => $door_url, 'protocolBinding' => 'HTTP+JSON', 'protocolVersion' => '1.0'),
+        ),
     );
 }
 
