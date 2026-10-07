@@ -3657,6 +3657,46 @@ export function compileDeclaration(declaration, { version = 1 } = {}) {
   return contract;
 }
 
+/**
+ * The front-page block for a declaration: every offer of compileDeclaration, as words,
+ * with each input, the line "needs the customer's key", and one
+ * `knock <absolute card URL> --offer <id>`. Also the head link, bodySignpost and the
+ * absolute card URL. Pure: the same bytes whatever the key order, no mutation, no fetch.
+ * Offer text is escaped. The card path and URL are the canonical address, included
+ * verbatim so the signpost and the knock line match that address.
+ */
+export function offersSignpost(declaration) {
+  const { offers } = compileDeclaration(declaration);
+  const base = canonicalBaseUrl(declaration.entry.baseUrl, { warn: false });
+  const cardPath = `${canonicalMount(base)}${AGENT_CARD_PATH}`;
+  const cardUrl = `${base}${AGENT_CARD_PATH}`;
+  const lines = [
+    `<link rel="${AGENT_ENTRY_REL}" href="${cardPath}">`,
+    bodySignpost(cardPath),
+    cardUrl,
+  ];
+  for (const offer of offers) {
+    lines.push(`${escapeHtml(offer.verb)} ${escapeHtml(offer.of)}`);
+    lines.push(escapeHtml(offer.about));
+    for (const name of Object.keys(offer.input).sort()) {
+      lines.push(`${escapeHtml(name)} ${escapeHtml(offer.input[name])}`);
+    }
+    lines.push('needs the customer\'s key');
+    lines.push(`knock ${cardUrl} --offer ${escapeHtml(offer.id)}`);
+  }
+  return lines.join('\n');
+}
+
+/** True when Accept lists text/html as its own media type. text/htmlextra is not HTML. */
+function acceptListsHtml(headers) {
+  const raw = wbaHeaderGet(headers, 'accept');
+  if (!raw) return false;
+  for (const part of raw.split(',')) {
+    if (asciiLower(part.split(';')[0].trim()) === 'text/html') return true;
+  }
+  return false;
+}
+
 /** The card's `skills[]`, one per offer in order (AT-7). */
 export function skillsFromOffers(declaration) {
   return readDeclaration(declaration).offers.map((o) => {
@@ -4568,9 +4608,9 @@ export function createAgentEntry({
    *      page and add ONE header instead of migrating. An absolute URI because RFC 8288
    *      §2.1.2 permits a bare token only for an IANA-registered relation.
    *
-   *  HEADER-ONLY on purpose: the notice BODY is byte-identical for every caller, and now
-   *  so is this header — the UA family still steers observation (`tally`/`stats`), never
-   *  a byte on the wire. */
+   *  The header is the same for every caller. Accept chooses the body: the HTML offer
+   *  list when it lists text/html, and the text notice otherwise. The UA family still
+   *  steers observation (`tally`/`stats`), never a byte on the wire. */
   function steerHeaders(family) {   // `family` kept for observation symmetry, unread here
     const door = `<${mount}${AGENT_CARD_PATH}>; rel="${AGENT_ENTRY_REL}"`;
     return { Link: `<${mount}${AGENT_CARD_PATH}>; rel="service-desc", ${door}` };
@@ -5522,19 +5562,19 @@ export function createAgentEntry({
       if (!guestMount && isMountPath(pathname)) {
         const signatureAgent = wbaObserve(headers);
         tally(family, 'notice_get', { ...seen, signature_agent: signatureAgent });
-        const body = Buffer.from(
-          // "This ADDRESS", not "this origin": once an entry can be mounted under a
-          // path, the origin may hold several agents and this notice speaks for exactly
-          // one of them. A bare-origin entry reads the same either way.
-          `${name}\n\nThis address is agent-reachable (Muretai agent entry).\n`
+        // "This ADDRESS", not "this origin": once an entry can be mounted under a
+        // path, the origin may hold several agents and this notice speaks for exactly
+        // one of them. A bare-origin entry reads the same either way.
+        // Accept that lists text/html gets the offer list. Every other Accept, including
+        // none, keeps this text byte for byte. The Link header is the same either way.
+        const html = declaration !== undefined && acceptListsHtml(headers);
+        const notice = `${name}\n\nThis address is agent-reachable (Muretai agent entry).\n`
           + `DID:  ${did}\nCard: ${canonUrl}${AGENT_CARD_PATH}\n`
-          + `POST a signed A2A message/send request to ${mount || '/'} for a signed reply.\n`,
-          'utf8');
+          + `POST a signed A2A message/send request to ${mount || '/'} for a signed reply.\n`;
+        const body = Buffer.from(html ? offersSignpost(declaration) : notice, 'utf8');
         return { status: 200,
-          headers: { 'Content-Type': 'text/plain; charset=utf-8',
+          headers: { 'Content-Type': html ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8',
             'Content-Length': String(body.length),
-            // Every caller is pointed at the machine-readable door — the same one-field
-            // Link value for all of them (v1.11). The body above is byte-identical too.
             ...steerHeaders(family) },
           body };
       }
@@ -6754,7 +6794,7 @@ function doorModuleSource(framework) {
     `// The seed is read from ${SEED_NAME} in the environment, or else from the git-ignored file`,
     '// named below. It is never written into this file.',
     "import { existsSync, readFileSync } from 'node:fs';",
-    "import { bodySignpost, createAgentEntry } from '@muretai/agent-entry';",
+    "import { bodySignpost, createAgentEntry, offersSignpost } from '@muretai/agent-entry';",
     '',
     `const SEED_SLOT = new URL(${JSON.stringify(`./${slot}`)}, import.meta.url);`,
     `const WELL_KNOWN = new URL(${JSON.stringify(`./${staticDir}/.well-known/`)}, import.meta.url);`,
@@ -6794,6 +6834,7 @@ function doorModuleSource(framework) {
     `export const LINK_TAG = ${JSON.stringify(linkTagHtml())};`,
     `export const LINK_HEADER = ${JSON.stringify(`<${AGENT_CARD_PATH}>; rel="${AGENT_ENTRY_REL}"`)};`,
     'export const BODY_SIGNPOST = bodySignpost();',
+    'export const OFFERS_SIGNPOST = offersSignpost(declaration);',
     '',
     'const MOUNT = entry.mount;',
     '',
