@@ -510,7 +510,9 @@ await section('site-squarespace', async () => {
     return send(res, 'text/html; charset=utf-8', '<!doctype html><title>shop</title>', 200);
   });
   try {
-    const full = await runInit('site-squarespace/two-pages', store, ['--hint', 'squarespace', '--json']);
+    // The omitted flag stops at the README default of 10 product pages, as site-bounds pins.
+    // 25 lets the walk read all 21 items and the offset=20 page.
+    const full = await runInit('site-squarespace/two-pages', store, ['--hint', 'squarespace', '--max-pages', '25', '--json']);
     if (check(full.run.code === 0, 'site-squarespace/two-pages/exit-0', `exit ${full.run.code}; ${full.run.stderr.slice(0, 300)}`)) {
       const rows = JSON.parse(readFileSync(join(full.dir, SNAPSHOT), 'utf8'));
       const want = specs.map((s) => rowOf(store.origin, s));
