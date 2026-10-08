@@ -26,7 +26,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node conformance/run.mjs && node conformance/seam-twin.mjs && node conformance/recipes.mjs && node conformance/who-is-knocking.mjs && node conformance/vendor-ranges-helper.mjs && node conformance/muse-connector.mjs && node conformance/tools.mjs && node conformance/offers.mjs && node conformance/collector.mjs && node conformance/page.mjs && node conformance/runtime-tls.mjs && node conformance/cli.mjs && node conformance/ownership-proof.mjs && node conformance/private-facts.mjs && node conformance/docs.mjs && node conformance/counts-coverage.mjs && node conformance/receipts.mjs",
+    "test": "node conformance/run.mjs && node conformance/seam-twin.mjs && node conformance/recipes.mjs && node conformance/who-is-knocking.mjs && node conformance/vendor-ranges-helper.mjs && node conformance/muse-connector.mjs && node conformance/tools.mjs && node conformance/offers.mjs && node conformance/collector.mjs && node conformance/page.mjs && node conformance/runtime-tls.mjs && node conformance/cli.mjs && node conformance/ownership-proof.mjs && node conformance/private-facts.mjs && node conformance/docs.mjs && node conformance/counts-coverage.mjs && node conformance/receipts.mjs && node conformance/site.mjs",
     "test:docs": "node conformance/docs.mjs",
     "test:page": "node conformance/page.mjs",
     "test:cli": "node conformance/cli.mjs",

@@ -3869,13 +3869,21 @@ function catalogPermalink(value, origin) {
   return url.protocol === 'https:' && url.origin === origin ? value : null;
 }
 
+/** A snapshot id: a non-negative safe integer from the store API, or a non-empty sku or slug. */
+function catalogId(id) {
+  if (Number.isSafeInteger(id) && id >= 0) return id;
+  if (typeof id === 'string' && id.length > 0 && id.length <= 200 && !/[\u0000-\u001f\u007f]/.test(id)) return id;
+  return null;
+}
+
 /** One snapshot row built from an allowlist (never a spread of `row`): { id, name, price,
  *  stock_status, permalink }, or null when a field is missing, mistyped or off `origin`. */
 function catalogRow(row, origin) {
   if (!isPlainObject(row)) return null;
-  const { id, name, price, stock_status: stockStatus } = row;
+  const { name, price, stock_status: stockStatus } = row;
+  const id = catalogId(row.id);
   const permalink = catalogPermalink(row.permalink, origin);
-  if (!Number.isSafeInteger(id) || id < 0 || typeof name !== 'string' || typeof price !== 'string'
+  if (id === null || typeof name !== 'string' || typeof price !== 'string'
       || !CATALOG_STOCK.includes(stockStatus) || permalink === null) return null;
   return { id, name, price, stock_status: stockStatus, permalink };
 }
@@ -6189,6 +6197,7 @@ const WOO_DEFAULT_MAX_PAGES = 10;
 const WOO_DEFAULT_MAX_BYTES = 48 * 1024 * 1024;
 const WOO_PRODUCTS_PATH = 'wp-json/wc/store/v1/products';
 const WOO_FROM = 'woocommerce';
+const SITE_FROM = 'site';
 /** The most of a store's robots.txt init parses (RFC 9309 asks a crawler to parse at least 500 KiB). */
 const WOO_ROBOTS_MAX_BYTES = 512 * 1024;
 /** The product token robots.txt groups are matched against, and the User-Agent init sends. */
@@ -6209,12 +6218,18 @@ const WOO_FIND_OFFER = deepFreeze({ verb: 'find', of: 'products', about: 'Find p
  *  (confirmReceipt). No url, no payment verb: paying stays at the shop's own checkout. */
 const WOO_HOLD_OFFER = deepFreeze({ verb: 'hold', of: 'item', about: 'Hold one item for pickup; the shop confirms it.',
   input: { id: 'integer' }, door: { reply: 'pending' } });
+/** Hints for `init --from site`. The hold names a sku or a slug, so its id is a string. */
+const SITE_HINTS = Object.freeze(['wix', 'squarespace', 'base']);
+const SITE_HOLD_OFFER = deepFreeze({ verb: 'hold', of: 'item', about: 'Hold one item for pickup; the shop confirms it.',
+  input: { id: 'string' }, door: { reply: 'pending' } });
 const WOO_SNAPSHOT_FILE = 'agent-entry.products.json';
 
 const USAGE = {
   init: 'usage: agent-entry init --trade restaurant|retail|clinic|repair --base-url <url> [--name <name>] [--json]\n'
     + '       agent-entry init --from woocommerce <https store url> [--facts <file>] [--max-pages <n>]\n'
     + '                                           [--max-bytes <n>] [--name <name>] [--json]\n'
+    + '       agent-entry init --from site <https store url> [--hint wix|squarespace|base] [--facts <file>]\n'
+    + '                                   [--max-pages <n>] [--max-bytes <n>] [--name <name>] [--json]\n'
     + '  Detects the framework, mints the site seed into a git-ignored file, writes agent-entry.json and\n'
     + '  .agents/skills/agent-entry/SKILL.md, and wires the door routes, the signposts and the page tag.\n'
     + '  --from woocommerce reads the store\'s robots.txt, then the pages of its public Store API\n'
@@ -6228,7 +6243,15 @@ const USAGE = {
     + '  the owner confirms. --facts <file> is a JSON object of strings with\n'
     + `  the keys ${WOO_FACT_KEYS.join(', ')}\n`
     + '  (human_contact_email or human_contact_phone may be left out, not both); without --facts they are read\n'
-    + '  from stdin, one line each in that order.',
+    + '  from stdin, one line each in that order.\n'
+    + '  --from site reads robots.txt first, then product HTML. With no --hint it reads a sitemap urlset.\n'
+    + '  --hint wix reads store-products-sitemap.xml and not the other sitemaps in the index. --hint\n'
+    + '  squarespace reads /shop?format=json and then each item page. --hint base reads /categories/\n'
+    + '  pages and the /items/ links written on them. Product rows come from Product JSON-LD on those\n'
+    + '  pages, https on the store origin only. --max-pages and --max-bytes bound the product HTML\n'
+    + `  pages (defaults ${WOO_DEFAULT_MAX_PAGES} and ${WOO_DEFAULT_MAX_BYTES}); robots.txt, sitemaps, collection JSON\n`
+    + '  and category pages are discovery and count toward neither. It refuses not-a-store, a robots.txt\n'
+    + '  disallow, and a URL that is not https. It writes the same two files.',
   publish: 'usage: agent-entry publish [--fact <key>=<value> [--private]]... [--version <n>] [--json]   (alias: agent-entry deploy)\n'
     + '  Validates agent-entry.json, compiles and signs it, and writes <static dir>/.well-known/agent-tools.json,\n'
     + '  agent-tools.sig.json and agent-tools/v<n>.json. A published version is never rewritten. No network.\n'
@@ -6720,6 +6743,401 @@ async function initFromWoo(storeUrl, flags) {
   return 0;
 }
 
+// ------------------------------------------ init: product pages on the store's own site
+
+/** `--hint` for `init --from site`: one of the three names, or none. Misuse before any request. */
+function siteHint(flags) {
+  if (flags.hint === undefined) return null;
+  if (!SITE_HINTS.includes(flags.hint)) {
+    throw new CliMisuse(`--hint must be one of ${SITE_HINTS.join(', ')}, not ${JSON.stringify(String(flags.hint).slice(0, 40))}`);
+  }
+  return flags.hint;
+}
+
+/** `raw` resolved against the store, when it is https on that origin and carries no credentials. */
+function sameOriginHttps(base, raw) {
+  if (typeof raw !== 'string' || raw === '') return null;
+  let url;
+  try { url = new URL(raw, base); } catch { return null; }
+  if (url.protocol !== 'https:' || url.origin !== base.origin || url.username || url.password) return null;
+  url.hash = '';
+  return url;
+}
+
+function xmlDecode(text) {
+  return text.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+}
+
+function xmlLocs(xml) {
+  const locs = [];
+  const re = /<loc>\s*([^<]*?)\s*<\/loc>/gi;
+  let m;
+  while ((m = re.exec(xml))) locs.push(xmlDecode(m[1].trim()));
+  return locs;
+}
+
+const isSitemapIndex = (xml) => /<sitemapindex[\s>]/i.test(xml);
+
+/** One https response body, asked once and never redirected. `truncate` keeps the first `cap`
+ *  bytes (robots.txt). Otherwise a body past `cap` is `{ over }` and the rest is not kept. */
+async function siteBody(url, cap, { truncate = false } = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 30000);
+  try {
+    let res;
+    try {
+      res = await fetch(url, { redirect: 'manual', signal: ctrl.signal,
+        headers: { accept: '*/*', 'user-agent': WOO_USER_AGENT } });
+    } catch (e) {
+      return { failed: `got no answer (${shortError(e.cause ?? e)})` };
+    }
+    if (res.status !== 200) {
+      ctrl.abort();
+      return { status: res.status, failed: `answered status ${res.status}` };
+    }
+    const declared = Number(res.headers.get('content-length'));
+    if (!truncate && res.headers.has('content-length') && Number.isFinite(declared) && declared > cap) {
+      ctrl.abort();
+      return { status: 200, over: `Content-Length declares ${declared}` };
+    }
+    const chunks = [];
+    let total = 0;
+    if (res.body) {
+      const reader = res.body.getReader();
+      for (;;) {
+        let step;
+        try { step = await reader.read(); } catch (e) {
+          return { failed: `broke off mid-answer (${shortError(e.cause ?? e)})` };
+        }
+        if (step.done) break;
+        if (total + step.value.byteLength > cap) {
+          ctrl.abort();
+          if (!truncate) return { status: 200, over: 'more than that arrived' };
+          chunks.push(step.value.subarray(0, cap - total));
+          total = cap;
+          break;
+        }
+        chunks.push(step.value);
+        total += step.value.byteLength;
+      }
+    }
+    const text = Buffer.concat(chunks).subarray(0, cap).toString('utf8').replace(/^﻿/, '');
+    return { status: 200, text, bytes: total };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** robots.txt, or null when the store states no rules. A server error refuses before anything else. */
+async function loadRobots(base) {
+  const got = await siteBody(new URL('/robots.txt', base), WOO_ROBOTS_MAX_BYTES, { truncate: true });
+  if (got.status >= 500) {
+    throw new CliRefusal(`robots.txt on ${base.host} answered status ${got.status}, so init cannot tell whether it may read `
+      + 'the store. It asked nothing more. Try again later. Nothing was written.');
+  }
+  if (got.failed || got.status !== 200) return null;
+  return got.text ?? '';
+}
+
+/** Refuse, having fetched nothing further, when robots.txt disallows `url`. */
+function refuseIfDisallowed(robots, url) {
+  if (robots === null) return;
+  const rule = robotsDisallowing(robots, url.pathname);
+  if (rule !== null) {
+    throw new CliRefusal(`robots.txt on ${url.host} disallows ${url.pathname} to ${WOO_ROBOTS_AGENT} `
+      + `(Disallow: ${rule.slice(0, 120)}), so init does not read the store. Nothing was written.`);
+  }
+}
+
+/** GET `url` on the store origin only, after robots.txt has allowed it. */
+async function siteFetch(base, url, cap, robots, options) {
+  if (url.protocol !== 'https:' || url.origin !== base.origin) {
+    throw new CliRefusal('init --from site requests only https on the store origin. Nothing was written.');
+  }
+  refuseIfDisallowed(robots, url);
+  return siteBody(url, cap, options);
+}
+
+async function discoveryText(base, url, robots) {
+  const got = await siteFetch(base, url, WOO_PAGE_MAX_BYTES, robots);
+  if (got.failed || got.over) return null;
+  return got.text ?? null;
+}
+
+function linkedPaths(html, base, pred) {
+  const urls = [];
+  const seen = new Set();
+  const re = /href\s*=\s*(?:"([^"]+)"|'([^']+)')/gi;
+  let m;
+  while ((m = re.exec(html))) {
+    const url = sameOriginHttps(base, m[1] ?? m[2]);
+    if (!url || !pred(url.pathname) || seen.has(url.pathname)) continue;
+    seen.add(url.pathname);
+    urls.push(url);
+  }
+  return urls;
+}
+
+function collectProducts(node, out) {
+  if (Array.isArray(node)) {
+    for (const item of node) collectProducts(item, out);
+    return;
+  }
+  if (!isPlainObject(node)) return;
+  const type = node['@type'];
+  const types = Array.isArray(type) ? type : [type];
+  if (types.some((t) => typeof t === 'string' && t.split('/').pop() === 'Product')) out.push(node);
+  if (node['@graph'] !== undefined) collectProducts(node['@graph'], out);
+}
+
+/** Product nodes from application/ld+json blocks. No other markup is read. */
+function productNodes(html) {
+  const out = [];
+  const re = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = re.exec(html))) {
+    if (!/\btype\s*=\s*(?:"application\/ld\+json"|'application\/ld\+json')/i.test(m[1])) continue;
+    let parsed;
+    try { parsed = JSON.parse(m[2].trim().replace(/^﻿/, '')); } catch { continue; }
+    collectProducts(parsed, out);
+  }
+  return out;
+}
+
+/** A JSON number in decimal, or a JSON string kept as written. */
+function decimalPrice(price) {
+  if (typeof price === 'string') return price;
+  if (typeof price !== 'number' || !Number.isFinite(price)) return null;
+  const text = price.toString();
+  if (!/[eE]/.test(text)) return text;
+  return price.toFixed(8).replace(/\.?0+$/, '');
+}
+
+function offerOf(product) {
+  const raw = product.offers !== undefined ? product.offers : product.Offers;
+  if (Array.isArray(raw)) return raw.find((item) => isPlainObject(item)) ?? null;
+  return isPlainObject(raw) ? raw : null;
+}
+
+function availabilityOf(offer) {
+  if (typeof offer.availability === 'string') return offer.availability;
+  if (typeof offer.Availability === 'string') return offer.Availability;
+  return null;
+}
+
+function stockFromAvailability(availability) {
+  const token = availability.split('/').pop();
+  if (token === 'InStock') return 'in_stock';
+  if (token === 'OutOfStock') return 'out_of_stock';
+  return null;
+}
+
+function siteProductId(product, offer, permalink) {
+  if (typeof product.sku === 'string' && product.sku.trim() !== '') return product.sku;
+  if (typeof offer.sku === 'string' && offer.sku.trim() !== '') return offer.sku;
+  try {
+    return new URL(permalink).pathname.split('/').filter(Boolean).pop() || null;
+  } catch { return null; }
+}
+
+/** One Product as a snapshot row through catalogRow, or null when it has no usable offer.
+ *  A permalink off the store origin is left out and is never requested. */
+function siteSnapshotRow(product, origin) {
+  const offer = offerOf(product);
+  if (!offer || typeof offer.url !== 'string') return null;
+  const permalink = catalogPermalink(offer.url, origin);
+  if (permalink === null) return null;
+  const price = decimalPrice(offer.price);
+  const currency = offer.priceCurrency;
+  const availability = availabilityOf(offer);
+  const stock = availability === null ? null : stockFromAvailability(availability);
+  const id = siteProductId(product, offer, permalink);
+  if (price === null || price === '' || typeof currency !== 'string' || !/^[A-Z]{3}$/.test(currency)
+      || stock === null || id === null || typeof product.name !== 'string') return null;
+  return catalogRow({ id, name: product.name, price: `${price} ${currency}`, stock_status: stock, permalink }, origin);
+}
+
+/** One product HTML page. The first page past the byte bound refuses; a later one ends the walk.
+ *  Returns false when the walk should stop. Discovery pages never come through here. */
+async function takeProduct(base, url, state, robots) {
+  if (state.pages >= state.maxPages) { state.stopped = 'page-bound'; return false; }
+  if (state.bytes >= state.maxBytes) { state.stopped = 'byte-bound'; state.next = state.pages + 1; return false; }
+  const cap = Math.min(WOO_PAGE_MAX_BYTES, state.maxBytes - state.bytes);
+  const got = await siteFetch(base, url, cap, robots);
+  if (got.over) {
+    if (state.pages === 0) {
+      const bound = cap < WOO_PAGE_MAX_BYTES ? `--max-bytes bound of ${cap}` : `bound of ${WOO_PAGE_MAX_BYTES}`;
+      throw new CliRefusal(`the first product page from ${url.host} exceeds the ${bound} bytes (${got.over}); `
+        + 'init reads no more of it. Nothing was written.');
+    }
+    state.stopped = 'byte-bound';
+    state.next = state.pages + 1;
+    state.partial = got.over;
+    return false;
+  }
+  if (got.failed) return true;
+  state.pages += 1;
+  state.bytes += got.bytes;
+  const found = productNodes(got.text);
+  state.products += found.length;
+  for (const product of found) {
+    const row = siteSnapshotRow(product, base.origin);
+    if (row) state.rows.push(row);
+  }
+  return true;
+}
+
+async function genericProductUrls(base, robots) {
+  const text = await discoveryText(base, new URL('/sitemap.xml', base), robots);
+  if (text === null || isSitemapIndex(text)) return [];
+  return xmlLocs(text).map((loc) => sameOriginHttps(base, loc)).filter(Boolean);
+}
+
+/** The wix hint: the index, then only store-products-sitemap.xml, then those pages. */
+async function wixProductUrls(base, robots) {
+  const text = await discoveryText(base, new URL('/sitemap.xml', base), robots);
+  if (text === null) return [];
+  const locs = xmlLocs(text).map((loc) => sameOriginHttps(base, loc)).filter(Boolean);
+  if (!isSitemapIndex(text)) return locs;
+  const child = locs.find((url) => url.pathname.endsWith('/store-products-sitemap.xml'));
+  if (!child) return [];
+  const products = await discoveryText(base, child, robots);
+  if (products === null) return [];
+  return xmlLocs(products).map((loc) => sameOriginHttps(base, loc)).filter(Boolean);
+}
+
+/** The base hint: category locs from the sitemap, then /items/ links written on those pages.
+ *  An /items/ loc that appears only in the sitemap is not fetched. */
+async function baseItemUrls(base, robots) {
+  const text = await discoveryText(base, new URL('/sitemap.xml', base), robots);
+  if (text === null) return [];
+  const categories = xmlLocs(text).map((loc) => sameOriginHttps(base, loc))
+    .filter((url) => url && /^\/categories\/[^/]+$/.test(url.pathname));
+  const items = [];
+  const seen = new Set();
+  for (const category of categories) {
+    const html = await discoveryText(base, category, robots);
+    if (html === null) continue;
+    for (const item of linkedPaths(html, base, (path) => /^\/items\/[^/]+$/.test(path))) {
+      if (seen.has(item.pathname)) continue;
+      seen.add(item.pathname);
+      items.push(item);
+    }
+  }
+  return items;
+}
+
+/** The squarespace hint: /shop?format=json. pagination.nextPage false ends the collection walk and
+ *  pagination.nextPageOffset is the next offset when the store sends them. Otherwise pageSize is
+ *  the offset step when it is a positive integer, and the step is 20 only when it is absent. A short page, or itemCount once that many items are seen,
+ *  ends the collection walk. The next collection page is not requested once the product-page
+ *  bound has ended the walk. Rows come from each item page's JSON-LD. */
+async function walkSquarespace(base, robots, state) {
+  let offset = 0;
+  for (;;) {
+    if (state.stopped || state.pages >= state.maxPages) {
+      if (state.pages >= state.maxPages) state.stopped = 'page-bound';
+      return;
+    }
+    const url = new URL('/shop', base);
+    url.search = '';
+    url.searchParams.set('format', 'json');
+    if (offset > 0) url.searchParams.set('offset', String(offset));
+    const got = await siteFetch(base, url, WOO_PAGE_MAX_BYTES, robots);
+    if (got.failed || got.over || !got.text) return;
+    let doc;
+    try { doc = JSON.parse(got.text.replace(/^﻿/, '')); } catch { return; }
+    const items = isPlainObject(doc) && Array.isArray(doc.items) ? doc.items : [];
+    const collection = isPlainObject(doc) && isPlainObject(doc.collection) ? doc.collection : {};
+    const pageSize = Number.isSafeInteger(collection.pageSize) && collection.pageSize > 0 ? collection.pageSize : null;
+    const itemCount = Number.isSafeInteger(collection.itemCount) && collection.itemCount >= 0 ? collection.itemCount : null;
+    const step = pageSize ?? 20;
+    let fetched = 0;
+    for (const item of items) {
+      if (state.pages >= state.maxPages) { state.stopped = 'page-bound'; return; }
+      const itemUrl = isPlainObject(item) ? sameOriginHttps(base, item.fullUrl) : null;
+      if (!itemUrl) continue;
+      fetched += 1;
+      const keep = await takeProduct(base, itemUrl, state, robots);
+      if (!keep || state.stopped) return;
+    }
+    if (fetched === 0) return;
+    const pagination = isPlainObject(doc.pagination) ? doc.pagination : null;
+    if (pagination && pagination.nextPage === false) return;
+    const nextOffset = pagination && Number.isSafeInteger(pagination.nextPageOffset) ? pagination.nextPageOffset : null;
+    if (nextOffset !== null) {
+      if (nextOffset <= offset) return;
+      offset = nextOffset;
+      continue;
+    }
+    if (items.length < step) return;
+    if (itemCount !== null && offset + items.length >= itemCount) return;
+    offset += step;
+  }
+}
+
+async function siteWalk(base, hint, bounds) {
+  const robots = await loadRobots(base);
+  const state = { rows: [], pages: 0, products: 0, bytes: 0, stopped: null, next: null, partial: null, ...bounds };
+  if (hint === 'squarespace') await walkSquarespace(base, robots, state);
+  else {
+    const urls = hint === 'wix' ? await wixProductUrls(base, robots)
+      : hint === 'base' ? await baseItemUrls(base, robots)
+        : await genericProductUrls(base, robots);
+    for (const url of urls) {
+      const keep = await takeProduct(base, url, state, robots);
+      if (!keep || state.stopped) break;
+    }
+  }
+  if (state.products === 0) {
+    throw new CliRefusal('not-a-store: no product sitemap and no Product JSON-LD. Nothing was written.');
+  }
+  return state;
+}
+
+/** `init --from site <store> [--hint] [--facts <file>]`: robots.txt, then product HTML bounded
+ *  like the store API walk. Discovery is not counted. Only agent-entry.json and the snapshot
+ *  are written, and only after the walk has a Product. */
+async function initFromSite(storeUrl, flags) {
+  if (storeUrl === undefined) throw new CliMisuse('init --from site needs the store URL: init --from site <store-url>');
+  if (flags['base-url'] !== undefined) throw new CliMisuse('init --from site takes the store URL itself, not --base-url');
+  const hint = siteHint(flags);
+  const maxPages = wooBound(flags, 'max-pages', WOO_DEFAULT_MAX_PAGES);
+  const maxBytes = wooBound(flags, 'max-bytes', WOO_DEFAULT_MAX_BYTES);
+  const base = wooStoreBase(storeUrl);
+  const factsFromFile = flags.facts === undefined ? null : wooFactsFile(flags.facts);
+  const declPath = join(process.cwd(), DECLARATION_FILE);
+  const snapPath = join(process.cwd(), WOO_SNAPSHOT_FILE);
+  for (const [path, rel] of [[declPath, DECLARATION_FILE], [snapPath, WOO_SNAPSHOT_FILE]]) {
+    if (existsSync(path)) {
+      throw new CliRefusal(`${rel} already exists; init --from never overwrites it. Move it aside first. No request was made.`);
+    }
+  }
+  const walk = await siteWalk(base, hint, { maxPages, maxBytes });
+  const facts = factsFromFile ?? await wooFactsPrompted();
+  const declaration = checkedDeclaration({ v: 1, entry: { name: flags.name ?? base.hostname, baseUrl: base.href.replace(/\/$/, '') },
+    offers: [WOO_ASK_OFFER, WOO_FIND_OFFER, SITE_HOLD_OFFER].map((o) => JSON.parse(JSON.stringify(o))), facts });
+  writeFileSync(declPath, `${JSON.stringify(declaration, null, 2)}\n`, { flag: 'wx' });
+  writeFileSync(snapPath, `${jsonWithoutMarkup(JSON.stringify(walk.rows, null, 2))}\n`, { flag: 'wx' });
+  const stoppedLine = walk.stopped === 'page-bound'
+    ? [`Stopped at the page bound (--max-pages ${maxPages}): the store has more product pages, not read.`]
+    : walk.stopped === 'byte-bound'
+      ? [`Stopped at the byte bound (--max-bytes ${maxBytes}, ${walk.bytes} bytes read): page ${walk.next} `
+        + `${walk.partial ? `was begun and left unread (${walk.partial})` : 'and later pages were not read'}.`]
+      : [];
+  emit(flags.json, { from: SITE_FROM, store: base.href, products: walk.products, pages: walk.pages, stopped: walk.stopped,
+    wrote: [DECLARATION_FILE, WOO_SNAPSHOT_FILE] }, [
+    `Read robots.txt and ${walk.pages} product page${walk.pages === 1 ? '' : 's'} (${walk.products} product${walk.products === 1 ? '' : 's'}) from ${base.host}.`,
+    ...stoppedLine,
+    `Wrote ${DECLARATION_FILE}: one \`ask\` offer answered at the door from ${Object.keys(facts).length} facts, one \`find\` `
+      + `offer answered from ${WOO_SNAPSHOT_FILE}, and one \`hold\` offer answered pending with a receipt the owner confirms.`,
+    `Wrote ${WOO_SNAPSHOT_FILE}: ${walk.rows.length} product${walk.rows.length === 1 ? '' : 's'}.`,
+    'Next: run `agent-entry publish`, then `agent-entry doctor`.',
+  ]);
+  return 0;
+}
+
 /** Validate a declaration the CLI built. */
 function checkedDeclaration(declaration) {
   try {
@@ -7182,16 +7600,17 @@ function skillSource(framework) {
 async function initMain(argv) {
   const positionals = [];
   const flags = parseFlags(argv, { trade: 'string', from: 'string', name: 'string', 'base-url': 'string', json: 'boolean',
-    facts: 'string', 'max-pages': 'string', 'max-bytes': 'string' }, positionals);
-  // Only the literal `--from woocommerce` takes a store URL. Any other --from is misuse.
-  if (flags.from === WOO_FROM) {
+    facts: 'string', 'max-pages': 'string', 'max-bytes': 'string', hint: 'string' }, positionals);
+  if (flags.from === WOO_FROM || flags.from === SITE_FROM) {
     if (flags.trade !== undefined) throw new CliMisuse('give --trade or --from, not both');
+    if (flags.from === WOO_FROM && flags.hint !== undefined) throw new CliMisuse('--hint goes with --from site');
     if (positionals.length > 1) throw new CliMisuse(`unexpected argument ${JSON.stringify(positionals[1].slice(0, 60))}`);
-    return initFromWoo(positionals[0], flags);
+    return flags.from === WOO_FROM ? initFromWoo(positionals[0], flags) : initFromSite(positionals[0], flags);
   }
-  if (flags.from !== undefined) throw new CliMisuse('init --from accepts only woocommerce');
+  if (flags.from !== undefined) throw new CliMisuse('init --from accepts only woocommerce or site');
+  if (flags.hint !== undefined) throw new CliMisuse('--hint goes with --from site');
   for (const name of ['facts', 'max-pages', 'max-bytes']) {
-    if (flags[name] !== undefined) throw new CliMisuse(`--${name} goes with --from woocommerce`);
+    if (flags[name] !== undefined) throw new CliMisuse(`--${name} goes with --from woocommerce or --from site`);
   }
   if (positionals.length) throw new CliMisuse(`unexpected argument ${JSON.stringify(positionals[0].slice(0, 60))}`);
   const root = process.cwd();
