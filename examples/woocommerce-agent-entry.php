@@ -674,7 +674,10 @@ function mae_woo_card($declaration, $did) {
             'muretai' => $requirement,
         )),
         'security' => array(array(MAE_WOO_SCHEME => array())),
-        'supportedInterfaces' => array(array('url' => $door_url, 'protocolBinding' => 'JSONRPC', 'protocolVersion' => '0.2')),
+        'supportedInterfaces' => array(
+            array('url' => $door_url, 'protocolBinding' => 'JSONRPC', 'protocolVersion' => '0.2'),
+            array('url' => $door_url, 'protocolBinding' => 'HTTP+JSON', 'protocolVersion' => '1.0'),
+        ),
     );
 }
 
@@ -698,6 +701,56 @@ function mae_woo_envelope_bytes($card, $card_bytes, $secret) {
     ));
     set_transient(MAE_WOO_SIG_TRANSIENT, array('card' => $key, 'ts' => $now, 'body' => $body), MAE_WOO_SIG_REFRESH_S);
     return $body;
+}
+
+/** Offer text in an HTML page: the characters, never a tag. Same spelling as escapeHtml. */
+function mae_woo_escape_html($value) {
+    return str_replace(
+        array('&', '<', '>', '"', "'"),
+        array('&#38;', '&#60;', '&#62;', '&#34;', '&#39;'),
+        (string) $value
+    );
+}
+
+/** The same block offersSignpost prints: every offer, the knock line, the head link and the card. */
+function mae_woo_offers_signpost($declaration) {
+    $base = $declaration['base'];
+    $mount = rtrim((string) wp_parse_url($base, PHP_URL_PATH), '/');
+    $card_path = $mount . '/.well-known/agent-card.json';
+    $card_url = $base . '/.well-known/agent-card.json';
+    $rel = 'https://muretai.net/rel/agent-entry';
+    $lines = array(
+        '<link rel="' . $rel . '" href="' . $card_path . '">',
+        '<a href="' . $card_path . '" rel="' . $rel . '">This site answers agents at ' . $card_path . '</a>',
+        $card_url,
+    );
+    foreach ($declaration['offers'] as $offer) {
+        $lines[] = mae_woo_escape_html($offer['verb']) . ' ' . mae_woo_escape_html($offer['of']);
+        $lines[] = mae_woo_escape_html($offer['about']);
+        $names = array_keys($offer['input']);
+        sort($names, SORT_STRING);
+        foreach ($names as $name) {
+            $lines[] = mae_woo_escape_html($name) . ' ' . mae_woo_escape_html($offer['input'][$name]);
+        }
+        $lines[] = "needs the customer's key";
+        $lines[] = 'knock ' . $card_url . ' --offer ' . mae_woo_escape_html($offer['id']);
+    }
+    return implode("\n", $lines);
+}
+
+/** True when Accept lists text/html as its own media type. */
+function mae_woo_accept_lists_html() {
+    $raw = (string) ($_SERVER['HTTP_ACCEPT'] ?? '');
+    if ($raw === '') {
+        return false;
+    }
+    foreach (explode(',', $raw) as $part) {
+        $media = strtolower(trim(explode(';', $part, 2)[0]));
+        if ($media === 'text/html') {
+            return true;
+        }
+    }
+    return false;
 }
 
 function mae_woo_send($body, $head) {
@@ -749,4 +802,23 @@ add_action('parse_request', function () {
         mae_woo_send(mae_woo_envelope_bytes($card, $card_bytes, $identity['secret']), $method === 'HEAD');
     }
     mae_woo_send($card_bytes, $method === 'HEAD');
+});
+
+add_action('template_redirect', function () {
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET' || !mae_woo_accept_lists_html()) {
+        return;
+    }
+    $target = (string) ($_SERVER['REQUEST_URI'] ?? '/');
+    $path = explode('#', explode('?', $target, 2)[0], 2)[0];
+    if (substr($path, -strlen(MAE_WOO_CARD)) === MAE_WOO_CARD
+        || substr($path, -strlen(MAE_WOO_CARD_LEGACY)) === MAE_WOO_CARD_LEGACY
+        || substr($path, -strlen(MAE_WOO_SIG)) === MAE_WOO_SIG) {
+        return;
+    }
+    try {
+        $declaration = mae_woo_declaration();
+    } catch (RuntimeException $e) {
+        return;
+    }
+    echo mae_woo_offers_signpost($declaration);
 });

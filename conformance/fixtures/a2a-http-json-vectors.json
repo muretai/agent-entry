@@ -1,0 +1,36 @@
+{
+  "protocolBinding": "HTTP+JSON",
+  "protocolVersion": "1.0",
+  "mediaType": "application/a2a+json",
+  "sendSuffix": "/message:send",
+  "roleUser": "ROLE_USER",
+  "roleAgent": "ROLE_AGENT",
+  "signedFields": ["contextId", "from", "messageId", "text", "timestamp", "to"],
+  "errorInfoType": "type.googleapis.com/google.rpc.ErrorInfo",
+  "errorDomain": "a2a-protocol.org",
+  "unauthenticated": {
+    "http": 401,
+    "status": "UNAUTHENTICATED",
+    "reason": "UNAUTHENTICATED",
+    "jsonRpcCode": -32001,
+    "message": "Signature verification failed"
+  },
+  "taskNotFound": {
+    "http": 404,
+    "status": "NOT_FOUND",
+    "reason": "TASK_NOT_FOUND"
+  },
+  "taskRoutes": [
+    ["GET", "/tasks/task-1"],
+    ["GET", "/tasks"],
+    ["POST", "/tasks/task-1:cancel"],
+    ["POST", "/tasks/task-1:subscribe"],
+    ["GET", "/tasks/task-1/pushNotificationConfigs"],
+    ["POST", "/tasks/task-1/pushNotificationConfigs"],
+    ["GET", "/tasks/task-1/pushNotificationConfigs/cfg-1"],
+    ["DELETE", "/tasks/task-1/pushNotificationConfigs/cfg-1"]
+  ],
+  "observation": "bearer_issuer",
+  "countsKey": "platforms",
+  "scheme": "did-key-ed25519"
+}
