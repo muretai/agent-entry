@@ -32,10 +32,14 @@
 //   4 AT-12/AT-13 at the door, S6b-1 (`knock --offer`, landed 9e58808)   `knock --offer find`,
 //        `ask`, `hold`: find answers see_catalog, ask answers the facts, hold answers
 //        pending_confirmation with a deal receipt signed by the shop for this customer.
-//   5 Answer-1 (20261003T131710Z)   `decide <receipt file> approve --to <customer card url>` sends
-//        the customer's DID a signed message/send whose text the customer reads as its booking:
-//        status confirmed, the same termsHash, the shop's fresh signature over it. Sent once per
-//        receipt; a receipt that does not verify against the shop's key is refused, nothing sent.
+//   5 AT-28 (design record 20261004T022919Z; item 2 `decide <ref> approve` landed 83cc12d, item 5
+//        `knock --ref`, intake 20261010T051835Z)   the hold of step 4 sits in the door's receipts
+//        store under its ref; `decide <ref> approve --store <the door's state file>` stores the
+//        decision; the customer collects it with `knock <card> --offer track --ref <ref>`, which
+//        prints it as its booking: status confirmed, the same termsHash, signed by the shop. Once per
+//        ref (a repeat changes nothing); the superseded file form `decide <receipt file> approve
+//        --to <url>` is refused; an unknown ref, and the right ref under a stranger's knock key, are
+//        refused and print no decision.
 //   6a Analytics-1 (20261003T131711Z)   `counts --json` opens with a coverage header (log range,
 //        last event, store present) and counts the door knocks under who.signed, who.declared and
 //        who.network.
@@ -82,7 +86,7 @@ import * as door from '../muretai-agent-entry.mjs';
 const {
   AGENT_CARD_PATH, AGENT_CARD_SIG_PATH, AI_AGENT_FAMILIES, OFFER_STARTERS, REFERRAL_ENGINES, TOOLS_PATH,
   TOOLS_SIG_PATH, VENDORS, canonicalBytes, canonicalJSON, compileDeclaration, createAgentEntry,
-  createFileStore, didFromSeedHex, fileSink, knockAgentEntry, publicKeyHexFromDid, signBytes,
+  createFileStore, didFromSeedHex, fileSink, knockAgentEntry, publicKeyHexFromDid,
   validateDeclaration, verifyBytes, verifyCardEnvelope, verifyToolsEnvelope,
 } = door;
 
@@ -247,10 +251,8 @@ const state = {
   dataDir: null,          // the fileSink log and the file store
   declaration: null,      // what step 1 left in agent-entry.json (or the stand-in)
   initHits: null,         // what step 1's init asked the shop, in order
-  receiptFile: null,      // step 4's hold reply, for decide
-  hold: null,             // step 4's parsed hold reply
-  customer: null,         // the customer's own door (step 5)
-  inbox: [],              // what the customer's door was sent
+  receiptFile: null,      // step 4's hold reply (step 5 shows its file form is refused)
+  hold: null,             // step 4's parsed hold reply: its deal.ref is what step 5 decides and collects
 };
 
 function storeApi(req) {
@@ -370,7 +372,6 @@ before(async () => {
 
 after(async () => {
   if (state.shop) await state.shop.close();
-  if (state.customer) await state.customer.close();
   for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -558,11 +559,11 @@ test('frame 4 refusals [AT-11 door]: an offer the door does not make, and an uns
   assert.ok(!res.body.includes('DealReceipt'), 'no receipt for an unsigned knock');
 });
 
-// ---------------------------------------------------------------- 5. Answer-1: the owner approves
+// ---------------------------------------------------------------- 5. AT-28: the owner approves, the customer collects
 
 /** A receipt to decide on: step 4's hold, or (when step 4 is red) one the stand-in door issues in-process. */
 async function ensureReceipt() {
-  if (state.receiptFile && existsSync(state.receiptFile)) return;
+  if (state.hold && state.receiptFile && existsSync(state.receiptFile)) return;
   ensureDeclaration();
   const result = await knockAgentEntry(cardUrl(), { offer: 'hold', text: 'hold item {"sku":"L-12"}', keyPath: KNOCK_KEY, fetchImpl: caFetch });
   assert.ok(result.ok && result.booking, `the stand-in hold must be answered: ${JSON.stringify(result).slice(0, 300)}`);
@@ -571,87 +572,94 @@ async function ensureReceipt() {
   writeFileSync(state.receiptFile, result.text);
 }
 
-async function ensureCustomerDoor() {
-  if (state.customer) return;
-  let entry = null;
-  state.customer = await startHttps((req, body) => (entry
-    ? viaEntry(entry, req, body)
-    : { status: 404, headers: {}, body: '' }));
-  entry = createAgentEntry({
-    seedHex: SEEDS.customer,
-    name: 'The customer',
-    baseUrl: state.customer.origin,
-    responder: (env) => { state.inbox.push(env); return 'received'; },
-  });
-}
+/** `decide <ref> approve` against the door's own state file, signed with the door's seed. */
+const decideApprove = (ref) => runCli(['decide', ref, 'approve', '--store', storePath()],
+  { cwd: state.project, env: { AGENT_ENTRY_SEED_HEX: shopSeed() } });
 
-async function waitFor(pred, ms = 8000) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    if (pred()) return true;
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  return pred();
-}
+/** The customer's `knock <card> --offer track --ref <ref>`, with `keyPath` as the knock key. */
+const knockTrack = (ref, keyPath = KNOCK_KEY) => runCli(['knock', cardUrl(), '--offer', 'track', '--ref', ref],
+  { cwd: state.project, env: { AGENT_ENTRY_KNOCK_KEY: keyPath, AGENT_ENTRY_KNOCK_TEXT: 'hold item {"sku":"L-12"}' } });
 
-test('frame 5 [Answer-1 20261003T131710Z]: decide <receipt> approve sends the signed follow-up the customer reads as confirmed', async () => {
+const rowOf = (ref) => createFileStore(storePath()).getReceipt(ref);
+
+test('frame 5 [AT-28 items 2 and 5, 20261010T051835Z]: hold, decide <ref> approve, knock --offer track --ref <ref>: confirmed on the same terms, signed by the shop', async () => {
   await ensureReceipt();
-  await ensureCustomerDoor();
   const shopDid = state.entry.did;
-  const sent = state.inbox.length;
-  const to = `${state.customer.origin}${AGENT_CARD_PATH}`;
-  const run = await runCli(['decide', state.receiptFile, 'approve', '--to', to], { cwd: state.project });
-  assertStayedHome(run, 'decide approve');
-  assert.equal(run.code, 0, `decide <receipt> approve succeeds: ${said(run)}`);
-  assert.ok(await waitFor(() => state.inbox.length > sent), 'the customer\'s door received the follow-up through message/send');
-  assert.equal(state.inbox.length, sent + 1, 'exactly one follow-up');
-  const env = state.inbox[state.inbox.length - 1];
-  assert.equal(env.verified, true, 'the follow-up is a verified signed message');
-  assert.equal(env.peer_did, shopDid, 'signed by the shop\'s door key');
-  // What the customer's checkedBookingReceipt reads: the Suite shape filed under this customer.
-  const follow = JSON.parse(env.text);
+  const ref = state.hold.deal?.ref;
+  assert.equal(typeof ref, 'string', `the hold carries its ref: ${JSON.stringify(state.hold).slice(0, 300)}`);
+  const row = await rowOf(ref);
+  assert.ok(row && row.decision === null, `the hold sits undecided in the door's receipts store: ${JSON.stringify(row).slice(0, 300)}`);
+
+  const approve = await decideApprove(ref);
+  assertStayedHome(approve, 'decide <ref> approve');
+  assert.equal(approve.code, 0, `decide <ref> approve succeeds: ${said(approve)}`);
+  const approved = JSON.parse(approve.stdout.trim());
+  assert.equal(approved.status, 'confirmed', 'the owner\'s decision reads confirmed');
+  assert.equal((await rowOf(ref)).decision?.status, 'confirmed', 'and is stored under the ref');
+
+  const run = await knockTrack(ref);
+  assertStayedHome(run, 'knock --offer track --ref <ref>');
+  assert.equal(run.code, 0, `the customer collects the decision: ${said(run)}`);
+  const follow = JSON.parse(run.stdout.trim());
+  assert.deepEqual(follow, approved, 'the customer reads the decision the owner made, as it was made');
   assert.equal(follow.customer_did, CUSTOMER_DID, 'filed under the customer\'s DID');
   assert.equal(follow.verb, state.hold.verb);
   assert.equal(follow.of, state.hold.of);
-  assert.equal(typeof follow.request, 'string');
+  assert.equal(follow.request, state.hold.request, 'on the hold\'s own request');
   assert.equal(follow.status, 'confirmed', 'the booking now reads confirmed');
-  const { deal } = assertDeal(follow, { signer: shopDid, what: 'the follow-up deal' });
-  assert.equal(deal.termsHash, state.hold.deal.termsHash, 'the follow-up re-signs the same termsHash: the two receipts chain');
+  const { deal } = assertDeal(follow, { signer: shopDid, what: 'the collected decision' });
+  assert.equal(deal.termsHash, state.hold.deal.termsHash, 'termsHash equal: the decision chains to the hold');
+  assert.equal(deal.ref, ref, 'on the ref asked');
 });
 
-test('frame 5 refusals [Answer-1]: once per receipt; a receipt the shop did not sign is refused and nothing is sent', async () => {
+test('frame 5 refusals [AT-28]: once per ref; the file form is refused; an unknown ref and a stranger\'s knock print no decision', async () => {
   await ensureReceipt();
-  await ensureCustomerDoor();
-  const to = `${state.customer.origin}${AGENT_CARD_PATH}`;
-  const sent = state.inbox.length;
+  const ref = state.hold.deal?.ref;
+  assert.equal(typeof ref, 'string', 'the hold carries its ref');
+  const first = await decideApprove(ref);
+  assert.equal(first.code, 0, `decide <ref> approve succeeds: ${said(first)}`);
+  const stored = JSON.parse(JSON.stringify(await rowOf(ref)));
+  const decision = stored.decision?.text;
+  assert.equal(typeof decision, 'string', 'a decision is stored');
 
-  const again = await runCli(['decide', state.receiptFile, 'approve', '--to', to], { cwd: state.project });
-  assertStayedHome(again, 'decide approve (again)');
-  await new Promise((r) => setTimeout(r, 500));
-  assert.equal(state.inbox.length, sent, `a second decide on the same receipt sends nothing: ${said(again)}`);
+  // Once per ref: a repeat prints the same bytes and changes nothing, and the customer still reads the one decision.
+  const again = await decideApprove(ref);
+  assertStayedHome(again, 'decide <ref> approve (again)');
+  assert.equal(again.code, 0, `a repeat is idempotent: ${said(again)}`);
+  assert.equal(again.stdout, first.stdout, 'the same bytes');
+  assert.deepEqual(await rowOf(ref), stored, 'the stored decision is unchanged');
+  const collected = await knockTrack(ref);
+  assertStayedHome(collected, 'knock --offer track --ref <ref> (after the repeat)');
+  assert.equal(collected.code, 0, `the customer collects it: ${said(collected)}`);
+  assert.deepEqual(JSON.parse(collected.stdout.trim()), JSON.parse(decision), 'the one decision');
 
-  const tampered = JSON.parse(readFileSync(state.receiptFile, 'utf8'));
-  tampered.deal.termsHash = createHash('sha256').update('other terms').digest('hex');
-  const tamperedFile = join(state.project, 'hold-receipt-tampered.json');
-  writeFileSync(tamperedFile, JSON.stringify(tampered));
-  const bad = await runCli(['decide', tamperedFile, 'approve', '--to', to], { cwd: state.project });
-  assertStayedHome(bad, 'decide approve <tampered>');
-  assert.notEqual(bad.code, 0, `a receipt whose signature does not verify is refused: ${said(bad)}`);
+  // The superseded file form, with --to, is refused and changes nothing.
+  const fileForm = await runCli(['decide', state.receiptFile, 'approve', '--to', `${state.shop.origin}${AGENT_CARD_PATH}`],
+    { cwd: state.project, env: { AGENT_ENTRY_SEED_HEX: shopSeed() } });
+  assertStayedHome(fileForm, 'decide <receipt file> approve --to');
+  assert.notEqual(fileForm.code, 0, `the file form is superseded: ${said(fileForm)}`);
+  assert.deepEqual(await rowOf(ref), stored, 'the file form changed nothing');
 
-  const foreign = JSON.parse(readFileSync(state.receiptFile, 'utf8'));
-  const stranger = 'c3'.repeat(32);
-  foreign.deal.partyA = didFromSeedHex(stranger);
-  foreign.deal.sigA = signBytes(stranger, canonicalBytes({ type: 'DealReceipt', partyA: foreign.deal.partyA,
-    partyB: foreign.deal.partyB, termsHash: foreign.deal.termsHash, contextId: foreign.deal.contextId,
-    ref: foreign.deal.ref, ts: foreign.deal.ts })).toString('base64');
-  const foreignFile = join(state.project, 'hold-receipt-foreign.json');
-  writeFileSync(foreignFile, JSON.stringify(foreign));
-  const other = await runCli(['decide', foreignFile, 'approve', '--to', to], { cwd: state.project });
-  assertStayedHome(other, 'decide approve <another key\'s receipt>');
-  assert.notEqual(other.code, 0, `a receipt another key issued is not this shop's to decide: ${said(other)}`);
+  // An unknown ref: the owner cannot decide it and the customer cannot collect it.
+  const unknownDecide = await decideApprove('no-such-ref');
+  assertStayedHome(unknownDecide, 'decide <unknown ref> approve');
+  assert.equal(unknownDecide.code, 1, `an unknown ref is refused: ${said(unknownDecide)}`);
+  const unknownKnock = await knockTrack('no-such-ref');
+  assertStayedHome(unknownKnock, 'knock --offer track --ref <unknown>');
+  assert.equal(unknownKnock.code, 1, `an unknown ref is refused at the door: ${said(unknownKnock)}`);
+  assert.equal(unknownKnock.stdout, '', 'nothing printed');
+  assert.match(unknownKnock.stderr, /Refused \(-32602\)/, said(unknownKnock));
 
-  await new Promise((r) => setTimeout(r, 500));
-  assert.equal(state.inbox.length, sent, 'no refused decide sent anything');
+  // The right ref, under a stranger's knock key: refused, and the decision never leaks.
+  const strangerKey = join(tmp('ae-frame-stranger-'), 'knock-seed');
+  writeFileSync(strangerKey, `${'c3'.repeat(32)}\n`, { mode: 0o600 });
+  const stranger = await knockTrack(ref, strangerKey);
+  assertStayedHome(stranger, 'knock --offer track --ref <ref> by a stranger');
+  assert.equal(stranger.code, 1, `a stranger cannot collect the customer's decision: ${said(stranger)}`);
+  assert.equal(stranger.stdout, '', 'nothing printed');
+  assert.ok(!stranger.stderr.includes(decision) && !stranger.stderr.includes(JSON.parse(decision).deal.sigA), 'the decision never leaks');
+  assert.match(stranger.stderr, /Refused \(-32602\)/, said(stranger));
+  assert.deepEqual(await rowOf(ref), stored, 'no refusal changed the stored decision');
 });
 
 // ---------------------------------------------------------------- 6. Analytics: who came, who came back
