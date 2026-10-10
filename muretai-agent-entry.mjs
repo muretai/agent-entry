@@ -3510,6 +3510,11 @@ export const COLLECTOR_MAX_EVENTS_PER_SESSION = 100;
 const COLLECTOR_MAX_MS = 600000;
 const COLLECTOR_SESSION = /^[A-Za-z0-9_-]{8,64}$/;
 const COLLECTOR_EVENT_KEYS = ['name', 'offer', 'engine', 'ms'];
+/** An offer id trunk's hosted collector counts: a registry verb, then the `of`, at most 64
+ *  characters. A declared offer outside it (AT-4) is counted here but never posted, because
+ *  trunk refuses the whole body over one such id. */
+const COUNTS_OFFER = new RegExp(`^(${VERBS.join('|')})_[a-z][a-z0-9_]*$`);
+const COUNTS_MAX_OFFER = 64;
 /** Sessions remembered for the per-session cap. Bounded so a stranger minting session names
  *  cannot grow the door's memory; the oldest is forgotten first. */
 const COLLECTOR_MAX_SESSIONS = 10000;
@@ -5632,15 +5637,34 @@ export function createAgentEntry({
   /** S6a-2: the counted events also go to `entry.counts`, the AT-14 body and nothing else — no
    *  DID, no text, no visitor header, `Origin` the shop's own. Best-effort as gaSink is: one
    *  attempt, never awaited, every failure swallowed, so the 204 and every signed reply are
-   *  the same bytes whether the sink is up, slow, hung or down. */
+   *  the same bytes whether the sink is up, slow, hung or down. Every body is one trunk's
+   *  parse_beacon accepts: an offer id off trunk's registry is left out, and since the door
+   *  re-serializes (`6e5` posts as `600000`), the events are split across as many posts as
+   *  keep each at most COLLECTOR_MAX_BODY_BYTES. */
   function postCounts(sessionId, events) {
     try {
-      const body = JSON.stringify({ session: sessionId, events });
-      Promise.resolve()
-        .then(() => globalThis.fetch(tools.counts, { method: 'POST',
-          headers: { 'content-type': 'application/json', origin: doorOrigin }, body }))
-        .then(undefined, () => {});
+      const postable = events.filter((e) => e.offer === undefined
+        || (e.offer.length <= COUNTS_MAX_OFFER && COUNTS_OFFER.test(e.offer)));
+      const bodyOf = (part) => JSON.stringify({ session: sessionId, events: part });
+      let part = [];
+      for (const e of postable) {
+        if (part.length > 0 && Buffer.byteLength(bodyOf([...part, e]), 'utf8') > COLLECTOR_MAX_BODY_BYTES) {
+          sendCounts(bodyOf(part));
+          part = [];
+        }
+        part.push(e);
+      }
+      if (part.length > 0) sendCounts(bodyOf(part));
     } catch { /* the hosted count never changes what the door does */ }
+  }
+
+  function sendCounts(body) {
+    // One event with a bounded session and offer is far under the cap; never send one that is not.
+    if (Buffer.byteLength(body, 'utf8') > COLLECTOR_MAX_BODY_BYTES) return;
+    Promise.resolve()
+      .then(() => globalThis.fetch(tools.counts, { method: 'POST',
+        headers: { 'content-type': 'application/json', origin: doorOrigin }, body }))
+      .then(undefined, () => {});
   }
 
   /** What `Allow:` may truthfully say about THIS path, or null when the entry does not own
