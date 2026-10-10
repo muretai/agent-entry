@@ -279,6 +279,16 @@ You do not have to write it by hand: `agent-entry init` writes a starter for you
 [Put it on a site](#put-it-on-a-site)), and the declaration is passed to the door as
 `createAgentEntry({ declaration, … })`.
 
+An offer whose door replies `pending` leaves the decision to you. The door keeps each pending
+receipt in its store under the deal's ref, and you approve one by that ref:
+
+```bash
+npx @muretai/agent-entry decide <ref> approve --store var/ledger.json
+```
+
+It prints the shop's confirmed reply and stores it as that receipt's decision. Approving the same
+ref again prints the same bytes, and nothing is sent.
+
 ## Who is knocking
 
 Observation, never identity. The person who found you often never opens a browser:

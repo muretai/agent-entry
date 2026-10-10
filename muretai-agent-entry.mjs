@@ -6543,9 +6543,9 @@ const USAGE = {
     + '  Per offer: asked on the page, asked at the door, completed, receipts; referrals by engine; returning\n'
     + '  customers (a count); door knocks by stage and client class; platforms, the bearer issuer hosts.\n'
     + '  --serve renders one page on loopback only.',
-  decide: 'usage: agent-entry decide <receipt file> approve\n'
-    + '  The owner\'s approval of a pending receipt the door signed: prints the signed message/send follow-up\n'
-    + '  (confirmReceipt\'s confirmed reply) from this site\'s DID to the receipt\'s customer_did. Nothing is sent.',
+  decide: 'usage: agent-entry decide <ref> approve --store <file store>\n'
+    + '  The owner\'s approval of a pending receipt the door issued, by its deal ref in the door\'s store: prints\n'
+    + '  confirmReceipt\'s confirmed reply and stores it as the row\'s decision. A repeat prints the same. Nothing is sent.',
   serve: 'usage: agent-entry serve --proof-path /.well-known/<file> --proof-body <text> [--port <p>] [--host 127.0.0.1]\n'
     + '  Runs this site\'s door on 127.0.0.1 only and serves the ownership proof: GET of exactly --proof-path\n'
     + `  answers --proof-body as text/plain. The seed is ${SEED_NAME}, from the project's env files or the environment.`,
@@ -8826,39 +8826,45 @@ async function serveMain(argv) {
 
 // ------------------------------------------ decide
 
-/** The most of a receipt file `decide` reads. */
-const RECEIPT_FILE_MAX_BYTES = 1024 * 1024;
+/** The owner's approval of the receipt the store keeps under `ref` (AT-28): confirmReceipt over
+ *  the row's pending_text as signed, stored on that row only as {status, text, decided_ts}. A
+ *  repeat of approve returns the stored text and writes nothing; another verdict is refused.
+ *  Everything that can refuse is decided before anything is written. */
+function approveStoredReceipt(store, seedHex, ref) {
+  const row = store.getReceipt(ref);
+  if (!row || typeof row !== 'object' || row.ref !== ref || typeof row.pending_text !== 'string') {
+    throw new CliRefusal(`unknown ref ${JSON.stringify(String(ref).slice(0, 120))}: no receipt in the store under it`);
+  }
+  if (row.decision !== null && row.decision !== undefined) {
+    if (row.decision.status === 'confirmed' && typeof row.decision.text === 'string') return row.decision.text;
+    throw new CliRefusal(`ref ${JSON.stringify(ref.slice(0, 120))} is already decided: `
+      + `${String(row.decision.status).slice(0, 40)}; approve does not overwrite it`);
+  }
+  let text;
+  try { text = confirmReceipt(seedHex, row.pending_text); } catch (e) { throw new CliRefusal(shortError(e)); }
+  store.putReceipt(ref, { ...row, decision: { status: 'confirmed', text, decided_ts: nowEpoch() } });
+  return text;
+}
 
-/** `decide <receipt file> approve`: the owner's approval, built locally and never sent. The
- *  follow-on is confirmReceipt's (it checks the receipt is this key's, pending and unedited); the
- *  customer's DID is read from that signed follow-on only. Prints one JSON-RPC message/send. */
+/** `decide <ref> approve --store <file>`: the owner's approval of a pending receipt this door
+ *  issued, looked up by ref in its file store and never sent. Prints the follow-up text. */
 async function decideMain(argv) {
   const positionals = [];
-  parseFlags(argv, {}, positionals);
-  if (positionals.length !== 2 || positionals[1] !== 'approve') throw new CliMisuse('expected <receipt file> approve');
-  const path = resolve(process.cwd(), positionals[0]);
-  let stat;
-  try { stat = statSync(path); } catch { throw new CliRefusal(`no receipt file at ${positionals[0].slice(0, 200)}`); }
-  if (!stat.isFile()) throw new CliRefusal('the receipt is not a regular file');
-  if (stat.size > RECEIPT_FILE_MAX_BYTES) throw new CliRefusal(`the receipt file is over ${RECEIPT_FILE_MAX_BYTES} bytes`);
-  const receiptText = readFileSync(path, 'utf8');
+  const flags = parseFlags(argv, { store: 'string' }, positionals);
+  if (positionals.length !== 2 || positionals[1] !== 'approve') throw new CliMisuse('expected <ref> approve --store <file>');
+  if (typeof flags.store !== 'string') throw new CliMisuse('--store is required');
   const root = process.cwd();
   const seed = findSeed(root, detectFramework(root));
   if (!seed.hex) {
     throw new CliRefusal(`no seed: ${SEED_NAME} is in none of this project's env files nor in the environment. `
       + 'Run agent-entry init, which mints it into a git-ignored file.');
   }
-  let text;
-  try { text = confirmReceipt(seed.hex, receiptText); } catch (e) { throw new CliRefusal(shortError(e)); }
-  const follow = JSON.parse(text);
-  const from = didFromSeedHex(seed.hex);
-  const to = follow.customer_did;
-  const messageId = newId();
-  const contextId = follow.deal.contextId ?? null;
-  const timestamp = nowEpoch();
-  const sig = signEnvelope(seed.hex, { from, to, messageId, contextId, timestamp, text });
-  const message = toA2A({ role: 'user', text, messageId, contextId, timestamp, from, to, sig });
-  process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: messageId, method: 'message/send', params: { message } })}\n`);
+  const storePath = resolve(root, flags.store);
+  if (!existsSync(storePath)) throw new CliRefusal(`no store at ${flags.store.slice(0, 200)}`);
+  let store;
+  try { store = createFileStore(storePath); } catch (e) { throw new CliRefusal(shortError(e)); }
+  const text = approveStoredReceipt(store, seed.hex, positionals[0]);
+  process.stdout.write(`${text}\n`);
   return 0;
 }
 
