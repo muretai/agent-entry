@@ -202,7 +202,9 @@ the following, each hanging off its mount like every v1 route:
   byte as first published.
 
 The card gains `agentEntry.tools` and `agentEntry.events`: the absolute URLs of the contract and
-of the collector (AT-14). The legacy `muretai` alias **MUST NOT** carry them.
+of the collector (AT-14). A door whose declaration names `entry.counts` also names it as
+`agentEntry.counts`, and a door without one names none. The legacy `muretai` alias **MUST NOT**
+carry them.
 
 Method rules:
 
@@ -414,6 +416,11 @@ absolute URL, `//host`, `/\host` and `javascript:` are refused before anything i
 whose `agentEntry.tools` or `agentEntry.events` names another origin is read as this origin's
 own well-known path.
 
+The one deliberate exception is `agentEntry.counts` (AT-21): a runtime whose contract verified
+**MAY** POST its count bodies there, and to no other URL the card or contract names. It is used
+only when it is an absolute `https` URL with a host, checked on the raw string before parsing;
+anything else (`http:`, `javascript:`, `data:`, `//host`, `https:///path`) is never used.
+
 **AT-20. Resync and abort.** Tools follow the route of a single-page app:
 
 - With the Navigation API, the runtime follows `currententrychange` and `navigatesuccess` and
@@ -438,6 +445,14 @@ engine is recognised from `document.referrer` or `utm_source`; never for an empt
 one from the page's own origin. Every call counts `offer_started`, and then `offer_succeeded`
 with an integer `ms`, `offer_failed`, or `ask_denied`. A handoff also counts `handoff`. Each
 registration counts `offer_registered`. No beacon carries an input value or a DID.
+
+When the verified card names `agentEntry.counts` (S6a-3), each local beacon **MUST** be followed
+by exactly one POST to that URL whose body is byte-identical to the local body, except that an
+event whose offer id trunk's registry refuses (a verb outside it, an id over 64 characters) is
+left out; a body left with no events is not sent. That post is best-effort: one attempt, no
+retry, never before the contract verified, and its failing, hanging or being slow never throws
+into the page, delays or suppresses the local beacon, or changes what `install` or a tool
+returns. A local beacon that fails never suppresses it either.
 
 ### 2.8 The site's CLI
 
@@ -584,7 +599,7 @@ countersigned deal attach later.
 | AT-16 | page runtime: registration, route patterns, annotation projection, page actions |
 | AT-17 | page runtime: one `<dialog>` per ask, confirm only on `returnValue === "confirm"` |
 | AT-18 | page runtime: handoff emission (`_meta.handoff`, legacy `muretai`) |
-| AT-19 | page runtime: same origin only |
+| AT-19 | page runtime: same origin only, save `agentEntry.counts` |
 | AT-20 | page runtime: SPA resync and abort |
 | AT-21 | page runtime: count emission |
 | AT-22 | `init`: the seed slot git would never carry |

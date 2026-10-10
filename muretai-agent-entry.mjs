@@ -4400,10 +4400,14 @@ export function createAgentEntry({
   const canonPrefer = validatePrefer(prefer) ?? (tools ? tools.prefer : null);
   if (openDoor) card.agentEntry = { open_door: true, ...(canonPrefer ? { prefer: canonPrefer } : {}) };
   // Suite S1: where the signed contract and the collector are, on the NEUTRAL key only — the
-  // legacy alias stays `open_door` alone, as it did for `prefer`.
+  // legacy alias stays `open_door` alone, as it did for `prefer`. S6a-3: `counts` names
+  // `entry.counts` beside them, so the page runtime posts its AT-14 body there too. The card
+  // is what the page verifies the contract against, so it trusts the URL as it trusts `events`;
+  // a door without `entry.counts` names none and the contract's hash does not move.
   if (tools) {
     card.agentEntry = { ...(card.agentEntry || {}),
-      tools: `${canonUrl}${TOOLS_PATH}`, events: `${canonUrl}${TOOLS_EVENTS_PATH}` };
+      tools: `${canonUrl}${TOOLS_PATH}`, events: `${canonUrl}${TOOLS_EVENTS_PATH}`,
+      ...(tools.counts !== null ? { counts: tools.counts } : {}) };
   }
   if (openDoor) card.muretai = { open_door: true };
   // Deliberately NO `relay`/`enc_pub` on the card: those advertise a store-and-forward

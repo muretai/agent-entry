@@ -16,7 +16,9 @@
  * action names; without one there, the function is looked up on `window`.
  *
  * Rules (spec/tools-v1.md AT-15 onwards):
- *   - same origin only: every request, navigation and count stays on `location.origin`;
+ *   - same origin only: every request, navigation and count stays on `location.origin`, with
+ *     one exception (S6a-3): when the verified card names `agentEntry.counts`, an https URL, the
+ *     same count body is also posted there, once, best-effort;
  *   - one `<dialog>` per call for an offer whose compiled `ask` is `advised` or `always`, and
  *     the call goes ahead only on `returnValue === "confirm"`;
  *   - results of an offer with `then: "door"` carry `_meta.handoff` and the legacy `muretai` key;
@@ -34,6 +36,10 @@ const ASKING = new Set(['advised', 'always']);
 const MAX_EVENTS = 100;
 const MAX_BEACON_BYTES = 2048;
 const MAX_RESULT_CHARS = 50000;
+/** An offer id trunk's hosted collector counts (the door's COUNTS_OFFER): a registry verb, then
+ *  the `of`, at most 64 characters. Trunk refuses a whole body over one other id. */
+const COUNTS_OFFER = /^(find|ask|quote|book|hold|order|buy|track|change|cancel|join)_[a-z][a-z0-9_]*$/;
+const COUNTS_MAX_OFFER = 64;
 const ENGINES = [
   ['chatgpt', ['chatgpt.com', 'chat.openai.com']],
   ['claude', ['claude.ai']],
@@ -209,7 +215,20 @@ async function verifyContract(win) {
   if (!Array.isArray(contract.offers)) throw new Refusal('hash_mismatch');
 
   const eventsUrl = homeUrl(win, card.agentEntry.events, EVENTS_PATH);
-  return { contract, did: card.did, cardUrl, eventsUrl: eventsUrl.href };
+  return { contract, did: card.did, cardUrl, eventsUrl: eventsUrl.href, countsUrl: hostedUrl(win, card.agentEntry.counts) };
+}
+
+/** The card's `agentEntry.counts` (the declaration's `entry.counts`) when it is an absolute
+ *  https URL with a host, else null. The raw prefix is checked first, because the URL parser
+ *  repairs `https:///counts` into host `counts`. */
+function hostedUrl(win, value) {
+  if (typeof value !== 'string' || !/^https:\/\/[^/\\?#@]/i.test(value)) return null;
+  try {
+    const url = new win.URL(value);
+    return url.protocol === 'https:' && url.hostname && !url.username && !url.password ? url.href : null;
+  } catch {
+    return null;
+  }
 }
 
 /** `value` when it is a URL on this origin, else `fallback` on this origin. Never elsewhere. */
@@ -255,7 +274,11 @@ function engineOf(win) {
   }
 }
 
-function makeCounter(win, eventsUrl, offerIds) {
+/** A counter for one install. With `countsUrl` (the entry's hosted counts, S6a-3) each local
+ *  post is followed by one post of the same bytes there, less any event whose offer id trunk
+ *  refuses. Both are sent once, never retried and never awaited: neither one failing changes
+ *  the other or anything the page does. */
+function makeCounter(win, eventsUrl, offerIds, countsUrl) {
   const session = sessionId(win);
   const queue = [];
   let total = 0;
@@ -263,6 +286,7 @@ function makeCounter(win, eventsUrl, offerIds) {
   const encoder = new win.TextEncoder();
   const encode = (events) => JSON.stringify({ session, events });
   const bytes = (events) => encoder.encode(encode(events)).length;
+  const trunkTakes = (e) => e.offer === undefined || (e.offer.length <= COUNTS_MAX_OFFER && COUNTS_OFFER.test(e.offer));
   const flush = () => {
     const send = win.navigator?.sendBeacon;
     if (typeof send !== 'function') { queue.length = 0; return; }
@@ -270,7 +294,14 @@ function makeCounter(win, eventsUrl, offerIds) {
       const batch = [];
       while (queue.length && bytes([...batch, queue[0]]) <= MAX_BEACON_BYTES) batch.push(queue.shift());
       if (!batch.length) { queue.shift(); continue; }
-      try { send.call(win.navigator, eventsUrl, encode(batch)); } catch { /* counts are best effort */ }
+      const body = encode(batch);
+      try { send.call(win.navigator, eventsUrl, body); } catch { /* counts are best effort */ }
+      if (!countsUrl) continue;
+      const hosted = batch.filter(trunkTakes);
+      if (!hosted.length) continue;
+      try {
+        send.call(win.navigator, countsUrl, hosted.length === batch.length ? body : encode(hosted));
+      } catch { /* the hosted count never changes the page */ }
     }
   };
   const emit = (name, extra = {}) => {
@@ -530,10 +561,10 @@ export async function install({ window: win = globalThis, signal, handlers } = {
   if (signal?.aborted) return { ok: true, aborted: true, tools: [] };
 
   installed.get(win)?.();
-  const { contract, did, cardUrl, eventsUrl } = verified;
+  const { contract, did, cardUrl, eventsUrl, countsUrl } = verified;
   const offers = contract.offers.filter((o) => isObject(o) && typeof o.id === 'string'
     && isObject(o.input) && typeof o.about === 'string' && actionOf(o) && Array.isArray(o.page?.on));
-  const counts = makeCounter(win, eventsUrl, new Set(contract.offers.map((o) => o?.id)));
+  const counts = makeCounter(win, eventsUrl, new Set(contract.offers.map((o) => o?.id)), countsUrl);
   const ctx = { win, handlers: isObject(handlers) || typeof handlers === 'function' ? handlers : null };
   const modelContext = win.document.modelContext ?? win.navigator?.modelContext ?? null;
   const live = new Map();
