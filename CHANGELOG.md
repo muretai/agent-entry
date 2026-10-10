@@ -9,6 +9,10 @@ Breaking CLI change.
 
 - removed: the third-party config converter; use init --scan or write agent-entry.json
 
+## 1.13.1 — Muse connector page and README without the not-tested caveat (2026-09-28)
+
+The Muse connector page and the README no longer carry the "not tested in Muse" caveat.
+
 ## 1.13.0 — Agent Entry Suite S1 to S4: one declaration, verbs first, on the door and the page (2026-09-26)
 
 A site can now describe what a customer can do there in one declaration, `agent-entry.json`,

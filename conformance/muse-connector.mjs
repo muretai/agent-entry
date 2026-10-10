@@ -59,6 +59,22 @@ function check(ok, label, detail) {
   return false;
 }
 
+/** The released version: the version of the newest `## ` heading that ends in "(YYYY-MM-DD)"
+ *  and does not say it is unreleased. Throws, naming the problem, when there is no dated
+ *  heading or the newest one does not start with a version. */
+function releasedVersionFrom(text) {
+  const headings = String(text).split('\n').filter((l) => /^## /.test(l));
+  const dated = headings.find((l) => /\(\d{4}-\d{2}-\d{2}\)\s*$/.test(l)
+    && !/unreleased|not yet published/i.test(l));
+  if (!dated) throw new Error('CHANGELOG.md has no dated section: no "## " heading ends in "(YYYY-MM-DD)"');
+  const m = /^## (\d+\.\d+\.\d+)(?=\s)/.exec(dated);
+  if (!m) throw new Error(`CHANGELOG.md's newest dated heading does not start with a version: ${JSON.stringify(dated)}`);
+  return { version: m[1], heading: dated };
+}
+
+/** Equal versions only: two missing versions are never the same release. */
+const sameVersion = (a, b) => typeof a === 'string' && a.length > 0 && a === b;
+
 /** One block; a throw inside it is ONE red row rather than the end of the run. */
 async function section(name, fn) {
   try { await fn(); } catch (e) {
@@ -485,7 +501,31 @@ await section('static', async () => {
   check(Boolean(home), 'static/changelog-has-connectors-Muse-recipe', '');
   const heading = home ? home.split('\n', 1)[0] : '';
   check(/unreleased|not yet published/i.test(heading), 'static/changelog-Muse-line-is-unreleased', heading);
-  check(pkg.version === '1.13.0', 'static/version-is-the-released-one', `package.json version is ${pkg.version}`);
+  // The released version is the newest dated CHANGELOG section, never a literal here.
+  let released = null;
+  let releasedError = '';
+  try { released = releasedVersionFrom(changelog); } catch (e) { releasedError = e.message; }
+  check(released !== null, 'static/changelog-names-a-released-version', releasedError);
+  check(released !== null && sameVersion(pkg.version, released.version), 'static/version-is-the-released-one',
+    `package.json version is ${JSON.stringify(pkg.version)}, the newest dated CHANGELOG section is ${JSON.stringify(released && released.version)}`);
+  const top = sections.length ? sections[0].split('\n', 1)[0] : '';
+  check(released !== null && (!/not yet published|unreleased/i.test(top) || released.heading !== top),
+    'static/undated-top-heading-is-not-the-released-one', `${top} / ${released && released.heading}`);
+
+  // The reader itself, fed small changelog texts.
+  const refuses = (text, re) => {
+    try { releasedVersionFrom(text); return false; } catch (e) { return re.test(e.message); }
+  };
+  const DATED = '## 1.2.3 — a release (2026-01-02)\n\nBody.\n';
+  check(releasedVersionFrom(DATED).version === '1.2.3', 'static/reader/dated-heading-gives-its-version', '');
+  check(releasedVersionFrom('## 9.0.0 — breaking (not yet published)\n\nX.\n\n' + DATED).version === '1.2.3',
+    'static/reader/undated-heading-above-a-dated-one-is-skipped', '');
+  check(refuses('## 9.0.0 — breaking (not yet published)\n\nX.\n', /no dated section/),
+    'static/reader/refusal/no-dated-section-throws', '');
+  check(refuses('## Next big thing (2026-01-02)\n' + DATED, /does not start with a version/),
+    'static/reader/refusal/unparseable-newest-dated-heading-throws', '');
+  check(!sameVersion(undefined, undefined) && !sameVersion('', '') && !sameVersion('1.2.3', undefined),
+    'static/reader/refusal/a-missing-version-is-never-equal', '');
 });
 
 // ---------------------------------------------------------------- 7. no public "not tested in Muse" caveat

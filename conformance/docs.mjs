@@ -27,8 +27,10 @@
  *   - Every example URL in those sections that was not already there before S4 uses a placeholder
  *     host (example.com, *.test, *.invalid, 192.0.2.0/24) — and the check is shown to refuse a
  *     real one.
- *   - CHANGELOG.md: the released 1.13.0 record carries a "Suite S4" heading beside S2 and S3.
- *   - package.json: the version is the one this release cut.
+ *   - CHANGELOG.md: the 1.13.0 record carries a "Suite S4" heading beside S2 and S3.
+ *   - package.json: the version is the released one, read from CHANGELOG.md's newest dated
+ *     section (a heading ending in "(YYYY-MM-DD)"), never a literal here; an undated heading
+ *     such as "(not yet published)" is not a release.
  *
  * Run:  node conformance/docs.mjs      (from the package root)
  */
@@ -42,7 +44,6 @@ import * as door from '../muretai-agent-entry.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
-const RELEASED_VERSION = '1.13.0';
 
 let pass = 0;
 const failures = [];
@@ -67,6 +68,27 @@ const SPEC_TOOLS = read('spec/tools-v1.md');
 const CHANGELOG = read('CHANGELOG.md');
 const PAGE_SRC = read('agent-entry-page.mjs');
 const GRANDFATHERED = JSON.parse(read('conformance/fixtures/docs/pre-s4-example-urls.json'));
+
+/** The released version: the version of the newest `## ` heading that ends in "(YYYY-MM-DD)"
+ *  and does not say it is unreleased. Throws, naming the problem, when there is no dated
+ *  heading or the newest one does not start with a version. */
+function releasedVersionFrom(text) {
+  const headings = String(text).split('\n').filter((l) => /^## /.test(l));
+  const dated = headings.find((l) => /\(\d{4}-\d{2}-\d{2}\)\s*$/.test(l)
+    && !/unreleased|not yet published/i.test(l));
+  if (!dated) throw new Error('CHANGELOG.md has no dated section: no "## " heading ends in "(YYYY-MM-DD)"');
+  const m = /^## (\d+\.\d+\.\d+)(?=\s)/.exec(dated);
+  if (!m) throw new Error(`CHANGELOG.md's newest dated heading does not start with a version: ${JSON.stringify(dated)}`);
+  return { version: m[1], heading: dated };
+}
+
+/** Equal versions only: two missing versions are never the same release. */
+const sameVersion = (a, b) => typeof a === 'string' && a.length > 0 && a === b;
+
+let RELEASED = null;
+let releasedError = '';
+try { RELEASED = releasedVersionFrom(CHANGELOG); } catch (e) { releasedError = e.message; }
+const RELEASED_VERSION = RELEASED ? RELEASED.version : undefined;
 
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const code = (name) => `\`${name}\``;
@@ -334,8 +356,9 @@ await section('hosts', async () => {
 await section('no-release', async () => {
   const raw = read('package.json');
   const pkg = JSON.parse(raw);
-  check(pkg.version === RELEASED_VERSION, 'release/package-version-is-the-released-version',
-    `package.json version is ${JSON.stringify(pkg.version)}, expected ${RELEASED_VERSION} — the version this release cut`);
+  check(RELEASED !== null, 'release/changelog-names-a-released-version', releasedError);
+  check(sameVersion(pkg.version, RELEASED_VERSION), 'release/package-version-is-the-released-version',
+    `package.json version is ${JSON.stringify(pkg.version)}, expected ${JSON.stringify(RELEASED_VERSION)} — the newest dated CHANGELOG section`);
   const lines = raw.split('\n').filter((l) => /^\s*"version"\s*:/.test(l));
   check(lines.length === 1 && lines[0] === `  "version": "${RELEASED_VERSION}",`, 'no-release/version-line-byte-identical',
     JSON.stringify(lines));
@@ -345,10 +368,13 @@ await section('no-release', async () => {
 
 await section('changelog', async () => {
   const headings = CHANGELOG.split('\n').filter((l) => /^## /.test(l));
+  const v = RELEASED_VERSION || '';
+  const hRel = v ? headings.filter((l) => l.startsWith(`## ${v} `)) : [];
+  check(hRel.length === 1, 'changelog/one-released-version-section', `${JSON.stringify(v)}: ${JSON.stringify(hRel)}`);
+  check(hRel.length === 1 && /\(20\d\d-\d\d-\d\d\)/.test(hRel[0])
+    && !/unreleased/i.test(hRel[0]), 'changelog/released-version-is-released-and-dated', hRel[0] || '');
   const h113 = headings.filter((l) => /^## 1\.13\.0\b/.test(l));
   check(h113.length === 1, 'changelog/one-1.13.0-section', JSON.stringify(h113));
-  check(h113.length === 1 && /\(20\d\d-\d\d-\d\d\)/.test(h113[0])
-    && !/unreleased/i.test(h113[0]), 'changelog/1.13.0-is-released-and-dated', h113[0] || '');
   const rec = mdSection(CHANGELOG, 2, '1.13.0') || '';
   const sub = rec.split('\n').filter((l) => /^### /.test(l));
   check(sub.some((l) => /^### Suite S4\b/.test(l)), 'changelog/1.13.0-has-a-Suite-S4-heading',
@@ -358,8 +384,42 @@ await section('changelog', async () => {
   }
   check(/^## 1\.14\.0\b/.test(headings[0]) && /breaking CLI change/i.test(headings[0]),
     'changelog/next-version-records-the-breaking-cli-change', headings[0] || '');
-  check(headings.indexOf(h113[0]) === 1, 'changelog/1.13.0-follows-the-next-version',
+  check(hRel.length === 1 && headings.indexOf(hRel[0]) === 1, 'changelog/released-version-follows-the-next-version',
     JSON.stringify(headings.slice(0, 2)));
+  check(!/\(\d{4}-\d{2}-\d{2}\)\s*$/.test(headings[0] || '') && RELEASED !== null && RELEASED.heading !== headings[0],
+    'changelog/undated-next-version-is-not-the-released-one', `${headings[0]} / ${RELEASED && RELEASED.heading}`);
+});
+
+// ---------------------------------------------------------------- 11. the released-version reader
+
+await section('released-version-reader', async () => {
+  const refuses = (text, re) => {
+    try { releasedVersionFrom(text); return false; } catch (e) { return re.test(e.message); }
+  };
+  const DATED = '## 1.2.3 — a release (2026-01-02)\n\nBody.\n';
+  check(releasedVersionFrom(DATED).version === '1.2.3', 'reader/control/dated-heading-gives-its-version',
+    JSON.stringify(releasedVersionFrom(DATED)));
+  const undatedAbove = '# Changelog\n\n## 9.0.0 — breaking (not yet published)\n\nX.\n\n' + DATED
+    + '\n## 1.0.0 — older (2025-01-01)\n';
+  check(releasedVersionFrom(undatedAbove).version === '1.2.3', 'reader/undated-heading-above-a-dated-one-is-skipped',
+    JSON.stringify(releasedVersionFrom(undatedAbove)));
+  check(releasedVersionFrom('## 2.0.0 — soon (unreleased, 2026-03-01)\n' + DATED).version === '1.2.3',
+    'reader/a-date-inside-an-unreleased-heading-is-not-a-release', '');
+  check(releasedVersionFrom('## 1.12.0 — v2 (landed 2026-09-19, not yet published)\n' + DATED).version === '1.2.3',
+    'reader/landed-but-not-published-is-not-a-release', '');
+  check(refuses('# Changelog\n\n## 9.0.0 — breaking (not yet published)\n\nX.\n', /no dated section/),
+    'reader/refusal/no-dated-section-throws', '');
+  check(refuses('', /no dated section/), 'reader/refusal/empty-changelog-throws', '');
+  check(refuses('## Next big thing (2026-01-02)\n' + DATED, /does not start with a version/),
+    'reader/refusal/unparseable-newest-dated-heading-throws', '');
+  check(refuses('## v1.2 — short (2026-01-02)\n', /does not start with a version/),
+    'reader/refusal/partial-version-throws', '');
+  check(!sameVersion(undefined, undefined), 'reader/refusal/undefined-is-never-equal-to-undefined', '');
+  check(!sameVersion('', ''), 'reader/refusal/empty-is-never-a-version', '');
+  check(!sameVersion(null, null), 'reader/refusal/null-is-never-a-version', '');
+  check(!sameVersion('1.13.1', undefined) && !sameVersion(undefined, '1.13.1'),
+    'reader/refusal/a-missing-side-is-never-equal', '');
+  check(sameVersion('1.13.1', '1.13.1') && !sameVersion('1.13.1', '1.13.0'), 'reader/control/equal-and-unequal', '');
 });
 
 // ---------------------------------------------------------------- verdict
