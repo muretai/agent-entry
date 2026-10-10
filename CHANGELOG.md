@@ -3,12 +3,42 @@
 Releases before 1.12.0 are recorded in the commit history and in the README's "Since 1.x"
 paragraphs.
 
-## 1.14.0 — breaking CLI change (not yet published)
+## 2.0.0 — Woo declaration generator, owner decisions by ref, hosted counts (unreleased)
 
-Breaking CLI change.
+Breaking CLI change, hence the major version: the third-party config converter is removed, and
+the claim workflow moves behind seams, so `publish --claim` now refuses and the entry claim
+field and the claimant flags are gone. These notes were gathered as 1.14.0 before publishing.
 
 - removed: the third-party config converter; use init --scan or write agent-entry.json
-- added: hosted counts. `entry.counts` in `agent-entry.json` is now accepted, an absolute https
+- removed: the door's built-in claim workflow. The entry claim field, its path and the claimant
+  flags are gone; `publish --claim` refuses and points at the ownership proof seam.
+- added: the ownership proof seam. `createAgentEntry` takes `ownershipProof` as an object or a
+  function, and `serve` takes `--proof-path` and `--proof-body` on 127.0.0.1 only.
+- added: the Woo declaration generator, `init --from woocommerce`, items 1 to 6.
+  - 1: a store URL that is not https, not a Woo store, or over the byte bound is refused, and
+    nothing is written.
+  - 2: `--facts` writes one `ask` offer from robots.txt and one Store API page, honouring a
+    Disallow.
+  - 3: the Store API pages are walked in order within `--max-pages` (default 10) and
+    `--max-bytes` (default 48 MiB), from the store's own origin only.
+  - 4: init writes the product snapshot `agent-entry.products.json` and a door-bound `find`
+    offer answered from it at reply time, with no request to the store.
+  - 5: a door-bound `hold` offer answered `pending_confirmation`, and the export
+    `confirmReceipt` lets the owner confirm it.
+  - 6: `doctor --from woocommerce` sends one signed knock per door-bound offer to the declared
+    door only, one PASS or FAIL row per offer, exit 1 on any FAIL.
+- added: owner decisions by ref (AT-28).
+  - `decide <ref> approve --store <file>` approves a pending receipt in the door's receipts
+    store, superseding the file form. A repeat is idempotent.
+  - `decide <ref> decline --note <text> --store <file>` declines one, through the new export
+    `declineReceipt`, with an optional note of at most 500 characters.
+  - The door answers `track` with the stored decision: `pending_confirmation` while undecided,
+    the decision text verbatim once decided, partyB only, no writes.
+  - `knock --offer track --ref <ref>` collects the decision, and `checkedBookingReceipt` refuses
+    a decision whose sigA, signer or terms do not check out.
+- added: `first_contact` on the envelope, the observer row and both sinks, and counts split into
+  new versus returning knocks (Analytics-2).
+- added: hosted counts (S6a-2, S6a-3, S6a-4). `entry.counts` in `agent-entry.json` is now accepted, an absolute https
   URL with a host, and the door publishes it on the card as `agentEntry.counts`.
   - The door post: the collector's kept events go to `entry.counts` as the AT-14 body, with no
     DID and no text, split across posts of at most 2048 bytes each.
@@ -16,6 +46,9 @@ Breaking CLI change.
     the card's `agentEntry.counts` beside its local beacon.
   - Both leave out offer ids trunk refuses, make one attempt, and never change a signed reply
     or the page.
+- changed: the released-version pins in `conformance/docs.mjs` and
+  `conformance/muse-connector.mjs` read the version from the newest dated CHANGELOG section and
+  assert `package.json` equals it.
 
 ## 1.13.1 — Muse connector page and README without the not-tested caveat (2026-09-28)
 

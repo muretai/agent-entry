@@ -385,8 +385,23 @@ await section('changelog', async () => {
   for (const n of ['S2', 'S3']) {
     check(sub.some((l) => new RegExp(`^### Suite ${n}\\b`).test(l)), `changelog/1.13.0-keeps-Suite-${n}`, '');
   }
-  check(/^## 1\.14\.0\b/.test(headings[0]) && /breaking CLI change/i.test(headings[0]),
-    'changelog/next-version-records-the-breaking-cli-change', headings[0] || '');
+  // The next version: above the newest dated section below it, its section records the breaking
+  // CLI change, and once its heading is dated it is the version package.json carries.
+  const top = headings[0] || '';
+  let below = null;
+  try { below = releasedVersionFrom(headings.slice(1).join('\n')); } catch { below = null; }
+  const topVersion = (/^## (\d+\.\d+\.\d+)(?=\s)/.exec(top) || [])[1];
+  const above = (a, b) => {
+    const [x, y] = [a, b].map((s) => s.split('.').map(Number));
+    for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i];
+    return false;
+  };
+  const topRec = topVersion ? mdSection(CHANGELOG, 2, topVersion) || '' : '';
+  const topDated = /\(\d{4}-\d{2}-\d{2}\)\s*$/.test(top);
+  check(topVersion !== undefined && below !== null && above(topVersion, below.version)
+    && /breaking CLI change/i.test(topRec)
+    && (!topDated || sameVersion(JSON.parse(read('package.json')).version, topVersion)),
+    'changelog/next-version-records-the-breaking-cli-change', `${top} / below it ${below && below.version}`);
   check(hRel.length === 1 && headings.indexOf(hRel[0]) === 1, 'changelog/released-version-follows-the-next-version',
     JSON.stringify(headings.slice(0, 2)));
   check(!/\(\d{4}-\d{2}-\d{2}\)\s*$/.test(headings[0] || '') && RELEASED !== null && RELEASED.heading !== headings[0],
