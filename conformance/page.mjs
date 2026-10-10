@@ -47,6 +47,8 @@
 //     collector body `{ session, events: [{ name, offer?, engine?, ms? }] }` (AT-14), <= 100
 //     events per session, flushed at the latest on `pagehide` / `visibilitychange` to hidden.
 //     Every beacon this runner sees is also POSTed to the real S1 door and must answer 204.
+//   entry.counts (S6a-3, section 10b): each local post is accompanied by one POST of the same
+//     bytes to the entry's counts URL, best-effort, never before the contract verified.
 import { createHash, webcrypto } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -1159,6 +1161,471 @@ if (install && entry) {
   }
   await collectorAccepts(busy.win, 'counts/busy');
 }
+
+// ---------------------------------------------------------------- 10b. entry.counts: the page posts the same body (S6a-3)
+//
+// Agent Entry S6a-3 (split 3 of 4 of intake 20261002T130609Z, after S6a-2), WRITTEN BEFORE THE
+// IMPLEMENTATION. A door whose declaration names `entry.counts` (S6a-1) posts the AT-14 body
+// there (S6a-2, conformance/collector.mjs section 8, not re-pinned here). The page runtime now
+// does the same, beside its local collector post:
+//   - The page learns the URL from what it verifies against: the door names `entry.counts` in
+//     the card it serves or in the signed contract (the implementer's choice). No entry.counts,
+//     no counts post; a counts URL that is not an absolute https URL with a host is never used.
+//   - Each local collector post (sendBeacon to <origin>/.well-known/agent-tools/events) is
+//     accompanied by exactly one POST to exactly that URL, by `navigator.sendBeacon` or
+//     `window.fetch`, whose body is BYTE-IDENTICAL to the local body. The only difference
+//     S6a-2 allows: an offer id trunk's registry refuses (a verb outside it, an id over 64) is
+//     left out, so the registry events beside it still reach trunk. Every counts body is one
+//     trunk's parse_beacon accepts (the JS twin below, copied from collector.mjs section 8), so
+//     it is at most 2048 bytes and 100 events.
+//   - Never before the contract verified, and never at all when verification fails.
+//   - Best-effort: a counts post that throws, rejects, answers 500, is slow or hangs is never
+//     retried, never throws into the page, never delays or suppresses the local post, and never
+//     changes what install() or a tool returns. A failing local post never suppresses it either.
+//   The counts endpoint here is a fake on the fake window; nothing leaves the process.
+
+const HOSTED = 'https://counts.muretai.example/shops/harbor-lamp/.well-known/agent-tools/events';
+
+// agent/shopcounts.py parse_beacon (trunk S5, 94b76839), twinned line for line as in
+// conformance/collector.mjs section 8: true when trunk would count the body.
+const TRUNK_EVENT_NAMES = ['page_ready', 'referral', 'offer_registered', 'offer_started',
+  'offer_succeeded', 'offer_failed', 'ask_denied', 'handoff'];
+const TRUNK_ENGINES = ['chatgpt', 'claude', 'perplexity', 'gemini', 'copilot', 'grok', 'deepseek',
+  'mistral', 'you', 'other'];
+const TRUNK_VERBS = ['find', 'ask', 'quote', 'book', 'hold', 'order', 'buy', 'track', 'change', 'cancel', 'join'];
+const TRUNK_OFFER = new RegExp(`^(${TRUNK_VERBS.join('|')})_[a-z][a-z0-9_]*$`);
+const TRUNK_SESSION = /^[A-Za-z0-9_-]{8,64}$/;
+
+function parseBeaconTrunk(raw) {
+  if (raw.length > 2048) return false;
+  if (raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf) return false;
+  let doc;
+  try { doc = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw)); } catch { return false; }
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return false;
+  if (JSON.stringify(Object.keys(doc).sort()) !== '["events","session"]') return false;
+  if (typeof doc.session !== 'string' || !TRUNK_SESSION.test(doc.session)) return false;
+  if (!Array.isArray(doc.events) || doc.events.length === 0 || doc.events.length > 100) return false;
+  for (const e of doc.events) {
+    if (!e || typeof e !== 'object' || Array.isArray(e)) return false;
+    if (Object.keys(e).some((k) => !['name', 'offer', 'engine', 'ms'].includes(k)) || !('name' in e)) return false;
+    if (typeof e.name !== 'string' || !TRUNK_EVENT_NAMES.includes(e.name)) return false;
+    if ('offer' in e && (typeof e.offer !== 'string' || e.offer.length > 64 || !TRUNK_OFFER.test(e.offer))) return false;
+    if ('engine' in e && (typeof e.engine !== 'string' || !TRUNK_ENGINES.includes(e.engine))) return false;
+    if ('ms' in e && !(Number.isInteger(e.ms) && e.ms >= 0 && e.ms <= 600000)) return false;
+  }
+  return true;
+}
+const trunkTakes = (e) => e.offer === undefined || (e.offer.length <= 64 && TRUNK_OFFER.test(e.offer));
+
+{
+  const t = (v) => parseBeaconTrunk(Buffer.from(JSON.stringify(v)));
+  check(t({ session: 'tab-twin0000', events: [{ name: 'offer_succeeded', offer: 'hold_item', ms: 3 }] }),
+    'hosted/trunk-twin/accepts-a-good-body');
+  check(!t({ session: 'tab-twin0000', events: [{ name: 'offer_started', offer: 'reserve_table' }] }),
+    'hosted/trunk-twin/refuses-an-offer-off-the-registry');
+  check(!t({ session: 'tab-twin0000', events: [] }), 'hosted/trunk-twin/refuses-no-events');
+}
+
+let hostedUnhandled = 0;
+let hostedUncaught = 0;
+const onHostedUnhandled = () => { hostedUnhandled += 1; };
+const onHostedUncaught = () => { hostedUncaught += 1; };
+process.on('unhandledRejection', onHostedUnhandled);
+process.on('uncaughtException', onHostedUncaught);
+
+function hostedDoor(extraOffers = []) {
+  const declaration = clone(harbor.declaration);
+  declaration.entry.counts = HOSTED;
+  declaration.offers.push(...clone(extraOffers));
+  try {
+    return createAgentEntry({ seedHex: SEED, name: 'Harbor Lamp', baseUrl: ORIGIN, declaration });
+  } catch (e) {
+    check(false, 'hosted/setup/door-with-entry-counts-starts', e.message);
+    return null;
+  }
+}
+
+async function doorText(door, path) {
+  const out = await door.handleRequestAsync('GET', path, { 'sec-fetch-site': 'same-origin', accept: 'application/json' },
+    Buffer.alloc(0));
+  return Buffer.from(out.body || '').toString('utf8');
+}
+
+/** What the fake counts endpoint does with a post: `mode` for a fetch; a beacon throws on
+ *  "throw", returns false on "reject" / "500", and returns true otherwise. */
+function hostedAnswer(mode) {
+  switch (mode) {
+    case 'throw': throw new TypeError('the counts endpoint is unreachable');
+    case 'reject': return Promise.reject(new TypeError('Failed to fetch'));
+    case 'hang': return new Promise(() => {});
+    case 'slow': return new Promise((done) => {
+      setTimeout(() => done(new Response(null, { status: 204 })), 3000).unref();
+    });
+    case '500': return Promise.resolve(new Response('{"error":"down"}', { status: 500 }));
+    default: return Promise.resolve(new Response(null, { status: 204 }));
+  }
+}
+
+/**
+ * A page whose well-known routes come from `door` (null: the plain S1 door, no entry.counts).
+ * Every request or beacon to another origin is recorded in `win.hosted` and answered by `mode`;
+ * the local collector's beacons stay in `win.beacons` and fail by `local` ("throw" / "false").
+ */
+function hostedWindow({ door = null, mode = 'ok', local = 'ok', ...opts } = {}) {
+  const win = makeWindow(opts);
+  win.hosted = [];
+  const resolve = (u) => { try { return new URL(String(u?.url ?? u), win.location.href); } catch { return null; } };
+  const plainFetch = win.fetch;
+  win.fetch = function hostedFetch(input, init = {}) {
+    const url = resolve(typeof input === 'string' || input instanceof URL ? input : input?.url);
+    const method = String(init?.method || input?.method || 'GET').toUpperCase();
+    if (url && url.origin !== win.location.origin) {
+      win.hosted.push({ via: 'fetch', url: url.href, method, data: init?.body ?? null, at: Date.now() });
+      return hostedAnswer(mode);
+    }
+    if (url && door && url.pathname.startsWith('/.well-known/') && win.routes[url.pathname] === undefined) {
+      win.requests.push({ url: url.href, method, init });
+      return door.handleRequestAsync(method, url.pathname + url.search,
+        { 'sec-fetch-site': 'same-origin', accept: 'application/json' }, Buffer.alloc(0))
+        .then((out) => toResponse({ status: out.status, body: Buffer.from(out.body || ''), headers: out.headers }, method));
+    }
+    return plainFetch(input, init);
+  };
+  win.navigator.sendBeacon = function hostedBeacon(target, data) {
+    const url = resolve(target);
+    if (!url || url.origin !== win.location.origin) {
+      win.hosted.push({ via: 'beacon', url: url ? url.href : String(target), method: 'POST', data, at: Date.now() });
+      if (mode === 'throw') throw new TypeError('the counts endpoint is unreachable');
+      return mode !== 'reject' && mode !== '500';
+    }
+    win.beacons.push({ url: String(target), data });
+    if (local === 'throw') throw new TypeError('the local collector is unreachable');
+    return local !== 'false';
+  };
+  return win;
+}
+
+async function bootHosted(opts = {}) {
+  const win = hostedWindow(opts);
+  if (opts.form !== false) harborForm(win);
+  let result = null;
+  let error = null;
+  const started = Date.now();
+  try { result = await withTimeout(install({ window: win }), 5000, 'install'); } catch (e) { error = e; }
+  const took = Date.now() - started;
+  await settle();
+  return { win, result, error, took };
+}
+
+async function hostedPosts(win) {
+  const out = [];
+  for (const p of win.hosted) {
+    const text = await beaconText(p.data);
+    let body = null;
+    try { body = JSON.parse(text); } catch { /* reported by the caller */ }
+    out.push({ ...p, text, bytes: Buffer.from(text, 'utf8'), body });
+  }
+  return out;
+}
+
+/** Flush without awaiting anything first: what the page sent is read synchronously after. */
+function flushNow(win) {
+  let threw = null;
+  win.document.visibilityState = 'hidden';
+  win.document.hidden = true;
+  try {
+    win.document.dispatchEvent(new Event('visibilitychange'));
+    win.dispatchEvent(new Event('pagehide'));
+  } catch (e) { threw = e; }
+  return { threw, localNow: win.beacons.length };
+}
+
+/** Each counts post is a POST to exactly HOSTED that trunk takes, at most 2048 bytes. */
+function checkHostedPost(p, label) {
+  check(p.url === HOSTED, `${label}/posted-to-exactly-entry-counts`, p.url);
+  check(p.method === 'POST', `${label}/method-POST`, p.method);
+  check(p.bytes.length <= 2048, `${label}/at-most-2048-bytes`, String(p.bytes.length));
+  check((p.body?.events?.length ?? 0) <= 100, `${label}/at-most-100-events`);
+  check(parseBeaconTrunk(p.bytes), `${label}/trunk-shopcounts-accepts-the-bytes`, p.text.slice(0, 300));
+  check(!p.text.includes('did:key:') && !p.text.includes('Ada Lovelace') && !p.text.includes('L-12'),
+    `${label}/no-did-no-input-value`, p.text.slice(0, 300));
+}
+
+/** Pairs local post i with counts post i: one each, the same bytes. */
+async function checkPaired(win, label) {
+  const local = await beaconBodies(win);
+  const posts = await hostedPosts(win);
+  check(local.length >= 1, `${label}/the-local-collector-post-happens`, `${local.length} local post(s)`);
+  check(local.every((b) => { const u = new URL(b.url, ORIGIN); return u.origin === ORIGIN && u.pathname === EVENTS; }),
+    `${label}/the-local-post-still-goes-to-the-same-origin-collector`, local.map((b) => b.url).join(' '));
+  check(posts.length === local.length, `${label}/one-counts-post-per-local-post`,
+    `${posts.length} counts post(s) for ${local.length} local post(s)`);
+  for (const [i, p] of posts.entries()) {
+    checkHostedPost(p, `${label}/post-${i}`);
+    if (local[i]) {
+      check(p.text === local[i].text, `${label}/post-${i}/byte-identical-to-the-local-post`,
+        `${p.text.slice(0, 200)}\n      vs ${local[i].text.slice(0, 200)}`);
+    }
+  }
+  return { local, posts };
+}
+
+const DOOR_H = install ? hostedDoor() : null;
+const H_CARD = DOOR_H ? await doorText(DOOR_H, AGENT_CARD_PATH) : null;
+const H_SIG = DOOR_H ? await doorText(DOOR_H, TOOLS_SIG) : null;
+const H_ENV = H_SIG ? (() => { try { return JSON.parse(H_SIG); } catch { return null; } })() : null;
+
+// 10b-a. The door names the URL in what the page verifies against (card or signed contract).
+if (DOOR_H) {
+  const inCard = String(H_CARD).includes(HOSTED);
+  const inContract = H_ENV ? canonicalJSON(H_ENV.contract).includes(HOSTED) : false;
+  check(inCard || inContract, 'hosted/the-door-names-entry-counts-in-its-card-or-signed-contract',
+    'neither the served card nor the signed contract carries entry.counts');
+  check(!String(await doorText(entry, AGENT_CARD_PATH)).includes('counts.muretai.example')
+      && !String(await doorText(entry, TOOLS)).includes('counts.muretai.example'),
+    'hosted/a-door-without-entry-counts-names-none');
+}
+
+// 10b-b. Verified: both posts happen, the counts body is the local body, byte for byte.
+if (DOOR_H) {
+  const { win, result } = await bootHosted({ door: DOOR_H, referrer: 'https://claude.ai/' });
+  check(result?.ok === true, 'hosted/verified/install-ok', JSON.stringify(result));
+  const r = await run(win, 'hold_item', { sku: 'L-12', name: 'Ada Lovelace' });
+  check(succeeded(r), 'hosted/verified/the-tool-still-works', r.error?.message ?? JSON.stringify(r.result));
+  await flush(win);
+  const { posts } = await checkPaired(win, 'hosted/verified');
+  const events = posts.flatMap((p) => p.body?.events ?? []);
+  for (const name of ['page_ready', 'referral', 'offer_registered', 'offer_started', 'offer_succeeded', 'handoff']) {
+    check(events.some((e) => e.name === name), `hosted/verified/counts-carry-${name}`, JSON.stringify(events));
+  }
+  check(win.foreign.length === 0, 'hosted/verified/no-other-origin-but-entry-counts', win.foreign.join(' '));
+}
+
+// 10b-c. A busy page: several local posts, each with its own counts post; none past 2048 or 100.
+if (DOOR_H) {
+  const { win } = await bootHosted({ door: DOOR_H, href: `${ORIGIN}/shop/lamps`,
+    routes: { '/wp-json/wc/store/v1/products': { body: '[]', type: 'application/json' } } });
+  for (let i = 0; i < 70; i += 1) await run(win, 'find_products', { q: `lamp ${i}` });
+  await flush(win);
+  const { local, posts } = await checkPaired(win, 'hosted/busy');
+  check(local.length >= 2, 'hosted/busy/fixture-spans-several-local-posts', `${local.length}`);
+  const sent = posts.reduce((n, p) => n + (p.body?.events?.length ?? 0), 0);
+  check(sent <= 100, 'hosted/busy/at-most-100-events-per-session', `${sent}`);
+  check(new Set(posts.map((p) => p.body?.session)).size <= 1, 'hosted/busy/one-session-per-page');
+}
+
+// 10b-d. Offer ids trunk refuses (a verb outside the registry, an id over 64) are left out, as in
+//        S6a-2; the registry events beside them still go.
+if (install) {
+  const read = { on: ['/**'], do: { read: '#nothing-here' } };
+  const longOf = `lamp_${'x'.repeat(62)}`;
+  const longId = `hold_${longOf}`;
+  const odd = hostedDoor([
+    { verb: 'reserve', of: 'table', about: 'Reserve a table.', input: {}, page: read },
+    { verb: 'hold', of: longOf, about: 'Hold a lamp with a long name.', input: {}, page: read },
+  ]);
+  if (odd) {
+    const { win, result } = await bootHosted({ door: odd });
+    check(result?.ok === true, 'hosted/off-registry/install-ok', JSON.stringify(result));
+    await run(win, 'reserve_table', {});
+    await run(win, longId, {});
+    await run(win, 'hold_item', { sku: 'L-12', name: 'Ada Lovelace' });
+    await flush(win);
+    const local = await beaconBodies(win);
+    const posts = await hostedPosts(win);
+    const localEvents = local.flatMap((b) => b.body?.events ?? []);
+    check(localEvents.some((e) => e.offer === 'reserve_table') && localEvents.some((e) => e.offer === longId),
+      'hosted/off-registry/fixture-the-local-post-carries-both-odd-ids', JSON.stringify(localEvents));
+    check(posts.length >= 1 && posts.length <= local.length, 'hosted/off-registry/at-most-one-counts-post-per-local-post',
+      `${posts.length} for ${local.length}`);
+    for (const [i, p] of posts.entries()) {
+      checkHostedPost(p, `hosted/off-registry/post-${i}`);
+      check(!p.text.includes('reserve_table') && !p.text.includes(longOf),
+        `hosted/off-registry/post-${i}/carries-no-offer-trunk-refuses`, p.text.slice(0, 300));
+      check(p.body?.session === local[0]?.body?.session, `hosted/off-registry/post-${i}/the-pages-own-session`);
+    }
+    const posted = posts.flatMap((p) => p.body?.events ?? []);
+    check(canonicalJSON(posted) === canonicalJSON(localEvents.filter(trunkTakes)),
+      'hosted/off-registry/every-other-event-goes-in-order', `${JSON.stringify(posted)}\n      vs ${
+        JSON.stringify(localEvents.filter(trunkTakes))}`);
+  }
+}
+
+// 10b-e. No entry.counts: the local post only, and nothing to any other origin.
+if (install && entry) {
+  const { win, result } = await bootHosted({ door: null });
+  check(result?.ok === true, 'hosted/no-entry-counts/install-ok', JSON.stringify(result));
+  await run(win, 'hold_item', { sku: 'L-12', name: 'Ada Lovelace' });
+  await flush(win);
+  check(win.beacons.length >= 1, 'hosted/no-entry-counts/the-local-post-happens');
+  check(win.hosted.length === 0, 'hosted/no-entry-counts/no-counts-post',
+    win.hosted.map((p) => `${p.via} ${p.url}`).join(' '));
+}
+
+// 10b-f. Verification fails: no counts post at all, whatever the page does next.
+if (DOOR_H && H_ENV) {
+  const contract = H_ENV.contract;
+  const card = JSON.parse(H_CARD);
+  const flipped = clone(H_ENV);
+  flipped.sig = (flipped.sig[0] === 'A' ? 'B' : 'A') + flipped.sig.slice(1);
+  const zero = { ...clone(contract), hash: '0'.repeat(64) };
+  for (const [label, opts] of [
+    ['sig-bit-flipped', { routes: servedContract(contract, flipped) }],
+    ['sig-by-another-key', { routes: servedContract(contract, makeToolsEnvelope(OTHER_SEED, clone(contract), now())) }],
+    ['card-names-another-key', { routes: { [AGENT_CARD_PATH]: { body: JSON.stringify({ ...card, did: didFromSeedHex(OTHER_SEED) }),
+      type: 'application/json' } } }],
+    ['signed-contract-with-a-zero-hash', { routes: servedContract(zero, handSign(SEED, zero)) }],
+    ['contract-404', { routes: { [TOOLS]: { status: 404, body: 'nope' } } }],
+    ['page-on-http', { href: 'http://shop.example/product/l-12' }],
+  ]) {
+    const { win, result } = await bootHosted({ door: DOOR_H, ...opts });
+    check(result?.ok === false, `hosted/refused/${label}/install-refuses`, JSON.stringify(result));
+    await flush(win);
+    win.dispatchEvent(new Event('pagehide'));
+    await settle();
+    check(win.hosted.length === 0, `hosted/refused/${label}/no-counts-post`,
+      win.hosted.map((p) => `${p.via} ${p.url}`).join(' '));
+  }
+}
+
+// 10b-g. Never before the contract verified: a flush while the envelope is still on its way
+//        sends nothing; once it verifies, the counts follow the local post; when it then fails,
+//        nothing ever goes.
+if (DOOR_H && H_ENV) {
+  const flipped = clone(H_ENV);
+  flipped.sig = (flipped.sig[0] === 'A' ? 'B' : 'A') + flipped.sig.slice(1);
+  for (const [label, envelope, verifies] of [['verifies', H_ENV, true], ['then-fails', flipped, false]]) {
+    let release;
+    const gate = new Promise((done) => { release = done; });
+    const win = hostedWindow({ door: DOOR_H, routes: {
+      [TOOLS_SIG]: async () => { await gate; return { body: JSON.stringify(envelope), type: 'application/json' }; },
+    } });
+    harborForm(win);
+    const pending = withTimeout(install({ window: win }), 5000, 'install').catch((e) => ({ threw: e.message }));
+    await settle();
+    flushNow(win);
+    await settle();
+    check(win.hosted.length === 0, `hosted/before-verify/${label}/nothing-posted-while-unverified`,
+      win.hosted.map((p) => `${p.via} ${p.url}`).join(' '));
+    win.document.visibilityState = 'visible';
+    win.document.hidden = false;
+    release();
+    const result = await pending;
+    check(result?.ok === verifies, `hosted/before-verify/${label}/install-${verifies ? 'ok' : 'refuses'}`,
+      JSON.stringify(result));
+    if (verifies) await run(win, 'hold_item', { sku: 'L-12', name: 'Ada Lovelace' });
+    await flush(win);
+    if (verifies) await checkPaired(win, `hosted/before-verify/${label}`);
+    else check(win.hosted.length === 0, `hosted/before-verify/${label}/never-posted`,
+      win.hosted.map((p) => `${p.via} ${p.url}`).join(' '));
+  }
+}
+
+// 10b-h. A failing, slow or hanging counts post: nothing thrown, the local post neither delayed
+//        nor suppressed, install() and every tool result unchanged, one attempt and no retry.
+if (DOOR_H) {
+  const script = async (opts) => {
+    const unhandledBefore = hostedUnhandled;
+    const uncaughtBefore = hostedUncaught;
+    const b = await bootHosted({ door: DOOR_H, ...opts });
+    const started = Date.now();
+    const first = await run(b.win, 'hold_item', { sku: 'L-12', name: 'Ada Lovelace' });
+    const firstTook = Date.now() - started;
+    const flushed = flushNow(b.win);
+    await settle();
+    b.win.document.visibilityState = 'visible';
+    b.win.document.hidden = false;
+    const second = await run(b.win, 'hold_item', { sku: 'L-13', name: 'Ada Lovelace' });
+    await flush(b.win);
+    await settle(200);
+    return { ...b, first, firstTook, second, flushed, unhandled: hostedUnhandled - unhandledBefore,
+      uncaught: hostedUncaught - uncaughtBefore };
+  };
+  const same = (r) => canonicalJSON({ threw: r.threw === true, result: r.result ?? null });
+  const base = await script({ mode: 'ok' });
+  check(base.result?.ok === true && base.flushed.localNow >= 1, 'hosted/sink-ok/baseline',
+    `${JSON.stringify(base.result)} ${base.flushed.localNow}`);
+  for (const mode of ['throw', 'reject', '500', 'slow', 'hang']) {
+    const s = await script({ mode });
+    const label = `hosted/sink-${mode}`;
+    check(s.error === null && s.took < 1000, `${label}/install-is-not-delayed`, `${s.error?.message ?? ''} ${s.took} ms`);
+    check(canonicalJSON(s.result) === canonicalJSON(base.result), `${label}/install-returns-the-same`,
+      `${JSON.stringify(s.result)} vs ${JSON.stringify(base.result)}`);
+    check(s.firstTook < 1000, `${label}/a-tool-is-not-delayed`, `${s.firstTook} ms`);
+    check(same(s.first) === same(base.first) && same(s.second) === same(base.second),
+      `${label}/every-tool-result-is-the-same`, `${same(s.second)} vs ${same(base.second)}`);
+    check(s.flushed.threw === null, `${label}/the-flush-throws-nothing-into-the-page`, s.flushed.threw?.message);
+    check(s.flushed.localNow === base.flushed.localNow, `${label}/the-local-post-is-not-delayed-or-suppressed`,
+      `${s.flushed.localNow} local post(s) at the flush vs ${base.flushed.localNow}`);
+    check(s.win.beacons.length === base.win.beacons.length, `${label}/every-local-post-still-happens`,
+      `${s.win.beacons.length} vs ${base.win.beacons.length}`);
+    check(s.win.hosted.length === s.win.beacons.length && s.win.hosted.length === base.win.hosted.length,
+      `${label}/one-attempt-per-local-post-no-retry`,
+      `${s.win.hosted.length} counts post(s), ${s.win.beacons.length} local, baseline ${base.win.hosted.length}`);
+    check(s.unhandled === 0, `${label}/no-unhandled-rejection`, `${s.unhandled}`);
+    check(s.uncaught === 0, `${label}/no-uncaught-exception`, `${s.uncaught}`);
+  }
+
+  // The reverse: a local post that throws or is refused never suppresses the counts post.
+  for (const local of ['throw', 'false']) {
+    const s = await script({ local });
+    const label = `hosted/local-${local}`;
+    check(s.flushed.threw === null, `${label}/the-flush-throws-nothing-into-the-page`, s.flushed.threw?.message);
+    check(same(s.second) === same(base.second), `${label}/every-tool-result-is-the-same`);
+    check(s.win.hosted.length >= 1 && s.win.hosted.length === base.win.hosted.length,
+      `${label}/the-counts-post-still-happens`, `${s.win.hosted.length} vs ${base.win.hosted.length}`);
+    const local2 = await beaconBodies(s.win);
+    for (const [i, p] of (await hostedPosts(s.win)).entries()) {
+      checkHostedPost(p, `${label}/post-${i}`);
+      check(local2[i] !== undefined && p.text === local2[i].text, `${label}/post-${i}/byte-identical-to-the-local-attempt`);
+    }
+    check(s.uncaught === 0 && s.unhandled === 0, `${label}/nothing-uncaught`, `${s.uncaught} ${s.unhandled}`);
+  }
+}
+
+// 10b-i. A counts URL that is not an absolute https URL with a host is never used, wherever the
+//        door put it; the page still counts at home (or refuses whole, never half).
+if (DOOR_H && H_ENV) {
+  const swap = (v, bad) => {
+    if (v === HOSTED) return bad;
+    if (Array.isArray(v)) return v.map((x) => swap(x, bad));
+    if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, swap(x, bad)]));
+    return v;
+  };
+  for (const bad of ['http://counts.muretai.example/events', 'javascript:alert(1)', '//counts.muretai.example/events',
+    'https:///counts', 'data:text/plain,x']) {
+    const routes = {};
+    const card = swap(JSON.parse(H_CARD), bad);
+    if (JSON.stringify(card) !== H_CARD) routes[AGENT_CARD_PATH] = { body: JSON.stringify(card), type: 'application/json' };
+    const contract = swap(clone(H_ENV.contract), bad);
+    if (canonicalJSON(contract) !== canonicalJSON(H_ENV.contract)) {
+      const signed = rehash(contract);
+      Object.assign(routes, servedContract(signed, handSign(SEED, signed)));
+    }
+    const label = `hosted/bad-url/${bad.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '')}`;
+    if (!check(Object.keys(routes).length > 0, `${label}/fixture-the-url-was-found-to-swap`)) continue;
+    const { win, result } = await bootHosted({ door: DOOR_H, routes });
+    if (result?.ok === true) await run(win, 'hold_item', { sku: 'L-12', name: 'Ada Lovelace' });
+    await flush(win);
+    check(win.hosted.length === 0, `${label}/never-posted`, win.hosted.map((p) => `${p.via} ${p.url}`).join(' '));
+    check(win.foreign.length === 0, `${label}/no-other-origin`, win.foreign.join(' '));
+    if (result?.ok === true) check(win.beacons.length >= 1, `${label}/still-counts-at-home`);
+    else check(REFUSALS.includes(result?.reason) && win.beacons.length === 0, `${label}/or-refuses-whole`,
+      JSON.stringify(result));
+  }
+}
+
+// 10b-j. The page runtime stays one file with zero dependencies and the vendored seam is untouched.
+{
+  const seam = readFileSync(join(ROOT, 'vendor', 'agent-seam', 'seam.mjs'));
+  check(createHash('sha256').update(seam).digest('hex')
+      === '0b724e456ebedf9063f8e562a4b77f70ddedbdc7c9880e80121dbe56995792ed',
+    'hosted/seam/vendor-agent-seam-seam-mjs-is-the-v0.3.5-copy');
+}
+
+await settle(50);
+process.off('unhandledRejection', onHostedUnhandled);
+process.off('uncaughtException', onHostedUncaught);
 
 // ---------------------------------------------------------------- 11. nothing left the test
 
