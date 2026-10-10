@@ -6301,6 +6301,46 @@ export function describeKnockRequirements(accepts) {
 /** The keys a Suite door's default reply (AT-12/AT-13) may carry; anything else is dropped. */
 const SUITE_BOOKING_KEYS = Object.freeze(['verb', 'of', 'customer_did', 'request', 'status', 'facts', 'url', 'deal']);
 
+/** The statuses a shop's decision on a pending receipt carries (confirmReceipt, declineReceipt). */
+const DECISION_STATUSES = new Set(['confirmed', 'declined']);
+
+/**
+ * AT-28: a decided reply must be exactly what confirmReceipt or declineReceipt makes for this
+ * visitor at this shop: the pending reply's keys (and, when declined, an optional note), a deal
+ * of dealBlock's keys with partyA the shop and partyB the visitor, a sigA by the shop over the
+ * seven fields, and a termsHash that still commits to the pending terms the reply names.
+ * Anything else throws; nothing about it is reported as a booking.
+ */
+function checkDecision(parsed, visitorDid, shopDid) {
+  const refuse = () => { throw new Error('knock: the shop\'s decision does not check out against its signature and terms'); };
+  const { verb, of, customer_did: customerDid, request, status, deal } = parsed;
+  const keys = status === 'declined' && Object.hasOwn(parsed, 'note') ? [...PENDING_REPLY_KEYS, 'note'] : PENDING_REPLY_KEYS;
+  if (!isPlainObject(deal) || !hasExactKeys(parsed, keys) || !hasExactKeys(deal, DEAL_RECEIPT_KEYS)) refuse();
+  if (keys !== PENDING_REPLY_KEYS && declineNoteProblem(parsed.note) !== null) refuse();
+  if (typeof shopDid !== 'string' || deal.type !== 'DealReceipt' || deal.partyA !== shopDid
+      || deal.partyB !== visitorDid || customerDid !== visitorDid
+      || typeof verb !== 'string' || typeof of !== 'string' || typeof request !== 'string'
+      || typeof deal.termsHash !== 'string' || !/^[0-9a-f]{64}$/.test(deal.termsHash)
+      || typeof deal.ref !== 'string' || (deal.contextId !== null && typeof deal.contextId !== 'string')
+      || !Number.isSafeInteger(deal.ts) || typeof deal.salt !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(deal.salt)
+      || typeof deal.sigA !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(deal.sigA)) {
+    refuse();
+  }
+  const sigA = Buffer.from(deal.sigA, 'base64');
+  const signed = { type: deal.type, partyA: deal.partyA, partyB: deal.partyB, termsHash: deal.termsHash,
+    contextId: deal.contextId, ref: deal.ref, ts: deal.ts };
+  let verified = false;
+  try {
+    verified = sigA.length === 64
+      && verifyBytes(Buffer.from(publicKeyHexFromDid(shopDid), 'hex'), sigA, canonicalBytes(signed));
+  } catch { verified = false; }
+  if (!verified) refuse();
+  const terms = { verb, of, customer_did: customerDid, request, status: 'pending_confirmation' };
+  const commit = createHash('sha256')
+    .update(Buffer.concat([canonicalBytes({ terms }), Buffer.from(deal.salt, 'base64')])).digest('hex');
+  if (commit !== deal.termsHash) refuse();
+}
+
 /**
  * Surface a shop-signed booking receipt from verified reply text.
  * Every field is taken from those bytes — never from the visitor's ask.
@@ -6310,8 +6350,10 @@ const SUITE_BOOKING_KEYS = Object.freeze(['verb', 'of', 'customer_did', 'request
  * For the Suite shape the booking keeps the signed object's Suite keys as they are (the deal's
  * termsHash commits to the reply minus `deal`, so they must not be rewritten); sale fields such
  * as paid/amount are dropped from both shapes.
+ * A Suite reply whose status is a decision (confirmed, declined) must pass checkDecision against
+ * `shopDid`, the card's DID, or this throws; a declined one keeps the shop's note.
  */
-function checkedBookingReceipt(replyText, visitorDid) {
+function checkedBookingReceipt(replyText, visitorDid, shopDid) {
   let parsed;
   try {
     parsed = JSON.parse(replyText);
@@ -6336,6 +6378,10 @@ function checkedBookingReceipt(replyText, visitorDid) {
   }
   if (customer_did !== visitorDid) {
     throw new Error('knock: the signed reply files a booking under a different customer');
+  }
+  if (typeof type !== 'string' && DECISION_STATUSES.has(status)) {
+    checkDecision(parsed, visitorDid, shopDid);
+    if (Object.hasOwn(parsed, 'note')) booking.note = parsed.note;
   }
   return booking;
 }
@@ -6463,7 +6509,7 @@ export async function knockAgentEntry(cardUrl, {
       || !verifyEnvelope(replyFields, { recipientDid: from, signerDid: card.did })) {
     throw new Error('knock: the door reply did not verify');
   }
-  const booking = checkedBookingReceipt(replyFields.text, from);
+  const booking = checkedBookingReceipt(replyFields.text, from, card.did);
   return {
     ok: true,
     did: from,
@@ -6479,18 +6525,24 @@ export async function knockAgentEntry(cardUrl, {
 async function knockMain(argv) {
   let cardUrl;
   let offer;
+  let ref;
   let misuse = argv[0] !== 'knock';
   for (let i = 1; i < argv.length && !misuse; i += 1) {
     if (argv[i] === '--offer' && offer === undefined && i + 1 < argv.length) offer = argv[++i];
+    else if (argv[i] === '--ref' && ref === undefined && i + 1 < argv.length) ref = argv[++i];
     else if (!argv[i].startsWith('-') && cardUrl === undefined) cardUrl = argv[i];
     else misuse = true;
   }
-  if (misuse || cardUrl === undefined || (offer !== undefined && !OFFER_SPELLING.test(offer))) {
-    console.error('usage: node muretai-agent-entry.mjs knock <card-url> [--offer <id or verb>]');
+  // AT-28: `--offer track` collects a decision, so it needs exactly one non-empty --ref, and
+  // --ref means nothing beside any other offer. The ref alone decides the text sent.
+  if (misuse || cardUrl === undefined || (offer !== undefined && !OFFER_SPELLING.test(offer))
+      || (offer === 'track') !== (ref !== undefined) || ref === '') {
+    console.error('usage: node muretai-agent-entry.mjs knock <card-url> [--offer <id or verb>]\n'
+      + '       node muretai-agent-entry.mjs knock <card-url> --offer track --ref <ref>');
     return 2;
   }
   try {
-    const result = await knockAgentEntry(cardUrl, { offer });
+    const result = await knockAgentEntry(cardUrl, { offer, ...(ref !== undefined ? { text: JSON.stringify({ ref }) } : {}) });
     if (result.ok) {
       console.log(result.text);
       return 0;
