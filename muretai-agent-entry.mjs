@@ -4839,7 +4839,9 @@ export function createAgentEntry({
     return toolsSigEnvelope;
   }
 
-  /** Record contact from an account. Returns the row (or a promise of it, with a store). */
+  /** Record contact from an account. Returns whether this was its FIRST contact — the store
+   *  held no row for it — (or a promise of that, with a store). Analytics-2 reads it as
+   *  `first_contact`; the row itself stays `{first_seen, last_seen, messages}`. */
   function noteContact(accountDid) {
     const now = nowEpoch();
     return then1(state.getAccount(accountDid), (row) => {
@@ -4848,14 +4850,14 @@ export function createAgentEntry({
         // store hands back the live object and the write is a no-op re-set of the same
         // reference — one code path, correct for both.
         const updated = { ...row, messages: (row.messages || 0) + 1, last_seen: now };
-        return then1(state.putAccount(accountDid, updated), () => updated);
+        return then1(state.putAccount(accountDid, updated), () => false);
       }
       // FIRST CONTACT IS ACCOUNT CREATION. There is no signup form: the sender proved
       // control of a device key one line above, which is strictly more than an email link.
       // The row is keyed by the ACCOUNT (the owner when bound), so sibling devices are one
       // customer.
       const fresh = { first_seen: now, last_seen: now, messages: 1 };
-      return then1(state.putAccount(accountDid, fresh), () => fresh);
+      return then1(state.putAccount(accountDid, fresh), () => true);
     });
   }
 
@@ -4941,7 +4943,7 @@ export function createAgentEntry({
   /** The FROZEN backend-handoff shape (agent/webhookwake.py::_envelope). The site's own
    *  code consumes this, so the key set must not drift: a webhook push, a drive-API read
    *  and an agent entry callback all parse with ONE schema. */
-  function backendEnvelope(msg, { verified, peerDid, ownerDid = null, wbaDid = null }) {
+  function backendEnvelope(msg, { verified, peerDid, ownerDid = null, wbaDid = null, firstContact = false }) {
     const meta = msg.metadata || {};
     return {
       to_agent: name,
@@ -4969,6 +4971,10 @@ export function createAgentEntry({
       coord: meta.coordination ?? null,
       deal: meta.deal ?? null,
       group: meta.group ?? null,
+      // Analytics-2: true only on the answered signed POST that created the account's row,
+      // false on every later one and on the anonymous lane (which mints no row). Additive,
+      // and a boolean, so the sinks may carry it.
+      first_contact: firstContact === true,
     };
   }
 
@@ -5397,12 +5403,12 @@ export function createAgentEntry({
         // itself has now proved possession of the op-key it names.
         const pinnedWrite = nextKeyState
           ? state.putKeyState(from, nextKeyState) : undefined;
-        return then1(pinnedWrite, () => then1(noteContact(account), () =>
+        return then1(pinnedWrite, () => then1(noteContact(account), (firstContact) =>
             // T107: `wba_did` may legitimately differ from `peer_did` (the transport signer
             // vs the message signer) — both facts are honest, and the schema says which is
             // which.
             respond(backendEnvelope(msg, { verified: true, peerDid: from, ownerDid,
-              wbaDid: wbaIdentify(reqHeaders) }), reqId, msg, from, chosen)));
+              wbaDid: wbaIdentify(reqHeaders), firstContact }), reqId, msg, from, chosen)));
       });
     });
     });
@@ -6033,7 +6039,8 @@ function messageText(msg) {
 // until it is added here on purpose.
 
 const SINK_FIELDS = ['stage', 'event', 'offer', 'engine', 'ms', 'reply', 'receipt', 'identified',
-  'verified', 'ua_family', 'client_class', 'ip_vendor', 'country', 'signature_agent', 'refused'];
+  'verified', 'ua_family', 'client_class', 'ip_vendor', 'country', 'signature_agent', 'refused',
+  'first_contact'];
 const SINK_TOKEN = /^[A-Za-z0-9_.:-]{1,64}$/;
 const GA_ENDPOINT = 'https://www.google-analytics.com/mp/collect';
 const GA_EVENT_NAME = /^[A-Za-z][A-Za-z0-9_]{0,39}$/;
@@ -8608,6 +8615,8 @@ function tallyCounts(lines, accounts, storePresent) {
   const platforms = new Map();
   let stealth = 0;
   let none = 0;
+  let firstContacts = 0;
+  let returningKnocks = 0;
   let dropped = 0;
   let from = null;
   let to = null;
@@ -8635,6 +8644,10 @@ function tallyCounts(lines, accounts, storePresent) {
     }
     if (!DOOR_STAGES.has(e.stage)) continue;
     bump(byStage, e.stage);
+    // Analytics-2: an answered signed knock is new or returning by its own boolean
+    // first_contact. A refusal, the anonymous lane, or a value that is not a boolean is neither.
+    if (e.stage === 'signed_post' && e.first_contact === true) firstContacts += 1;
+    if (e.stage === 'signed_post' && e.first_contact === false) returningKnocks += 1;
     bump(byClass, typeof e.client_class === 'string' && CLIENT_CLASSES.has(e.client_class) ? e.client_class : 'unknown');
     let tiers = 0;
     if (isVendor(e.signature_agent)) { bump(signed, e.signature_agent); tiers += 1; }
@@ -8657,6 +8670,7 @@ function tallyCounts(lines, accounts, storePresent) {
   return {
     coverage: { from: when(from), to: when(to), last_event: when(last), store_present: storePresent, rows_dropped: dropped },
     offers: Object.fromEntries(offers), referrals: Object.fromEntries(referrals), returning_customers: returning,
+    contacts: { new: firstContacts, returning: returningKnocks },
     knocks: { by_stage: Object.fromEntries(byStage), by_class: Object.fromEntries(byClass) },
     who: { signed: Object.fromEntries(signed), declared: Object.fromEntries(declared), network: Object.fromEntries(network),
       'stealth-agent': stealth, none },
@@ -8690,6 +8704,7 @@ function countsText(c) {
     '',
     `referrals by answer engine: ${pairs(c.referrals)}`,
     `returning customers: ${c.returning_customers}`,
+    `signed knocks: new ${c.contacts.new}, returning ${c.contacts.returning}`,
     `door knocks by stage: ${pairs(c.knocks.by_stage)}`,
     `door knocks by client class: ${pairs(c.knocks.by_class)}`,
     `platforms: ${pairs(c.platforms)}`,
@@ -8714,6 +8729,7 @@ ${Object.entries(c.offers).map(([id, o]) => `<tr>${cells([id, o.page_asked, o.do
 </tbody></table>
 <h2>Referrals by answer engine</h2><ul>${list(c.referrals)}</ul>
 <h2>Returning customers</h2><p>${escapeHtml(c.returning_customers)}</p>
+<h2>Signed knocks</h2><p>new ${escapeHtml(c.contacts.new)}, returning ${escapeHtml(c.contacts.returning)}</p>
 <h2>Door knocks by stage</h2><ul>${list(c.knocks.by_stage)}</ul>
 <h2>Door knocks by client class</h2><ul>${list(c.knocks.by_class)}</ul>
 <h2>platforms</h2><ul>${list(c.platforms)}</ul>
