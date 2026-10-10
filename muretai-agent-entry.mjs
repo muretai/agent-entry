@@ -4053,6 +4053,39 @@ function inputValues(text, input) {
   return out;
 }
 
+/** AT-28: the one refusal every `track` request that is not answered gets, whatever the reason:
+ *  an unknown ref, a signer other than partyB, the anonymous lane or any other text. One code, one
+ *  message, no data, so it never says whether a ref exists. */
+const TRACK_REFUSAL = 'the text must carry {"ref": "<ref>"} for a receipt this signer holds';
+
+/** The ref a `track` text carries as `{"ref": "<ref>"}`, optionally after plain words (read as
+ *  checkout fields are), or null for any other shape: a bare ref, no ref, a ref that is not a
+ *  non-empty string, malformed JSON. */
+function trackRef(text) {
+  const at = text.indexOf('{');
+  if (at === -1) return null;
+  let parsed;
+  try { parsed = JSON.parse(text.slice(at)); } catch { return null; }
+  if (!isPlainObject(parsed) || !Object.hasOwn(parsed, 'ref')) return null;
+  const { ref } = parsed;
+  return typeof ref === 'string' && ref.length > 0 && ref.length <= 200 ? ref : null;
+}
+
+/** The reply text `track` answers `signer` with from a receipts row, or null when the row is not
+ *  one this signer may read: the stored decision text verbatim once decided, else the AT-12 track
+ *  shape with status pending_confirmation and no deal. Reads only; writes nothing. */
+function trackAnswer(row, ref, signer, text) {
+  if (!isPlainObject(row) || row.ref !== ref || typeof row.partyB !== 'string' || row.partyB !== signer) return null;
+  if (row.decision !== null) {
+    return isPlainObject(row.decision) && typeof row.decision.text === 'string' ? row.decision.text : null;
+  }
+  let pending;
+  try { pending = JSON.parse(row.pending_text); } catch { return null; }
+  if (!isPlainObject(pending) || typeof pending.of !== 'string') return null;
+  return JSON.stringify({ verb: 'track', of: pending.of, customer_did: signer, request: text,
+    status: 'pending_confirmation' });
+}
+
 /** Woo-4: a product snapshot row is exactly id, name, price, stock_status and permalink, in that
  *  order (catalogRow builds it); stock_status is one of these. */
 const CATALOG_STOCK = Object.freeze(['in_stock', 'out_of_stock']);
@@ -5213,11 +5246,18 @@ export function createAgentEntry({
     //     answer at the door is refused here, before any crypto, so it mints no account row,
     //     and the refusal does not echo it. A door without a declaration ignores the key, as
     //     it always ignored unknown metadata.
+    //     AT-28: `track`, when no declared offer claims it, is the door's own: the customer
+    //     collects a receipt's decision with {"ref": ...}. Any other text is refused here,
+    //     before any crypto, with the one track refusal.
     let chosen = null;
+    let track = null;
     if (tools && Object.hasOwn(meta, 'offer')) {
       const pick = meta.offer;
       chosen = typeof pick === 'string' ? (tools.byId.get(pick) ?? tools.byVerb.get(pick) ?? null) : null;
-      if (!chosen) {
+      if (!chosen && pick === 'track') {
+        track = trackRef(text);
+        if (track === null) return rpcError(reqId, ERRORS.INVALID_PARAMS, TRACK_REFUSAL);
+      } else if (!chosen) {
         return rpcError(reqId, ERRORS.INVALID_PARAMS,
           'metadata.offer must be an offer id or a registry verb this door answers; the card\'s skills list them');
       }
@@ -5252,6 +5292,8 @@ export function createAgentEntry({
         }
         return rpcError(reqId, ERRORS.UNAUTHENTICATED, 'missing signing envelope (from/to/sig)');
       }
+      // AT-28: only a receipt's partyB may track it, and a walk-in has no DID to be one.
+      if (track !== null) return rpcError(reqId, ERRORS.INVALID_PARAMS, TRACK_REFUSAL);
       // Anonymous: answer, signed by us, addressed to nobody. NO ledger row — an
       // unauthenticated stranger must never be able to mint an account.
       //
@@ -5393,6 +5435,14 @@ export function createAgentEntry({
       //     on that same replay: free when no binding is attached, and with one attached a
       //     bounded signature check whose device pin the FIRST delivery already wrote, so
       //     the replay re-reads it and writes nothing.
+      //
+      //     AT-28: a `track` request reads its receipt HERE, after the signature named the signer
+      //     and before anything is written: a refused one writes no replay entry and no contact,
+      //     and its refusal is the same whether the ref is unknown or someone else's.
+      const answered = track === null ? null : then1(state.getReceipt(track), (row) => trackAnswer(row, track, from, text));
+      return then1(answered, (trackReply) => {
+      if (track !== null && trackReply === null) return rpcError(reqId, ERRORS.INVALID_PARAMS, TRACK_REFUSAL);
+      if (trackReply !== null) chosen = { track: trackReply };
       return then1(state.seenMessage(messageId, REPLAY_TTL_S), (fresh) => {
         if (!fresh) {
           return rpcError(reqId, ERRORS.REPLAY_REJECTED, 'duplicate messageId (replay) detected');
@@ -5409,6 +5459,7 @@ export function createAgentEntry({
             // which.
             respond(backendEnvelope(msg, { verified: true, peerDid: from, ownerDid,
               wbaDid: wbaIdentify(reqHeaders), firstContact }), reqId, msg, from, chosen)));
+      });
       });
     });
     });
@@ -5474,6 +5525,10 @@ export function createAgentEntry({
   }
 
   function respond(env, reqId, msg, toDid, chosen = null) {
+    // AT-28: a `track` answer was read from the receipts section before anything was written. The
+    // watcher sees an ordinary visit, no offer and nothing of the receipt; the responder is not asked.
+    const trackReply = chosen && Object.hasOwn(chosen, 'track') ? chosen.track : null;
+    if (trackReply !== null) chosen = null;
     // Suite S1: the responder and the watcher are told which offer this was. Added only when
     // one was chosen, so a door without a declaration hands over the same envelope as before.
     if (chosen) env = { ...env, offer: chosen.id };
@@ -5493,6 +5548,10 @@ export function createAgentEntry({
               ...bearerObservation(),
               ...(chosen ? { reply: chosen.door.reply,
                 receipt: Boolean(chosen.door.receipt && toDid && chosen.door.reply !== 'brain') } : {}) });
+    if (trackReply !== null) {
+      return finishReply(reqId, trackReply, { inbound: { contextId: msg.contextId ?? null,
+        messageId: msg.messageId ?? null }, toDid });
+    }
     if (chosen && chosen.door.reply !== 'brain') {
       let text;
       try {
