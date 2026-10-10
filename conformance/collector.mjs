@@ -27,7 +27,11 @@
 //     nothing. Nothing else rides along: no DID, no text, no input value, no address, no
 //     ua_family / ip_vendor / country, no page header. <= 2048 bytes, <= 100 events.
 //   - The bytes are ones trunk's collector accepts: parseBeaconTrunk below is a line-for-line
-//     JS twin of agent/shopcounts.py parse_beacon (trunk S5, 94b76839).
+//     JS twin of agent/shopcounts.py parse_beacon (trunk S5, 94b76839). That holds for the bytes
+//     the door WRITES, not the ones the page sent: a number spelled "6e5" grows when re-serialized,
+//     and an offer the door takes (a verb outside the registry, an id over 64) is one trunk
+//     refuses the whole body over (8j, 8k).
+//   - The door stays one file with no dependency and vendor/agent-seam is untouched (8l).
 //   - Fire-and-forget: a slow, hanging, throwing, rejecting or non-2xx sink never delays the
 //     204 or a signed reply, never changes one byte of either, is never retried, and never
 //     surfaces as an unhandled rejection. No entry.counts -> no request at all.
@@ -704,6 +708,101 @@ for (const mode of ['throw', 'reject', 'timeout', '500', '404']) {
       checkClean(c, `counts/knock/${mode}-sink/post-${j}`);
     }
   }
+}
+
+// 8j. The door re-serializes what it counted, so a beacon that fits can grow on the way out: "6e5"
+//     is a legal JSON spelling of 600000 and is three bytes shorter. A posted body is never over
+//     2048 bytes and never over 100 events, whatever the page spelled; a body that would be is
+//     not sent as one (trimmed, split or dropped, the door's choice), and the 204 stays the 204.
+{
+  wire.mode = 'ok';
+  const { entry } = countsDoor();
+  const plain = plainDoor().entry;
+  if (entry && plain) {
+    const spelled = (n, s) => `{"session":"${s}","events":[${
+      Array.from({ length: n }, () => '{"name":"offer_succeeded","offer":"hold_item","ms":6e5}').join(',')}]}`;
+    let fits = 1;
+    while (Buffer.byteLength(spelled(fits + 1, 'tab-spelled00'), 'utf8') <= 2048) fits += 1;
+    const raw = spelled(fits, 'tab-spelled00');
+    const grown = JSON.stringify(JSON.parse(raw));
+    check(Buffer.byteLength(raw) <= 2048 && Buffer.byteLength(grown) > 2048,
+      'counts/spelling/fixture-grows-past-2048-when-re-serialized',
+      `${Buffer.byteLength(raw)} -> ${Buffer.byteLength(grown)}`);
+    const before = wire.calls.length;
+    const out = await post(entry, raw);
+    const base = await post(plain, spelled(fits, 'tab-spelled01'));
+    check(out.status === 204 && sameResponse(out, base), 'counts/spelling/the-204-is-the-plain-doors-204',
+      `HTTP ${out.status} ${out.text}`);
+    await settle();
+    const mine = wire.calls.slice(before);
+    let sent = 0;
+    for (const [j, c] of mine.entries()) {
+      check(c.url === COUNTS && c.method === 'POST', `counts/spelling/post-${j}/a-POST-to-entry-counts`, c.url);
+      checkClean(c, `counts/spelling/post-${j}`);
+      sent += parsed(c)?.events?.length ?? 0;
+    }
+    check(sent <= fits, 'counts/spelling/never-more-events-than-were-counted', `${sent} of ${fits}`);
+  }
+}
+
+// 8k. An offer the door takes is not always one trunk takes: a verb outside the registry (AT-4)
+//     or an id over 64 characters is declared fine, counted locally, but trunk's parse_beacon
+//     refuses the WHOLE body over it. Whatever is posted is still a body trunk accepts, so one
+//     such event can never make trunk drop the registry events beside it; the 204 is unchanged.
+{
+  wire.mode = 'ok';
+  const offbeat = { verb: 'reserve', of: 'table', about: 'Reserve a table.', input: { q: 'string' },
+    page: JSON.parse(JSON.stringify(harbor.declaration.offers[0].page)) };
+  const longOf = `lamp_${'x'.repeat(62)}`;
+  const lengthy = { verb: 'hold', of: longOf, about: 'Hold a lamp with a long name.', input: { q: 'string' },
+    page: JSON.parse(JSON.stringify(harbor.declaration.offers[0].page)) };
+  const declaration = countsDeclaration();
+  declaration.offers.push(offbeat, lengthy);
+  const { entry, error, sink } = makeDoor({ declaration, signedRatePerMin: 0, signedRatePerMinTotal: 0 });
+  if (check(entry !== null, 'counts/off-registry/door-with-an-off-registry-offer-starts', error?.message)) {
+    const longId = `hold_${longOf}`;
+    check(longId.length > 64, 'counts/off-registry/fixture-id-is-over-64', String(longId.length));
+    for (const [label, odd] of [['verb-outside-the-registry', 'reserve_table'], ['id-over-64', longId]]) {
+      const before = wire.calls.length;
+      const observed = pageEvents(sink).length;
+      const out = await post(entry, { session: session(), events: [
+        { name: 'page_ready' }, { name: 'offer_started', offer: odd }, { name: 'offer_started', offer: 'hold_item' }] });
+      check(out.status === 204, `counts/off-registry/${label}/204`, `HTTP ${out.status} ${out.text}`);
+      check(pageEvents(sink).length - observed === 3, `counts/off-registry/${label}/the-local-observer-counts-all-three`,
+        `got ${pageEvents(sink).length - observed}`);
+      await settle();
+      const mine = wire.calls.slice(before);
+      for (const [j, c] of mine.entries()) {
+        checkClean(c, `counts/off-registry/${label}/post-${j}`);
+        check(!c.body.toString('utf8').includes(odd), `counts/off-registry/${label}/post-${j}/carries-no-offer-trunk-refuses`,
+          c.body.toString('utf8'));
+      }
+      const posted = mine.flatMap((c) => parsed(c)?.events ?? []);
+      check(posted.some((e) => e.name === 'offer_started' && e.offer === 'hold_item')
+          && posted.some((e) => e.name === 'page_ready'),
+        `counts/off-registry/${label}/the-registry-events-beside-it-still-reach-trunk`, JSON.stringify(posted));
+    }
+  }
+}
+
+// 8l. The door stays one file with no dependency, and the vendored seam is untouched by this item.
+{
+  const doorSource = readFileSync(join(HERE, '..', 'muretai-agent-entry.mjs'), 'utf8');
+  const specifiers = [...doorSource.matchAll(/^\s*(?:import|export)\b[^'"]*?\bfrom\s*['"]([^'"]+)['"]/gm)]
+    .map((m) => m[1]);
+  const dynamic = [...doorSource.matchAll(/\bimport\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1]);
+  const foreign = [...specifiers, ...dynamic].filter((s) => !s.startsWith('node:'));
+  check(foreign.length === 0, 'counts/one-file/the-door-imports-only-node-builtins', JSON.stringify(foreign));
+  const pkg = JSON.parse(readFileSync(join(HERE, '..', 'package.json'), 'utf8'));
+  for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies', 'bundledDependencies']) {
+    check(Object.keys(pkg[field] || {}).length === 0, `counts/one-file/package-json-has-no-${field}`,
+      JSON.stringify(pkg[field]));
+  }
+  const { createHash } = await import('node:crypto');
+  const seam = readFileSync(join(HERE, '..', 'vendor', 'agent-seam', 'seam.mjs'));
+  check(createHash('sha256').update(seam).digest('hex')
+      === '0b724e456ebedf9063f8e562a4b77f70ddedbdc7c9880e80121dbe56995792ed',
+    'counts/seam/vendor-agent-seam-seam-mjs-is-the-v0.3.5-copy');
 }
 
 // 8i. Every request the door made in this file went to entry.counts and carried a body trunk accepts.
