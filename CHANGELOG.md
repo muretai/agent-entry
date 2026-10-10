@@ -8,6 +8,14 @@ paragraphs.
 Breaking CLI change.
 
 - removed: the third-party config converter; use init --scan or write agent-entry.json
+- added: hosted counts. `entry.counts` in `agent-entry.json` is now accepted, an absolute https
+  URL with a host, and the door publishes it on the card as `agentEntry.counts`.
+  - The door post: the collector's kept events go to `entry.counts` as the AT-14 body, with no
+    DID and no text, split across posts of at most 2048 bytes each.
+  - The page-runtime post: once the contract verifies, the page runtime posts the same body to
+    the card's `agentEntry.counts` beside its local beacon.
+  - Both leave out offer ids trunk refuses, make one attempt, and never change a signed reply
+    or the page.
 
 ## 1.13.1 — Muse connector page and README without the not-tested caveat (2026-09-28)
 

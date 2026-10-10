@@ -1123,12 +1123,23 @@ door, completed, and how many receipts were issued. It also shows referrals by a
 returning customers (a count, never who), and door knocks by stage and client class. `--serve`
 binds only to `127.0.0.1` or `::1` and refuses any other `Host`.
 
-**A hosted dashboard is planned, not shipped.** The planned field is `entry.counts` in
-`agent-entry.json`: a URL for a Muretai-hosted counts endpoint. The page runtime and the door
-would send the same events there, and you would see the same numbers on your hosted door's
-ledger page with nothing to run. **`entry.counts` is NOT YET ACCEPTED in 1.13.0:** the
-declaration validator refuses unknown keys, so a declaration that sets it today is refused at
-startup. Until it ships, use `fileSink` with `agent-entry counts`, or `gaSink`.
+**Since 1.14.0 counts can be hosted.** Set `entry.counts` in `agent-entry.json` to an absolute
+https URL, a Muretai-hosted counts endpoint, and you see the same numbers on your hosted door's
+ledger page with nothing to run. A declaration whose `entry.counts` is not an https URL with a
+host is refused at startup. The door publishes the URL on its card as `agentEntry.counts`,
+beside `agentEntry.events`; a door without `entry.counts` names none, and the contract's hash
+does not move.
+
+Two posts carry the same body, the AT-14 `{session, events}` and nothing else: no DID, no text,
+no visitor header. The door posts the events its collector kept to `entry.counts`, with its own
+`Origin`. The page runtime, once the contract verifies, posts the same body to the card's
+`agentEntry.counts` beside its local beacon. Each post is capped at 2048 bytes, so the door
+splits the events across as many posts as that takes. Offer ids that trunk refuses, anything
+but a registry verb then `_<of>`, or longer than 64 characters, are dropped from the hosted
+post, so the events beside them still count. Both posts are one attempt, never retried and
+never awaited: a hosted endpoint that is down, slow or hung changes no byte of a signed reply
+and nothing on the page. `fileSink` with `agent-entry counts`, and `gaSink`, work as before,
+with or without `entry.counts`.
 
 **The rule that shapes everything else: a DID is not a cookie, and it is not a throwaway
 either.** Nobody imposed it — the visitor read your card *before* knocking, and an owner who
