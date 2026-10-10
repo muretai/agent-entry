@@ -3996,13 +3996,45 @@ const hasExactKeys = (obj, keys) => Object.keys(obj).length === keys.length && k
  * caller beyond the signed receipt.
  */
 export function confirmReceipt(seedHex, receiptText) {
-  if (typeof seedHex !== 'string' || !/^[0-9a-f]{64}$/i.test(seedHex)) throw new TypeError('confirmReceipt: seedHex must be 64 hex characters');
-  if (typeof receiptText !== 'string') throw new TypeError('confirmReceipt: receiptText must be the reply text');
+  return followUpReceipt('confirmReceipt', 'confirmed', seedHex, receiptText);
+}
+
+/** A declined reply's note: at most this many characters (code points). */
+const MAX_DECLINE_NOTE_CHARS = 500;
+
+/** Why `note` cannot ride on a declined reply, or null when it can: a string of at most
+ *  MAX_DECLINE_NOTE_CHARS characters with no control character (C0, DEL or C1). */
+function declineNoteProblem(note) {
+  if (typeof note !== 'string') return 'the note must be a string';
+  if ([...note].length > MAX_DECLINE_NOTE_CHARS) return `the note is longer than ${MAX_DECLINE_NOTE_CHARS} characters`;
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(note)) return 'the note carries a control character';
+  return null;
+}
+
+/**
+ * declineReceipt(seedHex, receiptText, note?) -> text
+ *
+ * confirmReceipt's twin (AT-28): the owner's refusal of a pending receipt. The same checks in the
+ * same order (the deal's sigA under this key FIRST, then the pending shape, then the terms), and
+ * the same follow-on reply with status "declined": verb, of, customer_did and request kept, a deal
+ * keeping partyA, partyB, termsHash, salt, ref and contextId, with a fresh ts (never before the
+ * hold's) and a fresh sigA over the same seven fields. `note`, when given, is the one key added
+ * (after the deal, never inside it): the shop's words, at most 500 characters, no control
+ * character. Without a note the bytes are confirmReceipt's with only the status word changed.
+ */
+export function declineReceipt(seedHex, receiptText, note) {
+  return followUpReceipt('declineReceipt', 'declined', seedHex, receiptText, note);
+}
+
+/** confirmReceipt and declineReceipt: the follow-on reply with `status`, refusals named `name`. */
+function followUpReceipt(name, nextStatus, seedHex, receiptText, note) {
+  if (typeof seedHex !== 'string' || !/^[0-9a-f]{64}$/i.test(seedHex)) throw new TypeError(`${name}: seedHex must be 64 hex characters`);
+  if (typeof receiptText !== 'string') throw new TypeError(`${name}: receiptText must be the reply text`);
   const shop = didFromSeedHex(seedHex);
   let receipt;
-  try { receipt = JSON.parse(receiptText); } catch { throw new TypeError('confirmReceipt: the receipt is not JSON'); }
+  try { receipt = JSON.parse(receiptText); } catch { throw new TypeError(`${name}: the receipt is not JSON`); }
   const deal = isPlainObject(receipt) ? receipt.deal : undefined;
-  if (!isPlainObject(deal)) throw new TypeError('confirmReceipt: the receipt carries no deal');
+  if (!isPlainObject(deal)) throw new TypeError(`${name}: the receipt carries no deal`);
   // 1. This shop signed it: sigA over the seven fields, with partyA this key's DID.
   const sigA = typeof deal.sigA === 'string' && /^[A-Za-z0-9+/]+={0,2}$/.test(deal.sigA) ? Buffer.from(deal.sigA, 'base64') : null;
   const signed = { type: deal.type, partyA: shop, partyB: deal.partyB, termsHash: deal.termsHash,
@@ -4012,29 +4044,35 @@ export function confirmReceipt(seedHex, receiptText) {
     verified = sigA !== null && sigA.length === 64
       && verifyBytes(Buffer.from(publicKeyHexFromDid(shop), 'hex'), sigA, canonicalBytes(signed));
   } catch { verified = false; }
-  if (!verified || deal.partyA !== shop) throw new TypeError('confirmReceipt: the receipt is not signed by this key');
+  if (!verified || deal.partyA !== shop) throw new TypeError(`${name}: the receipt is not signed by this key`);
+  // Only once the signature holds: the shop's note, when one is given.
+  if (note !== undefined) {
+    const problem = declineNoteProblem(note);
+    if (problem) throw new TypeError(`${name}: ${problem}`);
+  }
   // 2. Exactly the door's pending shape: no extra key, no confirmation claimed anywhere.
   if (!hasExactKeys(receipt, PENDING_REPLY_KEYS) || !hasExactKeys(deal, DEAL_RECEIPT_KEYS)) {
-    throw new TypeError('confirmReceipt: the receipt is not a pending reply');
+    throw new TypeError(`${name}: the receipt is not a pending reply`);
   }
   const { verb, of, customer_did: customerDid, request, status } = receipt;
-  if (status !== 'pending_confirmation' || deal.type !== 'DealReceipt') throw new TypeError('confirmReceipt: the receipt is not pending');
+  if (status !== 'pending_confirmation' || deal.type !== 'DealReceipt') throw new TypeError(`${name}: the receipt is not pending`);
   if (typeof verb !== 'string' || typeof of !== 'string' || typeof request !== 'string' || typeof customerDid !== 'string'
       || customerDid !== deal.partyB || typeof deal.termsHash !== 'string' || !/^[0-9a-f]{64}$/.test(deal.termsHash)
       || typeof deal.ref !== 'string' || (deal.contextId !== null && typeof deal.contextId !== 'string')
       || !Number.isSafeInteger(deal.ts) || typeof deal.salt !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(deal.salt)) {
-    throw new TypeError('confirmReceipt: the receipt is not a pending reply');
+    throw new TypeError(`${name}: the receipt is not a pending reply`);
   }
   // 3. Its termsHash still commits to its terms: nothing in the reply was edited after signing.
   const terms = { verb, of, customer_did: customerDid, request, status };
   const commit = createHash('sha256')
     .update(Buffer.concat([canonicalBytes({ terms }), Buffer.from(deal.salt, 'base64')])).digest('hex');
-  if (commit !== deal.termsHash) throw new TypeError('confirmReceipt: the receipt\'s terms were changed after it was signed');
+  if (commit !== deal.termsHash) throw new TypeError(`${name}: the receipt's terms were changed after it was signed`);
   const ts = Math.max(nowEpoch(), deal.ts);
   const next = { type: 'DealReceipt', partyA: shop, partyB: deal.partyB, termsHash: deal.termsHash,
     contextId: deal.contextId, ref: deal.ref, ts };
-  return JSON.stringify({ verb, of, customer_did: customerDid, request, status: 'confirmed',
-    deal: { ...next, salt: deal.salt, sigA: signBytes(seedHex, canonicalBytes(next)).toString('base64') } });
+  return JSON.stringify({ verb, of, customer_did: customerDid, request, status: nextStatus,
+    deal: { ...next, salt: deal.salt, sigA: signBytes(seedHex, canonicalBytes(next)).toString('base64') },
+    ...(note !== undefined ? { note } : {}) });
 }
 
 /** The input values a visitor wrote as a JSON object after the words (the skill example's
@@ -6602,9 +6640,10 @@ const USAGE = {
     + '  Per offer: asked on the page, asked at the door, completed, receipts; referrals by engine; returning\n'
     + '  customers (a count); door knocks by stage and client class; platforms, the bearer issuer hosts.\n'
     + '  --serve renders one page on loopback only.',
-  decide: 'usage: agent-entry decide <ref> approve --store <file store>\n'
-    + '  The owner\'s approval of a pending receipt the door issued, by its deal ref in the door\'s store: prints\n'
-    + '  confirmReceipt\'s confirmed reply and stores it as the row\'s decision. A repeat prints the same. Nothing is sent.',
+  decide: 'usage: agent-entry decide <ref> approve|decline [--note <text>] --store <file store>\n'
+    + '  The owner\'s verdict on a pending receipt the door issued, by its deal ref in the door\'s store: prints\n'
+    + '  confirmReceipt\'s confirmed reply (approve) or declineReceipt\'s declined one (decline, with --note of at\n'
+    + '  most 500 characters) and stores it as the row\'s decision. A repeat prints the same. Nothing is sent.',
   serve: 'usage: agent-entry serve --proof-path /.well-known/<file> --proof-body <text> [--port <p>] [--host 127.0.0.1]\n'
     + '  Runs this site\'s door on 127.0.0.1 only and serves the ownership proof: GET of exactly --proof-path\n'
     + `  answers --proof-body as text/plain. The seed is ${SEED_NAME}, from the project's env files or the environment.`,
@@ -8885,32 +8924,44 @@ async function serveMain(argv) {
 
 // ------------------------------------------ decide
 
-/** The owner's approval of the receipt the store keeps under `ref` (AT-28): confirmReceipt over
- *  the row's pending_text as signed, stored on that row only as {status, text, decided_ts}. A
- *  repeat of approve returns the stored text and writes nothing; another verdict is refused.
+/** The owner's verdict on the receipt the store keeps under `ref` (AT-28): confirmReceipt
+ *  (approve) or declineReceipt (decline, with the shop's note when given) over the row's
+ *  pending_text as signed, stored on that row only as {status, text, decided_ts}. A repeat of the
+ *  same verdict returns the stored text and writes nothing; another verdict is refused.
  *  Everything that can refuse is decided before anything is written. */
-function approveStoredReceipt(store, seedHex, ref) {
+function decideStoredReceipt(store, seedHex, ref, verdict, note) {
+  const status = verdict === 'approve' ? 'confirmed' : 'declined';
   const row = store.getReceipt(ref);
   if (!row || typeof row !== 'object' || row.ref !== ref || typeof row.pending_text !== 'string') {
     throw new CliRefusal(`unknown ref ${JSON.stringify(String(ref).slice(0, 120))}: no receipt in the store under it`);
   }
+  if (note !== undefined) {
+    const problem = declineNoteProblem(note);
+    if (problem && row.decision !== null && row.decision !== undefined) throw new CliRefusal(problem);
+  }
   if (row.decision !== null && row.decision !== undefined) {
-    if (row.decision.status === 'confirmed' && typeof row.decision.text === 'string') return row.decision.text;
+    if (row.decision.status === status && typeof row.decision.text === 'string') return row.decision.text;
     throw new CliRefusal(`ref ${JSON.stringify(ref.slice(0, 120))} is already decided: `
-      + `${String(row.decision.status).slice(0, 40)}; approve does not overwrite it`);
+      + `${String(row.decision.status).slice(0, 40)}; ${verdict} does not overwrite it`);
   }
   let text;
-  try { text = confirmReceipt(seedHex, row.pending_text); } catch (e) { throw new CliRefusal(shortError(e)); }
-  store.putReceipt(ref, { ...row, decision: { status: 'confirmed', text, decided_ts: nowEpoch() } });
+  try {
+    text = verdict === 'approve' ? confirmReceipt(seedHex, row.pending_text) : declineReceipt(seedHex, row.pending_text, note);
+  } catch (e) { throw new CliRefusal(shortError(e)); }
+  store.putReceipt(ref, { ...row, decision: { status, text, decided_ts: nowEpoch() } });
   return text;
 }
 
-/** `decide <ref> approve --store <file>`: the owner's approval of a pending receipt this door
- *  issued, looked up by ref in its file store and never sent. Prints the follow-up text. */
+/** `decide <ref> approve|decline [--note <text>] --store <file>`: the owner's verdict on a pending
+ *  receipt this door issued, looked up by ref in its file store and never sent. Prints the
+ *  follow-up text. */
 async function decideMain(argv) {
   const positionals = [];
-  const flags = parseFlags(argv, { store: 'string' }, positionals);
-  if (positionals.length !== 2 || positionals[1] !== 'approve') throw new CliMisuse('expected <ref> approve --store <file>');
+  const flags = parseFlags(argv, { store: 'string', note: 'string' }, positionals);
+  if (positionals.length !== 2 || !['approve', 'decline'].includes(positionals[1])) {
+    throw new CliMisuse('expected <ref> approve|decline [--note <text>] --store <file>');
+  }
+  if (flags.note !== undefined && positionals[1] !== 'decline') throw new CliMisuse('--note goes with decline only');
   if (typeof flags.store !== 'string') throw new CliMisuse('--store is required');
   const root = process.cwd();
   const seed = findSeed(root, detectFramework(root));
@@ -8922,7 +8973,7 @@ async function decideMain(argv) {
   if (!existsSync(storePath)) throw new CliRefusal(`no store at ${flags.store.slice(0, 200)}`);
   let store;
   try { store = createFileStore(storePath); } catch (e) { throw new CliRefusal(shortError(e)); }
-  const text = approveStoredReceipt(store, seed.hex, positionals[0]);
+  const text = decideStoredReceipt(store, seed.hex, positionals[0], positionals[1], flags.note);
   process.stdout.write(`${text}\n`);
   return 0;
 }

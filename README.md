@@ -289,6 +289,15 @@ npx @muretai/agent-entry decide <ref> approve --store var/ledger.json
 It prints the shop's confirmed reply and stores it as that receipt's decision. Approving the same
 ref again prints the same bytes, and nothing is sent.
 
+You decline one the same way, with an optional note of at most 500 characters for the customer:
+
+```bash
+npx @muretai/agent-entry decide <ref> decline --note "Sold this morning; we restock Friday." --store var/ledger.json
+```
+
+The declined reply keeps the receipt's deal and termsHash, signed afresh. A ref keeps its first
+verdict: approving a declined ref, or declining an approved one, is refused.
+
 ## Who is knocking
 
 Observation, never identity. The person who found you often never opens a browser:
