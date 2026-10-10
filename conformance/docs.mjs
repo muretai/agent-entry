@@ -31,6 +31,9 @@
  *   - package.json: the version is the released one, read from CHANGELOG.md's newest dated
  *     section (a heading ending in "(YYYY-MM-DD)"), never a literal here; an undated heading
  *     such as "(not yet published)" is not a release.
+ *   - Hosted counts (S6a-4): "Counting visits" says the door and the page runtime post to
+ *     `entry.counts` and the card publishes it, and no longer says it is planned; the newest,
+ *     unpublished CHANGELOG section records it, with no release heading added.
  *
  * Run:  node conformance/docs.mjs      (from the package root)
  */
@@ -420,6 +423,78 @@ await section('released-version-reader', async () => {
   check(!sameVersion('1.13.1', undefined) && !sameVersion(undefined, '1.13.1'),
     'reader/refusal/a-missing-side-is-never-equal', '');
   check(sameVersion('1.13.1', '1.13.1') && !sameVersion('1.13.1', '1.13.0'), 'reader/control/equal-and-unequal', '');
+});
+
+// ---------------------------------------------------------------- 12. hosted counts (S6a-4)
+//
+// Agent Entry S6a-4 (split 4 of 4 of intake 20261002T130609Z, intake 20261002T215209Z, after
+// S6a-3 20261002T215208Z), WRITTEN BEFORE THE DOCS. What landed: the door posts the AT-14 body
+// to `entry.counts` (at most 2048 bytes, offer ids trunk refuses dropped, S6a-2), the page
+// runtime posts the same body, and the door publishes the counts URL on the card (S6a-3). The
+// README's "Counting visits" says so and no longer says it is planned; the newest, unpublished
+// CHANGELOG section records it, with no release heading and no version bump. Loose phrases,
+// never sentences.
+
+/** The paragraphs of `text` that name the counts field (`entry.counts` or `agentEntry.counts`). */
+const countsParas = (text) => String(text).split(/\n\s*\n/)
+  .filter((p) => /\b(?:entry|agentEntry)\.counts\b/.test(p));
+
+/** What a passage on hosted counts must say: each key phrase, case-insensitive. */
+const HOSTED_PHRASES = {
+  'hosted': (t) => /\bhosted\b/i.test(t),
+  'door-posts': (t) => /\bdoor\b/i.test(t) && /\bpost(?:s|ed|ing)?\b/i.test(t),
+  'page-runtime-posts': (t) => /\bpage runtime\b|agent-entry-page/i.test(t),
+  '2048-byte-cap': (t) => /\b2048\b|\b2\s?KB\b|\b2\s?KiB\b/i.test(t),
+  'trunk-refused-ids-dropped': (t) => /\btrunk\b/i.test(t)
+    && /\b(?:drop(?:s|ped)?|omit(?:s|ted)?|left out|skip(?:s|ped)?)\b/i.test(t),
+  'counts-url-on-card-or-contract': (t) => /\b(?:card|contract)\b/i.test(t)
+    && (/agentEntry\.counts/.test(t) || /\b(?:publish(?:es|ed)?|names?|carries)\b/i.test(t)),
+};
+const hostedMissing = (t) => Object.keys(HOSTED_PHRASES).filter((k) => !HOSTED_PHRASES[k](t));
+
+await section('hosted-counts', async () => {
+  const counting = mdSection(README, 3, 'Counting visits') ?? mdSection(README, 2, 'Counting visits') ?? '';
+  const paras = countsParas(counting).join('\n\n');
+  check(paras.length > 0, 'hosted-counts/readme/counting-names-entry.counts', '');
+  for (const k of hostedMissing(paras)) {
+    check(false, `hosted-counts/readme/${k}`, 'the "Counting visits" paragraphs naming entry.counts do not say it');
+  }
+
+  // Refusals: what was planned is now shipped, and the README says so nowhere else.
+  check(!/planned,?\s+not\s+shipped/i.test(README), 'hosted-counts/refusal/readme-no-longer-says-planned-not-shipped', '');
+  check(!/not\s+yet\s+accepted/i.test(counting), 'hosted-counts/refusal/readme-no-longer-says-entry.counts-not-yet-accepted', '');
+  check(!/until\s+it\s+ships/i.test(counting), 'hosted-counts/refusal/readme-no-longer-says-until-it-ships', '');
+  check(!/\bwould\s+send\b/i.test(paras), 'hosted-counts/refusal/readme-no-longer-in-the-conditional', '');
+
+  // The CHANGELOG: the newest section, undated and unpublished, records it.
+  const headings = CHANGELOG.split('\n').filter((l) => /^## /.test(l));
+  const top = headings[0] || '';
+  const undated = (l) => !/\(\d{4}-\d{2}-\d{2}\)\s*$/.test(l);
+  check(undated(top) && /not yet published|unreleased/i.test(top), 'hosted-counts/changelog/newest-section-is-unpublished', top);
+  const rec = (top && mdSection(CHANGELOG, 2, top.slice(3))) || '';
+  check(/\bhosted counts\b/i.test(rec), 'hosted-counts/changelog/names-hosted-counts', '');
+  check(rec.includes('entry.counts'), 'hosted-counts/changelog/names-entry.counts', '');
+  for (const k of hostedMissing(rec).filter((x) => x !== 'trunk-refused-ids-dropped')) {
+    check(false, `hosted-counts/changelog/${k}`, `the newest CHANGELOG section (${top}) does not say it`);
+  }
+
+  // Refusals: no release heading, no second unpublished heading, no bump.
+  const aboveReleased = RELEASED ? headings.slice(0, headings.indexOf(RELEASED.heading)) : headings;
+  check(aboveReleased.length === 1 && undated(aboveReleased[0]), 'hosted-counts/refusal/changelog-adds-no-second-unpublished-heading',
+    JSON.stringify(aboveReleased));
+  check(RELEASED !== null && headings.indexOf(RELEASED.heading) === 1 && !/hosted counts/i.test(RELEASED.heading),
+    'hosted-counts/refusal/changelog-adds-no-release-heading', RELEASED ? RELEASED.heading : releasedError);
+
+  // The checks discriminate: the 1.13.0 paragraph is refused, a shipped one passes.
+  const OLD = '**A hosted dashboard is planned, not shipped.** The planned field is `entry.counts` in\n'
+    + '`agent-entry.json`: a URL for a Muretai-hosted counts endpoint. The page runtime and the door\n'
+    + 'would send the same events there.';
+  check(hostedMissing(OLD).length > 0 && /planned,?\s+not\s+shipped/i.test(OLD), 'hosted-counts/refusal/old-paragraph-is-refused',
+    JSON.stringify(hostedMissing(OLD)));
+  const NEW = 'Hosted counts: the door posts the AT-14 body to `entry.counts`, at most 2048 bytes, and drops\n'
+    + 'an offer id trunk refuses. The page runtime posts the same body, and the card names the URL as\n'
+    + '`agentEntry.counts`.';
+  check(hostedMissing(NEW).length === 0, 'hosted-counts/control/shipped-paragraph-passes', JSON.stringify(hostedMissing(NEW)));
 });
 
 // ---------------------------------------------------------------- verdict
