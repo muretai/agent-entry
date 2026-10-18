@@ -32,8 +32,9 @@
  *     section (a heading ending in "(YYYY-MM-DD)"), never a literal here; an undated heading
  *     such as "(not yet published)" is not a release.
  *   - Hosted counts (S6a-4): "Counting visits" says the door and the page runtime post to
- *     `entry.counts` and the card publishes it, and no longer says it is planned; the newest,
- *     unpublished CHANGELOG section records it, with no release heading added.
+ *     `entry.counts` and the card publishes it, and no longer says it is planned; the newest
+ *     CHANGELOG section records hosted counts. An unpublished heading still passes. A dated
+ *     heading passes only for 2.0.0 when that section records hosted counts.
  *
  * Run:  node conformance/docs.mjs      (from the package root)
  */
@@ -481,12 +482,21 @@ await section('hosted-counts', async () => {
   check(!/until\s+it\s+ships/i.test(counting), 'hosted-counts/refusal/readme-no-longer-says-until-it-ships', '');
   check(!/\bwould\s+send\b/i.test(paras), 'hosted-counts/refusal/readme-no-longer-in-the-conditional', '');
 
-  // The CHANGELOG: the newest section, undated and unpublished, records it.
+  // The CHANGELOG: an unpublished newest section still passes. A dated newest section
+  // passes only for 2.0.0, and only when that section records hosted counts.
   const headings = CHANGELOG.split('\n').filter((l) => /^## /.test(l));
   const top = headings[0] || '';
   const undated = (l) => !/\(\d{4}-\d{2}-\d{2}\)\s*$/.test(l);
-  check(undated(top) && /not yet published|unreleased/i.test(top), 'hosted-counts/changelog/newest-section-is-unpublished', top);
   const rec = (top && mdSection(CHANGELOG, 2, top.slice(3))) || '';
+  const newestOk = (heading, section) => (undated(heading)
+    ? /not yet published|unreleased/i.test(heading)
+    : /^## 2\.0\.0(?=\s)/.test(heading) && /\bhosted counts\b/i.test(section));
+  check(newestOk(top, rec)
+    && newestOk('## 2.0.0 -- next (unreleased)', '')
+    && newestOk('## 2.0.0 -- hosted counts (2026-10-18)', 'added: hosted counts')
+    && !newestOk('## 2.0.0 -- other work (2026-10-18)', 'other work only')
+    && !newestOk('## 2.1.0 -- hosted counts (2026-10-18)', 'hosted counts'),
+    'hosted-counts/changelog/newest-section-is-unpublished', top);
   check(/\bhosted counts\b/i.test(rec), 'hosted-counts/changelog/names-hosted-counts', '');
   check(rec.includes('entry.counts'), 'hosted-counts/changelog/names-entry.counts', '');
   for (const k of hostedMissing(rec).filter((x) => x !== 'trunk-refused-ids-dropped')) {

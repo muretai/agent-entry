@@ -12,8 +12,7 @@ The runbook is [RELEASING.md](../../../RELEASING.md); this file is the order and
    pinned constants by name, writes `vendor/agent-seam/VENDOR.json` and rebuilds
    `conformance/vectors.json`. Commit that alone. Never edit the block or the vendored files by
    hand: `conformance/seam-twin.mjs` refuses the digests.
-2. **`npm test`** — must be green with no other checkout present (try
-   `MURETAI_AGENT_SEAM=/nonexistent npm test` if in doubt). The published tarball's `npm test`
+2. **`npm test`** — must be green with no other checkout present. The published tarball's `npm test`
    runs `conformance/run.mjs` and a `skip:` line from the twin; that is expected.
 3. **Guards, then cut.** `gh api user --jq .login` is `muretai`; `npm whoami` answers;
    `npm version minor|patch`; `npm publish`; `git push --follow-tags origin main`. Nothing is
