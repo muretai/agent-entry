@@ -58,6 +58,12 @@ import * as door from '../muretai-agent-entry.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
+const seamPath = join(ROOT, 'vendor', 'agent-seam', 'seam.mjs');
+if (!existsSync(seamPath)) {
+  if (!existsSync(join(ROOT, 'scripts', 'build-vectors.mjs'))) {
+    console.log('skip: vendor/agent-seam/seam.mjs is absent outside a checkout');
+  }
+}
 const VECTORS = JSON.parse(readFileSync(join(HERE, 'vectors-tools.json'), 'utf8'));
 const { AGENT_CARD_PATH, canonicalJSON, compileDeclaration, createAgentEntry, didFromSeedHex,
   makeToolsEnvelope, signBytes } = door;
@@ -1616,11 +1622,17 @@ if (DOOR_H && H_ENV) {
 }
 
 // 10b-j. The page runtime stays one file with zero dependencies and the vendored seam is untouched.
+// The published package carries no vendor/agent-seam/; a source checkout still pins the copy.
 {
-  const seam = readFileSync(join(ROOT, 'vendor', 'agent-seam', 'seam.mjs'));
-  check(createHash('sha256').update(seam).digest('hex')
-      === '0b724e456ebedf9063f8e562a4b77f70ddedbdc7c9880e80121dbe56995792ed',
-    'hosted/seam/vendor-agent-seam-seam-mjs-is-the-v0.3.5-copy');
+  if (existsSync(seamPath)) {
+    const seam = readFileSync(seamPath);
+    check(createHash('sha256').update(seam).digest('hex')
+        === '0b724e456ebedf9063f8e562a4b77f70ddedbdc7c9880e80121dbe56995792ed',
+      'hosted/seam/vendor-agent-seam-seam-mjs-is-the-v0.3.5-copy');
+  } else if (existsSync(join(ROOT, 'scripts', 'build-vectors.mjs'))) {
+    check(false, 'hosted/seam/vendor-agent-seam-seam-mjs-is-the-v0.3.5-copy',
+      'vendor/agent-seam/seam.mjs is missing from a source checkout — run: npm run vendor:seam');
+  }
 }
 
 await settle(50);
