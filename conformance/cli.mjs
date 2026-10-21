@@ -766,8 +766,11 @@ await section('doctor-live', async () => {
     check(forged.code === 1 && (parseJsonOut('doctor-live/forged', forged)?.rows || []).some((r) => r.level === 'FAIL'),
       'doctor-live/forged-contract-envelope-fails', `exit ${forged.code}`);
 
-    // A door without a declaration: no contract, no collector -> FAIL.
-    const plain = createAgentEntry({ seedHex: DOCTOR_SEED, name: 'Harbor Lamp', baseUrl: fx.origin });
+    // Skills and no declaration: no contract, no collector -> FAIL.
+    const plain = createAgentEntry({
+      seedHex: DOCTOR_SEED, name: 'Harbor Lamp', baseUrl: fx.origin,
+      skills: [{ id: 'book', name: 'book', description: 'Book a table.' }],
+    });
     fx.state.handler = (...a) => plain.handleRequestAsync(...a);
     const none = await runCli(['doctor', '--url', fx.origin, '--json']);
     check(none.code === 1, 'doctor-live/door-without-contract-fails', `exit ${none.code}`);
