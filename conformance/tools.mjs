@@ -437,14 +437,24 @@ async function get(entry, method, path, headers = {}, body = Buffer.alloc(0)) {
       === JSON.stringify(['https://hire.example', 'https://pedal-hire.example']),
     'origin/vector-origins-are-baseUrl-then-lowercased-domains');
 
-  // A door without a declaration is byte-for-byte the door it was: no tools, no collector.
+  // No declaration and no skills of its own: a default declaration is derived. The shape is
+  // pinned in conformance/default-declaration.mjs. Skills the caller passed stay an empty face.
   const plain = createAgentEntry({ seedHex: SEED, name: 'Plain', baseUrl: 'https://plain.example' });
-  check(!Object.hasOwn(plain.card.agentEntry || {}, 'tools') && !Object.hasOwn(plain.card.agentEntry || {}, 'events'),
-    'door/no-declaration-no-tools-on-the-card');
+  check(plain.card.agentEntry?.tools === `https://plain.example${TOOLS}`
+      && plain.card.agentEntry?.events === `https://plain.example${EVENTS}`,
+    'door/no-declaration-derives-tools-on-the-card', JSON.stringify(plain.card.agentEntry));
+  const derived = await get(plain, 'GET', TOOLS);
+  check(derived.status === 200, 'door/no-declaration/GET-agent-tools.json-200', `HTTP ${derived.status}`);
+  const skilled = createAgentEntry({
+    seedHex: SEED, name: 'Skilled', baseUrl: 'https://skilled.example',
+    skills: [{ id: 'book', name: 'book', description: 'Book a table.' }],
+  });
+  check(!Object.hasOwn(skilled.card.agentEntry || {}, 'tools') && !Object.hasOwn(skilled.card.agentEntry || {}, 'events'),
+    'door/skills-without-declaration-keeps-the-empty-face');
   for (const path of [TOOLS, TOOLS_SIG, '/.well-known/agent-tools/v1.json', EVENTS]) {
     for (const method of ['GET', 'POST', 'OPTIONS']) {
-      const o = await get(plain, method, path, { 'content-type': 'application/json' }, Buffer.from('{}'));
-      check(o.status === 404, `door/no-declaration/${method}-${path}-404`, `HTTP ${o.status}`);
+      const o = await get(skilled, method, path, { 'content-type': 'application/json' }, Buffer.from('{}'));
+      check(o.status === 404, `door/skills-without-declaration/${method}-${path}-404`, `HTTP ${o.status}`);
     }
   }
 }
