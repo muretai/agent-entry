@@ -8831,6 +8831,7 @@ function tallyCounts(lines, accounts, storePresent) {
   const declared = new Map();
   const network = new Map();
   const platforms = new Map();
+  const byCountry = new Map();
   let stealth = 0;
   let none = 0;
   let firstContacts = 0;
@@ -8867,6 +8868,8 @@ function tallyCounts(lines, accounts, storePresent) {
     if (e.stage === 'signed_post' && e.first_contact === true) firstContacts += 1;
     if (e.stage === 'signed_post' && e.first_contact === false) returningKnocks += 1;
     bump(byClass, typeof e.client_class === 'string' && CLIENT_CLASSES.has(e.client_class) ? e.client_class : 'unknown');
+    // A country is the two ASCII capitals look() logs; a knock with none adds no key.
+    if (typeof e.country === 'string' && /^[A-Z]{2}$/.test(e.country)) bump(byCountry, e.country);
     let tiers = 0;
     if (isVendor(e.signature_agent)) { bump(signed, e.signature_agent); tiers += 1; }
     if (typeof e.ua_family === 'string' && AI_AGENT_FAMILIES.has(e.ua_family)) { bump(declared, e.ua_family); tiers += 1; }
@@ -8892,6 +8895,7 @@ function tallyCounts(lines, accounts, storePresent) {
     knocks: { by_stage: Object.fromEntries(byStage), by_class: Object.fromEntries(byClass) },
     who: { signed: Object.fromEntries(signed), declared: Object.fromEntries(declared), network: Object.fromEntries(network),
       'stealth-agent': stealth, none },
+    by_country: Object.fromEntries(byCountry),
     platforms: Object.fromEntries(platforms),
   };
 }
@@ -8925,6 +8929,7 @@ function countsText(c) {
     `signed knocks: new ${c.contacts.new}, returning ${c.contacts.returning}`,
     `door knocks by stage: ${pairs(c.knocks.by_stage)}`,
     `door knocks by client class: ${pairs(c.knocks.by_class)}`,
+    `door knocks by country: ${pairs(c.by_country)}`,
     `platforms: ${pairs(c.platforms)}`,
   ];
 }
