@@ -286,3 +286,187 @@ test('counts --json: a value outside the bounded vocabularies never becomes a wh
   assert.equal(out.coverage.rows_dropped + out.who['stealth-agent'] + out.who.none, rows.length,
     `each forged row is either dropped or counted once outside the tiers: ${JSON.stringify(out)}`);
 });
+
+// ---------------------------------------------------------------- by country
+//
+// Intake 20261028T111224Z-2 (parent 20261003T131711Z), the predecessor of agent-entry-go's
+// counts-html by-country cases, which spawn this CLI and expect the same shape:
+//   json: a top-level `by_country` object, the key right after `who`. Each door knock
+//     (signed_post, anon_post, refused_post) counts under its country. A knock with no country,
+//     a page, card_get or notice_get row, and a dropped row add nothing. With no country data it
+//     is {}, never missing.
+//   text: exactly one line, right after `door knocks by client class:`, reading
+//     `door knocks by country: JP 2, US 1, DE 1` in by_country order, or
+//     `door knocks by country: none` when the map is empty.
+//   The coverage header and the who block are the same whether or not countries are present.
+
+/** Two JP knocks, one US, one DE; a knock with no country; page, card_get and notice_get rows
+ *  carrying countries that must not be counted. by_country is { JP: 2, US: 1, DE: 1 }. */
+function countryRows() {
+  return [
+    { t: T0 + 1, stage: 'signed_post', offer: 'ask', reply: 'facts', ua_family: 'claude-user',
+      client_class: 'declared-agent', ip_vendor: 'anthropic', signature_agent: 'anthropic', country: 'JP' },
+    { t: T0 + 2, stage: 'anon_post', ua_family: 'gptbot', client_class: 'declared-agent', ip_vendor: 'openai', country: 'US' },
+    { t: T0 + 3, stage: 'refused_post', refused: 'rate', ua_family: 'other', client_class: 'stealth-agent', country: 'DE' },
+    { t: T0 + 4, stage: 'refused_post', refused: 'size', ua_family: 'browser', client_class: 'human-like', country: 'JP' },
+    { t: T0 + 5, stage: 'anon_post', ua_family: 'browser', client_class: 'human-like' },
+    { t: T0 + 6, stage: 'page', event: 'referral', engine: 'chatgpt', country: 'FR' },
+    { t: T0 + 7, stage: 'card_get', ua_family: 'claude-user', client_class: 'declared-agent', country: 'BR' },
+    { t: T0 + 8, stage: 'notice_get', ua_family: 'gptbot', client_class: 'declared-agent', country: 'IN' },
+  ];
+}
+const COUNTRY_MAP = { JP: 2, US: 1, DE: 1 };
+const NOT_KNOCK_COUNTRIES = ['FR', 'BR', 'IN'];
+
+const noCountryRows = () => countryRows().map((r) => {
+  const copy = { ...r };
+  delete copy.country;
+  return copy;
+});
+
+/** `counts` (the text form) on a fixture: exit 0, no DID, the stdout lines. */
+async function countsTextLines(fx) {
+  const run = await runCli(['counts', '--log', fx.log, ...(fx.store ? ['--store', fx.store] : [])], fx.dir);
+  assert.equal(run.code, 0, `counts: ${said(run)}`);
+  assert.ok(!run.stdout.includes('did:'), `no DID anywhere in counts: ${said(run)}`);
+  assert.ok(!run.stdout.includes(MARKER), 'no message text anywhere in counts');
+  return run.stdout.split('\n');
+}
+
+const countryLineOf = (map) => {
+  const entries = Object.entries(map);
+  return `door knocks by country: ${entries.length ? entries.map(([k, n]) => `${k} ${n}`).join(', ') : 'none'}`;
+};
+
+function assertByCountry(out) {
+  assert.ok(Object.hasOwn(out, 'by_country'), `a top-level by_country: keys ${JSON.stringify(Object.keys(out))}`);
+  const map = out.by_country;
+  assert.ok(map && typeof map === 'object' && !Array.isArray(map), `by_country is a map: ${JSON.stringify(map)}`);
+  for (const [k, n] of Object.entries(map)) {
+    assert.equal(typeof k, 'string');
+    assert.ok(Number.isInteger(n) && n > 0, `by_country.${k} is a positive count: ${n}`);
+  }
+  const keys = Object.keys(out);
+  assert.equal(keys.indexOf('by_country'), keys.indexOf('who') + 1, `by_country is the key right after who: ${keys.join(',')}`);
+}
+
+function assertCountryLine(lines, map) {
+  const found = lines.filter((l) => l.startsWith('door knocks by country:'));
+  assert.equal(found.length, 1, `exactly one country line: ${JSON.stringify(lines)}`);
+  assert.equal(found[0], countryLineOf(map));
+  const classAt = lines.findIndex((l) => l.startsWith('door knocks by client class:'));
+  assert.ok(classAt >= 0, `the client class line is still there: ${JSON.stringify(lines)}`);
+  assert.equal(lines[classAt + 1], found[0], `the country line follows the client class line: ${JSON.stringify(lines)}`);
+}
+
+test('counts --json: by_country counts each door knock under its country, right after who', async () => {
+  const out = await countsJson(fixture(countryRows()));
+  assertShape(out);
+  assertByCountry(out);
+  assert.deepEqual(out.by_country, COUNTRY_MAP);
+  assert.deepEqual(Object.keys(out.by_country), ['JP', 'US', 'DE'], 'in first-seen order');
+});
+
+test('counts (text): one country line in by_country order, right after the client class line', async () => {
+  const lines = await countsTextLines(fixture(countryRows()));
+  assertCountryLine(lines, COUNTRY_MAP);
+  assert.ok(lines.includes('door knocks by country: JP 2, US 1, DE 1'), JSON.stringify(lines));
+});
+
+test('counts: json and text agree on the same fixture rows', async () => {
+  for (const rows of [countryRows(), noCountryRows(), []]) {
+    const fx = fixture(rows);
+    const out = await countsJson(fx);
+    assertByCountry(out);
+    assertCountryLine(await countsTextLines(fx), out.by_country);
+  }
+});
+
+test('counts --json: countries do not change the coverage header or the who block', async () => {
+  const withCountry = await countsJson(fixture(countryRows()));
+  const without = await countsJson(fixture(noCountryRows()));
+  assertShape(withCountry);
+  assertShape(without);
+  assertByCountry(withCountry);
+  assertByCountry(without);
+  assert.deepEqual(withCountry.coverage, without.coverage);
+  assert.deepEqual(withCountry.who, without.who);
+  assert.deepEqual(withCountry.coverage, {
+    from: iso(T0 + 1), to: iso(T0 + 8), last_event: iso(T0 + 8), store_present: true, rows_dropped: 0,
+  });
+  assert.deepEqual(withCountry.who, {
+    signed: { anthropic: 1 }, declared: { 'claude-user': 1, gptbot: 1 }, network: { anthropic: 1, openai: 1 },
+    'stealth-agent': 1, none: 2,
+  });
+  // The full fixture's who and coverage pins above still hold beside the new key.
+  const full = await countsJson(fixture(FULL));
+  assertByCountry(full);
+  assert.deepEqual(full.who, FULL_WHO);
+  assert.equal(full.coverage.rows_dropped, 0);
+});
+
+test('counts: an empty log has by_country {} beside who, and the text says none', async () => {
+  const fx = fixture([]);
+  const out = await countsJson(fx);
+  assertShape(out);
+  assertByCountry(out);
+  assert.deepEqual(out.by_country, {});
+  assert.deepEqual(out.who, { signed: {}, declared: {}, network: {}, 'stealth-agent': 0, none: 0 });
+  assertCountryLine(await countsTextLines(fx), {});
+  assert.ok((await countsTextLines(fx)).includes('door knocks by country: none'));
+});
+
+test('counts: knocks with no country give by_country {}, and the text says none', async () => {
+  const fx = fixture(noCountryRows());
+  const out = await countsJson(fx);
+  assertByCountry(out);
+  assert.deepEqual(out.by_country, {});
+  assert.ok(Object.keys(out.who.declared).length >= 1, 'the knocks are still counted under who');
+  const lines = await countsTextLines(fx);
+  assertCountryLine(lines, {});
+  assert.ok(lines.includes('door knocks by country: none'), JSON.stringify(lines));
+});
+
+// ---------------------------------------------------------------- by country: refusals
+
+test('counts --json: page, card_get and notice_get rows add no country', async () => {
+  const fx = fixture([
+    { t: T0 + 1, stage: 'page', event: 'referral', engine: 'chatgpt', country: 'FR' },
+    { t: T0 + 2, stage: 'page', event: 'offer_started', offer: 'ask', country: 'JP' },
+    { t: T0 + 3, stage: 'card_get', ua_family: 'claude-user', client_class: 'declared-agent', country: 'BR' },
+    { t: T0 + 4, stage: 'notice_get', ua_family: 'gptbot', client_class: 'declared-agent', country: 'IN' },
+  ]);
+  const out = await countsJson(fx);
+  assertByCountry(out);
+  assert.deepEqual(out.by_country, {}, `no knock, no country: ${JSON.stringify(out.by_country)}`);
+  assertCountryLine(await countsTextLines(fx), {});
+  const mixed = await countsJson(fixture(countryRows()));
+  for (const c of NOT_KNOCK_COUNTRIES) assert.equal(Object.hasOwn(mixed.by_country, c), false, `${c} is from a non-knock row`);
+});
+
+test('counts --json: a knock with no country adds nothing, not an empty or unknown key', async () => {
+  const out = await countsJson(fixture([
+    ...countryRows(),
+    { t: T0 + 9, stage: 'signed_post', offer: 'ask', reply: 'facts', ua_family: 'claude-user', client_class: 'declared-agent' },
+    { t: T0 + 10, stage: 'refused_post', refused: 'signature' },
+  ]));
+  assertByCountry(out);
+  assert.deepEqual(out.by_country, COUNTRY_MAP);
+  for (const k of ['', 'none', 'unknown', 'undefined', 'null']) assert.equal(Object.hasOwn(out.by_country, k), false, `no ${JSON.stringify(k)} key`);
+});
+
+test('counts --json: a dropped row adds no country, and is still counted in the header', async () => {
+  const dropped = [
+    { t: T0 + 100, stage: 'signed_post', offer: 'ask', reply: 'facts', ua_family: 'openai', did: DID, country: 'NZ' },
+    { t: T0 + 110, stage: 'anon_post', ua_family: 'claude-user', text: MARKER, country: 'NZ' },
+    { t: T0 + 120, stage: 'signed_post', signature_agent: DID, country: 'JP' },
+    { t: T0 + 130, stage: 'anon_post', country: DID },
+  ];
+  const fx = fixture([...countryRows(), ...dropped]);
+  const out = await countsJson(fx);
+  assertShape(out);
+  assertByCountry(out);
+  assert.deepEqual(out.by_country, COUNTRY_MAP, `dropped rows add nothing: ${JSON.stringify(out.by_country)}`);
+  assert.equal(out.coverage.rows_dropped, dropped.length, JSON.stringify(out.coverage));
+  assertCountryLine(await countsTextLines(fx), COUNTRY_MAP);
+});
