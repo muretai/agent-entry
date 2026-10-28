@@ -221,8 +221,16 @@ A door started with prior versions **MUST** refuse to start when any prior versi
 - is out of sequence (versions are 1, 2, … with no gap or repeat);
 - or does not name the door's origin.
 
-A door without a declaration **MUST** be exactly the door it was: no `tools` or `events` on the
-card, and every one of these routes 404.
+A door started with no declaration and no `skills` of its own derives a default declaration
+instead of an empty face. That declaration has one `ask` offer answered from the public facts
+and the site name, and one `find` offer only when a products snapshot was given. It is compiled
+and served as a given declaration is: the signed contract, its signature and `v1.json`, with
+`agentEntry.tools`, `agentEntry.events` and `skills[]` generated from those offers. `GET /`
+lists the offers. A fact value or a site name that holds markup or a control character is kept
+in the contract and is not echoed raw into `GET /`. A declaration the caller passed is compiled
+unchanged: facts and a snapshot are not merged into it. A door that passes its own `skills`
+and no declaration stays the door it was: no `tools` or `events` on the card, and every one
+of these routes 404. `null` is still a declaration that failed to load, and is refused.
 
 ### 2.5 The door answers offers
 
@@ -268,9 +276,10 @@ By kind (the reference's status strings are given for interoperability):
   gains `offer`, the chosen offer's id. A brain reply carries no `deal`: the door does not
   rewrite the site's text.
 
-A door built without a declaration keeps its own skills, responder and reply bytes unchanged.
-The recipe doors' card and reply bytes are pinned in
-`conformance/fixtures/recipe-replies-pre-offers.json`.
+A door built with its own `skills` and no declaration keeps those skills, its responder and
+its reply bytes unchanged. A knock that names no offer still reaches the responder. A knock
+that names a derived ask or find is answered by that offer. The recipe doors' card and reply
+bytes are pinned in `conformance/fixtures/recipe-replies-pre-offers.json`.
 
 **AT-13. The `deal` block.** When the chosen offer's `door.receipt` is true and the visitor
 signed, the reply **MUST** carry a deal block. The block is ready for a 2-of-2 receipt and is

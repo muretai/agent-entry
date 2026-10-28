@@ -20,7 +20,9 @@
     "scripts/vendor-ranges.mjs",
     "LICENSE",
     "spec/",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "connectors/muse.md"
   ],
   "engines": {
     "node": ">=20"

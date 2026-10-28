@@ -406,6 +406,7 @@ if (ks) {
     seedHex: '66'.repeat(32),
     name: 'knock-conformance',
     baseUrl: 'https://knock.example',
+    skills: [{ id: 'book', name: 'book', description: 'Book a time.' }],
     responder: (env) => `booked for ${env.peer_did}`,
   });
   const fetchEntry = async (url, init = {}) => {

@@ -38,11 +38,18 @@
 //   The door reaches the network through globalThis.fetch (read no earlier than createAgentEntry,
 //   as gaSink's default is), so the stub below sees every byte that would leave.
 import * as door from '../muretai-agent-entry.mjs';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const ROOT = join(HERE, '..');
+const seamPath = join(ROOT, 'vendor', 'agent-seam', 'seam.mjs');
+if (!existsSync(seamPath)) {
+  if (!existsSync(join(ROOT, 'scripts', 'build-vectors.mjs'))) {
+    console.log('skip: vendor/agent-seam/seam.mjs is absent outside a checkout');
+  }
+}
 const VECTORS = JSON.parse(readFileSync(join(HERE, 'vectors-tools.json'), 'utf8'));
 const { createAgentEntry, didFromSeedHex } = door;
 
@@ -799,10 +806,15 @@ for (const mode of ['throw', 'reject', 'timeout', '500', '404']) {
       JSON.stringify(pkg[field]));
   }
   const { createHash } = await import('node:crypto');
-  const seam = readFileSync(join(HERE, '..', 'vendor', 'agent-seam', 'seam.mjs'));
-  check(createHash('sha256').update(seam).digest('hex')
-      === '0b724e456ebedf9063f8e562a4b77f70ddedbdc7c9880e80121dbe56995792ed',
-    'counts/seam/vendor-agent-seam-seam-mjs-is-the-v0.3.5-copy');
+  if (existsSync(seamPath)) {
+    const seam = readFileSync(seamPath);
+    check(createHash('sha256').update(seam).digest('hex')
+        === '0b724e456ebedf9063f8e562a4b77f70ddedbdc7c9880e80121dbe56995792ed',
+      'counts/seam/vendor-agent-seam-seam-mjs-is-the-v0.3.5-copy');
+  } else if (existsSync(join(ROOT, 'scripts', 'build-vectors.mjs'))) {
+    check(false, 'counts/seam/vendor-agent-seam-seam-mjs-is-the-v0.3.5-copy',
+      'vendor/agent-seam/seam.mjs is missing from a source checkout — run: npm run vendor:seam');
+  }
 }
 
 // 8i. Every request the door made in this file went to entry.counts and carried a body trunk accepts.

@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name: WooCommerce Agent Entry
- * Description: One-file signed agent door for a WooCommerce shop: serves the shop's Agent Card and its signature.
+ * Description: One-file signed agent door for a WooCommerce shop: serves the shop's Agent Card, its signature, and the agent-tools contract.
  * Version: 1.0.0
  * Requires Plugins: woocommerce
  * License: MIT
@@ -14,8 +14,8 @@
  *
  * The card, its legacy path and the signature envelope are byte for byte what the Node door
  * (createAgentEntry({seedHex, name, baseUrl, declaration})) serves for the same declaration,
- * seed and second. The card names agent-tools.json because the Node door's card does; serving
- * that contract, ask and hold are later steps of this plugin.
+ * seed and second. So are the contract at /.well-known/agent-tools.json and its agenttools
+ * envelope at /.well-known/agent-tools.sig.json. Ask and hold are later steps of this plugin.
  */
 
 if (!defined('ABSPATH')) {
@@ -29,7 +29,10 @@ const MAE_WOO_CARD = '/.well-known/agent-card.json';
 const MAE_WOO_CARD_LEGACY = '/.well-known/agent.json';
 const MAE_WOO_SIG = '/.well-known/agent-card.sig.json';
 const MAE_WOO_TOOLS = '/.well-known/agent-tools.json';
+const MAE_WOO_TOOLS_SIG = '/.well-known/agent-tools.sig.json';
 const MAE_WOO_TOOLS_EVENTS = '/.well-known/agent-tools/events';
+const MAE_WOO_TOOLS_SIG_TRANSIENT = 'muretai_agent_entry_tools_sig';
+const MAE_WOO_TOOLS_ALLOW = 'GET, HEAD, OPTIONS';
 const MAE_WOO_SIG_REFRESH_S = 3600;
 const MAE_WOO_SCHEME = 'did-key-ed25519';
 
@@ -312,27 +315,27 @@ function mae_woo_prefer($entry) {
     return $prefer;
 }
 
+/** The compiled `page.do` value (AT-6). Validation is the same as before; the value is what
+ *  the contract publishes, in the Node door's key order. */
 function mae_woo_page_action($action, $value, $input, $field) {
     switch ($action) {
         case 'open':
-            mae_woo_same_origin_path($value, "$field.open");
-            mae_woo_placeholders_name_input($value, $input, "$field.open");
-            return;
+            $path = mae_woo_same_origin_path($value, "$field.open");
+            mae_woo_placeholders_name_input($path, $input, "$field.open");
+            return $path;
         case 'read':
-            mae_woo_declared_string($value, "$field.read");
-            return;
+            return mae_woo_declared_string($value, "$field.read");
         case 'call':
             if (!is_string($value) || !preg_match('/^[A-Za-z_$][A-Za-z0-9_$]*$/D', $value)) {
                 mae_woo_refuse("$field.call", 'must be the name of a function the page registers');
             }
-            return;
+            return $value;
         case 'fill':
             if (!$value instanceof stdClass) {
                 mae_woo_refuse("$field.fill", 'must be {form: "<selector>"}');
             }
             mae_woo_only_keys($value, array('form'), "$field.fill");
-            mae_woo_declared_string($value->form ?? null, "$field.fill.form");
-            return;
+            return array('form' => mae_woo_declared_string($value->form ?? null, "$field.fill.form"));
         case 'fetch':
             if (!$value instanceof stdClass) {
                 mae_woo_refuse("$field.fetch", 'must be {method, path, query?}');
@@ -341,19 +344,25 @@ function mae_woo_page_action($action, $value, $input, $field) {
             if (!in_array($value->method ?? null, array('GET', 'POST'), true)) {
                 mae_woo_refuse("$field.fetch.method", 'must be "GET" or "POST"');
             }
-            mae_woo_same_origin_path($value->path ?? null, "$field.fetch.path");
+            $out = array(
+                'method' => $value->method,
+                'path' => mae_woo_same_origin_path($value->path ?? null, "$field.fetch.path"),
+            );
             if (mae_woo_has($value, 'query')) {
                 if (!$value->query instanceof stdClass) {
                     mae_woo_refuse("$field.fetch.query", 'must map a query parameter to an input field');
                 }
+                $query = array();
                 foreach (get_object_vars($value->query) as $param => $from) {
                     mae_woo_declared_string((string) $param, "$field.fetch.query");
                     if (!is_string($from) || !array_key_exists($from, $input)) {
                         mae_woo_refuse("$field.fetch.query", 'must map each parameter to a field of the offer\'s input');
                     }
+                    $query[(string) $param] = $from;
                 }
+                $out['query'] = $query;
             }
-            return;
+            return $out;
     }
     mae_woo_refuse($field, 'must be one of open, read, fill, fetch, call');
 }
@@ -407,11 +416,14 @@ function mae_woo_offer($offer, $i, $has_facts) {
             mae_woo_refuse("$at.ask", 'is unknown or lowers the effect\'s floor');
         }
     }
+    $ask = mae_woo_has($offer, 'ask') ? $offer->ask : $floor;
     if (mae_woo_has($offer, 'then') && $offer->then !== 'door' && $offer->then !== 'none') {
         mae_woo_refuse("$at.then", 'must be "door" or "none"');
     }
 
     $bound = false;
+    $page_out = null;
+    $page_then = false;
     if (mae_woo_has($offer, 'page')) {
         $page = $offer->page;
         if (!$page instanceof stdClass) {
@@ -421,8 +433,9 @@ function mae_woo_offer($offer, $i, $has_facts) {
         if (!is_array($page->on ?? null) || count($page->on) === 0) {
             mae_woo_refuse("$at.page.on", 'must be a non-empty list of route patterns');
         }
+        $on = array();
         foreach ($page->on as $pattern) {
-            mae_woo_same_origin_path($pattern, "$at.page.on");
+            $on[] = mae_woo_same_origin_path($pattern, "$at.page.on");
         }
         $do = ($page->do ?? null) instanceof stdClass ? get_object_vars($page->do) : null;
         $actions = array('open', 'read', 'fill', 'fetch', 'call');
@@ -435,10 +448,15 @@ function mae_woo_offer($offer, $i, $has_facts) {
         if (mae_woo_has($page, 'then') && mae_woo_has($offer, 'then') && $offer->then === 'none') {
             mae_woo_refuse("$at.then", 'is "none" while page.then is "door"');
         }
+        $page_then = mae_woo_has($page, 'then') && $page->then === 'door';
         $action = (string) array_keys($do)[0];
-        mae_woo_page_action($action, $do[$action], $input, "$at.page.do");
+        $page_out = array(
+            'on' => $on,
+            'do' => array($action => mae_woo_page_action($action, $do[$action], $input, "$at.page.do")),
+        );
         $bound = true;
     }
+    $door_out = null;
     if (mae_woo_has($offer, 'door')) {
         $door = $offer->door;
         if (!$door instanceof stdClass) {
@@ -464,12 +482,41 @@ function mae_woo_offer($offer, $i, $has_facts) {
         } elseif (mae_woo_has($door, 'url')) {
             mae_woo_refuse("$at.door.url", 'belongs to a checkout reply only');
         }
+        $receipt_verbs = array('hold', 'book', 'order', 'quote');
+        $door_out = array(
+            'reply' => $reply,
+            'receipt' => mae_woo_has($door, 'receipt') ? $door->receipt : in_array($verb, $receipt_verbs, true),
+        );
+        if ($reply === 'checkout') {
+            $door_out['url'] = $door->url;
+        }
         $bound = true;
     }
     if (!$bound) {
         mae_woo_refuse($at, 'binds neither a page nor a door, so nothing can do it');
     }
-    return array('id' => $verb . '_' . $offer->of, 'verb' => $verb, 'of' => $offer->of, 'about' => $about, 'input' => $input);
+    // Key order is the Node door's (id, verb, of, about, input, effect?, ask?, page?, then?, door?),
+    // which JSON.stringify keeps. Canonical serving sorts the keys again.
+    $offer_then = mae_woo_has($offer, 'then') ? $offer->then : null;
+    $then_door = $offer_then === 'door' || $page_then
+        || ($offer_then !== 'none' && $effect !== null && ($effect === 'changes' || $effect === 'pays'));
+    $out = array('id' => $verb . '_' . $offer->of, 'verb' => $verb, 'of' => $offer->of, 'about' => $about, 'input' => $input);
+    if ($effect !== null) {
+        $out['effect'] = $effect;
+    }
+    if ($ask !== null) {
+        $out['ask'] = $ask;
+    }
+    if ($page_out !== null) {
+        $out['page'] = $page_out;
+    }
+    if ($then_door) {
+        $out['then'] = 'door';
+    }
+    if ($door_out !== null) {
+        $out['door'] = $door_out;
+    }
+    return $out;
 }
 
 /** The declaration in the option, read and validated; throws on anything the Node door refuses. */
@@ -479,7 +526,7 @@ function mae_woo_declaration() {
     if (!$d instanceof stdClass) {
         mae_woo_refuse('declaration', 'must be an object: {v, entry, offers, facts?}');
     }
-    mae_woo_only_keys($d, array('v', 'entry', 'offers', 'facts', 'facts_source'), 'declaration');
+    mae_woo_only_keys($d, array('v', 'entry', 'offers', 'facts', 'facts_source', 'privateFacts'), 'declaration');
     if (($d->v ?? null) !== 1 && ($d->v ?? null) !== 1.0) {   // JSON.parse reads 1.0 as 1
         mae_woo_refuse('v', 'must be 1');
     }
@@ -490,6 +537,7 @@ function mae_woo_declaration() {
     mae_woo_only_keys($entry, array('name', 'baseUrl', 'domains', 'prefer', 'catalog', 'counts', 'claim'), 'entry');
     $name = mae_woo_declared_string($entry->name ?? null, 'entry.name');
     $base = mae_woo_canonical_base_url($entry->baseUrl ?? null);
+    $domains = array();
     if (mae_woo_has($entry, 'domains')) {
         if (!is_array($entry->domains)) {
             mae_woo_refuse('entry.domains', 'must be a list of bare domain names');
@@ -500,7 +548,10 @@ function mae_woo_declaration() {
             if (!mae_woo_valid_bare_domain($lowered)) {
                 mae_woo_refuse('entry.domains', 'is not a list of bare domain names');
             }
-            $seen[$lowered] = true;
+            if (!isset($seen[$lowered])) {
+                $seen[$lowered] = true;
+                $domains[] = $lowered;
+            }
         }
         if (count($seen) > 5) {
             mae_woo_refuse('entry.domains', 'names more than the 5 a card may advertise');
@@ -520,13 +571,34 @@ function mae_woo_declaration() {
         mae_woo_refuse('entry.claim', 'must be the Catalog\'s claim code: exactly 32 lowercase hex characters');
     }
     $has_facts = mae_woo_has($d, 'facts');
+    $facts = null;
     if ($has_facts) {
         if (!$d->facts instanceof stdClass) {
             mae_woo_refuse('facts', 'must map a name to a string');
         }
+        $facts = array();
         foreach (get_object_vars($d->facts) as $key => $value) {
-            mae_woo_declared_string((string) $key, 'facts');
-            mae_woo_declared_string($value, 'facts');
+            $key = (string) $key;
+            mae_woo_declared_string($key, 'facts');
+            $facts[$key] = mae_woo_declared_string($value, 'facts');
+        }
+        if (count($facts) === 0) {
+            $facts = new stdClass();
+        }
+    }
+    // The owner's own facts: checked, never compiled, signed, served or logged.
+    if (mae_woo_has($d, 'privateFacts')) {
+        if (!$d->privateFacts instanceof stdClass) {
+            mae_woo_refuse('privateFacts', 'must map a name to a string');
+        }
+        foreach (get_object_vars($d->privateFacts) as $key => $value) {
+            $key = (string) $key;
+            mae_woo_declared_string($key, 'privateFacts');
+            $at = 'privateFacts.' . substr($key, 0, 40);
+            mae_woo_declared_string($value, $at);
+            if ($has_facts && property_exists($d->facts, $key)) {
+                mae_woo_refuse($at, 'is also a public fact: keep one of the two');
+            }
         }
     }
     // Who gave a fact (metadata beside facts, never in the contract), as the Node door reads it.
@@ -554,7 +626,18 @@ function mae_woo_declaration() {
         }
         $offers[$read['id']] = $read;
     }
-    return array('name' => $name, 'base' => $base, 'prefer' => $prefer, 'offers' => array_values($offers));
+    $origin = mae_woo_origin_of($base);
+    $origins = array($origin);
+    foreach ($domains as $domain) {
+        $named = 'https://' . $domain;
+        if (!in_array($named, $origins, true)) {
+            $origins[] = $named;
+        }
+    }
+    return array(
+        'name' => $name, 'base' => $base, 'origin' => $origin, 'origins' => $origins,
+        'prefer' => $prefer, 'offers' => array_values($offers), 'facts' => $facts,
+    );
 }
 
 // ---------------------------------------------------------------- the card
@@ -753,6 +836,193 @@ function mae_woo_accept_lists_html() {
     return false;
 }
 
+/** scheme://host[:port] of an already-accepted base URL. */
+function mae_woo_origin_of($url) {
+    $canon = mae_woo_canonical_base_url($url);
+    $sep = strpos($canon, '://');
+    $rest = substr($canon, $sep + 3);
+    $slash = strpos($rest, '/');
+    return $slash === false ? $canon : substr($canon, 0, $sep + 3 + $slash);
+}
+
+function mae_woo_site_origin() {
+    try {
+        return mae_woo_origin_of(home_url('/'));
+    } catch (RuntimeException $e) {
+        return null;
+    }
+}
+
+/** The contract (AT-6), insertion order matching compileDeclaration. `hash` is last. */
+function mae_woo_contract($declaration) {
+    $contract = array(
+        'v' => 1,
+        'name' => $declaration['name'],
+        'origins' => $declaration['origins'],
+        'version' => 1,
+        'offers' => $declaration['offers'],
+    );
+    if ($declaration['facts'] !== null) {
+        $contract['facts'] = $declaration['facts'];
+    }
+    $without = $contract;
+    $contract['hash'] = hash('sha256', mae_woo_json($without, true));
+    return $contract;
+}
+
+/** Canonical JSON of a contract with `hash` removed, or null. */
+function mae_woo_contract_core_json($contract) {
+    if ($contract instanceof stdClass) {
+        $copy = clone $contract;
+        unset($copy->hash);
+        return mae_woo_json($copy, true);
+    }
+    if (is_array($contract)) {
+        unset($contract['hash']);
+        return mae_woo_json($contract, true);
+    }
+    return null;
+}
+
+/** Canonical bytes an agenttools envelope signs: {contract, ts, typ, v}. */
+function mae_woo_tools_payload($contract, $ts) {
+    return mae_woo_json(array(
+        'contract' => $contract,
+        'ts' => (int) $ts,
+        'typ' => 'agenttools',
+        'v' => 1,
+    ), true);
+}
+
+/**
+ * 'serve' the stored envelope, 'mint' a new one, or 'refuse' a tampered one.
+ * A cache whose contract (aside from hash) is this declaration's, but whose hash or
+ * signature does not verify, is refused: the caller serves neither document.
+ */
+function mae_woo_tools_cache_verdict($cached, $core, $fresh_hash, $secret) {
+    $decoded = json_decode($cached);
+    if (!$decoded instanceof stdClass || !($decoded->contract instanceof stdClass) || !is_int($decoded->ts ?? null)) {
+        return 'refuse';
+    }
+    $cached_core = mae_woo_contract_core_json($decoded->contract);
+    if ($cached_core === null) {
+        return 'refuse';
+    }
+    if ($cached_core !== $core) {
+        return 'mint';
+    }
+    $cached_hash = $decoded->contract->hash ?? null;
+    if (($decoded->v ?? null) !== 1 || ($decoded->typ ?? null) !== 'agenttools'
+        || !is_string($cached_hash) || strlen($cached_hash) !== 64 || !hash_equals($fresh_hash, $cached_hash)
+        || !is_string($decoded->sig ?? null) || strlen($decoded->sig) !== strlen(base64_encode(str_repeat("\0", 64)))) {
+        return 'refuse';
+    }
+    $expected = base64_encode(sodium_crypto_sign_detached(mae_woo_tools_payload($decoded->contract, $decoded->ts), $secret));
+    if (strlen($expected) !== strlen($decoded->sig) || !hash_equals($expected, $decoded->sig)) {
+        return 'refuse';
+    }
+    $now = time();
+    if ($decoded->ts > $now || $now - $decoded->ts >= MAE_WOO_SIG_REFRESH_S) {
+        return 'mint';
+    }
+    return 'serve';
+}
+
+/** Contract bytes plus the envelope string, or null when the cached signature is refused. */
+function mae_woo_tools_prepared($declaration, $secret) {
+    $contract = mae_woo_contract($declaration);
+    $core = mae_woo_contract_core_json($contract);
+    $cached = get_transient(MAE_WOO_TOOLS_SIG_TRANSIENT);
+    if (is_string($cached) && $cached !== '') {
+        $verdict = mae_woo_tools_cache_verdict($cached, $core, $contract['hash'], $secret);
+        if ($verdict === 'serve') {
+            return array('contract' => mae_woo_json($contract, true), 'envelope' => $cached);
+        }
+        if ($verdict === 'refuse') {
+            return null;
+        }
+    }
+    $now = time();
+    $envelope = mae_woo_json(array(
+        'v' => 1,
+        'typ' => 'agenttools',
+        'contract' => $contract,
+        'ts' => $now,
+        'sig' => base64_encode(sodium_crypto_sign_detached(mae_woo_tools_payload($contract, $now), $secret)),
+    ));
+    set_transient(MAE_WOO_TOOLS_SIG_TRANSIENT, $envelope, MAE_WOO_SIG_REFRESH_S);
+    return array('contract' => mae_woo_json($contract, true), 'envelope' => $envelope);
+}
+
+function mae_woo_send_status($status, $body, $allow = null) {
+    status_header($status);
+    header('Content-Type: application/json; charset=utf-8');
+    header('Content-Length: ' . strlen($body));
+    if ($allow !== null) {
+        header('Allow: ' . $allow);
+    }
+    echo $body;
+    exit;
+}
+
+function mae_woo_send_options() {
+    status_header(204);
+    header('Allow: ' . MAE_WOO_TOOLS_ALLOW);
+    header('Content-Length: 0');
+    exit;
+}
+
+/** The well-known contract and its signature. Exits when it answers; returns when it does not
+ *  own the path, or when a signature would be refused (no contract bytes either). */
+function mae_woo_maybe_serve_tools() {
+    $target = (string) ($_SERVER['REQUEST_URI'] ?? '/');
+    $path = explode('#', explode('?', $target, 2)[0], 2)[0];
+    if (strpos($path, 'agent-tool') === false) {
+        return;
+    }
+    if (!function_exists('sodium_crypto_sign_detached')) {
+        return;
+    }
+    $seed = mae_woo_seed();
+    if ($seed === null) {
+        return;
+    }
+    try {
+        $declaration = mae_woo_declaration();
+    } catch (RuntimeException $e) {
+        return;
+    }
+    if (mae_woo_site_origin() !== $declaration['origin']) {
+        return;
+    }
+    $mount = wp_parse_url($declaration['base'], PHP_URL_PATH);
+    if (!is_string($mount)) {
+        $mount = '';
+    }
+    if ($path === $mount . MAE_WOO_TOOLS) {
+        $kind = 'contract';
+    } elseif ($path === $mount . MAE_WOO_TOOLS_SIG) {
+        $kind = 'sig';
+    } else {
+        $kind = 'miss';
+    }
+    if ($kind === 'miss') {
+        mae_woo_send_status(404, '{"error":"not found"}');
+    }
+    $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+    if ($method === 'OPTIONS') {
+        mae_woo_send_options();
+    }
+    if ($method !== 'GET' && $method !== 'HEAD') {
+        mae_woo_send_status(405, '{"error":"method not allowed"}', MAE_WOO_TOOLS_ALLOW);
+    }
+    $prepared = mae_woo_tools_prepared($declaration, mae_woo_identity($seed)['secret']);
+    if ($prepared === null) {
+        return;
+    }
+    mae_woo_send($kind === 'sig' ? $prepared['envelope'] : $prepared['contract'], $method === 'HEAD');
+}
+
 function mae_woo_send($body, $head) {
     status_header(200);
     header('Content-Type: application/json; charset=utf-8');
@@ -768,6 +1038,7 @@ function mae_woo_send($body, $head) {
 }
 
 add_action('parse_request', function () {
+    mae_woo_maybe_serve_tools();
     $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
     if ($method !== 'GET' && $method !== 'HEAD') {
         return;
@@ -812,7 +1083,8 @@ add_action('template_redirect', function () {
     $path = explode('#', explode('?', $target, 2)[0], 2)[0];
     if (substr($path, -strlen(MAE_WOO_CARD)) === MAE_WOO_CARD
         || substr($path, -strlen(MAE_WOO_CARD_LEGACY)) === MAE_WOO_CARD_LEGACY
-        || substr($path, -strlen(MAE_WOO_SIG)) === MAE_WOO_SIG) {
+        || substr($path, -strlen(MAE_WOO_SIG)) === MAE_WOO_SIG
+        || strpos($path, 'agent-tool') !== false) {
         return;
     }
     try {

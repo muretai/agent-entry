@@ -4173,6 +4173,43 @@ function readCatalogFile(path, origin) {
   return rows.map((row) => catalogRow(row, origin)).filter((row) => row !== null);
 }
 
+/** Public facts for a derived declaration: the caller's map, copied, plus the site name as one
+ *  of the values when it is not already there. Never mutates `given`. */
+function factsWithSiteName(siteName, given) {
+  const facts = {};
+  if (given !== undefined && given !== null) {
+    if (!isPlainObject(given)) throw new TypeError('createAgentEntry: facts must map a name to a string');
+    for (const [key, value] of Object.entries(given)) facts[key] = value;
+  }
+  if (!Object.values(facts).includes(siteName)) {
+    let key = 'name';
+    if (Object.hasOwn(facts, key)) key = 'site';
+    if (Object.hasOwn(facts, key)) key = 'site_name';
+    let n = 2;
+    while (Object.hasOwn(facts, key)) key = `site_${n++}`;
+    facts[key] = siteName;
+  }
+  return facts;
+}
+
+/** The declaration a door compiles when the caller passed none and did not bring its own skills.
+ *  One ask offer, answered from the facts, and a find offer only when a product snapshot is
+ *  present. The caller's object is not the return value. */
+function defaultDeclaration({ name, baseUrl, facts, catalog }) {
+  const offers = [{
+    verb: 'ask', of: 'shop',
+    about: 'Ask the shop about hours, shipping, returns, payment, pickup, warranty, and how to reach a person.',
+    input: { text: 'string' }, door: { reply: 'facts' },
+  }];
+  if (catalog) {
+    offers.push({
+      verb: 'find', of: 'products', about: 'Find products in the shop catalogue.',
+      input: { q: 'string' }, door: { reply: 'catalog' },
+    });
+  }
+  return { v: 1, entry: { name, baseUrl }, facts: factsWithSiteName(name, facts), offers };
+}
+
 /**
  * createAgentEntry(opts) -> { did, card, ledger, handleRequest, handleRequestAsync, listen }
  *
@@ -4290,7 +4327,14 @@ function readCatalogFile(path, origin) {
  *   catalogFile    the product snapshot `init --from woocommerce` wrote (agent-entry.products.json).
  *                  A door-bound `catalog` offer then replies its rows as `products`, read from
  *                  this file at reply time; nothing is requested of the store. Rows whose
- *                  permalink is not https on this door's origin are left out.
+ *                  permalink is not https on this door's origin are left out. When no
+ *                  declaration is passed, a readable snapshot is also what adds the derived
+ *                  find offer. It never adds an offer to a declaration the caller passed.
+ *   facts          OPTIONAL map of public fact name to string. Used only when no declaration
+ *                  is passed: the derived ask offer answers with these facts and with the
+ *                  site name as one of the values. Omitted, null or {} leaves just the site
+ *                  name. A declaration the caller passed is compiled unchanged; these facts
+ *                  are not merged into it.
  *   ownershipProof { path, body }, or a function returning that shape (called once, at start).
  *                  The door answers GET of exactly `path` — one file name directly under
  *                  /.well-known/, at the ORIGIN whatever the mount — with `body` as text/plain,
@@ -4327,6 +4371,7 @@ export function createAgentEntry({
   declaration = undefined,
   toolsHistory = null,
   catalogFile = null,
+  facts = undefined,
   ownershipProof = undefined,
 } = {}) {
   if (!seedHex) throw new TypeError('createAgentEntry: seedHex is required');
@@ -4384,12 +4429,28 @@ export function createAgentEntry({
   // Suite S1: a DECLARATION makes this door serve its signed contract, generate its skills
   // and answer its offers. Refuse-to-start posture, as for `prefer` (AE-30): a declaration
   // that fails validation, names another origin, or arrives with a prior version that does
-  // not check out would otherwise publish something the operator did not write. Only an
-  // ABSENT declaration means "none": `null` is a declaration that failed to load, and refused.
+  // not check out would otherwise publish something the operator did not write. An ABSENT
+  // declaration with no skills of its own is not an empty face: one is derived from the
+  // site name, the public facts and, when a snapshot is present, a find offer. `null` is
+  // still a declaration that failed to load, and refused. Skills the caller passed are
+  // already a face, and stay the door they were — deriving would either replace them or
+  // refuse to start, and a given declaration is never merged with facts or a snapshot.
+  let servedDeclaration = declaration;
+  if (servedDeclaration === undefined) {
+    if (toolsHistory !== null && toolsHistory !== undefined) {
+      throw new TypeError('createAgentEntry: toolsHistory needs the declaration it precedes');
+    }
+    if (!(Array.isArray(skills) && skills.length)) {
+      servedDeclaration = defaultDeclaration({
+        name, baseUrl: canonUrl, facts,
+        catalog: typeof catalogFile === 'string' && catalogFile.length > 0,
+      });
+    }
+  }
   let tools = null;
   let privateFacts = null;
-  if (declaration !== undefined) {
-    const read = readDeclaration(declaration);
+  if (servedDeclaration !== undefined) {
+    const read = readDeclaration(servedDeclaration);
     privateFacts = read.privateFacts ?? null;
     if (read.origin !== doorOrigin) {
       throw new TypeError(`createAgentEntry: the declaration's entry.baseUrl is ${read.origin} and this `
@@ -4420,7 +4481,7 @@ export function createAgentEntry({
         throw new TypeError(`createAgentEntry: toolsHistory[${i}] does not name ${doorOrigin}`);
       }
     });
-    const contract = compileDeclaration(declaration, { version: history.length + 1 });
+    const contract = compileDeclaration(servedDeclaration, { version: history.length + 1 });
     const byId = new Map();
     const byVerb = new Map();
     const ambiguous = new Set();
@@ -4435,15 +4496,13 @@ export function createAgentEntry({
     tools = {
       contract,
       versions: [...history, contract].map((c) => Buffer.from(canonicalJSON(c), 'utf8')),
-      skills: skillsFromOffers(declaration),
+      skills: skillsFromOffers(servedDeclaration),
       prefer: read.prefer,
       byId,
       byVerb,
       offerIds: new Set(contract.offers.map((o) => o.id)),
       counts: read.counts,
     };
-  } else if (toolsHistory !== null && toolsHistory !== undefined) {
-    throw new TypeError('createAgentEntry: toolsHistory needs the declaration it precedes');
   }
 
   const card = {
@@ -5896,13 +5955,22 @@ export function createAgentEntry({
         // "This ADDRESS", not "this origin": once an entry can be mounted under a
         // path, the origin may hold several agents and this notice speaks for exactly
         // one of them. A bare-origin entry reads the same either way.
-        // Accept that lists text/html gets the offer list. Every other Accept, including
-        // none, keeps this text byte for byte. The Link header is the same either way.
-        const html = declaration !== undefined && acceptListsHtml(headers);
-        const notice = `${name}\n\nThis address is agent-reachable (Muretai agent entry).\n`
+        // Accept that lists text/html gets the offer list, then the contract's name and
+        // fact values. Every other Accept, including none, keeps this text byte for byte
+        // when the name has no markup and no control character. Either way those characters
+        // are not echoed raw. The Link header is the same either way.
+        const html = servedDeclaration !== undefined && acceptListsHtml(headers);
+        const notice = `${pageText(name)}\n\nThis address is agent-reachable (Muretai agent entry).\n`
           + `DID:  ${did}\nCard: ${canonUrl}${AGENT_CARD_PATH}\n`
           + `POST a signed A2A message/send request to ${mount || '/'} for a signed reply.\n`;
-        const body = Buffer.from(html ? offersSignpost(declaration) : notice, 'utf8');
+        let page = notice;
+        if (html) {
+          const lines = [offersSignpost(servedDeclaration), pageText(tools.contract.name)];
+          const factValues = tools.contract.facts ? Object.values(tools.contract.facts) : [];
+          for (const value of factValues) lines.push(pageText(value));
+          page = `${lines.join('\n')}\n`;
+        }
+        const body = Buffer.from(page, 'utf8');
         return { status: 200,
           headers: { 'Content-Type': html ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8',
             'Content-Length': String(body.length),
@@ -8763,6 +8831,9 @@ function tallyCounts(lines, accounts, storePresent) {
   const declared = new Map();
   const network = new Map();
   const platforms = new Map();
+  const byCountry = new Map();
+  const byVendor = new Map();
+  const byEngine = new Map();
   let stealth = 0;
   let none = 0;
   let firstContacts = 0;
@@ -8799,6 +8870,12 @@ function tallyCounts(lines, accounts, storePresent) {
     if (e.stage === 'signed_post' && e.first_contact === true) firstContacts += 1;
     if (e.stage === 'signed_post' && e.first_contact === false) returningKnocks += 1;
     bump(byClass, typeof e.client_class === 'string' && CLIENT_CLASSES.has(e.client_class) ? e.client_class : 'unknown');
+    // A country is the two ASCII capitals look() logs; a knock with none adds no key.
+    if (typeof e.country === 'string' && /^[A-Z]{2}$/.test(e.country)) bump(byCountry, e.country);
+    // A vendor is the knock's ip_vendor, as vendorStats() keys it; a signer label or UA family is not.
+    if (isVendor(e.ip_vendor)) bump(byVendor, e.ip_vendor);
+    // A page engine is the knock's own engine word in REFERRAL_ENGINES; page referrals stay in `referrals`.
+    if (typeof e.engine === 'string' && REFERRAL_ENGINES.includes(e.engine)) bump(byEngine, e.engine);
     let tiers = 0;
     if (isVendor(e.signature_agent)) { bump(signed, e.signature_agent); tiers += 1; }
     if (typeof e.ua_family === 'string' && AI_AGENT_FAMILIES.has(e.ua_family)) { bump(declared, e.ua_family); tiers += 1; }
@@ -8824,6 +8901,9 @@ function tallyCounts(lines, accounts, storePresent) {
     knocks: { by_stage: Object.fromEntries(byStage), by_class: Object.fromEntries(byClass) },
     who: { signed: Object.fromEntries(signed), declared: Object.fromEntries(declared), network: Object.fromEntries(network),
       'stealth-agent': stealth, none },
+    by_country: Object.fromEntries(byCountry),
+    by_vendor: Object.fromEntries(byVendor),
+    by_engine: Object.fromEntries(byEngine),
     platforms: Object.fromEntries(platforms),
   };
 }
@@ -8857,11 +8937,20 @@ function countsText(c) {
     `signed knocks: new ${c.contacts.new}, returning ${c.contacts.returning}`,
     `door knocks by stage: ${pairs(c.knocks.by_stage)}`,
     `door knocks by client class: ${pairs(c.knocks.by_class)}`,
+    `door knocks by country: ${pairs(c.by_country)}`,
+    `door knocks by vendor: ${pairs(c.by_vendor)}`,
+    `door knocks by page engine: ${pairs(c.by_engine)}`,
     `platforms: ${pairs(c.platforms)}`,
   ];
 }
 
 const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
+
+/** Text safe to place in GET /. Control characters are dropped and markup is escaped.
+ *  A string with neither is returned unchanged, so a plain notice stays byte for byte. */
+function pageText(value) {
+  return escapeHtml(String(value).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ''));
+}
 
 function countsHtml(c) {
   const cells = (xs, tag = 'td') => xs.map((x) => `<${tag}>${escapeHtml(x)}</${tag}>`).join('');
