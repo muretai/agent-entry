@@ -470,3 +470,316 @@ test('counts --json: a dropped row adds no country, and is still counted in the 
   assert.equal(out.coverage.rows_dropped, dropped.length, JSON.stringify(out.coverage));
   assertCountryLine(await countsTextLines(fx), COUNTRY_MAP);
 });
+
+// ---------------------------------------------------------------- by vendor
+//
+// Intake 20261028T150329Z (parent 20261003T131711Z, the backlog grouping parent), the shape
+// agent-entry-go's counts page will read:
+//   json: a top-level `by_vendor` object, the key right after `by_country`. Each door knock
+//     (signed_post, anon_post, refused_post) counts under its vendor word: the row's `ip_vendor`,
+//     the per-row vendor value the who block's network tier and the door's vendorStats() already
+//     read, and only when it is one of VENDORS. A knock with no vendor word, a page, card_get or
+//     notice_get row, and a dropped row add nothing. With no vendor data it is {}, never missing.
+//     It is its own map: no other word map (who, by_country, referrals) gains or loses a key.
+//   text: exactly one line, right after `door knocks by country:`, reading
+//     `door knocks by vendor: openai 2, anthropic 1` in by_vendor order, or
+//     `door knocks by vendor: none` when the map is empty.
+//   The coverage header, the who block and by_country are the same whether or not vendors are present.
+
+/** Two openai knocks, one anthropic; a knock with no vendor word; page, card_get and notice_get
+ *  rows carrying vendors that must not be counted. by_vendor is { openai: 2, anthropic: 1 }. */
+function vendorRows() {
+  return [
+    { t: T0 + 1, stage: 'signed_post', offer: 'ask', reply: 'facts', ua_family: 'openai',
+      client_class: 'declared-agent', ip_vendor: 'openai', signature_agent: 'openai', country: 'JP' },
+    { t: T0 + 2, stage: 'anon_post', ua_family: 'claude-user', client_class: 'declared-agent', ip_vendor: 'anthropic', country: 'US' },
+    { t: T0 + 3, stage: 'refused_post', refused: 'rate', ua_family: 'browser', client_class: 'stealth-agent', ip_vendor: 'openai' },
+    { t: T0 + 4, stage: 'anon_post', ua_family: 'curl', client_class: 'named-tool', country: 'JP' },
+    { t: T0 + 5, stage: 'page', event: 'referral', engine: 'perplexity', ip_vendor: 'google' },
+    { t: T0 + 6, stage: 'card_get', ua_family: 'gptbot', client_class: 'declared-agent', ip_vendor: 'microsoft' },
+    { t: T0 + 7, stage: 'notice_get', ua_family: 'claude-user', client_class: 'declared-agent', ip_vendor: 'meta' },
+  ];
+}
+const VENDOR_MAP = { openai: 2, anthropic: 1 };
+const NOT_KNOCK_VENDORS = ['google', 'microsoft', 'meta'];
+const DOOR_KNOCKS = ['signed_post', 'anon_post', 'refused_post'];
+
+const noVendorRows = () => vendorRows().map((r) => {
+  const copy = { ...r };
+  delete copy.ip_vendor;
+  return copy;
+});
+
+const vendorLineOf = (map) => {
+  const entries = Object.entries(map);
+  return `door knocks by vendor: ${entries.length ? entries.map(([k, n]) => `${k} ${n}`).join(', ') : 'none'}`;
+};
+
+function assertByVendor(out) {
+  assert.ok(Object.hasOwn(out, 'by_vendor'), `a top-level by_vendor: keys ${JSON.stringify(Object.keys(out))}`);
+  const map = out.by_vendor;
+  assert.ok(map && typeof map === 'object' && !Array.isArray(map), `by_vendor is a map: ${JSON.stringify(map)}`);
+  for (const [k, n] of Object.entries(map)) {
+    assert.ok(VENDORS.includes(k), `by_vendor names vendors only: ${k}`);
+    assert.ok(Number.isInteger(n) && n > 0, `by_vendor.${k} is a positive count: ${n}`);
+  }
+  const keys = Object.keys(out);
+  assert.equal(keys.indexOf('by_vendor'), keys.indexOf('by_country') + 1, `by_vendor is the key right after by_country: ${keys.join(',')}`);
+}
+
+function assertVendorLine(lines, map) {
+  const found = lines.filter((l) => l.startsWith('door knocks by vendor:'));
+  assert.equal(found.length, 1, `exactly one vendor line: ${JSON.stringify(lines)}`);
+  assert.equal(found[0], vendorLineOf(map));
+  const countryAt = lines.findIndex((l) => l.startsWith('door knocks by country:'));
+  assert.ok(countryAt >= 0, `the country line is still there: ${JSON.stringify(lines)}`);
+  assert.equal(lines[countryAt + 1], found[0], `the vendor line follows the country line: ${JSON.stringify(lines)}`);
+}
+
+test('counts --json: by_vendor counts each door knock under its vendor word, right after by_country', async () => {
+  const out = await countsJson(fixture(vendorRows()));
+  assertShape(out);
+  assertByCountry(out);
+  assertByVendor(out);
+  assert.deepEqual(out.by_vendor, VENDOR_MAP);
+  assert.deepEqual(Object.keys(out.by_vendor), ['openai', 'anthropic'], 'in first-seen order');
+});
+
+test('counts (text): one vendor line in by_vendor order, right after the country line', async () => {
+  const lines = await countsTextLines(fixture(vendorRows()));
+  assertCountryLine(lines, { JP: 2, US: 1 });
+  assertVendorLine(lines, VENDOR_MAP);
+  assert.ok(lines.includes('door knocks by vendor: openai 2, anthropic 1'), JSON.stringify(lines));
+});
+
+test('counts: by_vendor json and the vendor line agree on the same fixture rows', async () => {
+  for (const rows of [vendorRows(), noVendorRows(), countryRows(), FULL, []]) {
+    const fx = fixture(rows);
+    const out = await countsJson(fx);
+    assertByVendor(out);
+    const lines = await countsTextLines(fx);
+    assertCountryLine(lines, out.by_country);
+    assertVendorLine(lines, out.by_vendor);
+  }
+});
+
+test('counts --json: vendors do not change the coverage header, the who block or by_country', async () => {
+  const withV = await countsJson(fixture(vendorRows()));
+  assertShape(withV);
+  assertByCountry(withV);
+  assertByVendor(withV);
+  assert.deepEqual(withV.coverage, {
+    from: iso(T0 + 1), to: iso(T0 + 7), last_event: iso(T0 + 7), store_present: true, rows_dropped: 0,
+  });
+  assert.deepEqual(withV.who, {
+    signed: { openai: 1 }, declared: { openai: 1, 'claude-user': 1 }, network: { openai: 2, anthropic: 1 },
+    'stealth-agent': 0, none: 1,
+  });
+  assert.deepEqual(withV.by_country, { JP: 2, US: 1 });
+  // Non-knock rows carrying vendors move nothing: the same knocks alone give the same maps.
+  const knocks = await countsJson(fixture(vendorRows().filter((r) => DOOR_KNOCKS.includes(r.stage))));
+  assert.deepEqual(knocks.by_vendor, withV.by_vendor);
+  assert.deepEqual(knocks.who, withV.who);
+  assert.deepEqual(knocks.by_country, withV.by_country);
+  // The pins already landed for the full and the country fixtures still hold beside the new key.
+  const full = await countsJson(fixture(FULL));
+  assertShape(full);
+  assertByCountry(full);
+  assertByVendor(full);
+  assert.deepEqual(full.who, FULL_WHO);
+  assert.deepEqual(full.coverage, { from: iso(T0), to: iso(T0 + 90), last_event: iso(T0 + 90), store_present: true, rows_dropped: 0 });
+  assert.deepEqual(full.by_country, { US: 1 });
+  assert.deepEqual(full.by_vendor, { openai: 1, anthropic: 1, aws: 1 });
+  const country = await countsJson(fixture(countryRows()));
+  assertByVendor(country);
+  assert.deepEqual(country.by_country, COUNTRY_MAP);
+  assert.deepEqual(country.by_vendor, { anthropic: 1, openai: 1 });
+});
+
+test('counts: an empty log has by_vendor {} beside by_country {}, and the text says none', async () => {
+  const fx = fixture([]);
+  const out = await countsJson(fx);
+  assertShape(out);
+  assertByCountry(out);
+  assertByVendor(out);
+  assert.deepEqual(out.by_vendor, {});
+  assert.deepEqual(out.by_country, {});
+  assert.deepEqual(out.coverage, { from: null, to: null, last_event: null, store_present: true, rows_dropped: 0 });
+  assert.deepEqual(out.who, { signed: {}, declared: {}, network: {}, 'stealth-agent': 0, none: 0 });
+  const lines = await countsTextLines(fx);
+  assertVendorLine(lines, {});
+  assert.ok(lines.includes('door knocks by vendor: none'), JSON.stringify(lines));
+});
+
+test('counts: knocks with no vendor word give by_vendor {}, and the text says none', async () => {
+  const fx = fixture(noVendorRows());
+  const out = await countsJson(fx);
+  assertByVendor(out);
+  assert.deepEqual(out.by_vendor, {});
+  assert.deepEqual(out.by_country, { JP: 2, US: 1 }, 'the knocks are still counted by country');
+  const lines = await countsTextLines(fx);
+  assertVendorLine(lines, {});
+  assert.ok(lines.includes('door knocks by vendor: none'), JSON.stringify(lines));
+});
+
+// ---------------------------------------------------------------- by vendor: refusals
+
+test('counts --json: a knock with no vendor word, or one outside VENDORS, adds nothing', async () => {
+  const fx = fixture([
+    ...vendorRows(),
+    { t: T0 + 10, stage: 'signed_post', offer: 'ask', reply: 'facts', ua_family: 'claude-user', client_class: 'declared-agent' },
+    { t: T0 + 11, stage: 'anon_post', ip_vendor: null },
+    { t: T0 + 12, stage: 'anon_post', ip_vendor: 'none' },
+    { t: T0 + 13, stage: 'anon_post', ip_vendor: '' },
+    { t: T0 + 14, stage: 'refused_post', refused: 'rate', ip_vendor: 'Anthropic' },
+    { t: T0 + 15, stage: 'anon_post', ip_vendor: 'evilcorp' },
+    { t: T0 + 16, stage: 'anon_post', ip_vendor: '__proto__' },
+    { t: T0 + 17, stage: 'anon_post', ip_vendor: 'constructor' },
+    { t: T0 + 18, stage: 'anon_post', ip_vendor: 7 },
+  ]);
+  const out = await countsJson(fx);
+  assertShape(out);
+  assertByVendor(out);
+  assert.deepEqual(out.by_vendor, VENDOR_MAP, `no vendor word, no key: ${JSON.stringify(out.by_vendor)}`);
+  for (const k of ['', 'none', 'unknown', 'undefined', 'null', 'Anthropic', 'evilcorp', '__proto__', 'constructor', '7']) {
+    assert.equal(Object.hasOwn(out.by_vendor, k), false, `no ${JSON.stringify(k)} key`);
+  }
+  assertVendorLine(await countsTextLines(fx), VENDOR_MAP);
+});
+
+test('counts --json: a signer label or a UA family alone is not a vendor word', async () => {
+  // The vendor word is ip_vendor; signature_agent and ua_family stay in who.signed and who.declared.
+  const fx = fixture([
+    { t: T0 + 1, stage: 'signed_post', offer: 'ask', reply: 'facts', signature_agent: 'anthropic', ua_family: 'browser', client_class: 'stealth-agent' },
+    { t: T0 + 2, stage: 'anon_post', ua_family: 'openai', client_class: 'declared-agent' },
+    { t: T0 + 3, stage: 'anon_post', ua_family: 'perplexity', client_class: 'declared-agent' },
+  ]);
+  const out = await countsJson(fx);
+  assertShape(out);
+  assertByVendor(out);
+  assert.deepEqual(out.by_vendor, {}, JSON.stringify(out.by_vendor));
+  assert.deepEqual(out.who.signed, { anthropic: 1 });
+  assert.deepEqual(out.who.declared, { openai: 1, perplexity: 1 });
+  assertVendorLine(await countsTextLines(fx), {});
+});
+
+test('counts --json: page, card_get and notice_get rows add no vendor', async () => {
+  const fx = fixture([
+    { t: T0 + 1, stage: 'page', event: 'referral', engine: 'perplexity', ip_vendor: 'perplexity' },
+    { t: T0 + 2, stage: 'page', event: 'offer_started', offer: 'ask', ip_vendor: 'openai' },
+    { t: T0 + 3, stage: 'card_get', ua_family: 'claude-user', client_class: 'declared-agent', ip_vendor: 'anthropic' },
+    { t: T0 + 4, stage: 'notice_get', ua_family: 'gptbot', client_class: 'declared-agent', ip_vendor: 'openai' },
+  ]);
+  const out = await countsJson(fx);
+  assertByVendor(out);
+  assert.deepEqual(out.by_vendor, {}, `no knock, no vendor: ${JSON.stringify(out.by_vendor)}`);
+  assertVendorLine(await countsTextLines(fx), {});
+  const mixed = await countsJson(fixture(vendorRows()));
+  for (const v of NOT_KNOCK_VENDORS) assert.equal(Object.hasOwn(mixed.by_vendor, v), false, `${v} is from a non-knock row`);
+});
+
+test('counts --json: a dropped row adds no vendor, and is still counted in the header', async () => {
+  const dropped = [
+    { t: T0 + 100, stage: 'signed_post', offer: 'ask', reply: 'facts', ip_vendor: 'openai', did: DID },
+    { t: T0 + 110, stage: 'anon_post', ip_vendor: 'anthropic', text: MARKER },
+    { t: T0 + 120, stage: 'signed_post', signature_agent: DID, ip_vendor: 'openai' },
+    { t: T0 + 130, stage: 'anon_post', ip_vendor: DID },
+    { t: T0 + 140, stage: 'anon_post', ip_vendor: 'xai', peer_did: DID },
+  ];
+  const fx = fixture([...vendorRows(), ...dropped]);
+  const out = await countsJson(fx);
+  assertShape(out);
+  assertByVendor(out);
+  assert.deepEqual(out.by_vendor, VENDOR_MAP, `dropped rows add nothing: ${JSON.stringify(out.by_vendor)}`);
+  assert.equal(out.coverage.rows_dropped, dropped.length, JSON.stringify(out.coverage));
+  assert.equal(out.coverage.to, iso(T0 + 7), JSON.stringify(out.coverage));
+  assertVendorLine(await countsTextLines(fx), VENDOR_MAP);
+});
+
+test('counts --json: by_vendor is its own map, merged into no other word map', async () => {
+  // perplexity is a referral engine, an AI family and a vendor; aws is a vendor and nothing else.
+  const out = await countsJson(fixture([
+    { t: T0 + 1, stage: 'page', event: 'referral', engine: 'perplexity' },
+    { t: T0 + 2, stage: 'anon_post', ua_family: 'perplexity', client_class: 'declared-agent', country: 'FR' },
+    { t: T0 + 3, stage: 'anon_post', ua_family: 'browser', client_class: 'stealth-agent', ip_vendor: 'perplexity' },
+    { t: T0 + 4, stage: 'refused_post', refused: 'rate', ip_vendor: 'aws', country: 'DE' },
+  ]));
+  assertShape(out);
+  assertByCountry(out);
+  assertByVendor(out);
+  assert.deepEqual(out.by_vendor, { perplexity: 1, aws: 1 });
+  assert.deepEqual(out.referrals, { perplexity: 1 }, 'a knock vendor is not a referral');
+  assert.deepEqual(out.by_country, { FR: 1, DE: 1 }, 'no vendor word in by_country');
+  assert.deepEqual(out.who, {
+    signed: {}, declared: { perplexity: 1 }, network: { perplexity: 1, aws: 1 }, 'stealth-agent': 0, none: 0,
+  });
+  for (const k of ['by_vendor', 'vendor', 'vendors']) {
+    assert.equal(Object.hasOwn(out.who, k), false, `who gains no ${k}`);
+    assert.equal(Object.hasOwn(out.knocks, k), false, `knocks gains no ${k}`);
+  }
+  assert.deepEqual(Object.keys(out.knocks).sort(), ['by_class', 'by_stage']);
+});
+
+// ---------------------------------------------------------------- by vendor: kind-fuzz
+//
+// Property (equivalent): for a seeded mix of fileSink-shaped and hostile rows, by_vendor equals an
+// oracle that keeps sink rows, takes door knocks only and counts each VENDORS ip_vendor once, in
+// first-seen order; the vendor line says the same; the CLI exits 0 on every log.
+
+function rng(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 0x100000000;
+  };
+}
+
+const FUZZ_STAGES = [...DOOR_KNOCKS, 'page', 'card_get', 'notice_get', 'other', 7, null];
+const FUZZ_VENDORS = [...VENDORS, 'none', 'Anthropic', 'OPENAI', '', '__proto__', 'constructor', 'toString', DID, null, 3, true];
+const FUZZ_EXTRA = [null, ['did', DID], ['text', MARKER], ['country', 'JP'], ['country', DID],
+  ['signature_agent', 'openai'], ['ua_family', 'gptbot']];
+
+function fuzzRows(seed, n) {
+  const r = rng(seed);
+  const pick = (xs) => xs[Math.floor(r() * xs.length)];
+  const rows = [];
+  for (let i = 0; i < n; i += 1) {
+    const roll = r();
+    if (roll < 0.04) { rows.push('{not json'); continue; }
+    if (roll < 0.07) { rows.push('[1,2]'); continue; }
+    const row = { t: T0 + i, stage: pick(FUZZ_STAGES) };
+    if (r() < 0.8) row.ip_vendor = pick(FUZZ_VENDORS);
+    const extra = pick(FUZZ_EXTRA);
+    if (extra) row[extra[0]] = extra[1];
+    rows.push(row);
+  }
+  return rows;
+}
+
+/** The generator only writes `did` and `text` outside the sink allowlist. */
+function vendorOracle(rows) {
+  const out = new Map();
+  for (const raw of rows) {
+    if (typeof raw === 'string') continue;
+    if (Object.hasOwn(raw, 'did') || Object.hasOwn(raw, 'text')) continue;
+    if (Object.values(raw).some((v) => typeof v === 'string' && v.startsWith('did:'))) continue;
+    if (!DOOR_KNOCKS.includes(raw.stage)) continue;
+    if (typeof raw.ip_vendor !== 'string' || !VENDORS.includes(raw.ip_vendor)) continue;
+    out.set(raw.ip_vendor, (out.get(raw.ip_vendor) || 0) + 1);
+  }
+  return Object.fromEntries(out);
+}
+
+test('counts kind-fuzz: by_vendor equals the oracle over seeded hostile logs, json and text alike', async () => {
+  for (const seed of [1, 4417, 20261028]) {
+    const rows = fuzzRows(seed, 160);
+    const fx = fixture(rows);
+    const out = await countsJson(fx);
+    assertShape(out);
+    assertByVendor(out);
+    const want = vendorOracle(rows);
+    assert.deepEqual(out.by_vendor, want, `seed ${seed}`);
+    assert.deepEqual(Object.keys(out.by_vendor), Object.keys(want), `seed ${seed}: first-seen order`);
+    assertVendorLine(await countsTextLines(fx), want);
+  }
+});
