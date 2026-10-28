@@ -8833,6 +8833,7 @@ function tallyCounts(lines, accounts, storePresent) {
   const platforms = new Map();
   const byCountry = new Map();
   const byVendor = new Map();
+  const byEngine = new Map();
   let stealth = 0;
   let none = 0;
   let firstContacts = 0;
@@ -8873,6 +8874,8 @@ function tallyCounts(lines, accounts, storePresent) {
     if (typeof e.country === 'string' && /^[A-Z]{2}$/.test(e.country)) bump(byCountry, e.country);
     // A vendor is the knock's ip_vendor, as vendorStats() keys it; a signer label or UA family is not.
     if (isVendor(e.ip_vendor)) bump(byVendor, e.ip_vendor);
+    // A page engine is the knock's own engine word in REFERRAL_ENGINES; page referrals stay in `referrals`.
+    if (typeof e.engine === 'string' && REFERRAL_ENGINES.includes(e.engine)) bump(byEngine, e.engine);
     let tiers = 0;
     if (isVendor(e.signature_agent)) { bump(signed, e.signature_agent); tiers += 1; }
     if (typeof e.ua_family === 'string' && AI_AGENT_FAMILIES.has(e.ua_family)) { bump(declared, e.ua_family); tiers += 1; }
@@ -8900,6 +8903,7 @@ function tallyCounts(lines, accounts, storePresent) {
       'stealth-agent': stealth, none },
     by_country: Object.fromEntries(byCountry),
     by_vendor: Object.fromEntries(byVendor),
+    by_engine: Object.fromEntries(byEngine),
     platforms: Object.fromEntries(platforms),
   };
 }
@@ -8935,6 +8939,7 @@ function countsText(c) {
     `door knocks by client class: ${pairs(c.knocks.by_class)}`,
     `door knocks by country: ${pairs(c.by_country)}`,
     `door knocks by vendor: ${pairs(c.by_vendor)}`,
+    `door knocks by page engine: ${pairs(c.by_engine)}`,
     `platforms: ${pairs(c.platforms)}`,
   ];
 }
