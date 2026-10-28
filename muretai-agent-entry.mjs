@@ -150,6 +150,16 @@ export const MAX_CARD_DOMAINS = 5;
  *  still has to. */
 export const MAX_MESSAGE_ID_BYTES = 256;
 
+/** Ceilings on UNDECIDED receipts (AT-28): rows whose `decision` is null, per partyB and in
+ *  total. A pending hold is the shop's to decide, so its row is never evicted to make room;
+ *  instead the door refuses the next hold, -32004, until the owner decides one. Decided rows
+ *  are never counted. Without these the signed rate (SIGNED_RATE_PER_MIN_TOTAL, with DIDs
+ *  free to mint) files ~864k undecided rows a day, and the file store re-reads and re-writes
+ *  every one of them on every request. A pending offer with no deal files no row and is not
+ *  counted. */
+export const MAX_UNDECIDED_RECEIPTS_PER_PARTY = 5;
+export const MAX_UNDECIDED_RECEIPTS = 500;
+
 export const AGENT_CARD_PATH = '/.well-known/agent-card.json';
 export const AGENT_CARD_PATH_LEGACY = '/.well-known/agent.json';
 export const AGENT_CARD_SIG_PATH = '/.well-known/agent-card.sig.json';
@@ -5664,14 +5674,30 @@ export function createAgentEntry({
       // about to be signed. Written before the reply is: a receipt the owner cannot see is never
       // issued, so a store that fails here refuses the knock rather than answering it.
       const failed = () => rpcError(reqId, ERRORS.INTERNAL_ERROR, 'the door failed to record this receipt');
-      let wrote;
-      try {
-        wrote = state.putReceipt(msg.messageId, { ref: msg.messageId, offer: chosen.verb, partyB: toDid,
-          issued_ts: nowEpoch(), pending_text: text, decision: null });
-      } catch {
-        return failed();
-      }
-      return isThenable(wrote) ? wrote.then(finish, failed) : finish();
+      // Each store step either answers or refuses the knock; a store that throws or rejects is
+      // the store failure above. Plain values stay plain, so the memory store stays synchronous.
+      const step = (read, next) => {
+        let v;
+        try { v = read(); } catch { return failed(); }
+        return isThenable(v) ? v.then(next, failed) : next(v);
+      };
+      // The ref is the visitor's messageId, so one that already names a row (past the replay
+      // window, or a client that counts its ids) is refused rather than written: the store's
+      // putReceipt replaces, and replacing would hand the row, decided or not, to this knock.
+      // The refusal is the store failure's, and says nothing of the row it found.
+      return step(() => state.getReceipt(msg.messageId), (existing) => {
+        if (existing != null) return failed();
+        return step(() => state.listUndecidedReceipts(), (rows) => {
+          const undecided = (rows ?? []).filter((r) => r && r.decision === null);
+          if (undecided.length >= MAX_UNDECIDED_RECEIPTS
+              || undecided.filter((r) => r.partyB === toDid).length >= MAX_UNDECIDED_RECEIPTS_PER_PARTY) {
+            return rpcError(reqId, ERRORS.RATE_LIMITED,
+              'the shop holds as many undecided receipts as it takes — try again once it has decided one');
+          }
+          return step(() => state.putReceipt(msg.messageId, { ref: msg.messageId, offer: chosen.verb,
+            partyB: toDid, issued_ts: nowEpoch(), pending_text: text, decision: null }), () => finish());
+        });
+      });
     }
     let answer;
     try {
