@@ -11,7 +11,8 @@
 // never changes an existing row. Each case files a hold under the id, moves a fake clock past the
 // replay window (REPLAY_TTL_S), and sends a second hold under the same id from a different visitor
 // with different text. When the first hold left a row, the second is refused -32603 and the row
-// reads back byte-identical.
+// reads back byte-identical. An id the seam's signEnvelope refuses (a lone surrogate) is not
+// sendable: that case is skipped and counted apart, and the quarter-filed check counts sent cases.
 //
 // Deterministic: a local seeded generator (mulberry32, fixed seed), a fake Date.now, no network,
 // no real time, no sleeps. A failure names the case index and the id, so it reproduces exactly.
@@ -122,16 +123,36 @@ async function hold(entry, seed, messageId, text, what) {
   return parsed;
 }
 
+/** Whether the test seam's signer accepts `messageId` (it refuses lone surrogates before any door sees them). */
+function signable(seed, messageId) {
+  try {
+    signEnvelope(seed, { from: didFromSeedHex(seed), to: 'did:key:z', messageId, contextId: null, timestamp: 0, text: 'x' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function fuzz(store, cases, label) {
   const rand = mulberry32(FUZZ_SEED);
   const entry = makeDoor(store);
   let filed = 0;
+  let sent = 0;
+  let skipped = 0;
   await withFakeClock(async ({ advance }) => {
     for (let i = 0; i < cases; i += 1) {
       const id = messageIdFrom(rand);
       const what = `${label} case ${i} messageId ${JSON.stringify(id).slice(0, 80)}`;
       const first = seedHexFrom(rand);
       const second = seedHexFrom(rand);
+      // Not sendable: no visitor can sign this id, so it is skipped, never counted as the door failing.
+      // The window draw is still taken so the generator stream is the same whatever is skipped.
+      if (!signable(first, id)) {
+        skipped += 1;
+        advance(REPLAY_TTL_S + 1 + Math.floor(rand() * 3600) + 1);
+        continue;
+      }
+      sent += 1;
       await hold(entry, first, id, `hold item {"id":${i}}`, `${what} (first)`);
       const before = JSON.stringify(await store.getReceipt(id));
       advance(REPLAY_TTL_S + 1 + Math.floor(rand() * 3600));
@@ -146,8 +167,10 @@ async function fuzz(store, cases, label) {
       advance(1);
     }
   });
+  assert.equal(sent + skipped, cases, `${label}: every case is either sent or skipped`);
   // A harness whose ids the door refused every time would prove nothing.
-  assert.ok(filed >= cases / 4, `${label}: at least a quarter of the cases filed a row (${filed} of ${cases})`);
+  assert.ok(sent > 0 && filed >= sent / 4,
+    `${label}: at least a quarter of the sent cases filed a row (${filed} of ${sent} sent, ${skipped} not sendable)`);
 }
 
 test('kind fuzz, memory store: no_crash, and a repeated messageId never changes an existing row', async () => {
