@@ -1,0 +1,24 @@
+{
+  "_type": "https://in-toto.io/Statement/v1",
+  "subject": [
+    {
+      "name": "6059cf43a1380ffc77a116758f4b8433ee61c440..e31a6be1abec9d9eaf22a38be5a843bfa6d1c006",
+      "digest": {
+        "sha256": "fdcb6b6aede53e35e75e228ba1d678155f4fa09340bc7cdcc90206f7275e6119"
+      }
+    }
+  ],
+  "predicateType": "urn:muretai:appl:audit-receipt:v1",
+  "predicate": {
+    "seq": 0,
+    "head": "c815b132d1e02d69e180f74548228339fc0806bc",
+    "files": [],
+    "blobs": {},
+    "findings": 39,
+    "verdict": "findings-filed",
+    "notes": "secrev-entry-6059-0363-5: range 6059cf43..e31a6be (147 commits), judged at e31a6be. Carried every finding from the -2, -3 and -4 reports and re-checked each at its file:line on the tip. No commit in the range was left uncovered by those three reports, so I added no new findings. 39 findings are open at the tip.\nFixed inside the range: D1 (2f63f16, muretai-agent-entry.mjs:5688). T8 is partly fixed (e31a6be, 302a1e8).\nKilled: T6. The herdr socket's parent (~/.config/herdr) is under no allow-write in the generated wall profile.\nOpen and highest: T1 and T2 (HIGH, wall), N1 (MEDIUM, the decision is unsigned, :4081-4084 and :6432), C2 and E3 (the required check is red, and the D1/D2/T8 tests run nowhere), and the D2 residual.\nFull report: <herd-cache>/secrev-entry-6059-0363-5/report.md",
+    "audited_at": "2026-10-31T19:08:42+0400",
+    "range": "6059cf43a1380ffc77a116758f4b8433ee61c440..e31a6be1abec9d9eaf22a38be5a843bfa6d1c006",
+    "scope": "guard-files-only"
+  }
+}
