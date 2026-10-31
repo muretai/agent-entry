@@ -6742,13 +6742,17 @@ const SITE_HOLD_OFFER = deepFreeze({ verb: 'hold', of: 'item', about: 'Hold one 
 const WOO_SNAPSHOT_FILE = 'agent-entry.products.json';
 
 const USAGE = {
-  init: 'usage: agent-entry init --trade restaurant|retail|clinic|repair --base-url <url> [--name <name>] [--json]\n'
+  init: 'usage: agent-entry init <https store url> [--facts <file>] [--max-pages <n>] [--max-bytes <n>] [--name <name>] [--json]\n'
+    + '       agent-entry init --trade restaurant|retail|clinic|repair --base-url <url> [--name <name>] [--json]\n'
     + '       agent-entry init --from woocommerce <https store url> [--facts <file>] [--max-pages <n>]\n'
     + '                                           [--max-bytes <n>] [--name <name>] [--json]\n'
     + '       agent-entry init --from site <https store url> [--hint wix|squarespace|base] [--facts <file>]\n'
     + '                                   [--max-pages <n>] [--max-bytes <n>] [--name <name>] [--json]\n'
     + '  Detects the framework, mints the site seed into a git-ignored file, writes agent-entry.json and\n'
     + '  .agents/skills/agent-entry/SKILL.md, and wires the door routes, the signposts and the page tag.\n'
+    + '  init <store url> detects the store\'s source: the WooCommerce Store API first, then Product JSON-LD\n'
+    + '  on the store\'s own pages. It reads the first that answers as its --from flag would, names it\n'
+    + '  (--json `source`), and refuses a store that answers neither. --from forces one source.\n'
     + '  --from woocommerce reads the store\'s robots.txt, then the pages of its public Store API\n'
     + `  (wc/store/v1/products) in order, each once, https only and at most ${WOO_PAGE_MAX_BYTES} bytes a page,\n`
     + '  never past x-wp-totalpages, never from another host, with no retries. --max-pages <n> (default\n'
@@ -6920,7 +6924,7 @@ function wooStoreBase(storeUrl) {
   let base;
   try { base = new URL(storeUrl); } catch { throw new CliMisuse(`${JSON.stringify(String(storeUrl).slice(0, 80))} is not a URL`); }
   if (base.protocol !== 'https:') {
-    throw new CliRefusal(`init --from woocommerce reads a store only over https, and ${base.protocol.replace(/:$/, '')}:// is not https. `
+    throw new CliRefusal(`init reads a store only over https, and ${base.protocol.replace(/:$/, '')}:// is not https. `
       + 'Give the store\'s https:// URL. No request was made.');
   }
   if (base.username || base.password) throw new CliMisuse('the store URL must not carry a user name or password');
@@ -7141,16 +7145,23 @@ async function wooPage(url, cap) {
   }
 }
 
+/** robots.txt, then page 1 of the Store API products, read as wooPage reads any page. */
+async function wooFirstPage(base, maxBytes) {
+  const first = new URL(WOO_PRODUCTS_PATH, base);
+  await wooRobotsAllow(first);
+  return wooPage(first, Math.min(WOO_PAGE_MAX_BYTES, maxBytes));
+}
+
 /** The store's public Store API products, page 1 then ?page=2 ... in order, each asked once, from
  *  the store's own origin only (page URLs are built here; a Link header is never followed). The
  *  walk ends at the first of: the last page (x-wp-totalpages, or an empty page when the store
  *  sends none), `maxPages`, or `maxBytes` read over every page together; `stopped` names a bound
  *  that ended it. Refusals: page 1 that is no Store API page (not-woo) or larger than the bound
  *  (too-large), as in Woo-1; a later page that fails, redirects or breaks off, named by number.
- *  robots.txt is read first, and a disallow is respected. */
-async function wooProductPages(base, { maxPages, maxBytes }) {
+ *  robots.txt is read first, and a disallow is respected. `firstGot` is page 1 as wooFirstPage
+ *  already read it (detection), so it is not asked again. */
+async function wooProductPages(base, { maxPages, maxBytes }, firstGot = null) {
   const first = new URL(WOO_PRODUCTS_PATH, base);
-  await wooRobotsAllow(first);
   const where = `${first.host}${first.pathname}`;
   const products = [];
   let bytes = 0;
@@ -7164,7 +7175,7 @@ async function wooProductPages(base, { maxPages, maxBytes }) {
     const url = new URL(first);
     if (n > 1) url.searchParams.set('page', String(n));
     const cap = Math.min(WOO_PAGE_MAX_BYTES, maxBytes - bytes);
-    const got = await wooPage(url, cap);
+    const got = n === 1 ? firstGot ?? await wooFirstPage(base, maxBytes) : await wooPage(url, cap);
     if (n === 1) {
       if (got.failed) {
         throw new CliRefusal(`not a WooCommerce store: GET ${where} ${got.failed}, so this is no public Store API `
@@ -7217,13 +7228,13 @@ function wooBound(flags, name, fallback) {
   return Number(raw);
 }
 
-/** `init --from woocommerce <store> [--facts <file>]`: robots.txt and the bounded Store API walk prove the
- *  store answers; agent-entry.json gets one `ask` offer answered at the door from the facts. Only
- *  that file is written: the store's door (the WordPress plugin) keeps its own seed. A facts file
- *  is checked before any request; prompted facts are read once the store has answered. */
-async function initFromWoo(storeUrl, flags) {
-  if (storeUrl === undefined) throw new CliMisuse('init --from woocommerce needs the store URL: init --from woocommerce <store-url>');
-  if (flags['base-url'] !== undefined) throw new CliMisuse('init --from woocommerce takes the store URL itself, not --base-url');
+/** What `init <store>` decides before any request, forced (`from` is the flag's source) or
+ *  detected (`from` null): the bounds, the store base, a facts file, and that neither file exists. */
+function storeInitPrep(storeUrl, flags, from) {
+  const verb = from === null ? 'init' : `init --from ${from}`;
+  if (storeUrl === undefined) throw new CliMisuse(`${verb} needs the store URL: ${verb} <store-url>`);
+  if (flags['base-url'] !== undefined) throw new CliMisuse(`${verb} takes the store URL itself, not --base-url`);
+  const hint = from === SITE_FROM ? siteHint(flags) : null;
   const maxPages = wooBound(flags, 'max-pages', WOO_DEFAULT_MAX_PAGES);
   const maxBytes = wooBound(flags, 'max-bytes', WOO_DEFAULT_MAX_BYTES);
   const base = wooStoreBase(storeUrl);
@@ -7232,10 +7243,24 @@ async function initFromWoo(storeUrl, flags) {
   const snapPath = join(process.cwd(), WOO_SNAPSHOT_FILE);
   for (const [path, rel] of [[declPath, DECLARATION_FILE], [snapPath, WOO_SNAPSHOT_FILE]]) {
     if (existsSync(path)) {
-      throw new CliRefusal(`${rel} already exists; init --from never overwrites it. Move it aside first. No request was made.`);
+      throw new CliRefusal(`${rel} already exists; ${verb} never overwrites it. Move it aside first. No request was made.`);
     }
   }
-  const walk = await wooProductPages(base, { maxPages, maxBytes });
+  return { hint, maxPages, maxBytes, base, factsFromFile, declPath, snapPath };
+}
+
+/** The text line naming the source a store init read. */
+function sourceLine(name, detected) {
+  return `Source: ${name} (${detected ? 'detected from the store' : `forced by --from ${name}`}).`;
+}
+
+/** `init --from woocommerce <store> [--facts <file>]`: robots.txt and the bounded Store API walk prove the
+ *  store answers; agent-entry.json gets one `ask` offer answered at the door from the facts. Only
+ *  that file is written: the store's door (the WordPress plugin) keeps its own seed. A facts file
+ *  is checked before any request; prompted facts are read once the store has answered. */
+async function initFromWoo(storeUrl, flags, detected = null) {
+  const { maxPages, maxBytes, base, factsFromFile, declPath, snapPath } = detected?.prep ?? storeInitPrep(storeUrl, flags, WOO_FROM);
+  const walk = await wooProductPages(base, { maxPages, maxBytes }, detected?.found ?? null);
   const { host, products, pages } = walk;
   const facts = factsFromFile ?? await wooFactsPrompted();
   const declaration = checkedDeclaration({ v: 1, entry: { name: flags.name ?? base.hostname, baseUrl: base.href.replace(/\/$/, '') },
@@ -7249,8 +7274,9 @@ async function initFromWoo(storeUrl, flags) {
       ? [`Stopped at the byte bound (--max-bytes ${maxBytes}, ${walk.bytes} bytes read): page ${walk.next} `
         + `${walk.partial ? `was begun and left unread (${walk.partial})` : 'and later pages were not read'}.`]
       : [];
-  emit(flags.json, { from: WOO_FROM, store: base.href, products: products.length, pages, stopped: walk.stopped,
-    wrote: [DECLARATION_FILE, WOO_SNAPSHOT_FILE] }, [
+  emit(flags.json, { source: WOO_FROM, detected: detected !== null, from: WOO_FROM, store: base.href, products: products.length,
+    pages, stopped: walk.stopped, wrote: [DECLARATION_FILE, WOO_SNAPSHOT_FILE] }, [
+    sourceLine(WOO_FROM, detected),
     `Read robots.txt and ${pages} Store API page${pages === 1 ? '' : 's'} (${products.length} product${products.length === 1 ? '' : 's'}) from ${host}.`,
     ...stoppedLine,
     `Wrote ${DECLARATION_FILE}: one \`ask\` offer answered at the door from ${Object.keys(facts).length} facts, one \`find\` `
@@ -7596,6 +7622,9 @@ async function walkSquarespace(base, robots, state) {
   }
 }
 
+/** The site reader's not-a-store: detection reads it as "site does not answer". */
+class NotAStore extends CliRefusal {}
+
 async function siteWalk(base, hint, bounds) {
   const robots = await loadRobots(base);
   const state = { rows: [], pages: 0, products: 0, bytes: 0, stopped: null, next: null, partial: null, ...bounds };
@@ -7610,30 +7639,73 @@ async function siteWalk(base, hint, bounds) {
     }
   }
   if (state.products === 0) {
-    throw new CliRefusal('not-a-store: no product sitemap and no Product JSON-LD. Nothing was written.');
+    throw new NotAStore('not-a-store: no product sitemap and no Product JSON-LD. Nothing was written.');
   }
   return state;
+}
+
+// ------------------------------------------ init: which source a store is
+
+const STORE_DEFAULT_BOUNDS = Object.freeze({ maxPages: WOO_DEFAULT_MAX_PAGES, maxBytes: WOO_DEFAULT_MAX_BYTES });
+
+/** The sources `init <store>` detects, tried in this order; the first that answers is read. Each
+ *  detect(base, { bounds, found }) reads the store exactly as its forced flag's reader does and
+ *  resolves true when the source answers, leaving what it read in `found` under its name, so the
+ *  reader asks nothing twice. A next source (a products.json feed, say) is one more entry here and
+ *  one more reader in STORE_READERS. Refusals other than "not this source" (robots.txt) stand. */
+export const SOURCE_DETECTORS = [
+  { name: WOO_FROM, async detect(base, { bounds = STORE_DEFAULT_BOUNDS, found = null } = {}) {
+    const got = await wooFirstPage(base, bounds.maxBytes);
+    if (got.failed) return false;
+    found?.set(WOO_FROM, got);
+    return true;
+  } },
+  { name: SITE_FROM, async detect(base, { bounds = STORE_DEFAULT_BOUNDS, found = null } = {}) {
+    let walk;
+    try { walk = await siteWalk(base, null, bounds); } catch (e) {
+      if (e instanceof NotAStore) return false;
+      throw e;
+    }
+    found?.set(SITE_FROM, walk);
+    return true;
+  } },
+];
+
+const STORE_READERS = { [WOO_FROM]: initFromWoo, [SITE_FROM]: initFromSite };
+
+/** The first answering detector's name and what it read, or a refusal naming the store. */
+async function detectIn(base, bounds) {
+  const found = new Map();
+  const tried = [];
+  for (const detector of SOURCE_DETECTORS) {
+    tried.push(detector.name);
+    if (await detector.detect(base, { bounds, found })) return { name: detector.name, found: found.get(detector.name) ?? null };
+  }
+  throw new CliRefusal(`no source detected at ${base.href}: none of ${tried.join(', ')} answered (the WooCommerce Store API `
+    + `at ${WOO_PRODUCTS_PATH}, then Product JSON-LD on the store's own pages). Check the URL is the shop's own address. `
+    + 'Nothing was written.');
+}
+
+/** The name of the source `init <storeUrl>` would read, detected in SOURCE_DETECTORS order. */
+export async function detectSource(storeUrl) {
+  return (await detectIn(wooStoreBase(String(storeUrl)), STORE_DEFAULT_BOUNDS)).name;
+}
+
+/** `init <store>`: detect the source, then read it exactly as its forced flag does. */
+async function initDetected(storeUrl, flags) {
+  const prep = storeInitPrep(storeUrl, flags, null);
+  const { name, found } = await detectIn(prep.base, prep);
+  const reader = STORE_READERS[name];
+  if (!reader) throw new CliRefusal(`${prep.base.href} answered as ${name}, which init cannot read yet. Nothing was written.`);
+  return reader(storeUrl, flags, { prep, found });
 }
 
 /** `init --from site <store> [--hint] [--facts <file>]`: robots.txt, then product HTML bounded
  *  like the store API walk. Discovery is not counted. Only agent-entry.json and the snapshot
  *  are written, and only after the walk has a Product. */
-async function initFromSite(storeUrl, flags) {
-  if (storeUrl === undefined) throw new CliMisuse('init --from site needs the store URL: init --from site <store-url>');
-  if (flags['base-url'] !== undefined) throw new CliMisuse('init --from site takes the store URL itself, not --base-url');
-  const hint = siteHint(flags);
-  const maxPages = wooBound(flags, 'max-pages', WOO_DEFAULT_MAX_PAGES);
-  const maxBytes = wooBound(flags, 'max-bytes', WOO_DEFAULT_MAX_BYTES);
-  const base = wooStoreBase(storeUrl);
-  const factsFromFile = flags.facts === undefined ? null : wooFactsFile(flags.facts);
-  const declPath = join(process.cwd(), DECLARATION_FILE);
-  const snapPath = join(process.cwd(), WOO_SNAPSHOT_FILE);
-  for (const [path, rel] of [[declPath, DECLARATION_FILE], [snapPath, WOO_SNAPSHOT_FILE]]) {
-    if (existsSync(path)) {
-      throw new CliRefusal(`${rel} already exists; init --from never overwrites it. Move it aside first. No request was made.`);
-    }
-  }
-  const walk = await siteWalk(base, hint, { maxPages, maxBytes });
+async function initFromSite(storeUrl, flags, detected = null) {
+  const { hint, maxPages, maxBytes, base, factsFromFile, declPath, snapPath } = detected?.prep ?? storeInitPrep(storeUrl, flags, SITE_FROM);
+  const walk = detected?.found ?? await siteWalk(base, hint, { maxPages, maxBytes });
   const facts = factsFromFile ?? await wooFactsPrompted();
   const declaration = checkedDeclaration({ v: 1, entry: { name: flags.name ?? base.hostname, baseUrl: base.href.replace(/\/$/, '') },
     offers: [WOO_ASK_OFFER, WOO_FIND_OFFER, SITE_HOLD_OFFER].map((o) => JSON.parse(JSON.stringify(o))), facts });
@@ -7645,8 +7717,9 @@ async function initFromSite(storeUrl, flags) {
       ? [`Stopped at the byte bound (--max-bytes ${maxBytes}, ${walk.bytes} bytes read): page ${walk.next} `
         + `${walk.partial ? `was begun and left unread (${walk.partial})` : 'and later pages were not read'}.`]
       : [];
-  emit(flags.json, { from: SITE_FROM, store: base.href, products: walk.products, pages: walk.pages, stopped: walk.stopped,
-    wrote: [DECLARATION_FILE, WOO_SNAPSHOT_FILE] }, [
+  emit(flags.json, { source: SITE_FROM, detected: detected !== null, from: SITE_FROM, store: base.href, products: walk.products,
+    pages: walk.pages, stopped: walk.stopped, wrote: [DECLARATION_FILE, WOO_SNAPSHOT_FILE] }, [
+    sourceLine(SITE_FROM, detected),
     `Read robots.txt and ${walk.pages} product page${walk.pages === 1 ? '' : 's'} (${walk.products} product${walk.products === 1 ? '' : 's'}) from ${base.host}.`,
     ...stoppedLine,
     `Wrote ${DECLARATION_FILE}: one \`ask\` offer answered at the door from ${Object.keys(facts).length} facts, one \`find\` `
@@ -8129,8 +8202,12 @@ async function initMain(argv) {
   }
   if (flags.from !== undefined) throw new CliMisuse('init --from accepts only woocommerce or site');
   if (flags.hint !== undefined) throw new CliMisuse('--hint goes with --from site');
+  if (positionals.length && flags.trade === undefined) {
+    if (positionals.length > 1) throw new CliMisuse(`unexpected argument ${JSON.stringify(positionals[1].slice(0, 60))}`);
+    return initDetected(positionals[0], flags);
+  }
   for (const name of ['facts', 'max-pages', 'max-bytes']) {
-    if (flags[name] !== undefined) throw new CliMisuse(`--${name} goes with --from woocommerce or --from site`);
+    if (flags[name] !== undefined) throw new CliMisuse(`--${name} goes with a store URL: init <store-url>`);
   }
   if (positionals.length) throw new CliMisuse(`unexpected argument ${JSON.stringify(positionals[0].slice(0, 60))}`);
   const root = process.cwd();
