@@ -1,0 +1,27 @@
+{
+  "_type": "https://in-toto.io/Statement/v1",
+  "subject": [
+    {
+      "name": "appl.toml",
+      "digest": {
+        "sha256": "c0a2f03f68412278195820498fe245273624687d95a31f4b3d928b45e0047826"
+      }
+    }
+  ],
+  "predicateType": "urn:muretai:appl:audit-receipt:v1",
+  "predicate": {
+    "seq": 0,
+    "head": "59a62536b5a702470778d1d8ced4a52be986c2eb",
+    "files": [
+      "appl.toml"
+    ],
+    "blobs": {
+      "appl.toml": "955e957e4c8224f6aa1423beee1cdaf131b5b86a"
+    },
+    "findings": 2,
+    "verdict": "findings-filed",
+    "notes": "Landing gate-github-and-revendor-v0-1-10, range 407f74e..59a6253 on agent-entry main.\n\nIn plain words: this landing turns on the GitHub landing gate for agent-entry by adding appl.toml with gate = \"github\", swaps the gate-absent pin test for a gate-github pin test, adds source detection to `agent-entry init <store url>` (WooCommerce Store API first, then Product JSON-LD on the store's pages), and re-vendors APPL v0.1.10 at 3a26fee.\n\nVendored files: vendor.sh check says 67 files match the pin, appl @ v0.1.10 = 3a26fee5acc3. No drift.\n\nPersonas run, read-only, general-purpose, each carrying the adversarial contract verbatim:\n1. Gate attacker: a hostile worker or branch trying to get code onto main, or published from it, past review, tests or the scan via the gate=github setting, or by reverting it.\n2. Init attacker: the operator of a hostile store trying to reach another host, break the page, byte or robots.txt bounds, write or overwrite files, or inject content into agent-entry.json through the new detection path.\n\nFindings confirmed: 2.\n1. Under gate = \"github\", the only required check, `test`, is defined by .github/workflows/test.yml and package.json scripts.test, both taken from the PR head. docs/LANDING.md's owner steps require no approving or code-owner review. A hostile branch can therefore pass the check by rewriting its own test.\n2. The new detection path does not share the --max-bytes budget. The woo probe reads up to min(4 MiB, maxBytes), and then siteWalk starts again at bytes 0. A hostile store makes init read past the documented bound.",
+    "audited_at": "2026-11-01T20:23:33+0400",
+    "range": "407f74e..59a6253"
+  }
+}
