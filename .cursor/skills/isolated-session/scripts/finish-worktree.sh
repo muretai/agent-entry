@@ -144,14 +144,332 @@ branch="${1:-}"
 worktree="${2:-}"
 if [[ -z "$branch" || -z "$worktree" ]]; then
   echo "usage: finish-worktree.sh <branch> <worktree-path>" >&2
+  echo "REFUSAL=usage"
   exit 2
 fi
 if [[ ! -d "$worktree" ]]; then
   echo "worktree not found: ${worktree}" >&2
+  echo "REFUSAL=usage"
   exit 1
 fi
 worktree="$(cd "$worktree" && pwd)"
 here="$(cd "$(dirname "$0")" && pwd)"
+
+# --- the running-landing marker: a herd worker's pane is not swept mid-landing ---------
+# herd-watch.sh closes a finished or idle worker pane, and closing a pane SIGTERMs the
+# landing running in it. So a landing started for a herd worker (HERD_WORKER=<w>, as
+# herd-spawn.sh exports it) writes HERD_DIR/<w>/landing-running -- `pid=` the process
+# that was started (this one; the BASE copy and the gate copy below are its children),
+# `started=` the UTC time it wrote the marker -- here, before the re-exec, the tests
+# and the landing-lock wait. Every EXIT trap from here on removes it, and a SIGKILLed
+# landing leaves one naming a dead pid, which the sweep treats as stale. The sweep only
+# ever KEEPS a pane for it. No `ps`: behind a wall the setuid /bin/ps cannot be exec'd.
+# Written with O_CREAT|O_EXCL|O_NOFOLLOW, mode 600, into the worker's own directory only
+# (a real directory this user owns). The one thing removed first is a stale regular
+# file of ours naming a dead pid. A symlink or anything else at the path is left alone
+# and no marker is written, and so is a marker naming a live pid -- in a nested copy
+# that is the started process's own marker. Never fatal: a marker that cannot be
+# written is no marker. Removed only while it still names this pid.
+landing_marker=""
+landing_marker_drop() {
+  local m="$landing_marker"
+  landing_marker=""
+  [[ -n "$m" && -f "$m" && ! -L "$m" && -O "$m" ]] || return 0
+  grep -qx "pid=$$" "$m" 2>/dev/null && rm -f "$m" 2>/dev/null
+  return 0
+}
+landing_marker_write() {
+  local w="${HERD_WORKER:-}" d=""
+  [[ -n "$w" && -n "${HERD_DIR:-}" ]] || return 0
+  [[ "$w" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 0
+  d="${HERD_DIR%/}/${w}"
+  [[ -d "$d" && ! -L "$d" && -O "$d" ]] || return 0
+  python3 -I - "${d}/landing-running" "$$" <<'PY' >/dev/null 2>&1 || return 0
+import os, stat, sys, time
+path, pid = sys.argv[1], sys.argv[2]
+try:
+    st = os.lstat(path)
+except FileNotFoundError:
+    st = None
+if st is not None:
+    # only a regular file of ours naming a dead pid is stale; anything else stays
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+        sys.exit(1)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                sys.exit(1)
+            old = os.read(fd, 4096).decode("ascii", "replace")
+        finally:
+            os.close(fd)
+    except OSError:
+        sys.exit(1)
+    for ln in old.splitlines():
+        k, _, v = ln.partition("=")
+        if k.strip() == "pid" and v.strip().isdigit() and int(v.strip()) > 1:
+            try:
+                os.kill(int(v.strip()), 0)
+            except ProcessLookupError:
+                continue
+            except OSError:
+                pass
+            sys.exit(1)                     # a live pid, or one we may not ask about
+    os.unlink(path)
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+try:
+    os.fchmod(fd, 0o600)
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    os.write(fd, ("pid=%s\nstarted=%s\n" % (pid, started)).encode("ascii"))
+finally:
+    os.close(fd)
+PY
+  landing_marker="${d}/landing-running"
+}
+trap 'landing_marker_drop' EXIT
+landing_marker_write || true
+
+# --- the receipt, appended to the herd worker's report.md ------------------------------
+# A worker whose turn ended before its landing did has no receipt on record unless the
+# landing writes one. So for a herd worker (HERD_WORKER set) the gate's own run below is
+# started through this relay: it passes the run's stdout and stderr through as they come,
+# keeps a copy, and once the run has exited appends to HERD_DIR/<w>/report.md the receipt
+# it printed -- every `KEY=value` line of stdout, in order -- and, on a non-zero exit, the
+# stderr lines from the last `refusing to land` on (the why, which for held gate slots is
+# the runner's own words and on stderr only). Appended, never truncated: O_APPEND, created
+# mode 600 when absent, opened with O_NOFOLLOW under a descriptor of HERD_DIR/<w> that was
+# itself opened with O_NOFOLLOW. The marker's rule decides who may be written for: HERD_WORKER
+# matches `[A-Za-z0-9][A-Za-z0-9._-]*`, HERD_DIR/<w> is a real directory this user owns,
+# and report.md is a regular file of this user's. Anything else is refused with one stderr
+# line naming report.md, and nothing is written. Never fatal, and never the exit status:
+# the run's own is passed on. HUP/INT/TERM do not stop the relay (the run, in the same
+# process group, gets them itself, and the relay passes each on to it as TERM for a
+# signal sent to the relay alone), so the run never writes into a closed pipe while it
+# releases the landing lock. No HERD_WORKER, or no HERD_DIR (as for the marker): no relay,
+# nothing logged, the run is started as before.
+receipt_append_py=""
+read -r -d '' receipt_append_py <<'PY' || true
+import os, re, select, signal, stat, subprocess, sys, time
+herd, worker, branch, argv = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+KEEP = 1 << 20
+p = None
+
+
+def pass_on(*_):
+    # the relay stays; the run is told to give up (TERM), and releases what it holds
+    if p is not None and p.poll() is None:
+        try:
+            p.send_signal(signal.SIGTERM)
+        except OSError:
+            pass
+
+
+for s in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(s, pass_on)
+
+
+def shown(s):
+    return "".join(c if c.isprintable() else "?" for c in s)
+
+
+try:
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+except OSError as e:
+    sys.stderr.write("refusing to land %s: the gate copy could not be started (%s); nothing moved.\n"
+                     % (shown(branch), e.strerror or type(e).__name__))
+    sys.stdout.write("REFUSAL=gate\n")
+    sys.exit(1)
+bufs = {p.stdout.fileno(): (1, bytearray()), p.stderr.fileno(): (2, bytearray())}
+out, err = bufs[p.stdout.fileno()][1], bufs[p.stderr.fileno()][1]
+live, broken, deadline = set(bufs), set(), None
+while live:
+    if deadline is None and p.poll() is not None:
+        deadline = time.time() + 5           # what is still buffered, not a lingering child
+    wait = 0.5 if deadline is None else deadline - time.time()
+    if wait <= 0:
+        break
+    ready = select.select(list(live), [], [], wait)[0]
+    for fd in ready:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            live.discard(fd)
+            continue
+        dest, buf = bufs[fd]
+        if dest not in broken:
+            try:
+                view = memoryview(chunk)
+                while view:
+                    view = view[os.write(dest, view):]
+            except OSError:
+                broken.add(dest)             # keep reading: the run must never see EPIPE
+        buf += chunk
+        if len(buf) > KEEP:
+            del buf[:len(buf) - KEEP]
+rc = p.wait()
+rc = 128 - rc if rc < 0 else rc
+
+lines = [shown(ln) for ln in out.decode("utf-8", "replace").splitlines()
+         if re.match(r"[A-Z][A-Z0-9_]*=", ln)]
+if rc != 0:
+    said = err.decode("utf-8", "replace").splitlines()
+    at = [i for i, ln in enumerate(said) if ln.startswith("refusing to land ")]
+    if at:
+        lines += [shown(ln) for ln in said[at[-1]:at[-1] + 40]]
+path = os.path.join(herd, worker, "report.md")
+
+
+def refuse(why):
+    sys.stderr.write("note: refusing to append the landing receipt to %s: %s; nothing was written.\n"
+                     % (shown(path), why))
+    sys.stderr.flush()
+
+
+def append():
+    if not re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z", worker):
+        return refuse("HERD_WORKER is not a worker name")
+    try:
+        dfd = os.open(os.path.join(herd, worker), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        return refuse("HERD_DIR/<worker> is not a real directory (%s)" % (e.strerror or type(e).__name__))
+    try:
+        st = os.fstat(dfd)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            return refuse("HERD_DIR/<worker> is not a directory of this user's")
+        flags = os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
+        try:
+            fd, created = os.open("report.md", flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dfd), True
+        except FileExistsError:
+            try:
+                fd, created = os.open("report.md", flags, dir_fd=dfd), False
+            except OSError as e:
+                return refuse("it is a symlink or cannot be opened (%s)" % (e.strerror or type(e).__name__))
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+                return refuse("it is not a regular file of this user's")
+            if created:
+                os.fchmod(fd, 0o600)
+            head = "\n" if st.st_size and os.pread(fd, 1, st.st_size - 1) != b"\n" else ""
+            text = head + "\n## landing receipt: finish-worktree.sh %s, exit %d, %s\n\n%s\n" % (
+                shown(branch), rc, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "\n".join(lines))
+            view = memoryview(text.encode("utf-8"))
+            while view:
+                view = view[os.write(fd, view):]
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dfd)
+
+
+if lines:
+    try:
+        append()
+    except Exception as e:                   # writing the receipt never fails a landing
+        refuse("the write failed (%s)" % type(e).__name__)
+sys.exit(rc)
+PY
+
+# The copy that was started runs the landing as a CHILD (BASE's blob, the gate copy), and
+# that child is the one that takes the landing lock and runs the in-lock gate. A TERM,
+# INT or HUP sent to the started process alone used to end it and leave the child
+# landing on, holding the lock. So the child runs in the background and is waited for,
+# and each of those signals is passed on to it as TERM -- the child gives up, releasing
+# what it holds -- while this copy waits for it to end and exits with its status. stdin
+# is the caller's (`<&0`: an async command's is /dev/null otherwise), and INT and QUIT
+# are put back to their defaults before the exec: bash starts an async command with both
+# ignored, and an ignored signal is inherited by every test the gate runs. A python3 that
+# cannot run starts the child as it is: the landing then refuses on its own words where it
+# needs python3, rather than here with none.
+finish_child_run() {
+  local child rc=0
+  if python3 -I -c '' >/dev/null 2>&1; then
+    python3 -I -c 'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+os.execvp(sys.argv[1], sys.argv[1:])' "$@" <&0 &
+  else
+    "$@" <&0 &
+  fi
+  child=$!
+  trap 'kill -TERM "$child" 2>/dev/null || true' TERM INT HUP
+  while :; do
+    rc=0
+    wait "$child" || rc=$?
+    kill -0 "$child" 2>/dev/null || break
+  done
+  trap - TERM INT HUP
+  return "$rc"
+}
+
+# --- the common dir is the PRIMARY's, never the one the worktree names ---------------
+# A linked worktree finds its refs and objects through <gitdir>/commondir, and that gitdir
+# is the worker's to write. A worker that pointed it at a git dir of its own, whose main
+# carried a finish-worktree.sh, had that blob read through `git -C <worktree>` below and
+# run here as the launcher, outside every wall (intake 20261011T142331Z, ruling
+# 20261011T142424Z). So the common dir is asked of the PRIMARY -- the directory the landing
+# runs from: land.sh and the operator both start it there -- and a worktree whose common
+# dir resolves anywhere else is refused before anything is read through it. land.sh also
+# hands over the common dir and git dir pinned to the dirs it recorded and checked: they
+# are read once, by the first git call here, and cleared, so nothing this landing starts
+# (the merge in the primary, a test that builds a repository of its own) inherits them.
+# Every other repository-location variable is cleared before that call. The launcher is
+# started in the worktree, so this process also inherits GIT_WORK_TREE, GIT_INDEX_FILE
+# or GIT_OBJECT_DIRECTORY. Left set, the dirty-base check reads the branch: its committed
+# files are reported as uncommitted changes on main, and a stray object directory makes
+# a clean primary look dirty. Identity and the global config stay. A landing started
+# outside any repository has no primary to ask and reads the worktree's.
+finish_resolve_dir() {  # $1 a git dir as git printed it, $2 the directory it is relative to
+  local d="$1"
+  [[ -n "$d" ]] || return 1
+  [[ "$d" == /* ]] || d="$2/$d"
+  (cd "$d" 2>/dev/null && pwd -P)
+}
+# GIT_WORK_TREE, GIT_INDEX_FILE and the other location variables redirect
+# `git -C <checkout>` onto whatever they name. Drop them before the pin read.
+# GIT_DIR and GIT_COMMON_DIR stay for that one read, then go too.
+# Cleared before the pin is read, so the pin's git and the dirty-base check both see
+# the primary. land.sh hands the two pins as ISO_FINISH_PIN_COMMON_DIR and
+# ISO_FINISH_PIN_GIT_DIR, names an older vendored finish ignores; an inherited
+# GIT_COMMON_DIR and GIT_DIR are read the same way. All four go before any git call, and
+# the pins are put back on that one read only.
+unset GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX \
+  GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM \
+  GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_GRAFT_FILE \
+  GIT_IMPLICIT_WORK_TREE GIT_INTERNAL_SUPER_PREFIX GIT_NO_REPLACE_OBJECTS \
+  GIT_REPLACE_REF_BASE GIT_SHALLOW_FILE GIT_QUARANTINE_PATH
+pin_common_in="${ISO_FINISH_PIN_COMMON_DIR:-${GIT_COMMON_DIR:-}}"
+pin_gitdir_in="${ISO_FINISH_PIN_GIT_DIR:-${GIT_DIR:-}}"
+unset ISO_FINISH_PIN_COMMON_DIR ISO_FINISH_PIN_GIT_DIR GIT_COMMON_DIR GIT_DIR
+pin_common=""
+if [[ -n "$pin_common_in" ]]; then
+  if [[ -n "$pin_gitdir_in" ]]; then
+    pin_common="$(GIT_COMMON_DIR="$pin_common_in" GIT_DIR="$pin_gitdir_in" git -C "$worktree" rev-parse --git-common-dir 2>/dev/null)" || pin_common=""
+  else
+    pin_common="$(GIT_COMMON_DIR="$pin_common_in" git -C "$worktree" rev-parse --git-common-dir 2>/dev/null)" || pin_common=""
+  fi
+  pin_common="$(finish_resolve_dir "$pin_common" "$worktree")" || pin_common=""
+  if [[ -z "$pin_common" ]]; then
+    echo "refusing to land ${branch}: the GIT_COMMON_DIR this landing was handed is not a directory; nothing moved." >&2
+    echo "REFUSAL=other"
+    exit 1
+  fi
+fi
+primary_common="$(git -C "$PWD" rev-parse --git-common-dir 2>/dev/null)" || primary_common=""
+primary_common="$(finish_resolve_dir "$primary_common" "$PWD")" || primary_common=""
+wt_common="$(git -C "$worktree" rev-parse --git-common-dir 2>/dev/null)" || wt_common=""
+wt_common="$(finish_resolve_dir "$wt_common" "$worktree")" || wt_common=""
+if [[ -n "$pin_common" && -n "$primary_common" && "$pin_common" != "$primary_common" ]]; then
+  echo "refusing to land ${branch}: the common dir this landing was handed (${pin_common}) is not the primary's (${primary_common}); nothing moved." >&2
+  echo "REFUSAL=other"
+  exit 1
+fi
+[[ -n "$primary_common" ]] || primary_common="${pin_common:-$wt_common}"
+if [[ -n "$wt_common" && "$wt_common" != "$primary_common" ]]; then
+  echo "refusing to land ${branch}: the worktree's commondir names ${wt_common}, not the primary's common dir ${primary_common}; nothing moved." >&2
+  echo "REFUSAL=other"
+  exit 1
+fi
 
 # --- the code that judges a landing is BASE's: re-run from BASE's own copy ----------
 # Everything below this block -- lib.sh, assert-head.sh, the landing lease
@@ -171,11 +489,106 @@ here="$(cd "$(dirname "$0")" && pwd)"
 # primary's working tree to the branch's code -- still run BASE's copy. Always the blobs,
 # never the primary's working tree: a blob cannot be edited under us or swapped for a link.
 #
-# The one shape that stays open: an operator who runs a branch's EDITED copy of this file
-# has handed the branch control before this block exists
-# (ISSUE(branch-edited-finish-is-trusted-when-run-directly)); the documented call is the
-# primary's copy, by absolute path.
-#
+# An edited copy of this file used to be trusted up to the block below
+# (ISSUE(branch-edited-finish-is-trusted-when-run-directly)). Before that block, and
+# before any line a branch can plant ahead of it, the invoked file is compared with
+# BASE's blob of this script. The blob is read from BASE's commit (`git cat-file blob`
+# of the id `rev-parse <base>:<path>` names), never from the worktree file, a branch
+# commit or the primary working tree. A difference re-execs that blob with the original
+# argv, written to a private temporary file that is removed when the run returns or
+# fails to start. The re-exec'd copy is marked with ISO_FINISH_REEXEC_BLOB set to that
+# blob id (exported into its environment only) and does not re-exec again; any other
+# value is ignored, so a stand-in id cannot skip the check. A byte-identical copy does
+# not take this detour. An edited copy that belongs to the repository refuses when BASE
+# carries no such script; a copy from outside the repository still falls through.
+# $1 is this file's path. The remaining arguments are the caller's original argv.
+finish_reexec_base_blob() {
+  local g_common="" g_base="main" g_sha="" blob_id="" invoked="" invoked_id=""
+  local rel="" here_real="" here_common="" reexec_rc=0
+  rel=".cursor/skills/isolated-session/scripts/finish-worktree.sh"
+  invoked="${1:-}"
+  shift
+  # the primary's common dir (above), never the one the worktree's commondir names
+  g_common="$primary_common"
+  [[ -n "$g_common" ]] || return 0
+  if git --git-dir="$g_common" symbolic-ref --quiet refs/remotes/origin/HEAD >/dev/null 2>&1; then
+    g_base="$(git --git-dir="$g_common" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+  fi
+  if ! git --git-dir="$g_common" show-ref --verify --quiet "refs/heads/${g_base}" 2>/dev/null &&
+     git --git-dir="$g_common" show-ref --verify --quiet "refs/heads/master" 2>/dev/null; then
+    g_base="master"
+  fi
+  g_sha="$(git --git-dir="$g_common" rev-parse --verify --quiet "refs/heads/${g_base}^{commit}" 2>/dev/null)" || return 0
+  blob_id="$(git --git-dir="$g_common" rev-parse --verify --quiet "${g_sha}:${rel}" 2>/dev/null)" || blob_id=""
+  # Honoured only when it names BASE's blob. A different value is not a mark.
+  if [[ -n "${ISO_FINISH_REEXEC_BLOB:-}" && -n "$blob_id" && "${ISO_FINISH_REEXEC_BLOB}" == "$blob_id" ]]; then
+    unset ISO_FINISH_REEXEC_BLOB
+    return 0
+  fi
+  if [[ -n "${ISO_FINISH_REEXEC_BLOB:-}" ]]; then
+    unset ISO_FINISH_REEXEC_BLOB
+  fi
+  case "$invoked" in
+    /*) ;;
+    "") invoked="" ;;
+    *) invoked="$(cd "$(dirname "$invoked")" 2>/dev/null && pwd)/$(basename "$invoked")" || invoked="" ;;
+  esac
+  if [[ -n "$blob_id" && -n "$invoked" && -f "$invoked" ]]; then
+    invoked_id="$(git --git-dir="$g_common" hash-object -- "$invoked" 2>/dev/null)" || invoked_id=""
+    if [[ -n "$invoked_id" && "$invoked_id" == "$blob_id" ]]; then
+      return 0
+    fi
+  fi
+  if [[ -z "$blob_id" ]]; then
+    if [[ -z "$invoked" ]]; then
+      return 0
+    fi
+    here_real="$(cd "$(dirname "$invoked")" 2>/dev/null && pwd -P)" || return 0
+    here_common="$(git -C "$here_real" rev-parse --git-common-dir 2>/dev/null || true)"
+    if [[ -z "$here_common" ]]; then
+      return 0
+    fi
+    [[ "$here_common" == /* ]] || here_common="${here_real}/${here_common}"
+    here_common="$(cd "$here_common" 2>/dev/null && pwd -P || true)"
+    if [[ "$here_common" == "$g_common" ]]; then
+      echo "refusing to land ${branch}: ${g_base} carries no ${rel}, and the copy started (${here}) belongs to the repository being landed; nothing moved." >&2
+      echo "REFUSAL=gate"
+      exit 1
+    fi
+    return 0
+  fi
+  FINISH_REEXEC_TMP="$(mktemp "${TMPDIR:-/tmp}/finish-reexec-XXXXXX" 2>/dev/null)" || {
+    echo "refusing to land ${branch}: could not create a private file for ${g_base}'s finish-worktree.sh; nothing moved." >&2
+    echo "REFUSAL=gate"
+    exit 1
+  }
+  trap 'rm -f "$FINISH_REEXEC_TMP"; landing_marker_drop' EXIT
+  chmod 700 "$FINISH_REEXEC_TMP" 2>/dev/null || {
+    rm -f "$FINISH_REEXEC_TMP"
+    trap 'landing_marker_drop' EXIT
+    echo "refusing to land ${branch}: could not make the re-exec file private; nothing moved." >&2
+    echo "REFUSAL=gate"
+    exit 1
+  }
+  if ! git --git-dir="$g_common" cat-file blob "$blob_id" > "$FINISH_REEXEC_TMP"; then
+    rm -f "$FINISH_REEXEC_TMP"
+    trap 'landing_marker_drop' EXIT
+    echo "refusing to land ${branch}: could not read ${g_base}'s finish-worktree.sh from the commit object; nothing moved." >&2
+    echo "REFUSAL=gate"
+    exit 1
+  fi
+  chmod 700 "$FINISH_REEXEC_TMP" 2>/dev/null || true
+  set +e
+  ISO_FINISH_REEXEC_BLOB="$blob_id" finish_child_run bash "$FINISH_REEXEC_TMP" "$@"
+  reexec_rc=$?
+  set -e
+  rm -f "$FINISH_REEXEC_TMP"
+  trap 'landing_marker_drop' EXIT
+  exit "$reexec_rc"
+}
+
+finish_reexec_base_blob "${BASH_SOURCE[0]}" "$@"
+
 # A copy of this file that lives OUTSIDE the repository being landed (a vendored skill
 # driving another repository, a test harness) is nothing the branch wrote: when BASE
 # carries no finish-worktree.sh of its own, that copy runs, still with BASE's tools. A copy
@@ -185,35 +598,148 @@ gate_tools="tools/run_tests.py tools/gate_slots.py tools/affected_tests.py tools
             tools/ledger.py tools/backlog_build.py tools/spec_build.py company/ops/backlog_to_core.py
             appl/config.py"
 here_real="$(cd "$here" && pwd -P)"
+# --- a gate directory handed in is trusted only as a sealed copy of BASE's blobs ----------
+# ISO_FINISH_GATE_DIR used to be taken on -d, ! -L and -O alone: any directory of this
+# uid's was the gate, and every tool the landing runs came out of it. And the branch's tests
+# run as this uid too, so a copy they can reach they can chmod and rewrite
+# (ISSUE(security-audit-2026-09-27-daily-2026-09-27)). So a directory is the gate only when
+# it is a real directory of this uid's, nothing in it is writable by anyone, it holds only
+# directories and regular files of this uid's, and every file is byte for byte the blob
+# BASE carries at that path. Which BASE is gate_dir_from's answer, once, as the dir is
+# accepted: the commit ISO_FINISH_GATE_BASE names when it is BASE's tip or under it (the
+# commit land.sh or the copy below extracted from), else BASE's tip. gate_dir_from prints
+# that commit, or why not and returns 1; gate_dir_untrusted prints why the dir is not such
+# a copy of it and returns 1, silent and 0 when it is. The second is asked again, of the
+# same commit, after every run of the branch's tests, before anything runs out of the dir.
+gate_dir_from() {  # $1 the BASE commit the dir was extracted from, or ""
+  local g_common="$primary_common" g_base="main" g_tip="" g_from=""
+  if [[ -z "$g_common" ]]; then
+    echo "there is no primary common dir to check it against"
+    return 1
+  fi
+  if git --git-dir="$g_common" symbolic-ref --quiet refs/remotes/origin/HEAD >/dev/null 2>&1; then
+    g_base="$(git --git-dir="$g_common" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+  fi
+  if ! git --git-dir="$g_common" show-ref --verify --quiet "refs/heads/${g_base}" 2>/dev/null &&
+     git --git-dir="$g_common" show-ref --verify --quiet "refs/heads/master" 2>/dev/null; then
+    g_base="master"
+  fi
+  if ! g_tip="$(git --git-dir="$g_common" rev-parse --verify --quiet "refs/heads/${g_base}^{commit}" 2>/dev/null)"; then
+    echo "there is no branch ${g_base} to check it against"
+    return 1
+  fi
+  g_from="$g_tip"
+  if [[ -n "$1" ]]; then
+    if [[ "$1" == *[!0-9a-f]* ]] ||
+       ! g_from="$(git --git-dir="$g_common" rev-parse --verify --quiet "${1}^{commit}" 2>/dev/null)" ||
+       ! git --git-dir="$g_common" merge-base --is-ancestor "$g_from" "$g_tip" 2>/dev/null; then
+      echo "the commit it names as its BASE is not ${g_base}'s tip or under it"
+      return 1
+    fi
+  fi
+  printf '%s\n' "$g_from"
+}
+gate_dir_untrusted() {  # $1 the directory, $2 the commit gate_dir_from named
+  if [[ -z "$primary_common" || -z "$2" ]]; then
+    echo "there is no BASE commit to check it against"
+    return 1
+  fi
+  # git, find and the shell only: a landing with no python3 on PATH gates itself too
+  local top="$1" rev="$2" uid="" out="" rel="" rels="" want="" got="" n=0 i=0
+  local -a wants=() gots=() names=()
+  if [[ -L "$top" ]]; then
+    echo "it is a symlink"
+    return 1
+  fi
+  if [[ ! -d "$top" ]]; then
+    echo "it is not a directory"
+    return 1
+  fi
+  uid="$(id -u)" || { echo "this uid could not be read"; return 1; }
+  # find never follows a link here (-P is its default); a walk that fails is a refusal
+  if ! out="$(find "$top" ! -user "$uid" 2>&1)"; then
+    echo "it could not be walked: ${out%%$'\n'*}"
+    return 1
+  fi
+  if [[ -n "$out" ]]; then
+    echo "${out%%$'\n'*} is owned by another uid, not this uid ${uid}"
+    return 1
+  fi
+  out="$(find "$top" \( -perm -0200 -o -perm -0020 -o -perm -0002 \) 2>&1)" ||
+    { echo "it could not be walked"; return 1; }
+  if [[ -n "$out" ]]; then
+    echo "${out%%$'\n'*} is writable, so it could have been changed since it was extracted"
+    return 1
+  fi
+  out="$(find "$top" ! -type d ! -type f 2>&1)" || { echo "it could not be walked"; return 1; }
+  if [[ -n "$out" ]]; then
+    echo "${out%%$'\n'*} is neither a directory nor a regular file"
+    return 1
+  fi
+  out="$(find "$top" -mindepth 1 -name '*[!A-Za-z0-9._-]*' 2>&1)" || { echo "it could not be walked"; return 1; }
+  if [[ -n "$out" ]]; then
+    echo "it holds a name no gate copy carries"
+    return 1
+  fi
+  rels="$(cd "$top" && find . -type f | sort)" || { echo "its files could not be listed"; return 1; }
+  [[ -n "$rels" ]] || return 0
+  while IFS= read -r rel; do
+    names[n]="${rel#./}"
+    n=$(( n + 1 ))
+  done <<< "$rels"
+  # what BASE holds at each path, and what each file hashes to, one line per file in order
+  want="$(for rel in "${names[@]}"; do printf '%s:%s\n' "$rev" "$rel"; done |
+          git --git-dir="$primary_common" cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null)" ||
+    { echo "BASE's tree could not be read"; return 1; }
+  got="$(for rel in "${names[@]}"; do printf '%s/%s\n' "$top" "$rel"; done |
+         git --git-dir="$primary_common" hash-object --no-filters --stdin-paths 2>/dev/null)" ||
+    { echo "its files could not be hashed"; return 1; }
+  while IFS= read -r rel; do wants[${#wants[@]}]="$rel"; done <<< "$want"
+  while IFS= read -r rel; do gots[${#gots[@]}]="$rel"; done <<< "$got"
+  while (( i < n )); do
+    if [[ "${wants[i]:-}" != "${gots[i]:-x} blob" ]]; then
+      echo "${top}/${names[i]} is not BASE's blob"
+      return 1
+    fi
+    i=$(( i + 1 ))
+  done
+  return 0
+}
 gate_dir=""
-if [[ -n "${ISO_FINISH_GATE_DIR:-}" && "${ISO_FINISH_GATE_SELF:-}" == "$here_real" &&
-      -d "${ISO_FINISH_GATE_DIR}" && ! -L "${ISO_FINISH_GATE_DIR}" && -O "${ISO_FINISH_GATE_DIR}" ]]; then
+gate_dir_base=""
+if [[ -n "${ISO_FINISH_GATE_DIR:-}" && "${ISO_FINISH_GATE_SELF:-}" == "$here_real" ]]; then
+  if ! gate_dir_base="$(gate_dir_from "${ISO_FINISH_GATE_BASE:-}" 2>&1)" ||
+     ! gate_dir_why="$(gate_dir_untrusted "$ISO_FINISH_GATE_DIR" "$gate_dir_base" 2>&1)"; then
+    echo "refusing to land ${branch}: the gate directory ISO_FINISH_GATE_DIR=${ISO_FINISH_GATE_DIR} is not a copy this landing can trust: ${gate_dir_why:-${gate_dir_base:-it could not be checked}}; nothing ran from it and nothing moved." >&2
+    echo "REFUSAL=gate"
+    exit 1
+  fi
   gate_dir="$ISO_FINISH_GATE_DIR"
 fi
 gate_from_base="${ISO_FINISH_GATE_FROM:-}"
 # never inherited: a test this landing runs starts its own finish, which gates itself
-unset ISO_FINISH_GATE_DIR ISO_FINISH_GATE_SELF ISO_FINISH_GATE_FROM
+unset ISO_FINISH_GATE_DIR ISO_FINISH_GATE_SELF ISO_FINISH_GATE_FROM ISO_FINISH_GATE_BASE
 if [[ -z "$gate_dir" ]]; then
   # One stderr line, before any lock, lease or ref is touched.
   gate_refuse() {
     echo "refusing to land ${branch}: $1; nothing moved." >&2
+    echo "REFUSAL=gate"
     exit 1
   }
-  g_common="$(git -C "$worktree" rev-parse --git-common-dir 2>/dev/null)" ||
+  # BASE and its blobs come out of the primary's common dir, never the worktree's commondir
+  g_common="$primary_common"
+  [[ -n "$g_common" ]] ||
     gate_refuse "${worktree} is not a git checkout, so there is no BASE to take the gate code from"
-  [[ "$g_common" == /* ]] || g_common="${worktree}/${g_common}"
-  g_common="$(cd "$g_common" 2>/dev/null && pwd -P)" ||
-    gate_refuse "could not resolve the git directory of ${worktree}"
-  if git -C "$worktree" symbolic-ref --quiet refs/remotes/origin/HEAD >/dev/null 2>&1; then
-    g_base="$(git -C "$worktree" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+  if git --git-dir="$g_common" symbolic-ref --quiet refs/remotes/origin/HEAD >/dev/null 2>&1; then
+    g_base="$(git --git-dir="$g_common" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
   else
     g_base="main"
   fi
-  if ! git -C "$worktree" show-ref --verify --quiet "refs/heads/${g_base}" 2>/dev/null &&
-     git -C "$worktree" show-ref --verify --quiet "refs/heads/master" 2>/dev/null; then
+  if ! git --git-dir="$g_common" show-ref --verify --quiet "refs/heads/${g_base}" 2>/dev/null &&
+     git --git-dir="$g_common" show-ref --verify --quiet "refs/heads/master" 2>/dev/null; then
     g_base="master"
   fi
-  g_sha="$(git -C "$worktree" rev-parse --verify --quiet "refs/heads/${g_base}^{commit}" 2>/dev/null)" ||
+  g_sha="$(git --git-dir="$g_common" rev-parse --verify --quiet "refs/heads/${g_base}^{commit}" 2>/dev/null)" ||
     gate_refuse "there is no branch ${g_base} in $(dirname "$g_common") to take the gate code from"
   # is the copy that was started part of the repository being landed?
   g_here_common="$(git -C "$here_real" rev-parse --git-common-dir 2>/dev/null || true)"
@@ -227,13 +753,13 @@ if [[ -z "$gate_dir" ]]; then
   fi
   g_dir="$(mktemp -d "${TMPDIR:-/tmp}/finish-gate-XXXXXX" 2>/dev/null)" ||
     gate_refuse "could not create a private directory for ${g_base}'s gate code under ${TMPDIR:-/tmp}"
-  trap 'rm -rf "$g_dir"' EXIT
+  trap 'chmod -R u+w "$g_dir" 2>/dev/null; rm -rf "$g_dir"; landing_marker_drop' EXIT
   chmod 700 "$g_dir" 2>/dev/null || gate_refuse "could not make ${g_dir} private"
   g_real="$(cd "$g_dir" && pwd -P)"
   # One path out of BASE's tree: 0 written, 1 not in BASE as a regular file, 2 failed.
   gate_put() {  # $1 path relative to the top of the tree
     local rec="" meta="" mode=""
-    rec="$(git -C "$worktree" ls-tree --full-tree "$g_sha" -- "$1" 2>/dev/null)" || return 2
+    rec="$(git --git-dir="$g_common" ls-tree --full-tree "$g_sha" -- "$1" 2>/dev/null)" || return 2
     [[ -n "$rec" && "${rec#*$'\t'}" == "$1" ]] || return 1
     meta="${rec%%$'\t'*}"
     mode="${meta%% *}"
@@ -242,10 +768,10 @@ if [[ -z "$gate_dir" ]]; then
       *) return 1 ;;
     esac
     mkdir -p "${g_dir}/$(dirname "$1")" 2>/dev/null || return 2
-    git -C "$worktree" cat-file blob "${meta##* }" > "${g_dir}/$1" 2>/dev/null || return 2
+    git --git-dir="$g_common" cat-file blob "${meta##* }" > "${g_dir}/$1" 2>/dev/null || return 2
     chmod 700 "${g_dir}/$1" 2>/dev/null || return 2
   }
-  g_names="$(git -C "$worktree" ls-tree --full-tree --name-only "$g_sha" -- "${gate_scripts_rel}/" 2>/dev/null)" ||
+  g_names="$(git --git-dir="$g_common" ls-tree --full-tree --name-only "$g_sha" -- "${gate_scripts_rel}/" 2>/dev/null)" ||
     gate_refuse "could not list ${gate_scripts_rel} in ${g_base}"
   for g_path in $g_names $gate_tools; do
     case "$g_path" in
@@ -254,6 +780,55 @@ if [[ -z "$gate_dir" ]]; then
     g_rc=0
     gate_put "$g_path" || g_rc=$?
     [[ "$g_rc" != "2" ]] || gate_refuse "could not write ${g_base}:${g_path} into ${g_dir}"
+  done
+  # BASE's tools/ledger.py puts its own directory on sys.path and imports siblings from it,
+  # which no fixed list can name (ISSUE(gate-copy-lacks-the-ledgers-import)). So its imports
+  # are READ -- parsed, never run -- out of the copy, and every tools/<name>.py they reach
+  # that BASE carries is written in from BASE's blob, walking on through each one written.
+  # A name the interpreter itself resolves (the standard library) is left alone, and a name
+  # BASE does not carry is left out: the ledger then crashes in the copy, and the check
+  # below reports that as a ledger crash. The branch's copy of a sibling is never read.
+  g_absent=""
+  while [[ -f "${g_dir}/tools/ledger.py" ]]; do
+    g_more="$(python3 -I - "$g_dir" $g_absent <<'PY'
+import ast, importlib.util, os, sys
+top, absent = sys.argv[1], set(sys.argv[2:])
+queue = ["tools/ledger.py"]
+seen, want = set(queue), []
+while queue:
+    rel = queue.pop(0)
+    try:
+        tree = ast.parse(open(os.path.join(top, rel), "rb").read(), rel)
+    except (OSError, SyntaxError, ValueError):
+        continue
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            names.add(node.module.split(".")[0])
+    for name in sorted(names):
+        nxt = "tools/" + name + ".py"
+        if nxt in seen or not name.isidentifier():
+            continue
+        seen.add(nxt)
+        if os.path.isfile(os.path.join(top, nxt)):
+            queue.append(nxt)
+        elif nxt not in absent and importlib.util.find_spec(name) is None:
+            want.append(nxt)
+print("\n".join(want))
+PY
+)" || gate_refuse "could not read the imports of ${g_base}'s tools/ledger.py"
+    [[ -n "$g_more" ]] || break
+    for g_path in $g_more; do
+      case "$g_path" in
+        *[!A-Za-z0-9._/-]*) g_absent="${g_absent} ${g_path}"; continue ;;
+      esac
+      g_rc=0
+      gate_put "$g_path" || g_rc=$?
+      [[ "$g_rc" != "2" ]] || gate_refuse "could not write ${g_base}:${g_path} into ${g_dir}"
+      [[ "$g_rc" != "1" ]] || g_absent="${g_absent} ${g_path}"
+    done
   done
   if [[ -f "${g_dir}/${gate_scripts_rel}/finish-worktree.sh" && -f "${g_dir}/${gate_scripts_rel}/lib.sh" ]]; then
     g_run="${g_dir}/${gate_scripts_rel}/finish-worktree.sh"
@@ -266,13 +841,26 @@ if [[ -z "$gate_dir" ]]; then
     g_self="$here_real"
     g_from=""
   fi
+  # Sealed before it is handed over: the child takes it only as a read-only copy of
+  # g_sha's blobs (gate_dir_untrusted, above), the same test land.sh's copy passes, and
+  # asks it again after every run of the branch's tests.
+  chmod -R a-w "$g_dir" 2>/dev/null || gate_refuse "could not make ${g_dir} read-only"
   set +e
-  ISO_FINISH_GATE_DIR="$g_dir" ISO_FINISH_GATE_SELF="$g_self" ISO_FINISH_GATE_FROM="$g_from" \
-    bash "$g_run" "$@"
+  if [[ -n "${HERD_WORKER:-}" && -n "${HERD_DIR:-}" ]] && command -v python3 >/dev/null 2>&1; then
+    # a herd worker's landing: through the receipt relay above
+    ISO_FINISH_GATE_DIR="$g_dir" ISO_FINISH_GATE_SELF="$g_self" ISO_FINISH_GATE_FROM="$g_from" \
+      ISO_FINISH_GATE_BASE="$g_sha" \
+      finish_child_run python3 -I -c "$receipt_append_py" "${HERD_DIR:-}" "$HERD_WORKER" "$branch" bash "$g_run" "$@"
+  else
+    ISO_FINISH_GATE_DIR="$g_dir" ISO_FINISH_GATE_SELF="$g_self" ISO_FINISH_GATE_FROM="$g_from" \
+      ISO_FINISH_GATE_BASE="$g_sha" \
+      finish_child_run bash "$g_run" "$@"
+  fi
   g_rc=$?
   set -e
+  chmod -R u+w "$g_dir" 2>/dev/null || true
   rm -rf "$g_dir"
-  trap - EXIT
+  trap 'landing_marker_drop' EXIT
   exit "$g_rc"
 fi
 # From here on this is the gate's own run: `here` is BASE's scripts directory (or the
@@ -280,6 +868,20 @@ fi
 gate_runner="${gate_dir}/tools/run_tests.py"
 gate_ledger="${gate_dir}/tools/ledger.py"
 gate_config="${gate_dir}/appl/config.py"
+# The [tests] command's reader: BASE's appl/config.py, or -- in a consumer, whose BASE
+# carries no appl/ -- the byte-identical copy the skill ships, scripts/appl_config.py, out
+# of the same gate copy of BASE. Never the branch's, never one beside the started copy.
+gate_tests_config="$gate_config"
+if [[ ! -f "$gate_tests_config" ]]; then
+  gate_tests_config="${gate_dir}/${gate_scripts_rel}/appl_config.py"
+fi
+
+# land.sh hands over the tip it recorded and tested (ISO_FINISH_EXPECT_TIP): a branch that
+# no longer equals it when this landing reads it is refused before anything is judged. It
+# can only add a refusal, so it needs no trust. Cleared: nothing this landing starts
+# inherits it.
+expect_tip="${ISO_FINISH_EXPECT_TIP-}"
+unset ISO_FINISH_EXPECT_TIP
 
 # --- appl.toml's [tests] command: asked for, never trusted on its own ----------------
 # `bin/appl land` hands the launcher root's `[tests] command` over as APPL_TESTS_COMMAND.
@@ -305,6 +907,84 @@ ledger_command=""
 
 . "$here/lib.sh"
 iso_credless_arm
+
+# Everything from here to the end of this file is ONE command, read whole before any of it
+# runs. bash reads a script as it goes, so a branch test that rewrote this file in place
+# while the landing ran its tests would otherwise have its text run in the lines after
+# them -- ahead of the check (gate_dir_hold) that refuses the rewritten copy.
+{
+
+# The affected tests run in a disposable `git clone --shared` of BASE at the
+# checkout's tip (land-sandbox.sh), never with --root set to the worktree.
+# GIT_CEILING_DIRECTORIES is that clone's private parent. Every other GIT_* name
+# is stripped here; branch_tests_python's credential wall adds its own, and
+# tools/run_tests.py keeps those for the test child, drops every other GIT_*
+# name and blanks SSH_AUTH_SOCK when MURETAI_LAND_SANDBOX is set. The clone's
+# directory is removed when the run returns, pass or fail. A clone that cannot
+# be created refuses the landing.
+# The branch's tests run as this uid, so after every run of them the gate directory is held
+# to the check it was accepted on (gate_dir_untrusted, above) before anything runs out of it
+# again: a copy a test changed refuses the landing by name. $1 says where the landing is;
+# the rest are this landing's scratch files, removed on the refusal.
+gate_dir_hold() {  # $1 where, $2... files to remove on a refusal
+  local where="$1" why=""
+  shift
+  [[ -n "$gate_dir" ]] || return 0
+  if why="$(gate_dir_untrusted "$gate_dir" "$gate_dir_base" 2>&1)"; then
+    return 0
+  fi
+  [[ "$#" == "0" ]] || rm -f "$@"
+  echo "refusing to land ${branch}: the gate directory ${gate_dir} is no longer a copy this landing can trust ${where}: ${why:-it could not be checked}; nothing more runs from it, and ${branch} was not merged." >&2
+  echo "MERGED=no"
+  refusal_category="gate"
+  exit 1
+}
+sandbox_parent=""
+sandbox_clone=""
+sandbox_end() {
+  # The clone goes. The private parent stays: it is GIT_CEILING_DIRECTORIES. The helper
+  # runs out of the gate directory, and only while that still passes its check: the
+  # tests just ran, and the caller refuses a copy they changed.
+  if [[ -n "${sandbox_clone:-}" ]]; then
+    if gate_dir_untrusted "$gate_dir" "$gate_dir_base" >/dev/null 2>&1; then
+      /bin/bash "$here/land-sandbox.sh" remove "$sandbox_clone" || true
+    fi
+  fi
+  sandbox_parent=""
+  sandbox_clone=""
+}
+sandbox_begin() {  # $1 the checkout whose HEAD the clone detaches at
+  local out="" rc=0
+  sandbox_parent=""
+  sandbox_clone=""
+  if [[ ! -f "$here/land-sandbox.sh" || -L "$here/land-sandbox.sh" ]]; then
+    echo "disposable clone could not be created: land-sandbox.sh is not in the gate scripts" >&2
+    return 1
+  fi
+  out="$(/bin/bash "$here/land-sandbox.sh" prepare "$1")" || rc=$?
+  if [[ "$rc" != "0" ]]; then
+    return 1
+  fi
+  sandbox_parent="$(printf '%s\n' "$out" | sed -n 's/^parent=//p' | head -n 1)"
+  sandbox_clone="$(printf '%s\n' "$out" | sed -n 's/^clone=//p' | head -n 1)"
+  if [[ -z "$sandbox_parent" || -z "$sandbox_clone" || ! -d "$sandbox_clone" ]]; then
+    echo "disposable clone could not be created: the helper named no clone" >&2
+    sandbox_end
+    return 1
+  fi
+  return 0
+}
+sandbox_child_env() {
+  local key="" names=""
+  names="$(env | sed -n 's/=.*//p')"
+  for key in $names; do
+    case "$key" in
+      GIT_*) unset "$key" ;;
+    esac
+  done
+  export GIT_CEILING_DIRECTORIES="$sandbox_parent"
+  export MURETAI_LAND_SANDBOX="$sandbox_parent"
+}
 
 # --- behind a herd worker's wall, the landing is the launcher's to run ----------------
 # A walled worker (herd-spawn.sh) cannot run the landing's gate: suites that build a wall,
@@ -338,6 +1018,7 @@ ACK_S, WAIT_S = 30, 6 * 3600
 def refuse(why: str) -> None:
     print("refusing to land %s: %s; nothing moved." % (branch, why), file=sys.stderr)
     print("MERGED=no")
+    print("REFUSAL=other")
     sys.exit(1)
 
 
@@ -386,6 +1067,42 @@ PY
   set -e
   exit "$hg_rc"
 fi
+
+# --- the refusal's category, and the landing receipt in the run ledger ---------------
+# Every refusal prints exactly one stdout line REFUSAL=<category>, one of: usage config
+# lock lock-take-failed lease dirty diverged collision generated gate tests sec ledger publish other. A
+# refusal site from here on names its category in refusal_category before it exits; one
+# that names none is `other`. A landing that merged prints no REFUSAL= line. Each landing
+# that reaches this point, merged or refused, also appends one landing-receipt line to
+# $HERD_DIR/coordinator/runs.jsonl through run_ledger.py beside this script: MERGED, GATE,
+# SEC, TESTS and TESTS_SECS as the receipt printed them ("" when it printed no such line),
+# REFUSAL (the category, "" on a landing that merged) and COMMIT (the branch tip). The
+# append is best effort: a ledger that refuses the line or cannot be written never blocks
+# the landing, nor changes what it prints or exits with.
+refusal_category=""
+receipt_merged="no"
+receipt_gate=""
+receipt_sec=""
+receipt_tests=""
+receipt_tests_secs=""
+receipt_noted="no"
+receipt_tip="$(git --git-dir="$primary_common" rev-parse --verify --quiet "refs/heads/${branch}^{commit}" 2>/dev/null || true)"
+finish_receipt_note() {  # $1 the exit status
+  local refusal="" mod="$here/run_ledger.py"
+  [[ "$receipt_noted" == "no" ]] || return 0
+  receipt_noted="yes"
+  if [[ "$1" != "0" && "$receipt_merged" != "yes" ]]; then
+    refusal="${refusal_category:-other}"
+    echo "REFUSAL=${refusal}" || true
+  fi
+  [[ -f "$mod" && ! -L "$mod" ]] || return 0
+  landing_python "$mod" "${HERD_DIR:-${HOME:-}/.cache/muretai-herd}" landing-receipt "" "${HERD_WORKER:-}" \
+    "MERGED=${receipt_merged}" "GATE=${receipt_gate}" "SEC=${receipt_sec}" "TESTS=${receipt_tests}" \
+    "TESTS_SECS=${receipt_tests_secs}" "REFUSAL=${refusal}" "COMMIT=${scanned_tip:-$receipt_tip}" \
+    < /dev/null > /dev/null 2>&1 || true
+  return 0
+}
+trap 'finish_receipt_note $?; landing_marker_drop' EXIT
 
 # --- before anything prints a name somebody else chose ----------------------------
 # Every such name goes through iso_safe_text, which spells out each code point in an
@@ -447,19 +1164,34 @@ esac
 
 "$here/assert-head.sh" "$branch" "$worktree"
 
-if [[ -n "$(git -C "$worktree" status --porcelain)" ]]; then
+# The tip land.sh recorded and tested, when it handed one over: refuses, naming the branch
+# and both shas, when the branch is anywhere else. $1 says where the landing is.
+expect_tip_hold() {
+  local now=""
+  [[ -n "$expect_tip" ]] || return 0
+  now="$(git -C "$worktree" rev-parse --verify --quiet "refs/heads/${branch}^{commit}" 2>/dev/null || true)"
+  [[ "$now" != "$expect_tip" ]] || return 0
+  echo "refusing to land ${branch}: the branch moved ${1} -- the launcher recorded and tested ${expect_tip:0:12}, the branch is now ${now:0:12}; nothing was merged." >&2
+  echo "MERGED=no"
+  echo "TIP_MOVED=${now:-none}"
+  exit 1
+}
+expect_tip_hold "after the launcher recorded its tip"
+
+# GIT_COMMON_DIR pinned to the primary's: a commondir the worker swapped since the check
+# above is not followed
+if [[ -n "$(GIT_COMMON_DIR="$primary_common" git -C "$worktree" status --porcelain)" ]]; then
   echo "uncommitted changes in worktree; commit or discard before finish" >&2
-  git -C "$worktree" status -sb >&2
+  GIT_COMMON_DIR="$primary_common" git -C "$worktree" status -sb >&2
+  refusal_category="dirty"
   exit 1
 fi
 
-git_common="$(git -C "$worktree" rev-parse --git-common-dir)"
-if [[ "$git_common" != /* ]]; then
-  git_common="$(cd "${worktree}/${git_common}" && pwd)"
-else
-  git_common="$(cd "$git_common" && pwd)"
-fi
+# the primary's common dir, as resolved above -- never the worktree's commondir
+git_common="$primary_common"
 primary="$(dirname "$git_common")"
+# lib.sh's origin fetch runs with GIT_COMMON_DIR pinned to it
+iso_pin_common="$git_common"
 
 # The requests above stand only when the launcher root's appl.toml -- the primary's, a
 # regular file, read by BASE's config.py -- names that very command. Anything else (no
@@ -469,12 +1201,16 @@ if [[ -n "$tests_command_asked" || -n "$scan_command_asked" || -n "$ledger_comma
   tc_configured=""
   sc_configured=""
   lc_configured=""
-  if [[ -f "$gate_config" && -f "${primary}/appl.toml" && ! -L "${primary}/appl.toml" ]]; then
+  if [[ -f "$gate_tests_config" && -f "${primary}/appl.toml" && ! -L "${primary}/appl.toml" ]]; then
     tc_handoff="$(finish_tmp)"
-    if landing_python "$gate_config" handoff "${primary}/appl.toml" > "$tc_handoff" 2>/dev/null; then
+    if landing_python "$gate_tests_config" handoff "${primary}/appl.toml" > "$tc_handoff" 2>/dev/null; then
       while IFS= read -r -d '' tc_name && IFS= read -r -d '' tc_value; do
         if [[ "$tc_name" == "APPL_TESTS_COMMAND" ]]; then
           tc_configured="$tc_value"
+        elif [[ "$gate_tests_config" != "$gate_config" ]]; then
+          # the skill's copy vouches for the [tests] command only; [scan] and [ledger]
+          # stay with BASE's appl/config.py
+          continue
         elif [[ "$tc_name" == "APPL_SCAN_COMMAND" ]]; then
           sc_configured="$tc_value"
         elif [[ "$tc_name" == "APPL_LEDGER_COMMAND" ]]; then
@@ -485,7 +1221,8 @@ if [[ -n "$tests_command_asked" || -n "$scan_command_asked" || -n "$ledger_comma
     rm -f "$tc_handoff"
   fi
   if [[ -n "$tests_command_asked" ]]; then
-    if [[ -n "$tc_configured" && "$tc_configured" == "$tests_command_asked" ]]; then
+    # a whitespace-only [tests] command is no command: it counts as unset, never as a pass
+    if [[ -n "${tc_configured//[[:space:]]/}" && "$tc_configured" == "$tests_command_asked" ]]; then
       tests_command="$tc_configured"
     else
       echo "NOTE: ignoring APPL_TESTS_COMMAND -- it is not the [tests] command of ${primary}/appl.toml; tools/run_tests.py judges" >&2
@@ -507,6 +1244,262 @@ if [[ -n "$tests_command_asked" || -n "$scan_command_asked" || -n "$ledger_comma
   fi
 fi
 
+# --- appl.toml's gate = "github": a hand-off, not a landing --------------------------
+# BASE's COMMITTED appl.toml at BASE's tip (a regular blob, fed to BASE's config.py -- never
+# the primary's working tree, never the branch's) may say `gate = "github"`: the landing is
+# then not this machine's to make. The working tree is not read for it because a merge
+# runs in the checkout that has BASE checked out: a branch that landed `gate = "github"`
+# would otherwise hand off every later landing, the reviewer's receipt and the revert
+# included (intake 20261028T172727Z). No landing lock is taken and main is never written.
+# A branch that does not descend from main first has main MERGED into it, in the worktree
+# (a merge commit on the branch, never a rebase); a merge that conflicts is aborted, the
+# tip left as it was, and refused as diverged. Then the primary's appl.toml [tests] command
+# runs once, in the worktree, on the merged tree; a non-zero exit refuses as tests, and the
+# branch keeps the merge. Only when both pass does HANDED=github name the (new) branch tip,
+# and the exit is 0. The hand-off writes its landing-receipt line (MERGED=no, GATE=handed
+# github, COMMIT the tip) and a refusal on this path its own, as a local landing does. No
+# gate key, `gate = "local"`, or a file the reader refuses lands as today -- and so does a
+# branch whose change is only review receipts and notes, or only the gate taken back to
+# local (config.py lands_locally: exact path rules, anything mixed is handed off).
+gh_base="main"
+if git --git-dir="$primary_common" symbolic-ref --quiet refs/remotes/origin/HEAD >/dev/null 2>&1; then
+  gh_base="$(git --git-dir="$primary_common" symbolic-ref --short refs/remotes/origin/HEAD | sed 's#^origin/##')"
+fi
+if ! git --git-dir="$primary_common" show-ref --verify --quiet "refs/heads/${gh_base}" &&
+   git --git-dir="$primary_common" show-ref --verify --quiet "refs/heads/master"; then
+  gh_base="master"
+fi
+gh_main="$(git --git-dir="$primary_common" rev-parse --verify --quiet "refs/heads/${gh_base}^{commit}" 2>/dev/null || true)"
+gh_tip="$(git --git-dir="$primary_common" rev-parse --verify --quiet "refs/heads/${branch}^{commit}" 2>/dev/null || true)"
+# appl.toml at commit $1 into the file $2: 0 written, 1 none there as a regular blob
+gate_toml_put() {
+  local rec="" meta=""
+  rec="$(git --git-dir="$primary_common" ls-tree --full-tree "$1" -- appl.toml 2>/dev/null)" || return 1
+  [[ -n "$rec" && "${rec#*$'\t'}" == "appl.toml" ]] || return 1
+  meta="${rec%%$'\t'*}"
+  case "${meta%% *}" in
+    100644|100755) ;;
+    *) return 1 ;;
+  esac
+  git --git-dir="$primary_common" cat-file blob "${meta##* }" > "$2" 2>/dev/null || return 1
+}
+gate_word=""
+if [[ -f "$gate_config" && -n "$gh_main" ]]; then
+  gate_toml="$(finish_tmp)"
+  if gate_toml_put "$gh_main" "$gate_toml"; then
+    gate_word="$(landing_python "$gate_config" gate "$gate_toml" 2>/dev/null || true)"
+  fi
+  rm -f "$gate_toml"
+fi
+if [[ "$gate_word" == "github" && -n "$gh_tip" ]]; then
+  gl_mb="$(git --git-dir="$primary_common" merge-base "$gh_main" "$gh_tip" 2>/dev/null || true)"
+  if [[ -n "$gl_mb" ]]; then
+    gl_changes="$(finish_tmp)"
+    gl_base_toml="$(finish_tmp)"
+    gl_tip_toml="$(finish_tmp)"
+    gl_base_arg=""
+    gl_tip_arg=""
+    gate_toml_put "$gl_mb" "$gl_base_toml" && gl_base_arg="$gl_base_toml"
+    gate_toml_put "$gh_tip" "$gl_tip_toml" && gl_tip_arg="$gl_tip_toml"
+    gl_word=""
+    if git --git-dir="$primary_common" diff-tree -r -z --no-renames --no-abbrev "$gl_mb" "$gh_tip" > "$gl_changes" 2>/dev/null; then
+      gl_word="$(landing_python "$gate_config" lands-locally "$gl_changes" "$gl_base_arg" "$gl_tip_arg" 2>/dev/null || true)"
+    fi
+    rm -f "$gl_changes" "$gl_base_toml" "$gl_tip_toml"
+    if [[ "$gl_word" == "yes" ]]; then
+      echo "landing ${branch} here although ${gh_base}'s appl.toml says gate = \"github\": its change is only review receipts and notes, or only the gate taken back to local" >&2
+      gate_word=""
+    fi
+  fi
+fi
+if [[ "$gate_word" == "github" ]]; then
+  if [[ -z "$gh_main" || -z "$gh_tip" ]]; then
+    echo "refusing to hand ${branch} off: ${gh_base} or the branch tip could not be read; nothing moved" >&2
+    refusal_category="diverged"
+    exit 1
+  fi
+  if ! git -C "$worktree" merge-base --is-ancestor "$gh_main" "$gh_tip" >/dev/null 2>&1; then
+    echo "merging ${gh_base} ${gh_main} into ${branch} in its worktree before the hand-off" >&2
+    set +e
+    git -C "$worktree" merge --no-ff --no-edit -m "Merge ${gh_base} into ${branch}" "$gh_main" >&2
+    gh_rc=$?
+    set -e
+    if [[ "$gh_rc" != "0" ]]; then
+      git -C "$worktree" merge --abort >/dev/null 2>&1 || true
+      echo "refusing to hand ${branch} off: merging ${gh_base} into it ends in a conflict; the merge was aborted and the branch is as it was" >&2
+      refusal_category="diverged"
+      exit 1
+    fi
+    receipt_tip="$(git --git-dir="$primary_common" rev-parse --verify --quiet "refs/heads/${branch}^{commit}" 2>/dev/null || true)"
+  fi
+  gh_tests="$tests_command"
+  if [[ -z "$gh_tests" ]]; then
+    gh_handoff="$(finish_tmp)"
+    if landing_python "$gate_config" handoff "${primary}/appl.toml" > "$gh_handoff" 2>/dev/null; then
+      while IFS= read -r -d '' gh_name && IFS= read -r -d '' gh_value; do
+        if [[ "$gh_name" == "APPL_TESTS_COMMAND" ]]; then
+          gh_tests="$gh_value"
+        fi
+      done < "$gh_handoff"
+    fi
+    rm -f "$gh_handoff"
+  fi
+  if [[ "${ISOLATED_SESSION_LAND_TESTS:-1}" == "0" ]]; then
+    echo "NOTE: ISOLATED_SESSION_LAND_TESTS=0 -- handing ${branch} off without running its tests" >&2
+  elif [[ -z "$gh_tests" ]]; then
+    echo "refusing to hand ${branch} off: ${primary}/appl.toml names no [tests] command to run first" >&2
+    refusal_category="tests"
+    exit 1
+  else
+    echo "running appl.toml's [tests] command for ${branch}: $(iso_safe_text "$gh_tests")" >&2
+    set +e
+    ( cd "$worktree" && credless bash -c "$gh_tests" ) < /dev/null >&2
+    gh_rc=$?
+    set -e
+    if [[ "$gh_rc" != "0" ]]; then
+      echo "refusing to hand ${branch} off: appl.toml's [tests] command exited ${gh_rc}" >&2
+      refusal_category="tests"
+      exit 1
+    fi
+  fi
+  handed_tip="$(git --git-dir="$primary_common" rev-parse --verify --quiet "refs/heads/${branch}^{commit}" 2>/dev/null || true)"
+  receipt_tip="$handed_tip"
+  gh_handed() {
+    echo "handing ${branch} off to github: ${gh_base}'s appl.toml says gate = \"github\"; no landing lock, nothing written to main" >&2
+    echo "HANDED=github ${handed_tip}"
+    # the run ledger's line for it: a landing-receipt that neither merged nor refused
+    receipt_gate="handed github"
+  }
+  # The hand-off itself (intake 20261028T192508Z): the branch goes to the primary's
+  # `handoff` remote under the same refs/heads/feat/* name, and THEN its record is written
+  # beside that repository, at <dir>/<name without .git>.records/<branch, / as __>.json --
+  # the path and shape trunk's publisher reads (muretai-publish.py read_record): exactly
+  # the string keys intake (APPL_INTAKE, as bin/appl land hands it over), title (the
+  # worktree lock's task=), tip (the pushed sha) and base (BASE's sha at hand-off). A
+  # failed push leaves no record. The record is written to a fresh file beside its final
+  # path and renamed over it, never through an existing file; a symlink at the path is
+  # refused and left as it is. The worktree and the branch stay; no lock is taken. A
+  # primary with no `handoff` remote hands off with nothing pushed, and says so.
+  if ! gh_handoff_url="$(git -C "$primary" remote get-url handoff 2>/dev/null)"; then
+    echo "NOTE: ${primary} has no handoff remote -- nothing pushed and no hand-off record written" >&2
+    gh_handed
+    exit 0
+  fi
+  case "$branch" in
+    feat/*) ;;
+    *)
+      echo "refusing to hand ${branch} off: only feat/* branches go to the hand-off remote; nothing pushed, no record written" >&2
+      refusal_category="other"
+      exit 1
+      ;;
+  esac
+  gh_intake="${APPL_INTAKE:-}"
+  if [[ ! "$gh_intake" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+    echo "refusing to hand ${branch} off: APPL_INTAKE does not name the intake for its hand-off record; nothing pushed" >&2
+    refusal_category="publish"
+    exit 1
+  fi
+  gh_url_path="${gh_handoff_url#file://}"
+  if [[ "$gh_url_path" != /* ]]; then
+    echo "refusing to hand ${branch} off: the handoff remote is not a local path, so there is nowhere beside it for the hand-off record; nothing pushed" >&2
+    refusal_category="publish"
+    exit 1
+  fi
+  gh_url_path="${gh_url_path%/}"
+  gh_records="$(dirname "$gh_url_path")/$(basename "$gh_url_path" .git).records"
+  gh_record="${gh_records}/${branch//\//__}.json"
+  gh_push_err="$(finish_tmp)"
+  if ! ISOLATED_SESSION_PUSH=1 git -C "$primary" push --quiet handoff "${handed_tip}:refs/heads/${branch}" >/dev/null 2>"$gh_push_err"; then
+    echo "refusing to finish the hand-off of ${branch}: the push to the hand-off remote failed: $(iso_safe_text "$(tail -1 "$gh_push_err" 2>/dev/null | tr -d '\r' | cut -c1-200)"); no record written" >&2
+    rm -f "$gh_push_err"
+    refusal_category="publish"
+    exit 1
+  fi
+  rm -f "$gh_push_err"
+  gh_lock="$(iso_lock_path "$worktree" 2>/dev/null || true)"
+  set +e
+  landing_python - "$gh_records" "$gh_record" "$gh_lock" "$gh_intake" "$handed_tip" "$gh_main" <<'PY'
+import json
+import os
+import stat
+import sys
+import tempfile
+records, final, lock, intake, tip, base = sys.argv[1:7]
+title = ""
+if lock:
+    try:
+        fd = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as fh:
+            if stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                for line in fh.read(64 * 1024).decode("utf-8", "replace").splitlines():
+                    if line.startswith("task="):
+                        title = line[len("task="):].strip()
+                        break
+    except OSError:
+        pass
+title = title[:256]
+try:
+    st = os.lstat(records)
+except FileNotFoundError:
+    try:
+        os.mkdir(records, 0o755)
+    except OSError as e:
+        sys.stderr.write("could not make the hand-off records directory %s: %s\n" % (records, e.strerror))
+        sys.exit(1)
+else:
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        sys.stderr.write("the hand-off records directory %s is a symlink or not a directory\n" % records)
+        sys.exit(1)
+def at_final():
+    try:
+        return os.lstat(final)
+    except FileNotFoundError:
+        return None
+st = at_final()
+if st is not None and stat.S_ISLNK(st.st_mode):
+    sys.stderr.write("a symlink is at the hand-off record path %s; it is left as it is\n" % final)
+    sys.exit(1)
+if st is not None and not stat.S_ISREG(st.st_mode):
+    sys.stderr.write("the hand-off record path %s is not a regular file\n" % final)
+    sys.exit(1)
+body = json.dumps({"intake": intake, "title": title, "tip": tip, "base": base},
+                  ensure_ascii=False, indent=2) + "\n"
+try:
+    fd, tmp = tempfile.mkstemp(prefix=".record-", suffix=".tmp", dir=records)
+except OSError as e:
+    sys.stderr.write("could not write the hand-off record beside %s: %s\n" % (final, e.strerror))
+    sys.exit(1)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(body)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(tmp, 0o644)
+    st = at_final()
+    if st is not None and stat.S_ISLNK(st.st_mode):
+        raise RuntimeError("a symlink appeared at the hand-off record path %s; it is left as it is" % final)
+    os.replace(tmp, final)
+except (OSError, RuntimeError) as e:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    sys.stderr.write("could not put the hand-off record in place at %s: %s\n"
+                     % (final, getattr(e, "strerror", None) or e))
+    sys.exit(1)
+PY
+  gh_rc=$?
+  set -e
+  if [[ "$gh_rc" != "0" ]]; then
+    echo "refusing to finish the hand-off of ${branch}: its hand-off record was not written; the branch is on the hand-off remote at ${handed_tip}" >&2
+    refusal_category="publish"
+    exit 1
+  fi
+  echo "pushed ${branch} ${handed_tip} to the hand-off remote and wrote its record ${gh_record}" >&2
+  gh_handed
+  exit 0
+fi
+
 # Where a refusal tells the operator to find this skill's scripts: never the private
 # directory this run came from, which is gone the moment it exits. The name stays spelled
 # as $here's sibling so vendor.sh's closure still sees that finish needs dispatch-init.sh.
@@ -515,14 +1508,53 @@ if [[ -n "$gate_from_base" ]]; then
   hint_init="${primary}/${gate_scripts_rel}/${hint_init##*/}"
 fi
 
-if git -C "$worktree" symbolic-ref --quiet refs/remotes/origin/HEAD >/dev/null 2>&1; then
-  base="$(git -C "$worktree" symbolic-ref --short refs/remotes/origin/HEAD | sed 's#^origin/##')"
+if git --git-dir="$git_common" symbolic-ref --quiet refs/remotes/origin/HEAD >/dev/null 2>&1; then
+  base="$(git --git-dir="$git_common" symbolic-ref --short refs/remotes/origin/HEAD | sed 's#^origin/##')"
 else
   base="main"
 fi
-if ! git -C "$worktree" show-ref --verify --quiet "refs/heads/${base}"; then
-  if git -C "$worktree" show-ref --verify --quiet "refs/heads/master"; then
+if ! git --git-dir="$git_common" show-ref --verify --quiet "refs/heads/${base}"; then
+  if git --git-dir="$git_common" show-ref --verify --quiet "refs/heads/master"; then
     base="master"
+  fi
+fi
+
+# A tip that shares no history with base, or whose parent object is missing, must
+# not fast-forward base. A diverged tip that still shares history is rebased onto
+# base further down; this check leaves that case alone. Both shas are named so a
+# refusal says which two commits were compared. Nothing has moved yet.
+desc_main="$(git --git-dir="$git_common" rev-parse --verify --quiet "refs/heads/${base}^{commit}" 2>/dev/null || true)"
+desc_tip="$(git --git-dir="$git_common" rev-parse --verify --quiet "refs/heads/${branch}^{commit}" 2>/dev/null || true)"
+desc_refuse_not_descendant() {
+  echo "refusing to land ${branch}: ${desc_tip:-unreadable} is not a descendant of ${base} ${desc_main:-unreadable}; nothing moved." >&2
+  refusal_category="diverged"
+  exit 1
+}
+if [[ -z "$desc_main" || -z "$desc_tip" ]]; then
+  desc_refuse_not_descendant
+fi
+if ! git --git-dir="$git_common" merge-base --is-ancestor "$desc_main" "$desc_tip" >/dev/null 2>&1; then
+  desc_bad="no"
+  while IFS= read -r desc_line || [[ -n "$desc_line" ]]; do
+    case "$desc_line" in
+      parent\ *)
+        desc_p="${desc_line#parent }"
+        if [[ "${#desc_p}" -ne 40 || "$desc_p" == *[!0-9a-fA-F]* ]] ||
+           ! git --git-dir="$git_common" cat-file -e "${desc_p}^{commit}" >/dev/null 2>&1; then
+          desc_bad="yes"
+        fi
+        ;;
+      "")
+        break
+        ;;
+    esac
+  done < <(git --git-dir="$git_common" cat-file commit "$desc_tip" 2>/dev/null || true)
+  if [[ "$desc_bad" == "no" ]] &&
+     ! git --git-dir="$git_common" merge-base "$desc_main" "$desc_tip" >/dev/null 2>&1; then
+    desc_bad="yes"
+  fi
+  if [[ "$desc_bad" == "yes" ]]; then
+    desc_refuse_not_descendant
   fi
 fi
 
@@ -1317,8 +2349,9 @@ self_rebase_base() {
 # back to a five-day-old bundle
 # (ISSUE(origin-view-has-two-rules-and-one-of-them-serves-a-stale-bundle)).
 # Now there is ONE rule, iso_origin_view (lib.sh): the fetch, else the publisher's bundle
-# cross-checked against its status, else a REFUSAL with nothing moved. It runs before the
-# landing lock is taken, so a refusal leaves no lock behind.
+# cross-checked against its status, else -- only when no handoff remote names a publisher --
+# the operator's non-blank ORIGIN break-glass, else a REFUSAL with nothing moved. It runs
+# before the landing lock is taken, so a refusal leaves no lock behind.
 # A repository with NO origin remote has no origin to be stale about and lands as it
 # always did ("BASE_FF=none (no origin/BASE)"); that boundary is drawn HERE, by not
 # calling the helper, so the refusal cannot creep into repositories that never had one.
@@ -1414,16 +2447,55 @@ PY
     if grep -q -- '--gate-phase' "$gate_runner" 2>/dev/null; then
       gate_phase_ok=yes
     fi
+    # the pre-run never queues behind the order: with --gate-nowait a runner that cannot take
+    # a slot at once -- an in-lock gate or another waiter ahead, or the free slot reserved
+    # for an in-lock gate -- exits 3 and runs nothing, and the in-lock run below tests the
+    # branch, its verdict alone counting (intake 20261006T033737Z); an older BASE runner
+    # waits as before
+    gate_nowait_ok=""
+    if [[ -n "$gate_phase_ok" ]] && grep -q -- '--gate-nowait' "$gate_runner" 2>/dev/null; then
+      gate_nowait_ok=yes
+    fi
+    # ... but with every slot held it waits for one, bounded by the stuck threshold
+    # (intake 20261026T223744Z, plan item 14): --gate-wait-s, ISOLATED_SESSION_LAND_STUCK
+    # whole seconds, default 2700, the landing lock's own default wait (land_wait below).
+    # Past the bound the runner exits 4 and the landing is refused by name, before the
+    # landing lock. A BASE runner without --gate-wait-s skips at once as before.
+    gate_wait_s=""
+    if [[ -n "$gate_nowait_ok" ]] && grep -q -- '--gate-wait-s' "$gate_runner" 2>/dev/null; then
+      gate_wait_s="${ISOLATED_SESSION_LAND_STUCK:-2700}"
+      [[ "$gate_wait_s" =~ ^(0|[1-9][0-9]{0,8})$ ]] || gate_wait_s=2700
+    fi
     prerun_tmp="$(finish_tmp)"
     prerun_err="$(finish_tmp)"
     prerun_head="$(git -C "$worktree" rev-parse HEAD 2>/dev/null || true)"
     prerun_base="$(git -C "$worktree" rev-parse "${base}^{commit}" 2>/dev/null || true)"
     echo "running the affected tests of ${branch} before taking the landing lock" >&2
     set +e
-    ( cd "$worktree" && branch_tests_python "$gate_runner" --root "$worktree" --affected "${base}..HEAD" --gate --json -j "${ISOLATED_SESSION_LAND_JOBS:-4}" ${gate_phase_ok:+--gate-phase pre-run --gate-holder "$branch"} ) > "$prerun_tmp" 2>"$prerun_err"
+    (
+      sandbox_begin "$worktree" || exit 1
+      trap 'sandbox_end' EXIT
+      sandbox_child_env
+      cd "$sandbox_clone" && branch_tests_python "$gate_runner" --root "$sandbox_clone" --affected "${base}..HEAD" --gate --json ${ISOLATED_SESSION_LAND_JOBS:+-j "$ISOLATED_SESSION_LAND_JOBS"} ${gate_phase_ok:+--gate-phase pre-run --gate-holder "$branch"} ${gate_nowait_ok:+--gate-nowait} ${gate_wait_s:+--gate-wait-s "$gate_wait_s"}
+    ) > "$prerun_tmp" 2>"$prerun_err"
     prerun_rc=$?
     set -e
+    gate_dir_hold "after the tests ran before the landing lock" "$prerun_tmp" "$prerun_err"
+    if [[ "$prerun_rc" != "0" ]] && grep -q "disposable clone could not be created" "$prerun_err"; then
+      cat "$prerun_err" >&2
+      echo "refusing to land ${branch}: the disposable clone could not be created; nothing moved." >&2
+      rm -f "$prerun_err" "$prerun_tmp"
+      exit 1
+    fi
     rm -f "$prerun_err"
+    if [[ -n "$gate_wait_s" && "$prerun_rc" == "4" ]]; then
+      echo "refusing to land ${branch}: no gate slot came free for the pre-run in ${gate_wait_s}s (ISOLATED_SESSION_LAND_STUCK); nothing moved, and no landing lock was taken." >&2
+      rm -f "$prerun_tmp"
+      exit 1
+    fi
+    if [[ -n "$gate_nowait_ok" && "$prerun_rc" == "3" ]]; then
+      echo "skipped the pre-lock test run of ${branch}: no gate slot was free at once; the run under the landing lock tests the branch" >&2
+    fi
     if [[ "$prerun_rc" == "0" && -n "$prerun_head" && -n "$prerun_base" ]]; then
       prerun_receipt="$prerun_tmp"
     else
@@ -1526,6 +2598,16 @@ if [[ "$sb_need" == "yes" ]]; then
         break
       fi
     done <<< "$sb_heads"
+  elif [[ "$origin_read" == "yes" && "$ISO_ORIGIN_VIEW_SOURCE" == "break-glass" ]]; then
+    # the view is the operator path, not remote.origin.url
+    sb_rc=0
+    sb_sha="$(shared_ls_remote "$ISO_ORIGIN_BREAK_GLASS")" || sb_rc=$?
+    if [[ "$sb_rc" == "0" ]]; then
+      sb_signals="${sb_signals:+${sb_signals},}origin"
+      sb_copies="${sb_copies}origin ${sb_sha}"$'\n'
+    elif [[ "$sb_rc" != "2" ]]; then
+      shared_refuse "the origin break-glass $(iso_safe_text "$ISO_ORIGIN_BREAK_GLASS") could not be read (git ls-remote failed), so whether it holds a copy of ${branch} -- whether it is shared -- is unknown."
+    fi
   elif [[ "$origin_read" == "yes" ]]; then
     sb_rc=0
     sb_sha="$(shared_ls_remote origin)" || sb_rc=$?
@@ -1584,6 +2666,47 @@ fi
 # wait at all (refuse at once, leave no ticket). Any other value, including the
 # default, does not cap the wait.
 land_lock="$(iso_land_lock_path "$primary" 2>/dev/null || true)"
+# The release removes the lock only while it records THIS process ($$, which created it):
+# a lock some other landing has since put there is that landing's. Builtins only -- no
+# fork in front of the `rm`, for the reason above.
+land_lock_is_mine() {
+  local line
+  [[ -n "$land_lock" && -f "$land_lock" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      owner_pid=*)
+        [[ "${line#owner_pid=}" == "$$" ]] && return 0
+        return 1
+        ;;
+    esac
+  done 2>/dev/null < "$land_lock"
+  return 1
+}
+# The in-lock gate runs as a background job in a process group of its own (gate_pid is
+# its leader), so a landing that gives up -- a signal, or any exit while the gate still
+# runs -- takes the whole gate down with it: the runner, its tests, and the gate slot its
+# runner holds. A gate left running kept its 'in-lock' slot as an orphan while the lock it
+# ran under was gone. TERM first, KILL after five seconds.
+gate_pid=""
+land_gate_stop() {
+  local g="${gate_pid:-}" n=0
+  [[ -n "$g" ]] || return 0
+  gate_pid=""
+  kill -TERM -- "-${g}" 2>/dev/null || kill -TERM "$g" 2>/dev/null || true
+  while (( n < 50 )) && kill -0 -- "-${g}" 2>/dev/null; do
+    sleep 0.1
+    n=$(( n + 1 ))
+  done
+  kill -KILL -- "-${g}" 2>/dev/null || true
+  return 0
+}
+# A signal gives up once: a second one (the process group's after the started copy's
+# TERM, say) must not cut short the EXIT trap that releases what this landing holds.
+land_give_up() {  # $1 exit status
+  trap '' TERM INT HUP
+  land_gate_stop
+  exit "$1"
+}
 owner="$(iso_owner)"
 land_wait="${ISOLATED_SESSION_LAND_WAIT:-2700}"
 land_poll="${ISOLATED_SESSION_LAND_POLL:-5}"
@@ -1595,11 +2718,20 @@ since_progress=0
 holding_land="no"
 land_ticket=""
 land_ticket_name=""
+take_failures=0
+take_tries=3
 # Exits during the wait (before on_exit exists) still remove this landing's ticket.
 # on_exit replaces this trap and cleanup removes the ticket again if it is still set.
-trap 'iso_land_queue_drop "${land_ticket:-}"; land_ticket=""; land_ticket_name=""' EXIT
+trap 'finish_receipt_note $?; iso_land_queue_drop "${land_ticket:-}"; land_ticket=""; land_ticket_name=""; landing_marker_drop' EXIT
+# A landing that is stopped gives up: it stops its in-lock gate (land_gate_stop) and
+# exits, and the EXIT trap releases what it holds. Untrapped, SIGTERM ended bash with no
+# EXIT trap at all, leaving the lock and an orphan gate holding its slot.
+trap 'land_give_up 143' TERM
+trap 'land_give_up 130' INT
+trap 'land_give_up 129' HUP
 while :; do
-  state="$(iso_land_lock_state "$primary" "$owner")"
+  # `$$`: only the finish process that created the lock holds it, never its owner key
+  state="$(iso_land_lock_state "$primary" "$owner" "$$")"
   case "$state" in
     mine)
       iso_land_queue_drop "$land_ticket"
@@ -1610,17 +2742,35 @@ while :; do
       ;;
     dead)
       echo "note: a landing lock left by a session that is gone ($(iso_land_lock_describe "$primary")); taking it over" >&2
-      iso_land_lock_release "$primary"
+      iso_land_lock_take_over "$primary"
       ;;
     free|other)
       if [[ "$state" == "free" ]] && ! iso_land_queue_blocked "$primary" "$land_ticket_name"; then
-        if iso_land_lock_take "$primary" "$owner" "$branch"; then
+        if iso_land_lock_take "$primary" "$owner" "$branch" "$$"; then
           iso_land_queue_drop "$land_ticket"
           land_ticket=""
           land_ticket_name=""
           holding_land="yes"
           break
         fi
+        # The lock reads free but cannot be created: the take printed why. Retried a few
+        # times, then refused by name -- it used to loop with no sleep and no end
+        # (intake 20261026T142951Z).
+        take_failures=$(( take_failures + 1 ))
+        if (( take_failures >= take_tries )); then
+          iso_land_queue_drop "$land_ticket"
+          land_ticket=""
+          land_ticket_name=""
+          {
+            echo "refusing to land ${branch}: could not take the landing lock $(iso_land_lock_path "$primary" || echo "of ${primary}")"
+            echo "  The lock reads free, but creating it failed ${take_failures} times (the error is above)."
+            echo "  Most likely a wall denies writes to the primary's .git. Land from outside that wall."
+          } >&2
+          [[ -z "$prerun_tmp" ]] || rm -f "$prerun_tmp"
+          refusal_category="lock-take-failed"
+          exit 1
+        fi
+        sleep 1
       else
         # LAND_WAIT=0: do not queue and do not sleep. The lock (or an earlier live
         # ticket) is left as it is.
@@ -1634,6 +2784,7 @@ while :; do
             echo "Waited ${waited}s (ISOLATED_SESSION_LAND_WAIT). Run finish again when it is done."
           } >&2
           [[ -z "$prerun_tmp" ]] || rm -f "$prerun_tmp"
+          refusal_category="lock"
           exit 1
         fi
         if [[ -z "$land_ticket" ]]; then
@@ -1660,6 +2811,9 @@ while :; do
       ;;
   esac
 done
+# when this landing took the lock, epoch seconds: the lease take below, when it holds one,
+# moves it (LOCK_HELD_BEFORE_GATE, intake 20261010T143322Z)
+lock_taken_at="$(date +%s)"
 
 tmp_merge=""
 tmp_rebase=""
@@ -1703,6 +2857,7 @@ lease_as=""
 lease_repo=""
 lease_room=""
 lease_epoch=""
+lease_release_rc=""
 gate_scratch=""
 cleanup() {
   # The lease first, while this landing still holds the local lock (unless the hand-off
@@ -1711,13 +2866,17 @@ cleanup() {
   # to *find* the lock (see land_lock above for what a fork costs after a failed
   # write). Only then the temp merge worktree, which needs git and may fail.
   # Always 0: a cleanup that held nothing is not an error.
+  # A gate still running here is one this landing gave up on: it goes before the lock.
+  land_gate_stop
   if [[ "$lease_held" == "yes" ]]; then
     lease_held="no"
+    # The release's exit status is kept for the receipt: LEASE=released only on 0.
+    lease_release_rc=0
     if [[ -n "${LANDING_LEASE_CLI:-}" ]]; then
-      "$LANDING_LEASE_CLI" release --as "$lease_as" --repo "$lease_repo" --room "$lease_room" ${lease_epoch:+--epoch "$lease_epoch"} >/dev/null 2>&1 || true
+      "$LANDING_LEASE_CLI" release --as "$lease_as" --repo "$lease_repo" --room "$lease_room" ${lease_epoch:+--epoch "$lease_epoch"} >/dev/null 2>&1 || lease_release_rc=$?
     else
       DISPATCH_SKILL_REPO="$primary" bash "$here/landing-lease.sh" release --as "$lease_as" --repo "$lease_repo" \
-        ${lease_epoch:+--epoch "$lease_epoch"} >/dev/null 2>&1 || true
+        ${lease_epoch:+--epoch "$lease_epoch"} >/dev/null 2>&1 || lease_release_rc=$?
     fi
   fi
   if [[ -n "${land_ticket:-}" ]]; then
@@ -1727,7 +2886,7 @@ cleanup() {
   fi
   if [[ "$holding_land" == "yes" ]]; then
     holding_land="no"
-    [[ -n "$land_lock" ]] && rm -f "$land_lock" 2>/dev/null
+    land_lock_is_mine && rm -f "$land_lock" 2>/dev/null
   fi
   if [[ -n "$prerun_tmp" ]]; then
     rm -f "$prerun_tmp" 2>/dev/null
@@ -1750,6 +2909,7 @@ cleanup() {
     rm -rf "$gate_scratch" 2>/dev/null || true
     gate_scratch=""
   fi
+  landing_marker_drop
   return 0
 }
 on_exit() {
@@ -1764,6 +2924,7 @@ on_exit() {
   # with nothing wrong; `|| true` keeps that out of the way.)
   cleanup || true
   [[ "$rc" != "0" ]] || return 0
+  finish_receipt_note "$rc"
   if [[ "$base_ff_moved" == "yes" && "$base_ff_reported" == "no" ]]; then
     base_ff_reported="yes"
     echo "BASE_FF=${base_ff_line}" || true
@@ -1839,6 +3000,7 @@ publish_wait_s="${LANDING_PUBLISH_WAIT_S:-300}"
 case "$publish_wait_s" in
   ''|*[!0-9]*)
     echo "refusing to land ${branch}: LANDING_PUBLISH_WAIT_S=$(iso_safe_text "$publish_wait_s") is not a whole number of seconds; nothing moved." >&2
+    refusal_category="config"
     exit 1
     ;;
 esac
@@ -1877,6 +3039,7 @@ landing_lease_repo_from_repos() {
 
 dispatch_dir="${DISPATCH_DIR:-${HOME}/.muretai/dispatch}"
 room_file="${dispatch_dir}/room"
+refusal_category="lease"        # every refusal of the lease block below
 if [[ "${LANDING_LEASE:-}" == "off" || "${APPL_LEASE:-}" == "off" ]]; then
   echo "LEASE=off (break-glass)"
 elif [[ ! -f "$room_file" || -L "$room_file" ]]; then
@@ -2016,6 +3179,7 @@ else
     fi
     lease_held="yes"
     lease_did_hold="yes"
+    lock_taken_at="$(date +%s)"
     if [[ -n "$lease_expired_by" ]]; then
       echo "LEASE=held (expired lease by ${lease_expired_by} superseded) expired-lease-by=${lease_expired_by}"
     else
@@ -2024,6 +3188,7 @@ else
     rm -f "$lease_out" "$lease_err"
   fi
 fi
+refusal_category=""
 
 # --- origin is the serialization point: BASE comes down before the rebase ---------
 # Two primaries (two Macs) now publish to ONE origin through their own publishers
@@ -2044,6 +3209,62 @@ fi
 # tracked changes). A diverged BASE is a stop, not a warning: reconciling two
 # histories is a person's decision, and the session doing it says so with
 # ISOLATED_SESSION_FORCE=1, which lands onto local BASE as before.
+#
+# A refusal after this point used to say the worktree was untouched and already
+# rebased, whether or not either ref had moved. These are the refs before the
+# fast-forward and, filled in after the branch is brought onto base, the refs
+# after it. say_what_moved reads the difference, not a fixed sentence.
+ref_base_before="$(git -C "$worktree" rev-parse "$base" 2>/dev/null || true)"
+ref_branch_before="$(git -C "$worktree" rev-parse "$branch" 2>/dev/null || true)"
+expect_tip_hold "while the landing waited"
+ref_base_after=""
+ref_branch_after=""
+# $1 = quiet: when nothing moved, print nothing (the caller already spoke).
+# Otherwise say the worktree is untouched, and do not claim a rebase or a
+# fast-forward. When a recorded ref differs, name what moved and the branch tip.
+say_what_moved() {
+  local quiet="${1:-}" base_moved=no branch_moved=no tip="" fact=""
+  if [[ -n "$ref_base_before" && -n "$ref_base_after" && "$ref_base_before" != "$ref_base_after" ]]; then
+    base_moved=yes
+  fi
+  if [[ -n "$ref_branch_before" && -n "$ref_branch_after" && "$ref_branch_before" != "$ref_branch_after" ]]; then
+    branch_moved=yes
+  fi
+  if [[ "$base_moved" == "no" && "$branch_moved" == "no" ]]; then
+    if [[ "$quiet" != "quiet" ]]; then
+      echo "The worktree is untouched; fix, commit, run finish again." >&2
+    fi
+    return 0
+  fi
+  tip="$ref_branch_after"
+  if [[ "$base_moved" == "yes" && "$base_ff_moved" == "yes" ]]; then
+    fact="${base} was fast-forwarded"
+  elif [[ "$base_moved" == "yes" && "$base_rebased" == "yes" ]]; then
+    fact="${base} was rebased"
+  elif [[ "$base_moved" == "yes" ]]; then
+    fact="${base} moved"
+  fi
+  if [[ "$branch_moved" == "yes" && "$rebased" == "yes" ]]; then
+    if [[ -n "$fact" ]]; then
+      fact="${fact} and the branch was rebased"
+    else
+      fact="the branch was rebased"
+    fi
+  elif [[ "$branch_moved" == "yes" && "$rebased" == "merge" ]]; then
+    if [[ -n "$fact" ]]; then
+      fact="${fact} and ${base} was merged into the branch"
+    else
+      fact="${base} was merged into the branch"
+    fi
+  elif [[ "$branch_moved" == "yes" ]]; then
+    if [[ -n "$fact" ]]; then
+      fact="${fact} and the branch tip moved"
+    else
+      fact="the branch tip moved"
+    fi
+  fi
+  echo "${fact}; the branch tip is now ${tip}. Fix, commit, run finish again." >&2
+}
 if git -C "$worktree" remote get-url origin >/dev/null 2>&1 &&
    git -C "$worktree" rev-parse --verify --quiet "$remote_base" >/dev/null; then
   ff_from="$(git -C "$worktree" rev-parse "$base")"
@@ -2148,6 +3369,7 @@ if git -C "$worktree" remote get-url origin >/dev/null 2>&1 &&
           echo "Override with ISOLATED_SESSION_FORCE=1 (the session doing the reconcile), which"
           echo "lands onto local ${base} as before."
         } >&2
+        refusal_category="diverged"
         exit 1
       fi
     fi
@@ -2161,7 +3383,10 @@ fi
 # worktree) is merged, never rewritten. "not asked" is not a share signal: the branch
 # already contained BASE when that was checked, and BASE may have moved while this
 # landing waited for the lock. That one is rebased, so a queue of landings stays linear
-# and in ticket order. ISOLATED_SESSION_LAND_MERGE=1 merges too.
+# and in ticket order. ISOLATED_SESSION_LAND_MERGE=1 merges too. A local branch that
+# carries a merge of BASE and whose one-by-one replay conflicts is merged as well, with no
+# override, when the three-way merge of its tip is clean
+# (ISSUE(landing-rebase-replays-merged-branches-and-needs-an-owner-override)).
 # A conflict confined to the generated
 # files is resolved by taking BASE's copy -- the ledger is rebuilt below anyway; any
 # other conflict stops the landing with the steps to resolve it.
@@ -2186,6 +3411,16 @@ if ! git -C "$worktree" merge-base --is-ancestor "$base" "$branch"; then
     fi
     rebased="merge"
   else
+    # Does the branch carry a merge OF BASE: a merge commit whose later parent BASE
+    # already holds? A merge of some other branch is not one, and is rebased as ever.
+    merged_base=0
+    for m in $(git -C "$worktree" rev-list --merges "${base}..${branch}"); do
+      for p in $(git -C "$worktree" rev-list --parents -n 1 "$m" | cut -d' ' -f3-); do
+        if git -C "$worktree" merge-base --is-ancestor "$p" "$base"; then
+          merged_base=1
+        fi
+      done
+    done
     if ! git -C "$worktree" rebase "$base" >/dev/null 2>&1; then
       while :; do
         conflicted="$(git -C "$worktree" diff --name-only --diff-filter=U)"
@@ -2199,6 +3434,24 @@ if ! git -C "$worktree" merge-base --is-ancestor "$base" "$branch"; then
         done
         if [[ "$only_generated" != "1" ]]; then
           git -C "$worktree" rebase --abort >/dev/null 2>&1 || true
+          if [[ "$merged_base" == "1" ]]; then
+            # the branch already merged BASE once, so a replay of its commits one by one
+            # meets conflicts the merge settled: land the tip by a three-way merge of BASE
+            # into it instead, the method ISOLATED_SESSION_LAND_MERGE=1 uses. Every commit
+            # stays an ancestor of BASE. A conflict there too is refused, nothing half-landed.
+            if git -C "$worktree" merge --no-edit "$base" >/dev/null 2>&1; then
+              rebased="merge"
+              break
+            fi
+            git -C "$worktree" merge --abort >/dev/null 2>&1 || true
+            {
+              echo "refusing to land ${branch}: it merged ${base} before, and both rebasing onto"
+              echo "${base} and merging ${base} into it conflict in:"
+              for f in $conflicted; do printf '   %s\n' "$(iso_safe_text "$f")"; done
+              echo "In ${worktree}: git merge ${base}, resolve, commit, then run finish again."
+            } >&2
+            exit 1
+          fi
           {
             echo "refusing to land ${branch}: rebasing onto ${base} conflicts in:"
             # names the diff chose, on a line an operator reads: spelled out, never raw
@@ -2222,7 +3475,9 @@ if ! git -C "$worktree" merge-base --is-ancestor "$base" "$branch"; then
         gd="$(git -C "$worktree" rev-parse --git-dir)"
         [[ -d "$gd/rebase-merge" || -d "$gd/rebase-apply" ]] || break
       done
-      if [[ -n "$(git -C "$worktree" diff --name-only --diff-filter=U)" ]] ||
+      if [[ "$rebased" == "merge" ]]; then
+        :
+      elif [[ -n "$(git -C "$worktree" diff --name-only --diff-filter=U)" ]] ||
          [[ -d "$(git -C "$worktree" rev-parse --git-dir)/rebase-merge" ]] ||
          [[ -d "$(git -C "$worktree" rev-parse --git-dir)/rebase-apply" ]]; then
         git -C "$worktree" rebase --abort >/dev/null 2>&1 || true
@@ -2230,11 +3485,54 @@ if ! git -C "$worktree" merge-base --is-ancestor "$base" "$branch"; then
         exit 1
       fi
     fi
-    rebased="yes"
+    [[ "$rebased" == "merge" ]] || rebased="yes"
   fi
 fi
+ref_base_after="$(git -C "$worktree" rev-parse "$base" 2>/dev/null || true)"
+ref_branch_after="$(git -C "$worktree" rev-parse "$branch" 2>/dev/null || true)"
 # after a rebase the branch ref moved; make sure HEAD is still the branch
 "$here/assert-head.sh" "$branch" "$worktree" >/dev/null
+
+# --- the scanned tip: the one commit the gate judges and the merge lands -----------------
+# The tests, the scan and the invariant gate below judge THIS sha, and the merge lands
+# this sha -- never the branch by name. A walled worker owns its branch ref and can move it
+# to an unscanned child while the landing runs; a merge by name then carried that child
+# onto BASE under a clean receipt (ISSUE(security-audit-2026-10-10-pin-gate-file-review-497f)).
+# Just before the merge the branch must still equal it, or the landing refuses. Only
+# finish's own ledger-regeneration commit moves it, and moves it with the ref.
+scanned_tip="$(git -C "$worktree" rev-parse --verify --quiet "HEAD^{commit}" 2>/dev/null || true)"
+if [[ -z "$scanned_tip" || "$scanned_tip" != "$ref_branch_after" ]]; then
+  echo "refusing to land ${branch}: its tip could not be pinned (HEAD ${scanned_tip:-unreadable}, branch ${ref_branch_after:-unreadable}); nothing was scanned" >&2
+  exit 1
+fi
+# Refuses, naming the branch and both shas, when the branch ref or the worktree's HEAD is
+# no longer the scanned tip. $1 says where the landing is.
+scanned_tip_hold() {
+  local now_ref="" now_head=""
+  now_ref="$(git -C "$worktree" rev-parse --verify --quiet "refs/heads/${branch}^{commit}" 2>/dev/null || true)"
+  now_head="$(git -C "$worktree" rev-parse --verify --quiet "HEAD^{commit}" 2>/dev/null || true)"
+  if [[ "$now_ref" == "$scanned_tip" && "$now_head" == "$scanned_tip" ]]; then
+    return 0
+  fi
+  {
+    echo "refusing to land ${branch}: the branch moved ${1} -- the gate judged ${scanned_tip:0:12}, the branch is now ${now_ref:0:12} (HEAD ${now_head:0:12}); ${base} was not merged."
+    echo "Commits the tests and the scan never saw do not land. Run finish again on the tip you mean to land."
+  } >&2
+  echo "MERGED=no"
+  echo "TIP_MOVED=${now_ref:-none}"
+  exit 1
+}
+# finish's own ledger-regeneration commit moves the scanned tip with it: a single commit
+# whose only parent is the scanned tip, on the branch and at HEAD. Anything else refuses.
+scanned_tip_follow() {
+  local new="" parents=""
+  new="$(git -C "$worktree" rev-parse --verify --quiet "HEAD^{commit}" 2>/dev/null || true)"
+  parents="$(git -C "$worktree" rev-list --parents -n 1 "$new" 2>/dev/null | cut -d' ' -f2-)"
+  if [[ -n "$new" && "$parents" == "$scanned_tip" ]]; then
+    scanned_tip="$new"
+  fi
+  scanned_tip_hold "while its ledger was committed"
+}
 
 # --- a session never lands a generated file ------------------------------------
 # BASE's ledger, from the gate directory: a branch that brings or rewrites
@@ -2242,19 +3540,50 @@ fi
 ledger_tool="$gate_ledger"
 if [[ -f "$ledger_tool" ]]; then
   ledger_err="$(finish_tmp)"
-  if ! landing_python "$ledger_tool" --into "$worktree" check --diff "$base" --diff-only 2>"$ledger_err"; then
-    # A check that died with a Traceback judged nothing: BASE's gate is broken (a module
-    # its copy lacks, a bug in the ledger), and the branch is not to blame. Calling that a
-    # generated-file edit sent sessions hunting for an edit they never made
-    # (ISSUE(gate-copy-lacks-the-ledgers-import)). A refusal without one keeps its wording.
-    if grep -q 'Traceback (most recent call last)' "$ledger_err"; then
+  ledger_rc=0
+  landing_python "$ledger_tool" --into "$worktree" check --diff "$base" --diff-only 2>"$ledger_err" || ledger_rc=$?
+  if [[ "$ledger_rc" != "0" ]]; then
+    # Only the ledger's own verdict is a generated-file edit: exit 1, no Traceback, no
+    # `SomeError:` line, and a generated file named. Anything else -- a Traceback, an import
+    # failure the ledger printed itself, another exit code -- judged nothing: BASE's gate is
+    # broken, and the branch is not to blame. Calling that a generated-file edit sent
+    # sessions hunting for an edit they never made (ISSUE(gate-copy-lacks-the-ledgers-import)).
+    ledger_verdict="no"
+    if [[ "$ledger_rc" == "1" ]] &&
+       ! grep -q 'Traceback (most recent call last)' "$ledger_err" &&
+       ! grep -Eq '^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception): ' "$ledger_err"; then
+      for g_file in $generated; do
+        if grep -qF "$g_file" "$ledger_err"; then
+          ledger_verdict="yes"
+          break
+        fi
+      done
+    fi
+    if [[ "$ledger_verdict" != "yes" ]]; then
+      # the ledger's words, bounded and with every control byte but the newline escaped
+      ledger_said="$(landing_python - "$ledger_err" <<'PY'
+import sys
+text = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+if len(text) > 4000:
+    text = "...\n" + text[-4000:]
+out = []
+for ch in text:
+    cp = ord(ch)
+    if ch == "\n" or not (cp < 0x20 or 0x7f <= cp < 0xa0 or 0x2028 <= cp <= 0x2029):
+        out.append(ch)
+    else:
+        out.append("\\x%02x" % cp if cp < 0x100 else "\\u%04x" % cp)
+sys.stdout.write("".join(out).rstrip("\n"))
+PY
+)" || ledger_said="(the ledger's output could not be read)"
       {
         echo "refusing to land ${branch}: the landing gate is broken -- ${base}'s tools/ledger.py"
-        echo "check crashed before it could judge the branch (this is not a generated-file edit):"
-        cat "$ledger_err"
+        echo "check crashed (exit ${ledger_rc}) before it could judge the branch (this is not a generated-file edit):"
+        printf '%s\n' "$ledger_said"
         echo "Fix the ledger on ${base} (or the module it failed to import), then run finish again."
       } >&2
       rm -f "$ledger_err"
+      refusal_category="gate"
       exit 1
     fi
     {
@@ -2264,6 +3593,7 @@ if [[ -f "$ledger_tool" ]]; then
       echo "  git -C '${worktree}' checkout ${base} -- ${generated}   # then commit"
     } >&2
     rm -f "$ledger_err"
+    refusal_category="generated"
     exit 1
   fi
   rm -f "$ledger_err"
@@ -2278,6 +3608,9 @@ tests_line="none (no tools/run_tests.py in this repository)"
 tests_secs=""
 tests_files=""
 tests_on_base=""
+# whole minutes the landing lock was held before the in-lock gate's first test file
+# started; empty when no in-lock gate ran here or its runner does not say when it started
+lock_held_before_gate=""
 # appl.toml's [tests] command, delivered by bin/appl and matched against the primary's
 # appl.toml above, is the gate IN PLACE OF the runner: run once with the worktree under
 # test as its cwd, walled like the branch's tests, and its exit code is the verdict -- a
@@ -2299,11 +3632,13 @@ if [[ -n "$tests_command" ]]; then
       tests_line="${tests_command_text} (appl.toml [tests] command; exit ${rc})"
       {
         echo "refusing to land ${branch}: appl.toml's [tests] command exited ${rc}"
-        echo "The worktree is untouched (already rebased onto ${base}); fix, commit, run finish again."
+        say_what_moved
       } >&2
       echo "MERGED=no"
       echo "TESTS=${tests_line}"
+      receipt_tests="$tests_line"
       echo "TESTS_REFUSAL=red"
+      refusal_category="tests"
       exit 1
     fi
     tests_line="${tests_command_text} (appl.toml [tests] command; exit 0)"
@@ -2312,6 +3647,7 @@ if [[ -n "$tests_command" ]]; then
         echo "refusing to land ${branch}: the tests left the tree dirty -- a test wrote into the checkout:"
         git -C "$worktree" status --porcelain
       } >&2
+      refusal_category="tests"
       exit 1
     fi
   fi
@@ -2328,7 +3664,9 @@ elif [[ -f "$runner" ]]; then
     # worktree is still clean, it is the verdict and nothing runs again. The launcher's
     # receipt is bound to nothing this shell saw, so it goes through the runner's own
     # --reuse check (head, BASE, selection, worktree), which runs the files when it is
-    # not current.
+    # not current. A BASE that moved only by commits owing nothing, under the same tip
+    # rebased onto them, keeps it current there too (run_tests.py's harmless_base_move);
+    # the selector, its map or a guard path that is no record on that range never does.
     #
     # BASE moving under the pre-run is the common case (records commits and other landings
     # land every few minutes), so a moved BASE is judged rather than always paid for
@@ -2348,15 +3686,16 @@ elif [[ -f "$runner" ]]; then
     reuse_receipt=""
     judge_base=""
     tests_from_prerun=no
-    tests_range="${base}..HEAD"
+    tests_range="${base}..${scanned_tip}"
     prerun_moved_line=""
-    cur_head="$(git -C "$worktree" rev-parse HEAD 2>/dev/null || true)"
+    tests_receipt_line=""
+    cur_head="$scanned_tip"
     cur_base="$(git -C "$worktree" rev-parse "${base}^{commit}" 2>/dev/null || true)"
     if [[ -n "$prerun_receipt" && -z "$prerun_head" ]]; then
       reuse_receipt="$prerun_receipt"
     elif [[ -n "$prerun_base" && -n "$cur_base" && "$cur_base" != "$prerun_base" ]] &&
          git -C "$worktree" merge-base --is-ancestor "$prerun_base" "$cur_base" 2>/dev/null; then
-      tests_range="${prerun_base}..HEAD"
+      tests_range="${prerun_base}..${scanned_tip}"
       # the re-run selects over the BASE the pre-run saw and judges on this one; a BASE
       # runner that predates --judge-base (a consumer's older vendored copy) judges on the
       # range's start as before
@@ -2388,11 +3727,28 @@ try:
     # adds may import what the range took away (secrev-pin-pre-run-reuse-ac-64e9, finding 2)
     if names(pre_base, cur_base, "--diff-filter=D"):
         raise SystemExit(0)
+    # the selector and its map decide what every change owes: a move touching one is never
+    # records-only, whatever the selection over it says
+    if rng & {"tools/units.json", "tools/affected_tests.py", "tools/run_tests.py"}:
+        raise SystemExit(0)
     sys.path.insert(0, tools)
-    from affected_tests import Graph, load_units, select
+    from affected_tests import GUARD_TABLES, Graph, is_guard, is_record, load_units, parse_table, select
     from pathlib import Path
     root = Path(".").resolve()
-    tests, _why, full = select(Graph(root, load_units(root / "tools" / "units.json")), sorted(rng))
+    # the gate tables of BASE, read from git: a guard path that is no record owes the full suite
+    # (a security receipt under .security/audit-receipts/ is a record and stays harmless)
+    guards = ()
+    for rel, name in GUARD_TABLES:
+        blob = subprocess.run(GIT + ["show", cur_base + ":" + rel], capture_output=True)
+        if blob.returncode == 0:
+            guards += parse_table(blob.stdout.decode("utf-8"), rel, name)
+        elif subprocess.run(GIT + ["cat-file", "-e", cur_base + ":" + rel],
+                            capture_output=True).returncode == 0:
+            raise SystemExit(0)
+    if any(is_guard(p, guards) and not is_record(p) for p in rng):
+        raise SystemExit(0)
+    tests, _why, full = select(Graph(root, load_units(root / "tools" / "units.json")), sorted(rng),
+                               None, guards)
     if tests or full:
         raise SystemExit(0)
     n = subprocess.run(GIT + ["rev-list", "--count", pre_base + ".." + cur_base],
@@ -2440,10 +3796,85 @@ PY
       if grep -q -- '--gate-phase' "$runner" 2>/dev/null; then
         in_lock_phase_ok=yes
       fi
+      # A background job in a process group of its own (`set -m` only around the launch),
+      # waited for: a trapped TERM interrupts `wait` at once -- it would wait out a
+      # foreground gate -- and land_gate_stop then signals the whole group. stdin is
+      # /dev/null, so a gate outside the terminal's foreground group is never stopped
+      # reading it.
       set +e
-      ( cd "$worktree" && branch_tests_python "$runner" --root "$worktree" --affected "$tests_range" --gate --json -j "${ISOLATED_SESSION_LAND_JOBS:-4}" ${judge_base:+--judge-base "$judge_base"} ${reuse_receipt:+--reuse "$reuse_receipt"} ${in_lock_phase_ok:+--gate-phase in-lock --gate-holder "$branch"} ) > "$report" 2>"$tests_err"
+      set -m
+      (
+        sandbox_begin "$worktree" || exit 1
+        trap 'sandbox_end' EXIT
+        sandbox_child_env
+        cd "$sandbox_clone" && branch_tests_python "$runner" --root "$sandbox_clone" --affected "$tests_range" --gate --json ${ISOLATED_SESSION_LAND_JOBS:+-j "$ISOLATED_SESSION_LAND_JOBS"} ${judge_base:+--judge-base "$judge_base"} ${reuse_receipt:+--reuse "$reuse_receipt"} ${in_lock_phase_ok:+--gate-phase in-lock --gate-holder "$branch"}
+      ) < /dev/null > "$report" 2>"$tests_err" &
+      gate_pid=$!
+      set +m
+      wait "$gate_pid"
       rc=$?
+      gate_pid=""
       set -e
+      # the runner's started_at (a BASE runner without it: no line), less the lock's take,
+      # floored to whole minutes and never below 0
+      lock_held_before_gate="$(landing_python - "$report" "${lock_taken_at:-}" <<'PY' || true
+import json, sys
+try:
+    started = float(json.load(open(sys.argv[1])).get("started_at"))
+    taken = int(sys.argv[2])
+except Exception:
+    sys.exit(0)
+print(max(0, int((started - taken) // 60)))
+PY
+)"
+      case "$lock_held_before_gate" in
+        ''|*[!0-9]*) lock_held_before_gate="" ;;
+      esac
+      # the launcher's receipt the runner honoured ran nothing under the lock: the receipt
+      # says so the way our own pre-run does, counting the commits BASE moved since it was
+      # bound (the runner's harmless_base_move kept it current across them). A runner that
+      # judged the move says how on `reuse_move`, and its TESTS_RECEIPT= line counts the
+      # files the move changed and names the BASE the receipt was judged against; a code
+      # move is never called records-only
+      if [[ -n "$reuse_receipt" ]]; then
+        reuse_lines="$(landing_python - "$report" "$worktree" "$cur_base" <<'PY' 2>/dev/null || true
+import json, re, subprocess, sys
+path, worktree, cur_base = sys.argv[1:4]
+SHA = r"[0-9a-f]{40,64}"
+try:
+    d = json.load(open(path))
+except Exception:
+    sys.exit(0)
+if not isinstance(d, dict) or d.get("reused") is not True:
+    sys.exit(0)
+old = (d.get("bound") or {}).get("base", "") if isinstance(d.get("bound"), dict) else ""
+if not re.fullmatch(SHA, old or "") or old == cur_base:
+    print("yes (the launcher's pre-run, on this very HEAD and BASE)")
+    sys.exit(0)
+move = d.get("reuse_move") if isinstance(d.get("reuse_move"), dict) else {}
+code = move.get("kind") == "code-move"
+try:
+    n = int(subprocess.run(["git", "-C", worktree, "rev-list", "--count", old + ".." + cur_base],
+                           capture_output=True, text=True, check=True).stdout.strip())
+except Exception:
+    print("yes (the launcher's pre-run)")
+    n = None
+if n is not None:
+    print("yes (the launcher's pre-run; base moved by %d %s commit%s)"
+          % (n, "code-move" if code else "records-only", "" if n == 1 else "s"))
+files = move.get("files")
+judged = move.get("base")
+if (isinstance(files, int) and not isinstance(files, bool) and files >= 0
+        and isinstance(judged, str) and re.fullmatch(SHA, judged) and move.get("from") == old):
+    print("reused code-move %d file%s, judged against BASE %s, the pre-run on %s"
+          % (files, "" if files == 1 else "s", judged, old))
+PY
+)"
+        prerun_moved_line="${reuse_lines%%$'\n'*}"
+        if [[ "$reuse_lines" == *$'\n'* ]]; then
+          tests_receipt_line="${reuse_lines#*$'\n'}"
+        fi
+      fi
     fi
     if [[ -n "$prerun_tmp" ]]; then
       rm -f "$prerun_tmp"
@@ -2453,13 +3884,18 @@ PY
     # sink like any other: it goes to a file as NUL-separated records and is escaped here,
     # rather than being printed raw from inside the summary
     # (ISSUE(security-audit-2026-09-18-daily-2026-09-18-4)).
-    summary="$(landing_python - "$report" "$rc" "$tests_tail" <<'PY'
-import json, sys
-path, rc, tail_path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+    # BASE's own unit map, read from git, never from the tree: the receipt's TESTS_PARKED=
+    # marks a parked file this map does not park, whichever runner BASE carries
+    # (ISSUE(security-audit-2026-10-27-pin-parking-of-red-o-de38)). None to read is {}.
+    base_units_map="$(finish_tmp)"
+    git --git-dir="$git_common" show "${base}:tools/units.json" > "$base_units_map" 2>/dev/null || : > "$base_units_map"
+    summary="$(landing_python - "$report" "$rc" "$tests_tail" "$base_units_map" <<'PY'
+import json, sys, unicodedata
+path, rc, tail_path, base_map = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 try:
     d = json.load(open(path))
 except Exception:
-    print("BROKEN\t\t\t")
+    print("BROKEN\x1f\x1f\x1f\x1f\x1f\x1f")    # the read below splits on \x1f, never on a tab
     sys.exit(0)
 files = d.get("files", [])
 # red on BASE too (the runner re-ran it there once): counted as `red-on-base`, never as
@@ -2470,9 +3906,10 @@ for r in files:
     k = "red-on-base" if r["file"] in on_base else r["status"]
     counts[k] = counts.get(k, 0) + 1
 # could-not-run is the verdict of the runner for a file behind a wall: counted on its
-# own, never among the files that ran, and it refuses the landing like a red
-line = ", ".join(f"{counts.get(k, 0)} {k}" for k in ("ok", "skip", "fail", "timeout", "could-not-run",
-                                                     "red-on-base")
+# own, never among the files that ran, and it refuses the landing like a red. A parked file
+# (a units.json `parked` row) was not run and never refuses: counted `<n> parked`
+line = ", ".join(f"{counts.get(k, 0)} {k}" for k in ("ok", "skip", "flaky", "fail", "timeout",
+                                                     "could-not-run", "red-on-base", "parked")
                  if counts.get(k))
 # a timeout is not a fail: a file killed at its budget is named with a " (timeout)" suffix,
 # a failed one bare, and both refuse. timed_out is the list from the runner; a runner without it
@@ -2485,10 +3922,36 @@ for f in list(d.get("failed", [])) + [x for x in timed_out if x not in d.get("fa
 failed = " ".join(reds)
 unrun = " ".join(d.get("could_not_run", []))
 names = " ".join(r["file"] for r in files)
+# the files the gate ran once more after a timeout (a runner without it: none)
+rerun = " ".join(x for x in (d.get("rerun") or []) if isinstance(x, str))
+# the parked files, each marked ` (not parked on BASE)` when BASE's own map has no park row
+# for that exact path. A name is the diff's choice: a line break in it is spelled out here,
+# so it can neither end this record early nor start a receipt line (iso_safe_text after)
+try:
+    base_rows = json.load(open(base_map)).get("files")
+except Exception:
+    base_rows = {}
+base_rows = base_rows if isinstance(base_rows, dict) else {}
+
+
+def held(f):
+    row = base_rows.get(f)
+    why = row.get("parked") if isinstance(row, dict) else None
+    return isinstance(why, str) and bool(why.strip())
+
+
+def flat(text):
+    return "".join(("\\x%02x" % ord(c) if ord(c) < 256 else "\\u%04x" % ord(c))
+                   if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c for c in text)
+
+
+parked = " ".join(flat(f) + ("" if held(f) else " (not parked on BASE)")
+                  for f in (d.get("parked") or []) if isinstance(f, str))
 # unit separator, not a tab: bash `read` folds runs of IFS whitespace, so an empty
 # `failed` column would shift the columns after it
 print("\x1f".join([f"{line or '0 files'} (of {len(files)}; {d.get('selection', '')})",
-                   str(d.get("wall_s", "")), failed, unrun, " ".join(on_base), names]))
+                   str(d.get("wall_s", "")), failed, unrun, " ".join(on_base), parked, names,
+                   rerun]))
 with open(tail_path, "w", encoding="utf-8") as fh:
     for r in files:
         if r["status"] in ("fail", "timeout", "could-not-run"):
@@ -2497,7 +3960,8 @@ with open(tail_path, "w", encoding="utf-8") as fh:
                 fh.write("   | " + ln + "\0")
 PY
 )"
-    IFS=$'\x1f' read -r tests_line tests_secs tests_failed tests_unrun tests_on_base tests_files <<< "$summary"
+    rm -f "$base_units_map"
+    IFS=$'\x1f' read -r tests_line tests_secs tests_failed tests_unrun tests_on_base tests_parked tests_files tests_rerun <<< "$summary"
     while IFS= read -r -d '' tail_rec; do
       [[ -n "$tail_rec" ]] || continue
       if ! tail_esc="$(iso_safe_text "$tail_rec")"; then
@@ -2510,7 +3974,12 @@ PY
     rm -f "$tests_tail"
     if [[ "$tests_line" == "BROKEN" ]]; then
       { echo "refusing to land ${branch}: tools/run_tests.py gave no report:"; cat "$tests_err"; } >&2
+      # a receipt as a red test's is, saying what it is not: no verdict at all
+      echo "MERGED=no"
+      echo "TESTS=no report (tools/run_tests.py exit ${rc})"
+      receipt_tests="no report (tools/run_tests.py exit ${rc})"
       rm -f "$report" "$tests_err"
+      refusal_category="tests"
       exit 1
     fi
     if [[ "$rc" != "0" ]]; then
@@ -2525,8 +3994,9 @@ PY
         fi
         if [[ "$tests_from_wall" == "yes" ]]; then
           echo "The repair agent is asked before a person lands."
+          say_what_moved quiet
         else
-          echo "The worktree is untouched (already rebased onto ${base}); fix, commit, run finish again."
+          say_what_moved
         fi
       } >&2
       # A refusal is a receipt too: the counted verdict goes on STDOUT with the rest of
@@ -2535,6 +4005,8 @@ PY
       # is what tells it apart from a landing; the exit status is still the contract.
       echo "MERGED=no"
       echo "TESTS=${tests_line}"
+      receipt_tests="$tests_line"
+      refusal_category="tests"
       if [[ -n "$tests_failed" ]]; then
         echo "TESTS_RED=$(iso_safe_text "$tests_failed")"
       fi
@@ -2543,6 +4015,9 @@ PY
       fi
       if [[ -n "$tests_on_base" ]]; then
         echo "TESTS_RED_ON_BASE=$(iso_safe_text "$tests_on_base")"
+      fi
+      if [[ -n "$tests_parked" ]]; then
+        echo "TESTS_PARKED=$(iso_safe_text "$tests_parked")"
       fi
       # The refusal's class. `environment`: every suite that did not pass is one the room
       # refused (the runner measured a wall AND the suite carried the room's words), so
@@ -2563,10 +4038,15 @@ PY
         echo "refusing to land ${branch}: the tests left the tree dirty -- a test wrote into the checkout:"
         git -C "$worktree" status --porcelain
       } >&2
+      refusal_category="tests"
       exit 1
     fi
   fi
 fi
+# the tree the tests ran in is the scanned tip's, and the scan below reads that sha
+scanned_tip_hold "while its tests ran"
+# ... and the gate the rest of this landing runs is still the copy it was handed
+gate_dir_hold "after its tests ran"
 
 # --- the deterministic security scan of the diff ----------------------------------
 # tools/sec_lint.py reads the added lines and the touched paths and answers with one
@@ -2586,8 +4066,8 @@ fi
 # never the fallback. The rebuild runs THESE copies against the revision's data,
 # never the revision's tools/ (ISSUE(scanner-executes-scanned-revision)).
 #
-# EVERY COMMIT of the range is judged, one lint run per commit (`c^..c`, the first parent
-# for a merge), exactly as the publisher judges them (muretai-publish.py `evaluate`). The
+# EVERY COMMIT of the range is judged, one lint run per commit (`c^..c`; a merge is linted
+# against every parent, and its touched paths are taken against every parent), as the publisher judges them (muretai-publish.py `evaluate`). The
 # scan used to run ONCE over the net diff `BASE..HEAD`, so a commit that added a refused
 # line and a later commit of the same branch that rewrote it landed `clean` -- f6b03cee
 # went onto main that way, and only the publisher, asking the per-commit question, refused
@@ -2602,59 +4082,77 @@ fi
 #
 # $1 the checkout to run in, $2 the lint, $3 the range's base; writes the aggregate JSON
 # (the lint's own shape plus `scanned_files`, `commits`, `broken`) to $4 and the scanned
-# paths, NUL-separated and as git spelled them, to $5. Non-zero only when it could not run.
-sec_scan_commits() {  # $1 cwd, $2 lint, $3 base rev, $4 json out, $5 paths out
-  ( cd "$1" && landing_python - "$2" "$3" "$4" "$5" <<'PY'
+# paths, NUL-separated and as git spelled them, to $5. $6, when given, is the tip of the
+# range (the scanned tip); HEAD otherwise. Non-zero only when it could not run.
+sec_scan_commits() {  # $1 cwd, $2 lint, $3 base rev, $4 json out, $5 paths out, $6 tip rev
+  ( cd "$1" && landing_python - "$2" "$3" "$4" "$5" "${6:-HEAD}" <<'PY'
 import json, subprocess, sys
-lint, base, out_json, out_paths = sys.argv[1:5]
+lint, base, out_json, out_paths, tip = sys.argv[1:6]
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 GIT = ["git", "-c", "core.quotepath=false"]
 
 def git_out(*args):
     return subprocess.run(GIT + list(args), capture_output=True, check=True).stdout
 
-commits = git_out("rev-list", "--reverse", "--topo-order", base + "..HEAD").decode().split()
+commits = git_out("rev-list", "--reverse", "--topo-order", base + ".." + tip).decode().split()
 scanned, review, findings, seen, broken, refused_in = {}, set(), [], set(), [], []
 verdicts = set()
+def changed(a, b):
+    return [p for p in git_out("diff", "--name-only", "-z", "--no-renames", "--diff-filter=ACMRDT",
+                               a, b).split(b"\0") if p]
+
 for c in commits:
-    has_parent = subprocess.run(GIT + ["rev-parse", "--verify", "--quiet", c + "^"],
-                                capture_output=True).returncode == 0
-    parent = c + "^" if has_parent else EMPTY_TREE
-    touched = [p for p in git_out("diff", "--name-only", "-z", "--no-renames", "--diff-filter=ACMRDT",
-                                  parent, c).split(b"\0") if p]
+    parents = git_out("rev-list", "--parents", "-n", "1", c).decode().split()[1:]
+    parent = c + "^" if parents else EMPTY_TREE
+    touched = changed(parent, c)
+    # a merge is diffed against EACH parent for its paths: a resolution that puts back the
+    # branch's copy of a gate file main changed differs from its first parent on nothing,
+    # so a first-parent diff never named it and an undone guard landed clean
+    # (ISSUE(security-audit-2026-10-09-a-branch-that-merged-68d6)). The lint judges the
+    # first-parent diff, as the publisher does, AND the merge against each other parent: a
+    # resolution that puts back the branch's copy of an audited file that is no gate file
+    # (tools/release_sign.py) undoes main's fix with no line of the first-parent diff, and
+    # only that other-parent diff shows it to the audited-surface rule; the same diff
+    # brings back any line a newer line rule would refuse (intake 20261009T235603Z-2). The
+    # verdicts, review lists and findings of every run of the commit are one union.
+    for other in parents[1:]:
+        touched += [p for p in changed(other, c) if p not in touched]
     if not touched:
         continue                     # an empty commit: nothing of it to judge
     for p in touched:
         scanned.setdefault(p, None)
-    r = subprocess.run([sys.executable, "-I", lint, "--diff", parent + ".." + c, "--json"],
-                       capture_output=True, text=True)
-    try:
-        d = json.loads(r.stdout)
-        verdict = str(d["verdict"])
-    except (ValueError, KeyError, TypeError):
-        broken.append("%s: %s" % (c[:7], (r.stderr.strip() or "no JSON from the lint")[-300:]))
-        continue
-    if r.returncode == 2 and verdict != "refused":
-        verdict = "refused"          # the exit code is the contract; the word must agree
-    if verdict not in ("clean", "needs-eyes", "refused"):
-        broken.append("%s: the lint said %r" % (c[:7], verdict))
-        continue
-    verdicts.add(verdict)
-    if verdict == "refused":
-        refused_in.append(c[:7])
-    review.update(str(f) for f in (d.get("review_files") or d.get("audited_files", [])))
-    for f in d.get("findings", []):
-        key = (f.get("file"), f.get("line"), f.get("rule"), f.get("level"), f.get("text"))
-        if key in seen:
-            continue                 # the same finding again in a later commit: named once, first commit
-        seen.add(key)
-        f = dict(f)
-        f["commit"] = c[:7]
-        findings.append(f)
-if broken:
-    verdict = "broken"
-elif "refused" in verdicts:
+    for side in [parent] + parents[1:]:
+        r = subprocess.run([sys.executable, "-I", lint, "--diff", side + ".." + c, "--json"],
+                           capture_output=True, text=True)
+        try:
+            d = json.loads(r.stdout)
+            verdict = str(d["verdict"])
+        except (ValueError, KeyError, TypeError):
+            broken.append("%s: %s" % (c[:7], (r.stderr.strip() or "no JSON from the lint")[-300:]))
+            continue
+        if r.returncode == 2 and verdict != "refused":
+            verdict = "refused"          # the exit code is the contract; the word must agree
+        if verdict not in ("clean", "needs-eyes", "refused"):
+            broken.append("%s: the lint said %r" % (c[:7], verdict))
+            continue
+        verdicts.add(verdict)
+        if verdict == "refused" and c[:7] not in refused_in:
+            refused_in.append(c[:7])
+        review.update(str(f) for f in (d.get("review_files") or d.get("audited_files", [])))
+        for f in d.get("findings", []):
+            key = (f.get("file"), f.get("line"), f.get("rule"), f.get("level"), f.get("text"))
+            if key in seen:
+                continue                 # the same finding again in a later run: named once, first commit
+            seen.add(key)
+            f = dict(f)
+            f["commit"] = c[:7]
+            findings.append(f)
+# refused outranks broken: a range with a refused commit is refused whatever else it
+# holds, and a broken commit in it is still named in `broken`
+if "refused" in verdicts:
     verdict = "refused"
+elif broken:
+    verdict = "broken"
 elif "needs-eyes" in verdicts:
     verdict = "needs-eyes"
 elif scanned:
@@ -2667,8 +4165,14 @@ with open(out_json, "w", encoding="utf-8") as fh:
     json.dump({"verdict": verdict, "review_files": sorted(review), "findings": findings,
                "scanned_files": names, "commits": len(commits), "refused_in": refused_in,
                "broken": broken}, fh)
+# the paths file, which the gate table is asked about, is that union plus the net diff
+# base..tip, each path once
+gate_paths = dict(scanned)
+if commits:
+    for p in changed(base, tip):
+        gate_paths.setdefault(p, None)
 with open(out_paths, "wb") as fh:
-    for p in sorted(scanned):
+    for p in sorted(gate_paths):
         fh.write(p + b"\0")
 PY
   )
@@ -2691,6 +4195,55 @@ gate_scratch_ensure() {
   fi
 }
 
+# BASE's gate table over the NUL-separated paths in $2, asked of the lint at $1
+# (`--gate-files`). Appends what it names to gate_files. The answer is data: NUL-terminated
+# records, read and never evaluated. This used to end in `|| true`, so a step that exited
+# non-zero, died by a signal, or answered with anything but NUL-terminated records (the
+# last, unterminated record was dropped by `read -d ''`) read as "no gate file" and a clean
+# diff skipped its reviewer (IB:52982). A failed step now fails closed as a review OWED,
+# not a refusal -- a broken table must not stop every landing, and must never skip a
+# review: every path of $2 is put on gate_files (none can be cleared) and
+# gate_files_failed says why, with the step's own stderr cut to its last 300 bytes and
+# escaped. Called in this shell, never in a `$( )`: it sets globals.
+gate_files_failed=""
+gate_files_ask() {  # $1 lint, $2 NUL-separated paths
+  local out err rc=0 why="" tail_err="" last f
+  out="$(finish_tmp)"
+  err="$(finish_tmp)"
+  landing_python "$1" --gate-files < "$2" > "$out" 2> "$err" || rc=$?
+  if [[ "$rc" -gt 128 ]]; then
+    why="it was killed by signal $(( rc - 128 ))"
+  elif [[ "$rc" != "0" ]]; then
+    why="it exited ${rc}"
+  elif [[ -s "$out" ]]; then
+    last="$(tail -c 1 "$out" | od -An -tx1 | tr -d ' \n')"
+    [[ "$last" == "00" ]] || why="its answer is not NUL-terminated records"
+  fi
+  if [[ -z "$why" ]]; then
+    while IFS= read -r -d '' f; do
+      [[ -n "$f" ]] || continue
+      gate_files="${gate_files}${gate_files:+ }${f}"
+    done < "$out"
+    rm -f "$out" "$err"
+    return 0
+  fi
+  if [[ -s "$err" ]]; then
+    tail_err="$(tail -c 300 "$err")"
+    tail_err="$(iso_safe_text "$tail_err")" || tail_err="(its stderr could not be printed safely)"
+    why="${why}: ${tail_err}"
+  fi
+  rm -f "$out" "$err"
+  gate_files_failed="tools/sec_lint.py --gate-files failed (${why}), so no path of the diff is cleared as not a gate file"
+  while IFS= read -r -d '' f; do
+    [[ -n "$f" ]] || continue
+    case " $gate_files " in
+      *" $f "*) ;;
+      *) gate_files="${gate_files}${gate_files:+ }${f}" ;;
+    esac
+  done < "$2"
+  echo "warning: ${gate_files_failed}; the landing owes a review" >&2
+}
+
 sec_line="none (base has no tools/sec_lint.py)"
 sec_verdict="none"
 sec_scanned_line=""
@@ -2703,7 +4256,7 @@ gate_files=""
 # (ISSUE(security-audit-2026-09-12-the-reviewer-opens-in-a-c-2))
 for keep in tools/sec_lint.py tools/audit_scope.py; do
   if git -C "$worktree" cat-file -e "${base}:${keep}" 2>/dev/null &&
-     ! git -C "$worktree" cat-file -e "HEAD:${keep}" 2>/dev/null; then
+     ! git -C "$worktree" cat-file -e "${scanned_tip}:${keep}" 2>/dev/null; then
     echo "error: refusing to land ${branch}: it removes ${keep}, which every later landing's security gate runs" >&2
     exit 1
   fi
@@ -2721,14 +4274,18 @@ if [[ -n "$scan_command" ]]; then
   scan_command_text="$(iso_safe_text "$scan_command")"
   sec_paths="$(finish_tmp)"
   sec_paths_all="$(finish_tmp)"
-  for sc_c in $(git -C "$worktree" rev-list --reverse --topo-order "${base}..HEAD"); do
-    sc_parent="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-    if git -C "$worktree" rev-parse --verify --quiet "${sc_c}^" >/dev/null 2>&1; then
-      sc_parent="${sc_c}^"
-    fi
-    git -C "$worktree" -c core.quotepath=false diff --name-only -z --no-renames --diff-filter=ACMRDT \
-      "$sc_parent" "$sc_c" >> "$sec_paths_all"
+  for sc_c in $(git -C "$worktree" rev-list --reverse --topo-order "${base}..${scanned_tip}"); do
+    # every parent of a merge, as sec_scan_commits diffs it
+    sc_parents="$(git -C "$worktree" rev-list --parents -n 1 "$sc_c" | cut -d' ' -f2-)"
+    [[ "$sc_parents" != "$sc_c" ]] || sc_parents="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    for sc_parent in $sc_parents; do
+      git -C "$worktree" -c core.quotepath=false diff --name-only -z --no-renames --diff-filter=ACMRDT \
+        "$sc_parent" "$sc_c" >> "$sec_paths_all"
+    done
   done
+  # plus the net diff, each path once (sort -u below)
+  git -C "$worktree" -c core.quotepath=false diff --name-only -z --no-renames --diff-filter=ACMRDT \
+    "${base}..${scanned_tip}" >> "$sec_paths_all"
   sort -z -u < "$sec_paths_all" > "$sec_paths"
   rm -f "$sec_paths_all"
   sec_scanned_n=0
@@ -2739,16 +4296,16 @@ if [[ -n "$scan_command" ]]; then
     sec_scanned_files="${sec_scanned_files}${sec_scanned_files:+ }${f}"
   done < "$sec_paths"
   sec_scanned_line="SEC_SCANNED=${sec_scanned_n}"$'\n'"SEC_SCANNED_FILES=$(iso_safe_text "$sec_scanned_files")"
-  if git -C "$worktree" cat-file -e "${base}:tools/sec_lint.py" 2>/dev/null; then
+  if git --git-dir="$git_common" cat-file -e "${base}:tools/sec_lint.py" 2>/dev/null; then
     gate_scratch_ensure || exit 1
     sec_base="$(mktemp -d "${gate_scratch}/.sec-base-XXXXXX")"
     mkdir -p "$sec_base/tools" "$sec_base/company/ops"
-    git -C "$worktree" show "${base}:tools/sec_lint.py" > "$sec_base/tools/sec_lint.py"
+    git --git-dir="$git_common" show "${base}:tools/sec_lint.py" > "$sec_base/tools/sec_lint.py"
     for extra in tools/audit_scope.py tools/ledger.py tools/backlog_build.py \
                  tools/spec_build.py company/ops/backlog_to_core.py; do
-      if git -C "$worktree" cat-file -e "${base}:${extra}" 2>/dev/null; then
+      if git --git-dir="$git_common" cat-file -e "${base}:${extra}" 2>/dev/null; then
         mkdir -p "$sec_base/$(dirname "$extra")"
-        git -C "$worktree" show "${base}:${extra}" > "$sec_base/${extra}"
+        git --git-dir="$git_common" show "${base}:${extra}" > "$sec_base/${extra}"
       fi
     done
     # The command replaces the lint's VERDICT on the diff, never its per-commit refuse
@@ -2761,7 +4318,7 @@ if [[ -n "$scan_command" ]]; then
     sc_paths="$(finish_tmp)"
     sc_find_file="$(finish_tmp)"
     set +e
-    sec_scan_commits "$worktree" "$sec_base/tools/sec_lint.py" "$base" "$sc_report" "$sc_paths" 2>/dev/null
+    sec_scan_commits "$worktree" "$sec_base/tools/sec_lint.py" "$base" "$sc_report" "$sc_paths" "$scanned_tip" 2>/dev/null
     sc_lint_rc=$?
     set -e
     rm -f "$sc_paths"
@@ -2810,11 +4367,12 @@ PY
           [[ -n "$sc_findings" ]] && printf '%s' "$sc_findings"
           echo "Every commit is judged on its own, as the publisher judges it: a later commit that"
           echo "removes the line does not excuse the one that added it. Rebase or amend the branch"
-          echo "so no commit carries it (git rebase -i ${base}), then run finish again. The worktree"
-          echo "is untouched (already rebased onto ${base}); nothing moved."
+          echo "so no commit carries it (git rebase -i ${base}), then run finish again."
+          say_what_moved
         } >&2
         echo "MERGED=no"
         echo "SEC=refused (in commit(s) $(iso_safe_text "${sc_refused_in:-?}"); before appl.toml [scan] command)"
+        receipt_sec="refused (in commit(s) $(iso_safe_text "${sc_refused_in:-?}"); before appl.toml [scan] command)"
       else
         {
           echo "refusing to land ${branch}: tools/sec_lint.py gave no verdict for a commit of the range, so the per-commit refuse check (which runs before appl.toml's [scan] command) could not clear it:"
@@ -2822,19 +4380,18 @@ PY
         } >&2
         echo "MERGED=no"
         echo "SEC=no-verdict"
+        receipt_sec="no-verdict"
       fi
       printf '%s\n' "$sec_scanned_line"
+      refusal_category="sec"
       exit 1
     fi
     rm -f "$sc_find_file"
-    while IFS= read -r -d '' f; do
-      [[ -n "$f" ]] || continue
-      gate_files="${gate_files}${gate_files:+ }${f}"
-    done < <(landing_python "$sec_base/tools/sec_lint.py" --gate-files < "$sec_paths" 2>/dev/null || true)
+    gate_files_ask "$sec_base/tools/sec_lint.py" "$sec_paths"
     rm -rf "$sec_base"
   else
     for keep in tools/sec_lint.py tools/audit_scope.py; do
-      if [[ -n "$(git -C "$worktree" diff --name-only --no-renames --diff-filter=ACMRDT "${base}..HEAD" -- "$keep")" ]]; then
+      if [[ -n "$(git -C "$worktree" diff --name-only --no-renames --diff-filter=ACMRDT "${base}..${scanned_tip}" -- "$keep")" ]]; then
         gate_files="${gate_files}${gate_files:+ }${keep}"
       fi
     done
@@ -2848,11 +4405,13 @@ PY
   if [[ "$sc_rc" != "0" ]]; then
     {
       echo "refusing to land ${branch}: appl.toml's [scan] command exited ${sc_rc}"
-      echo "The worktree is untouched (already rebased onto ${base}); fix, commit, run finish again."
+      say_what_moved
     } >&2
     echo "MERGED=no"
     echo "SEC=refused (${scan_command_text}: appl.toml [scan] command; exit ${sc_rc})"
+    receipt_sec="refused (${scan_command_text}: appl.toml [scan] command; exit ${sc_rc})"
     printf '%s\n' "$sec_scanned_line"
+    refusal_category="sec"
     exit 1
   fi
   if [[ -n "$(git -C "$worktree" status --porcelain)" ]]; then
@@ -2860,28 +4419,34 @@ PY
       echo "refusing to land ${branch}: the scan command left the tree dirty -- it wrote into the checkout:"
       git -C "$worktree" status --porcelain
     } >&2
+    refusal_category="sec"
     exit 1
   fi
   sec_verdict="clean"
   sec_line="${scan_command_text} (appl.toml [scan] command; exit 0)"
-  if [[ -n "$gate_files" ]]; then
+  if [[ -n "$gate_files" || -n "$gate_files_failed" ]]; then
     sec_verdict="needs-eyes"
     sec_files="$gate_files"
     sec_count=0
     for f in $sec_files; do sec_count=$(( sec_count + 1 )); done
-    sec_line="${sec_line}; needs-eyes (${sec_count} file(s) to review: $(iso_safe_text "$sec_files"); gate files changed)"
-    echo "note: the diff changes gate file(s), so it is needs-eyes whatever the scan command said: $(iso_safe_text "$gate_files")" >&2
+    if [[ -n "$gate_files_failed" ]]; then
+      sec_line="${sec_line}; needs-eyes (${sec_count} file(s) to review: $(iso_safe_text "$sec_files"); the gate-files step failed)"
+      echo "note: ${gate_files_failed}, so it is needs-eyes whatever the scan command said" >&2
+    else
+      sec_line="${sec_line}; needs-eyes (${sec_count} file(s) to review: $(iso_safe_text "$sec_files"); gate files changed)"
+      echo "note: the diff changes gate file(s), so it is needs-eyes whatever the scan command said: $(iso_safe_text "$gate_files")" >&2
+    fi
   fi
-elif git -C "$worktree" cat-file -e "${base}:tools/sec_lint.py" 2>/dev/null; then
+elif git --git-dir="$git_common" cat-file -e "${base}:tools/sec_lint.py" 2>/dev/null; then
   gate_scratch_ensure || exit 1
   sec_base="$(mktemp -d "${gate_scratch}/.sec-base-XXXXXX")"
   mkdir -p "$sec_base/tools" "$sec_base/company/ops"
-  git -C "$worktree" show "${base}:tools/sec_lint.py" > "$sec_base/tools/sec_lint.py"
+  git --git-dir="$git_common" show "${base}:tools/sec_lint.py" > "$sec_base/tools/sec_lint.py"
   for extra in tools/audit_scope.py tools/ledger.py tools/backlog_build.py \
                tools/spec_build.py company/ops/backlog_to_core.py; do
-    if git -C "$worktree" cat-file -e "${base}:${extra}" 2>/dev/null; then
+    if git --git-dir="$git_common" cat-file -e "${base}:${extra}" 2>/dev/null; then
       mkdir -p "$sec_base/$(dirname "$extra")"
-      git -C "$worktree" show "${base}:${extra}" > "$sec_base/${extra}"
+      git --git-dir="$git_common" show "${base}:${extra}" > "$sec_base/${extra}"
     fi
   done
   sec_report="$(finish_tmp)"
@@ -2889,7 +4454,7 @@ elif git -C "$worktree" cat-file -e "${base}:tools/sec_lint.py" 2>/dev/null; the
   sec_find_file="$(finish_tmp)"
   sec_paths="$(finish_tmp)"
   set +e
-  sec_scan_commits "$worktree" "$sec_base/tools/sec_lint.py" "$base" "$sec_report" "$sec_paths" 2>"$sec_err"
+  sec_scan_commits "$worktree" "$sec_base/tools/sec_lint.py" "$base" "$sec_report" "$sec_paths" "$scanned_tip" 2>"$sec_err"
   sec_rc=$?
   set -e
   # the gate list, from BASE's table, over the SAME union the scan judged (every path
@@ -2897,10 +4462,7 @@ elif git -C "$worktree" cat-file -e "${base}:tools/sec_lint.py" 2>/dev/null; the
   # non-ASCII name arrives octal-quoted and matches no entry (the LONG S case);
   # deletions, renames (as D + A) and type changes included
   if [[ "$sec_rc" == "0" ]]; then
-    while IFS= read -r -d '' f; do
-      [[ -n "$f" ]] || continue
-      gate_files="${gate_files}${gate_files:+ }${f}"
-    done < <(landing_python "$sec_base/tools/sec_lint.py" --gate-files < "$sec_paths" 2>/dev/null || true)
+    gate_files_ask "$sec_base/tools/sec_lint.py" "$sec_paths"
   fi
   rm -f "$sec_paths"
   rm -rf "$sec_base"
@@ -2953,7 +4515,7 @@ PY
   sec_scanned_line="SEC_SCANNED=${sec_scanned_n:-0}"$'\n'"SEC_SCANNED_FILES=$(iso_safe_text "${sec_scanned_files:-}")"
   # a gate file changed: needs-eyes whatever the lint said (a refusal stays a refusal),
   # and the reviewer opens those files too
-  if [[ -n "$gate_files" ]]; then
+  if [[ -n "$gate_files" || -n "$gate_files_failed" ]]; then
     case "$sec_verdict" in
       clean|needs-eyes)
         sec_verdict="needs-eyes"
@@ -2966,6 +4528,7 @@ PY
         sec_count=0
         for f in $sec_files; do sec_count=$(( sec_count + 1 )); done
         sec_gate="; gate files changed"
+        [[ -z "$gate_files_failed" ]] || sec_gate="; the gate-files step failed"
         ;;
     esac
   fi
@@ -2985,7 +4548,9 @@ PY
         # already escaped, one record per line, with its own trailing newline
         { echo "note: tools/sec_lint.py wants eyes on:"; printf '%s' "$sec_findings"; } >&2
       fi
-      if [[ -n "$gate_files" ]]; then
+      if [[ -n "$gate_files_failed" ]]; then
+        echo "note: ${gate_files_failed}, so it is needs-eyes whatever the lint said" >&2
+      elif [[ -n "$gate_files" ]]; then
         echo "note: the diff changes gate file(s), so it is needs-eyes whatever the lint said: $(iso_safe_text "$gate_files")" >&2
       fi
       ;;
@@ -2996,14 +4561,16 @@ PY
         echo "Every commit is judged on its own, as the publisher judges it: a later commit that"
         echo "removes the line does not excuse the one that added it, because that commit would"
         echo "still be in ${base}'s history. Rebase or amend the branch so no commit carries it"
-        echo "(git rebase -i ${base}), then run finish again. The worktree is untouched (already"
-        echo "rebased onto ${base}); nothing moved."
+        echo "(git rebase -i ${base}), then run finish again."
+        say_what_moved
       } >&2
       # a refusal is a receipt too (as a red test's is): what the landing measured, on stdout
       echo "MERGED=no"
       echo "SEC=refused (in commit(s) $(iso_safe_text "${sec_refused_in:-?}"))"
+      receipt_sec="refused (in commit(s) $(iso_safe_text "${sec_refused_in:-?}"))"
       printf '%s\n' "$sec_scanned_line"
       rm -f "$sec_report" "$sec_err"
+      refusal_category="sec"
       exit 1
       ;;
     *)
@@ -3019,7 +4586,9 @@ PY
         cat "$sec_err"; } >&2
       echo "MERGED=no"
       echo "SEC=no-verdict"
+      receipt_sec="no-verdict"
       rm -f "$sec_report" "$sec_err"
+      refusal_category="sec"
       exit 1
       ;;
   esac
@@ -3028,7 +4597,7 @@ else
   # no lint, so no table -- but a diff that brings the scan tools themselves is said,
   # because those two names are the one thing this script knows about the gate
   for keep in tools/sec_lint.py tools/audit_scope.py; do
-    if [[ -n "$(git -C "$worktree" diff --name-only --no-renames --diff-filter=ACMRDT "${base}..HEAD" -- "$keep")" ]]; then
+    if [[ -n "$(git -C "$worktree" diff --name-only --no-renames --diff-filter=ACMRDT "${base}..${scanned_tip}" -- "$keep")" ]]; then
       gate_files="${gate_files}${gate_files:+ }${keep}"
     fi
   done
@@ -3041,19 +4610,45 @@ fi
 # BASE's tools/invariants.py, with BASE's sec_lint.py beside it (the table lives there,
 # not in the tree being judged). A BASE without the tool is INV=none and is not a
 # refusal, the same shape as SEC=none. refused stops the landing before the merge.
+# Fail closed: when BASE's tree names the checker (or the table) but the entry is not a
+# blob that can be read, the landing is refused -- it is never "no tool", and the
+# branch's copy is never run or read in its place.
+inv_refuse_unreadable() {
+  echo "refusing to land ${branch}: ${base}'s $1 cannot be read, so the invariant gate cannot judge the diff." >&2
+  say_what_moved
+  echo "MERGED=no"
+  echo "INV=refused"
+  exit 1
+}
+# prints BASE's tree entry for $1 ("<mode> <type> <sha>"), or nothing when BASE has none
+inv_base_entry() {
+  git --git-dir="$git_common" ls-tree "$base" -- "$1" 2>/dev/null | awk -F '\t' 'NR == 1 { print $1 }'
+}
+# copies BASE's blob $1 to $2; refuses when the entry is not a readable regular blob
+inv_base_copy() {
+  local entry
+  entry="$(inv_base_entry "$1")"
+  case "$entry" in
+    100644\ blob\ *|100755\ blob\ *) ;;
+    *) inv_refuse_unreadable "$1" ;;
+  esac
+  if ! git --git-dir="$git_common" cat-file blob "${entry##* }" > "$2" 2>/dev/null; then
+    inv_refuse_unreadable "$1"
+  fi
+}
 inv_line="none"
-if git -C "$worktree" cat-file -e "${base}:tools/invariants.py" 2>/dev/null; then
+if [[ -n "$(inv_base_entry tools/invariants.py)" ]]; then
   gate_scratch_ensure || exit 1
   inv_base="$(mktemp -d "${gate_scratch}/.inv-base-XXXXXX")"
   mkdir -p "$inv_base/tools"
-  git -C "$worktree" show "${base}:tools/invariants.py" > "$inv_base/tools/invariants.py"
-  if git -C "$worktree" cat-file -e "${base}:tools/sec_lint.py" 2>/dev/null; then
-    git -C "$worktree" show "${base}:tools/sec_lint.py" > "$inv_base/tools/sec_lint.py"
+  inv_base_copy tools/invariants.py "$inv_base/tools/invariants.py"
+  if [[ -n "$(inv_base_entry tools/sec_lint.py)" ]]; then
+    inv_base_copy tools/sec_lint.py "$inv_base/tools/sec_lint.py"
   fi
   inv_out="$(finish_tmp)"
   inv_err="$(finish_tmp)"
   set +e
-  ( cd "$worktree" && landing_python "$inv_base/tools/invariants.py" --diff "${base}..HEAD" --json >"$inv_out" 2>"$inv_err" )
+  ( cd "$worktree" && landing_python "$inv_base/tools/invariants.py" --diff "${base}..${scanned_tip}" --json >"$inv_out" 2>"$inv_err" )
   inv_rc=$?
   set -e
   inv_meta="$(landing_python - "$inv_out" <<'PY'
@@ -3088,7 +4683,8 @@ PY
     inv_verdict="refused"
   fi
   if [[ "$inv_verdict" == "refused" ]]; then
-    echo "refusing to land ${branch}: tools/invariants.py refused the diff. The worktree is untouched; nothing moved." >&2
+    echo "refusing to land ${branch}: tools/invariants.py refused the diff." >&2
+    say_what_moved
     if [[ -n "$inv_why" ]] && inv_why_safe="$(iso_safe_text "$inv_why")"; then
       echo "  why: ${inv_why_safe}" >&2
     fi
@@ -3128,15 +4724,18 @@ if [[ -f "$ledger_tool" ]]; then
     if [[ "$lc_rc" != "0" ]]; then
       {
         echo "refusing to land ${branch}: appl.toml's [ledger] command exited ${lc_rc}"
-        echo "The worktree is untouched (already rebased onto ${base}); fix, commit, run finish again."
+        say_what_moved
       } >&2
       echo "MERGED=no"
       echo "LEDGER_REFUSAL=${lc_rc}"
+      refusal_category="ledger"
       exit 1
     fi
     if [[ -n "$(git -C "$worktree" status --porcelain)" ]]; then
+      scanned_tip_hold "while its ledger was regenerated"
       git -C "$worktree" add -A -- $generated 2>/dev/null || git -C "$worktree" add -A
       git -C "$worktree" commit -q -m "ledger: regenerate on landing ${branch}"
+      scanned_tip_follow
     fi
     # the safe text of a command with nothing to escape is the command itself
     ledger_line="$ledger_command_text"
@@ -3144,17 +4743,25 @@ if [[ -f "$ledger_tool" ]]; then
     build_out="$(landing_python "$ledger_tool" --into "$worktree" build 2>&1)" || {
       echo "refusing to land ${branch}: tools/ledger.py build failed:" >&2
       printf '%s\n' "$build_out" >&2
+      refusal_category="ledger"
       exit 1
     }
     if [[ -n "$(git -C "$worktree" status --porcelain)" ]]; then
+      scanned_tip_hold "while its ledger was regenerated"
       git -C "$worktree" add -A -- $generated 2>/dev/null || git -C "$worktree" add -A
       git -C "$worktree" commit -q -m "ledger: regenerate on landing ${branch}"
+      scanned_tip_follow
       ledger_line="regenerated ($(git -C "$worktree" rev-parse --short HEAD))"
     else
       ledger_line="current"
     fi
   fi
 fi
+
+# the last word before the merge: the branch is still the tip the gate judged
+scanned_tip_hold "after it was scanned"
+# and the ledger build ran branch code: the gate copy is still BASE's
+gate_dir_hold "before the merge"
 
 base_wt="$(worktree_for_branch "$base" || true)"
 if [[ -n "$base_wt" ]]; then
@@ -3178,7 +4785,7 @@ else
 fi
 
 base_before="$(git -C "$merge_cwd" rev-parse "$base")"
-if git -C "$merge_cwd" merge-base --is-ancestor "$branch" "$base"; then
+if git -C "$merge_cwd" merge-base --is-ancestor "$scanned_tip" "$base"; then
   echo "BRANCH=${branch} already contained in ${base}"
   merge_kind="already"
   merged="yes"
@@ -3187,7 +4794,9 @@ else
   # TRACKED changes; what the branch would CREATE in this checkout is nobody's business
   # but this check's, and the file it lands on is a running node's live private state
   # (keys/, data/, agents.d/, node.env are ignored HERE, inside the very checkout the
-  # merge writes into). The range is the branch's own: base_before..branch.
+  # merge writes into). The range is the branch's own, base_before..branch: the branch was
+  # the scanned tip just above, and is held to it again right after this enumeration, so
+  # the paths listed are the paths of the sha the merge lands.
   merge_rc=0
   merge_collides="$(ff_collisions "$merge_cwd" "${base_before}..${branch}")" || merge_rc=$?
   if [[ "$merge_rc" == "3" ]]; then
@@ -3224,12 +4833,55 @@ else
       echo "the branch, then run finish again; ${base} was not merged and ${worktree} is"
       echo "as it was."
     } >&2
+    refusal_category="collision"
     exit 1
   fi
-  if git -C "$merge_cwd" -c advice.diverging=false merge --ff-only --no-verify "$branch"; then
+  scanned_tip_hold "while the paths it would create were listed"
+  # Nothing beyond the tip land.sh recorded and tested lands, judged BEFORE main moves so a
+  # refusal is one MERGED=no on an unmoved base. The range is base_before..scanned_tip, so a
+  # commit already on main (another landing's, or origin's taken by BASE_FF) is never counted.
+  # Every commit in it must be a rebased copy of a recorded commit, a merge (git cherry lists
+  # non-merges only), or finish's own ledger commit, once, straight on top of the recorded tip
+  # or a rebased copy of it.
+  if [[ -n "$expect_tip" ]]; then
+    bt_out=""
+    if ! bt_out="$(git -C "$merge_cwd" cherry "$expect_tip" "$scanned_tip" "$base_before")"; then
+      echo "refusing to land ${branch}: git cherry over the commits the landing would carry failed; ${base} was not merged." >&2
+      echo "MERGED=no"
+      exit 1
+    fi
+    bt_patch_of() {
+      git -C "$merge_cwd" diff-tree -p --no-commit-id "$1" | git -C "$merge_cwd" patch-id --stable | cut -d' ' -f1
+    }
+    bt_ledger_subject="ledger: regenerate on landing ${branch}"
+    bt_ledger_seen="no"
+    bt_tip_patch="$(bt_patch_of "$expect_tip")"
+    while IFS= read -r bt_line; do
+      [[ "$bt_line" == "+ "* ]] || continue
+      bt_sha="${bt_line#+ }"
+      bt_subject="$(git -C "$merge_cwd" log -1 --format=%s "$bt_sha")"
+      bt_parents="$(git -C "$merge_cwd" rev-list --parents -n 1 "$bt_sha" | cut -d' ' -f2-)"
+      if [[ "$bt_subject" == "$bt_ledger_subject" && "$bt_ledger_seen" == "no" && -n "$bt_parents" && "$bt_parents" != *" "* ]]; then
+        if [[ "$bt_parents" == "$expect_tip" ]] || [[ -n "$bt_tip_patch" && "$(bt_patch_of "$bt_parents")" == "$bt_tip_patch" ]]; then
+          bt_ledger_seen="yes"
+          continue
+        fi
+      fi
+      echo "refusing to land ${branch}: the landing carries commit ${bt_sha:0:12} of ${branch} beyond the recorded tip ${expect_tip:0:12}, which no test or scan judged; ${base} was not merged." >&2
+      echo "MERGED=no"
+      exit 1
+    done <<< "$bt_out"
+  fi
+  # the SHA the gate judged, never the branch by name: the ref is the worker's to move
+  merge_msg="Merge branch '${branch}'"
+  case "$base" in
+    main|master) ;;
+    *) merge_msg="${merge_msg} into ${base}" ;;
+  esac
+  if git -C "$merge_cwd" -c advice.diverging=false merge --ff-only --no-verify "$scanned_tip"; then
     merge_kind="fast-forward"
   else
-    if ! git -C "$merge_cwd" merge --no-edit --no-verify "$branch"; then
+    if ! git -C "$merge_cwd" merge --no-edit --no-verify -m "$merge_msg" "$scanned_tip"; then
       git -C "$merge_cwd" merge --abort >/dev/null 2>&1 || true
       echo "merge into ${base} failed; ${branch} was not merged" >&2
       exit 1
@@ -3288,20 +4940,33 @@ if [[ -n "$tmp_merge" ]]; then
   git -C "$primary" worktree remove --force "$tmp_merge" >/dev/null 2>&1 || true
   tmp_merge=""
 fi
-trap 'cleanup || true' EXIT
+receipt_merged="yes"
+receipt_tests="$tests_line"
+receipt_tests_secs="$tests_secs"
+receipt_sec="$sec_line"
+trap 'finish_receipt_note $?; cleanup || true' EXIT
 
 echo "MERGED=yes"
+if [[ "${ISO_ORIGIN_VIEW_SOURCE:-}" == "break-glass" ]]; then
+  printf '%s\n' "ORIGIN=${ISO_ORIGIN_BREAK_GLASS}"
+fi
 echo "MERGE_KIND=${merge_kind}"
 echo "BASE_FF=${base_ff_line}"
 [[ -n "$base_rebase_line" ]] && echo "BASE_REBASE=${base_rebase_line}"
 echo "REBASED=${rebased}"
 echo "SHARED=${shared_line}"
 echo "LANDING_LOCK=waited ${waited}s"
+[[ -n "$lock_held_before_gate" ]] && echo "LOCK_HELD_BEFORE_GATE=${lock_held_before_gate} min (lock held ${lock_held_before_gate} min before the in-lock gate ran)"
 echo "TESTS=${tests_line}"
 [[ -n "${prerun_moved_line:-}" ]] && echo "TESTS_FROM_PRERUN=${prerun_moved_line}"
+[[ -n "${tests_receipt_line:-}" ]] && echo "TESTS_RECEIPT=$(iso_safe_text "$tests_receipt_line")"
 [[ -n "$tests_on_base" ]] && echo "TESTS_RED_ON_BASE=$(iso_safe_text "$tests_on_base")"
+[[ -n "${tests_parked:-}" ]] && echo "TESTS_PARKED=$(iso_safe_text "$tests_parked")"
 [[ -n "$tests_secs" ]] && echo "TESTS_SECS=${tests_secs}"
 [[ -n "$tests_files" ]] && echo "TESTS_FILES=$(iso_safe_text "$tests_files")"
+# timed out under load and re-run once by the gate, green there (tools/run_tests.py, "A
+# GATE'S BUDGET HOLDS UNDER LOAD"): on record, so a slow file is not hidden by the re-run
+[[ -n "${tests_rerun:-}" ]] && echo "TESTS_RERUN=$(iso_safe_text "$tests_rerun")"
 # names are tests/test_x.py: that is how the runner spells a file, and the receipt
 # prints them with every invisible code point spelled out (iso_safe_text) -- a test file
 # is a name the diff chose, and this line is read in a terminal
@@ -3438,7 +5103,7 @@ publish_put_back() {  # $1 sha, $2 the checkout that has BASE ("" for none)
 publish_round() {
   local worktree="$primary"
   local pr_old="" pr_onto="" pr_wt="" pr_new="" pr_conf="" pr_one="" pr_only="" pr_gd=""
-  local pr_names="" pr_rc=0 pr_base_wt="" pr_hits="" pr_sec="" pr_extra="" pr_err="" pr_now=""
+  local pr_names="" pr_rc=0 pr_base_wt="" pr_hits="" pr_sec="" pr_extra="" pr_err="" pr_now="" pr_scan=""
   pr_old="$(git -C "$primary" rev-parse "$base")" || { pw_why="could not read ${base}"; return 1; }
   if [[ "$pr_old" != "$pw_tip" ]]; then
     pw_why="${base} moved during the wait (${pr_old:0:7}, the hand-off holds ${pw_tip:0:7})"
@@ -3539,13 +5204,25 @@ publish_round() {
     fi
   elif [[ -f "$gate_runner" && "${ISOLATED_SESSION_LAND_TESTS:-1}" != "0" ]]; then
     pr_rc=0
-    ( cd "$pr_wt" && branch_tests_python "$gate_runner" --root "$pr_wt" --affected "${pr_onto}..HEAD" --gate --json \
-        -j "${ISOLATED_SESSION_LAND_JOBS:-4}" ) >/dev/null 2>&1 || pr_rc=$?
+    pr_sandbox_err="$(finish_tmp)"
+    (
+      sandbox_begin "$pr_wt" || exit 1
+      trap 'sandbox_end' EXIT
+      sandbox_child_env
+      cd "$sandbox_clone" && branch_tests_python "$gate_runner" --root "$sandbox_clone" --affected "${pr_onto}..HEAD" --gate --json \
+        ${ISOLATED_SESSION_LAND_JOBS:+-j "$ISOLATED_SESSION_LAND_JOBS"}
+    ) >/dev/null 2>"$pr_sandbox_err" || pr_rc=$?
     if [[ "$pr_rc" != "0" ]]; then
-      pw_why="the tests went red on ${base} rebased onto ${remote_base} (${pr_onto:0:7}; tools/run_tests.py exit ${pr_rc})"
+      if grep -q "disposable clone could not be created" "$pr_sandbox_err"; then
+        pw_why="the disposable clone could not be created (${base} rebased onto ${remote_base}, ${pr_onto:0:7})"
+      else
+        pw_why="the tests went red on ${base} rebased onto ${remote_base} (${pr_onto:0:7}; tools/run_tests.py exit ${pr_rc})"
+      fi
+      rm -f "$pr_sandbox_err"
       cleanup_publish_wt
       return 1
     fi
+    rm -f "$pr_sandbox_err"
     if [[ -n "$(git -C "$pr_wt" status --porcelain)" ]]; then
       pw_why="the tests left the rebased tree dirty"
       cleanup_publish_wt
@@ -3553,8 +5230,10 @@ publish_round() {
     fi
   fi
 
-  # BASE's lint (as it was before this landing), over what the rebase rewrote; only a
-  # refusal stops the round -- needs-eyes was this landing's, and is on its REVIEW= line.
+  # BASE's lint (as it was before this landing), over what the rebase rewrote. The round
+  # fails closed on an allow list: only clean and needs-eyes publish (needs-eyes was this
+  # landing's, and is on its REVIEW= line); refused, broken (a commit with no, an unknown
+  # or an empty verdict), any other word or a scan that could not run holds it.
   # appl.toml's [scan] command, when it was this landing's scan, stands in for the lint's
   # verdict, never for its per-commit refuse check, which runs below either way.
   if [[ -n "$scan_command" ]]; then
@@ -3587,17 +5266,25 @@ publish_round() {
     pr_json="$(finish_tmp)" || { pw_why="could not stage the lint"; rm -rf "$pr_sec"; cleanup_publish_wt; return 1; }
     pr_paths="$(finish_tmp)" || { pw_why="could not stage the lint"; rm -rf "$pr_sec" "$pr_json"; cleanup_publish_wt; return 1; }
     sec_scan_commits "$pr_wt" "$pr_sec/tools/sec_lint.py" "$pr_onto" "$pr_json" "$pr_paths" >/dev/null 2>&1 || pr_rc=$?
-    if [[ "$pr_rc" == "0" ]] &&
-       landing_python -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["verdict"] == "refused" else 1)' \
-         "$pr_json" 2>/dev/null; then
-      pr_rc=2
+    pr_scan="no-verdict"
+    if [[ "$pr_rc" == "0" ]]; then
+      pr_scan="$(landing_python -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["verdict"]))' \
+                   "$pr_json" 2>/dev/null)" || pr_scan="no-verdict"
     fi
     rm -rf "$pr_sec" "$pr_json" "$pr_paths"
-    if [[ "$pr_rc" == "2" ]]; then
-      pw_why="tools/sec_lint.py refused a commit of ${base} rebased onto ${remote_base}"
-      cleanup_publish_wt
-      return 1
-    fi
+    case "$pr_scan" in
+      clean|needs-eyes) ;;
+      refused)
+        pw_why="tools/sec_lint.py refused a commit of ${base} rebased onto ${remote_base}"
+        cleanup_publish_wt
+        return 1
+        ;;
+      *)
+        pw_why="tools/sec_lint.py gave no clean verdict (${pr_scan:-empty}) for ${base} rebased onto ${remote_base}"
+        cleanup_publish_wt
+        return 1
+        ;;
+    esac
   fi
 
   # the ledgers, rebuilt on the rebased tip. appl.toml's [ledger] command, when this
@@ -3709,7 +5396,7 @@ fi
 # must never remove a lock another landing has taken since.
 if [[ "$holding_land" == "yes" ]]; then
   holding_land="no"
-  [[ -z "$land_lock" ]] || rm -f "$land_lock" 2>/dev/null || true
+  ! land_lock_is_mine || rm -f "$land_lock" 2>/dev/null || true
 fi
 if [[ "$handoff_took" == "yes" && "$lease_held" == "yes" ]]; then
   pw_pushed="$(date +%s)"
@@ -3756,9 +5443,15 @@ trap - EXIT
 echo "HANDOFF=${handoff_line}"
 [[ -n "$publish_line" ]] && echo "PUBLISH=${publish_line}"
 if [[ "$lease_did_hold" == "yes" ]]; then
-  echo "LEASE=released"
+  if [[ "$lease_release_rc" == "0" ]]; then
+    echo "LEASE=released"
+  else
+    # The merge already happened, so a failed release is reported, not a refusal.
+    echo "LEASE=release-failed (exit ${lease_release_rc})"
+  fi
 fi
 echo "WORKTREE_REMOVED=yes"
+finish_receipt_note 0
 
 # --- the human half of the scan: a reviewer session -------------------------------
 # The landing is done and its lock released; what follows can neither block nor fail
@@ -3784,8 +5477,19 @@ review_line="none"
 # its OWN landing say REVIEW=deferred and spawn nothing -- and in a vendored copy with no
 # daily LaunchAgent that is "no review at all". Absent in BASE means a reviewer per
 # landing, as before.
+#
+# Defer only when this landing's own $HOME holds the daily job as a regular file at
+# Library/LaunchAgents/com.muretai.security-daily.plist (a plain -f check, and not a
+# symlink). A missing file, a symlink or a directory is not installed: spawn the
+# reviewer exactly as with no cadence file. Never launchctl -- the check must not
+# change system state (IB:52979).
 review_cadence="$(git -C "$primary" show "${base_before}:.security/review-cadence" 2>/dev/null | tr -d '[:space:]')" || review_cadence=""
-if [[ "$sec_verdict" == "needs-eyes" && "$base_before" != "$base_tip" && -z "${ISOLATED_SESSION_LAND_REVIEW+set}" && "$review_cadence" == "daily" ]]; then
+daily_plist="${HOME:-}/Library/LaunchAgents/com.muretai.security-daily.plist"
+daily_job_installed=no
+if [[ -n "${HOME:-}" && -f "$daily_plist" && ! -L "$daily_plist" ]]; then
+  daily_job_installed=yes
+fi
+if [[ "$sec_verdict" == "needs-eyes" && "$base_before" != "$base_tip" && -z "${ISOLATED_SESSION_LAND_REVIEW+set}" && "$review_cadence" == "daily" && "$daily_job_installed" == "yes" ]]; then
   review_line="deferred -- daily cadence (${base}:.security/review-cadence at $(git -C "$primary" rev-parse --short=7 "$base_before")): tools/security_daily.sh reads the day's landings as one range, and the publisher waits for its receipt"
 elif [[ "$sec_verdict" == "needs-eyes" && "$base_before" != "$base_tip" ]]; then
   # herdr names an agent with [a-z][a-z0-9_-]{0,31}: "secrev-" leaves 25 for the slug
@@ -3924,7 +5628,9 @@ PY
       elif ! git -C "$primary" cat-file -e "${base_before}:${spawner_rel}" 2>/dev/null ||
            ! git -C "$primary" cat-file -e "${base_before}:${lib_rel}" 2>/dev/null; then
         review_line="needed -- no ${spawner_rel} in ${base} before this landing; run: ${run_hint}"
-      elif ! spawn_dir="$(mktemp -d "${TMPDIR:-/tmp}/finish-spawner-XXXXXX" 2>/dev/null)"; then
+      # A mode-700 direct child of HERD_DIR, never under TMPDIR: a worker wall may
+      # allow-write TMPDIR, and must not be able to replace this copy.
+      elif ! spawn_dir="$(mktemp -d "${herd_dir}/finish-spawner-XXXXXX" 2>/dev/null)"; then
         review_line="needed -- could not create a scratch directory for the spawner; run: ${run_hint}"
       elif ! git -C "$primary" show "${base_before}:${spawner_rel}" > "$spawn_dir/herd-spawn.sh" 2>/dev/null ||
            ! git -C "$primary" show "${base_before}:${lib_rel}" > "$spawn_dir/lib.sh" 2>/dev/null ||
@@ -3932,6 +5638,7 @@ PY
         rm -rf "$spawn_dir"
         review_line="needed -- could not read ${spawner_rel} from ${base_before}; run: ${run_hint}"
       else
+        chmod 700 "$spawn_dir" 2>/dev/null || true
         # ... and BASE's worker wall beside it (scripts/walls/: the platform plug and its
         # template), so the reviewer is walled like any herd session. Without it the spawner
         # finds no plug and, HERD_WALL unset being require, starts no reviewer: the landing
@@ -3960,6 +5667,22 @@ PY
           git -C "$primary" show "${base_before}:${spawner_rel%/*}/${claim_name}" > "$spawn_dir/${claim_name}" 2>/dev/null ||
             rm -f "$spawn_dir/${claim_name}"
         done
+        # ... and BASE's wake-adapter.sh with its wake-adapters/ declarations: the spawner
+        # reads each harness's spawn line, input row and resubmit key from them, and stops
+        # before typing anything when they are absent. Same base commit and the same
+        # top-level, regular-blob, safe-name rule as walls/; a BASE without them predates
+        # the adapter, and its spawner does not read one.
+        git -C "$primary" show "${base_before}:${spawner_rel%/*}/wake-adapter.sh" > "$spawn_dir/wake-adapter.sh" 2>/dev/null ||
+          rm -f "$spawn_dir/wake-adapter.sh"
+        if mkdir "$spawn_dir/wake-adapters" 2>/dev/null; then
+          git -C "$primary" ls-tree "${base_before}" "${spawner_rel%/*}/wake-adapters/" 2>/dev/null |
+            while read -r w_mode w_type _w_sha w_path; do
+              [[ "$w_type" == "blob" && ( "$w_mode" == "100644" || "$w_mode" == "100755" ) ]] || continue
+              w_base="${w_path##*/}"
+              case "$w_base" in *[!A-Za-z0-9._-]*|.*) continue ;; esac
+              git -C "$primary" show "${base_before}:${w_path}" > "$spawn_dir/wake-adapters/${w_base}" 2>/dev/null || rm -f "$spawn_dir/wake-adapters/${w_base}"
+            done || true
+        fi
         # The reviewer's checkout: at the sha main had before this landing, on its receipt
         # branch, under a review root that is a real directory of ours -- checked BEFORE the
         # cleanup walks it, so a review root swapped for a symlink to the session
@@ -4056,6 +5779,12 @@ PY
     fi
   fi
 fi
+# Cadence said daily and the job is not installed: the spawn above is the no-cadence
+# path, and the receipt says why. A set ISOLATED_SESSION_LAND_REVIEW still decides
+# this landing alone and does not get this note.
+if [[ "$sec_verdict" == "needs-eyes" && "$base_before" != "$base_tip" && -z "${ISOLATED_SESSION_LAND_REVIEW+set}" && "$review_cadence" == "daily" && "$daily_job_installed" != "yes" ]]; then
+  review_line="${review_line} -- daily cadence set but the daily job is not installed"
+fi
 echo "REVIEW=${review_line}"
 
 if git -C "$primary" remote get-url origin >/dev/null 2>&1 &&
@@ -4072,3 +5801,4 @@ fi
 # hands that spawner is this directory. It used to be removed right after
 # WORKTREE_REMOVED=, which is before the brief render and before the spawn.
 rm -rf "${ISO_GH_EMPTY:-/nonexistent/iso-gh}"
+}

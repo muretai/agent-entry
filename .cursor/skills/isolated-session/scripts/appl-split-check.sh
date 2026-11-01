@@ -7,7 +7,9 @@
 # matches a `Bash(prefix:*)` allow rule, so the coordinator's claude profile allows this
 # wrapper by its exact path instead (herd-spawn.sh). It feeds the file's bytes to
 # `python3` (from PATH) running appl-split-check.py on stdin, and passes the checker's
-# stdout and exit code through unchanged: 0 accepted, 1 refused.
+# stdout and exit code through unchanged: 0 accepted, 1 refused. When the file is named
+# by an intake id, it passes `--intake <coordinator dir>/intake <id>`: the checker then
+# prints every accepted line at `priority: P0` when that intake is owner P0.
 #
 # It REFUSES with exit 2 -- nothing on stdout, python3 never run -- when:
 #   * there is not exactly one argument, or it is empty;
@@ -64,4 +66,10 @@ esac
 
 here="$(phys_dir "$(dirname -- "${BASH_SOURCE[0]}")")"
 [[ -n "$here" ]] || refuse "cannot find its own directory"
+# briefs/<intake id>.split: the checker prints every line at P0 when that intake is owner P0
+ident="${name%.split}"
+id_re='^[0-9]{8}T[0-9]{6}Z(-[1-9][0-9]*)?$'
+if [[ "$ident" =~ $id_re ]]; then
+  exec python3 -I "$here/appl-split-check.py" --intake "${herd%/}/coordinator/intake" "$ident" < "$dir/$name"
+fi
 exec python3 -I "$here/appl-split-check.py" < "$dir/$name"

@@ -250,8 +250,10 @@ PY
 # mechanically, over every script a gate runs.
 #
 # What it clears: git's credential helpers, the terminal prompt, ssh, gh's config (the
-# keychain token is reached through hosts.yml, which is not in an empty directory), and
-# PYTHONNOUSERSITE -- a branch's own test run executes as the operator by accepted design,
+# keychain token is reached through hosts.yml, which is not in an empty directory),
+# CLAUDE_CODE_OAUTH_TOKEN (empty, the same as GH_TOKEN, GITHUB_TOKEN and
+# GH_ENTERPRISE_TOKEN), and PYTHONNOUSERSITE -- a branch's own test run executes as the
+# operator by accepted design,
 # so it can write `usercustomize.py` into the USER SITE directory, which is outside the
 # checkout: `git status --porcelain` after the tests stays green, the lint never sees it
 # and no reviewer opens it, yet every later plain `python3` imports it at start-up.
@@ -277,6 +279,7 @@ credless() {
   env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0= \
       GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_SSH_COMMAND=/usr/bin/false \
       GH_CONFIG_DIR="$ISO_GH_EMPTY" GH_TOKEN= GITHUB_TOKEN= GH_ENTERPRISE_TOKEN= \
+      CLAUDE_CODE_OAUTH_TOKEN= \
       PYTHONNOUSERSITE=1 "$@"
 }
 
@@ -465,15 +468,24 @@ iso_mtime() {  # $1 path
 #          behind or unrelated) is caught;
 #        * the tip is a fast-forward of the origin/<base> <repo> already has: an older
 #          view never replaces a newer one.
-#   3. Else it REFUSES: a line containing "refusing" on stderr, return 1, and no ref
+#   3. Else, when no `handoff` remote names a publisher, a non-blank ORIGIN in THIS
+#      process's environment is the operator break-glass: origin/<base> is read from
+#      that git repository, and only as a fast-forward of the origin/<base> <repo>
+#      already has. Unset, empty and whitespace-only are not a break-glass. The value
+#      is never taken from git config, remote.origin.url, a handoff remote, a machine
+#      file or a default. It replaces only this missing publisher view: a fetch that
+#      succeeded, and every publisher-bundle refusal, still run as themselves.
+#   4. Else it REFUSES: a line containing "refusing" on stderr, return 1, and no ref
 #      moved. There is no "go on with what we have" -- that was the bug.
 # On success refs/remotes/origin/<base> in <repo> is origin's tip and
-# ISO_ORIGIN_VIEW_SOURCE is `fetch` or `bundle`. git's own bundle errors never reach
-# the operator: each refusal says what was wrong in words of its own.
+# ISO_ORIGIN_VIEW_SOURCE is `fetch`, `bundle` or `break-glass`. For `break-glass`,
+# ISO_ORIGIN_BREAK_GLASS is the operator value, byte for byte. git's own bundle
+# errors never reach the operator: each refusal says what was wrong in words of its own.
 # A repository with NO origin remote has no origin to be stale about; the CALLER decides
 # that (finish-worktree.sh does not call this there), so the refusal cannot creep into
 # repositories that never had an origin.
 ISO_ORIGIN_VIEW_SOURCE=""
+ISO_ORIGIN_BREAK_GLASS=""
 
 _iso_ov_show() {  # a value for a refusal line; never fails
   iso_safe_text "$1" 2>/dev/null || printf '%s' "$1" | LC_ALL=C tr '\000-\037\177' '?'
@@ -487,17 +499,90 @@ _iso_ov_refuse() {  # $1.. lines; the first says "refusing"
   return 1
 }
 
+# 0 when this process's ORIGIN is a break-glass value. Nothing but the variable is read.
+_iso_origin_break_glass_on() {
+  local v="${ORIGIN-}"
+  [[ -n "${v//[[:space:]]/}" ]]
+}
+
+# The missing publisher view, replaced by the operator's ORIGIN. The caller has already
+# failed the fetch and found no handoff remote. A failure here moves no ref.
+_iso_ov_break_glass() {  # $1 repo, $2 base
+  local repo="$1" base="$2"
+  local ov_err="" ov_tip="" ov_have=""
+  echo "note: origin break-glass: reading origin/${base} from ORIGIN=$(_iso_ov_show "$ORIGIN")" >&2
+  ov_err="$(mktemp "${TMPDIR:-/tmp}/iso-origin-XXXXXX")" || {
+    _iso_ov_refuse "iso_origin_view: refusing: could not make a scratch file; the origin break-glass was not read"
+    return 1
+  }
+  # The tip is what ORIGIN itself says its refs/heads/<base> is, never FETCH_HEAD: <repo>
+  # may be a worktree, whose FETCH_HEAD the worker can rewrite between the fetch and the
+  # read. The fetch only brings the objects; the tip must then be a commit here.
+  if ! GIT_TERMINAL_PROMPT=0 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+       git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$repo" \
+       fetch --quiet --no-tags --no-write-fetch-head -- "$ORIGIN" "refs/heads/${base}" >/dev/null 2>"$ov_err"; then
+    rm -f "$ov_err"
+    _iso_ov_refuse "iso_origin_view: refusing: the origin break-glass ORIGIN=$(_iso_ov_show "$ORIGIN") could not be read" \
+      "(it is not a git repository, or it has no refs/heads/${base}); origin was not read from it."
+    return 1
+  fi
+  rm -f "$ov_err"
+  ov_tip="$(GIT_TERMINAL_PROMPT=0 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+    git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$repo" \
+    ls-remote -- "$ORIGIN" "refs/heads/${base}" 2>/dev/null |
+    awk -F '\t' -v r="refs/heads/${base}" '$2 == r { print $1 }')" || ov_tip=""
+  case "$ov_tip" in
+    *[!0-9a-f]* | "") ov_tip="" ;;
+  esac
+  if [[ ${#ov_tip} -ne 40 && ${#ov_tip} -ne 64 ]] ||
+     ! GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+       git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$repo" \
+       cat-file -e "${ov_tip}^{commit}" 2>/dev/null; then
+    _iso_ov_refuse "iso_origin_view: refusing: the origin break-glass ORIGIN=$(_iso_ov_show "$ORIGIN") carries no refs/heads/${base}" \
+      "that this repository now holds; origin was not read from it."
+    return 1
+  fi
+  ov_have="$(git -C "$repo" rev-parse --verify --quiet "refs/remotes/origin/${base}" 2>/dev/null || true)"
+  if [[ -n "$ov_have" && "$ov_have" != "$ov_tip" ]] &&
+     ! git -C "$repo" merge-base --is-ancestor "$ov_have" "$ov_tip"; then
+    _iso_ov_refuse "iso_origin_view: refusing: the origin break-glass origin/${base} (${ov_tip:0:7}) is not a fast-forward" \
+      "of the origin/${base} this repository already has (${ov_have:0:7}); an older view never replaces a newer one."
+    return 1
+  fi
+  if [[ "$ov_have" != "$ov_tip" ]]; then
+    if ! git -C "$repo" update-ref "refs/remotes/origin/${base}" "$ov_tip" ${ov_have:+"$ov_have"}; then
+      _iso_ov_refuse "iso_origin_view: refusing: could not set origin/${base} to ${ov_tip:0:7}."
+      return 1
+    fi
+  fi
+  ISO_ORIGIN_VIEW_SOURCE="break-glass"
+  ISO_ORIGIN_BREAK_GLASS="$ORIGIN"
+  return 0
+}
+
+# the primary's common dir, set by a landing after it sources this file; never inherited
+unset iso_pin_common
+
 iso_origin_view() {  # $1 repo, $2 base
   local repo="$1" base="$2"
   local ov_err="" ov_name="" ov_state="" ov_odir="" ov_sdir="" ov_bundle="" ov_status=""
   local ov_max="" ov_mtime="" ov_age="" ov_tip="" ov_claimed="" ov_got="" ov_have="" ov_show=""
   ISO_ORIGIN_VIEW_SOURCE=""
+  ISO_ORIGIN_BREAK_GLASS=""
   ov_err="$(mktemp "${TMPDIR:-/tmp}/iso-origin-XXXXXX")" || {
     _iso_ov_refuse "iso_origin_view: refusing: could not make a scratch file; origin was not read"
     return 1
   }
-  # never a terminal prompt: a landing that waits on a password nobody will type is a hang
-  if GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch origin --quiet 2>"$ov_err"; then
+  # never a terminal prompt: a landing that waits on a password nobody will type is a hang.
+  # A landing (finish-worktree.sh) sets iso_pin_common to the primary's common dir, so a
+  # worktree whose commondir was swapped does not choose the repository this fetch writes.
+  if [[ -n "${iso_pin_common:-}" ]]; then
+    if GIT_COMMON_DIR="$iso_pin_common" GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch origin --quiet 2>"$ov_err"; then
+      rm -f "$ov_err"
+      ISO_ORIGIN_VIEW_SOURCE="fetch"
+      return 0
+    fi
+  elif GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch origin --quiet 2>"$ov_err"; then
     rm -f "$ov_err"
     ISO_ORIGIN_VIEW_SOURCE="fetch"
     return 0
@@ -511,6 +596,10 @@ iso_origin_view() {  # $1 repo, $2 base
   rm -f "$ov_err"
 
   if ! ov_name="$(iso_publisher_name "$repo")"; then
+    if _iso_origin_break_glass_on; then
+      _iso_ov_break_glass "$repo" "$base"
+      return $?
+    fi
     _iso_ov_refuse "iso_origin_view: refusing: origin could not be fetched, and no \`handoff\` remote names a" \
       "publisher repository, so there is no publisher bundle to read origin from."
     return 1
@@ -637,20 +726,27 @@ iso_is_pid() {
 
 # `ps`, bounded. A `ps` that STALLS instead of refusing (a loaded machine, a room that
 # holds the exec) used to stall every claim with it, key or no key: nothing in the claim
-# path put a limit on it. It runs in the background and a watchdog kills it at
-# ISO_PS_SECS; then this says so by name on stderr and returns 124. The watchdog's own
-# output goes to /dev/null, so a caller reading `$(iso_ps ...)` never waits on it, and no
-# stalled `ps` outlives the call. A fixed bound, not a knob: nothing turns it off.
+# path put a limit on it. It runs in the background and is killed once ISO_PS_SECS have
+# passed; then this says so by name on stderr and returns 124. No stalled `ps` outlives
+# the call. A fixed bound, not a knob: nothing turns it off. The wait is a poll in this
+# shell, with no background watchdog: the old `( sleep 3; kill -9 p ) &` left its sleep to
+# launchd whenever `ps` answered first, one per call (72 at once on 2026-10-08,
+# ISSUE(caffeinate-and-sleep-orphans-per-gate-run)), and a TERM trap in the watchdog does
+# not cut bash 3.2's `wait` short.
 ISO_PS_SECS=3
 iso_ps() {
-  local p w rc=0
+  # SECONDS counts whole seconds: the +1 makes the bound at least ISO_PS_SECS, never less
+  local p rc=0 end=$((SECONDS + ISO_PS_SECS + 1))
   ps "$@" </dev/null &
   p=$!
-  ( sleep "$ISO_PS_SECS"; kill -9 "$p" ) >/dev/null 2>&1 </dev/null &
-  w=$!
+  while kill -0 "$p" 2>/dev/null; do
+    if (( SECONDS >= end )); then
+      kill -9 "$p" 2>/dev/null || true
+      break
+    fi
+    sleep 0.05 </dev/null >/dev/null 2>&1
+  done
   wait "$p" 2>/dev/null || rc=$?
-  kill "$w" 2>/dev/null || true
-  wait "$w" 2>/dev/null || true
   if (( rc == 137 )); then
     echo "iso_ps: \`ps $*\` timed out after ${ISO_PS_SECS}s and was killed" >&2
     return 124
@@ -755,9 +851,13 @@ iso_proc_comm() {
 }
 
 # 0 when pid $1 is alive AND (when $2 is given) still the process the lock recorded.
+# Pid 0 (any run of zeros) is never a process: `kill -0 0` asks about this shell's own
+# process group, which is always there.
 iso_owner_alive() {
   local pid="$1" recorded="${2:-}" now
   iso_is_pid "$pid" || return 1
+  pid=$((10#$pid))
+  (( pid > 0 )) || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   [[ -z "$recorded" ]] && return 0
   now="$(iso_proc_start "$pid")"
@@ -778,56 +878,129 @@ iso_lock_get() {  # $1 lock file, $2 key
   sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1
 }
 
-# Rewrite one key of a lock (whole file, tmp + mv: sed -i differs between BSD and GNU).
-iso_lock_set() {  # $1 lock file, $2 key, $3 value
-  # The temporary file is this process's own: two writers sharing one `$1.tmp` (a
-  # harness hook on every tool call, and a script in the same chat) truncated each
-  # other's copy, and one of them renamed an empty instant over the lock -- which the
-  # next writer then read as nothing, leaving a lock with `owner_seen` alone (2026-09-13,
-  # two Cursor workers). A lock that reads empty while it exists is being replaced by
-  # someone else: read it again rather than write that instant back.
-  local tmp="$1.tmp.$$" tries=0
-  while :; do
-    { grep -v "^$2=" "$1" 2>/dev/null || true; echo "$2=$3"; } > "$tmp"
-    if [[ -s "$1" ]] && [[ "$(grep -c . "$tmp")" -le 1 ]] && (( tries < 5 )); then
-      tries=$((tries + 1)); sleep 0.1; continue
-    fi
-    mv "$tmp" "$1"
+# The ONE reader of a numeric field (owner_pid, owner_seen, started) of a session lock,
+# the landing lock or a landing-queue ticket. Every one of those files is writable by a
+# walled worker (its own gitdir) or by any landing, and they are read UNWALLED: a value
+# like `a[$(cmd)]` inside `(( ))` runs `cmd` as the operator, because bash expands an
+# array subscript it evaluates (ISSUE(security-audit-2026-10-09-daily-appl-1)). So a value
+# reaches arithmetic or `kill -0` only through here: the digits, or nothing for an empty or
+# absent field (0), and anything else -- a sign, a space, a CR, hex, a name, an expression
+# -- is refused (1) with one line on stderr that names the field and never its value.
+# A refusal makes the holder NOT alive (iso_lock_alive). Arithmetic on the answer still
+# spells it `10#$v`: a leading zero is octal to bash, and `08` is an error.
+iso_lock_num() {  # $1 lock file, $2 key
+  local v
+  v="$(iso_lock_get "$1" "$2")"
+  case "$v" in
+    '') return 0 ;;
+    *[!0123456789]*)
+      echo "note: the ${2} field of the lock $(_iso_ov_show "$1") is not a run of decimal digits; its holder is taken as gone" >&2
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$v"
+}
+
+# owner_started is NOT a number: iso_proc_start records `ps -o lstart=` ("Fri Oct  9
+# 10:00:00 2026") and it is only ever compared as a string. BSD ps prints it in the
+# operator's locale ("ven.  9 oct. 08:51:43 2026", or with accents, CJK or Cyrillic), so
+# no character set fits it: an ASCII-letters set read every such live lock as dead, and a
+# landing, a ticket or a worktree was taken over from a live holder
+# (ISSUE(security-audit-2026-10-09-lock-and-ticket-fiel-6257)). It is read through here
+# all the same: no control character (tab, ESC, CR, DEL) and at most 256 bytes, or empty
+# (0). Anything else is refused (1) like a bad numeric field, so a planted value is never
+# printed and never keeps a lock alive -- where `ps` cannot run, an unchecked value would
+# not even be compared. Both checks run under LC_ALL=C so they count and match bytes.
+iso_lock_lstart() {  # $1 lock file
+  local v bytes
+  v="$(iso_lock_get "$1" owner_started)"
+  bytes="$(printf '%s' "$v" | LC_ALL=C wc -c | tr -d ' ')"
+  if [[ "$bytes" =~ ^[0-9]+$ ]] && (( 10#$bytes <= 256 )) \
+    && [[ "$(printf '%s' "$v" | LC_ALL=C tr -d '\001-\037\177')" == "$v" ]]; then
+    printf '%s\n' "$v"
     return 0
-  done
+  fi
+  echo "note: the owner_started field of the lock $(_iso_ov_show "$1") is not a process start time; its holder is taken as gone" >&2
+  return 1
+}
+
+# Rewrite one key of a lock (whole file, a sibling temporary renamed over it).
+#
+# ISSUE(security-audit-2026-10-09-lock-and-ticket-fiel-6257-2). The temporary file used to
+# be "$1.tmp.$$", opened with a plain `>`: a walled worker that planted symlinks under that
+# name for every pid in its own gitdir had the lock written THROUGH them -- into any file
+# the operator can write -- when finish-worktree.sh ran assert-head.sh unwalled, and `mv`
+# then moved the link onto the lock path. The write now goes through iso_lock_py: the lock
+# and its directory are opened with O_NOFOLLOW, the temporary file is created O_EXCL |
+# O_NOFOLLOW, so a planted link is never followed and never ends up at the lock path.
+# A lock carrying any line the writers do not write (iso_lock_write's twelve keys and the
+# hand-over's two) is refused and left byte for byte as it is: nothing a worker appended is
+# ever carried forward. Each writer still has its own temporary file and a lock that reads
+# empty while it exists is read again, as before (2026-09-13, two Cursor workers).
+#
+# The refusal is judged here first, so it holds on a host where python3 cannot run; the
+# write re-judges it on the file it opened. Returns 0 written, 1 refused, 2 not written
+# because python3 could not run (the lock is left as it is).
+ISO_LOCK_KEYS='owner|owner_pid|owner_started|owner_comm|owner_kind|owner_seen|kind|branch|task|started|started_iso|host|owner_worker|handed_over'
+iso_lock_set() {  # $1 lock file, $2 key, $3 value
+  local rc=0
+  if [[ -L "$1" || ( -e "$1" && ! -f "$1" ) ]]; then
+    echo "iso_lock_set: refusing: the lock ${1} is not a regular file (a symlink, FIFO or other); it is left as it is" >&2
+    return 1
+  fi
+  if [[ -f "$1" ]] && grep -qvE "^(${ISO_LOCK_KEYS})=" "$1"; then
+    echo "iso_lock_set: refusing: the lock ${1} carries a line no lock writer writes; it is left as it is" >&2
+    return 1
+  fi
+  iso_lock_py set "$(dirname "$1")" "$(basename "$1")" "$2" "$3" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    3) return 1 ;;
+  esac
+  echo "iso_lock_set: python3 could not run (exit ${rc}); the lock ${1} is left as it is" >&2
+  return 2
 }
 
 # A lock is alive when its process is, and -- for a key-owned lock, whose chat may end
 # without a sessionEnd -- when it was seen within ISOLATED_SESSION_OWNER_TTL_HOURS
 # (default 12). Every `mine` verdict touches it, so a chat in use never expires.
+# Every field is read through iso_lock_num / iso_lock_lstart BEFORE anything is judged:
+# one malformed field, used or not, makes the whole lock dead.
 iso_lock_alive() {  # $1 lock file
-  local owner pid seen ttl now
+  local owner pid seen started lstart ttl now
+  pid="$(iso_lock_num "$1" owner_pid)" || return 1
+  seen="$(iso_lock_num "$1" owner_seen)" || return 1
+  started="$(iso_lock_num "$1" started)" || return 1
+  lstart="$(iso_lock_lstart "$1")" || return 1
   owner="$(iso_lock_get "$1" owner)"
   if iso_is_pid "$owner"; then
-    iso_owner_alive "$owner" "$(iso_lock_get "$1" owner_started)"
+    iso_owner_alive "$owner" "$lstart"
     return $?
   fi
-  pid="$(iso_lock_get "$1" owner_pid)"
-  if [[ -n "$pid" ]] && ! iso_owner_alive "$pid" "$(iso_lock_get "$1" owner_started)"; then
+  if [[ -n "$pid" ]] && ! iso_owner_alive "$pid" "$lstart"; then
     return 1
   fi
-  seen="$(iso_lock_get "$1" owner_seen)"
-  [[ -n "$seen" ]] || seen="$(iso_lock_get "$1" started)"
+  [[ -n "$seen" ]] || seen="$started"
   if [[ -z "$seen" ]]; then return 1; fi
   ttl="${ISOLATED_SESSION_OWNER_TTL_HOURS:-12}"
+  case "$ttl" in
+    ''|*[!0123456789]*) ttl=12 ;;
+  esac
   now="$(date +%s)"
-  if (( now - seen < ttl * 3600 )); then return 0; fi
+  if (( 10#$now - 10#$seen < 10#$ttl * 3600 )); then return 0; fi
   return 1
 }
 
-# alive | gone | expired -- why a lock is or is not live, for a sentence.
+# alive | gone | expired -- why a lock is or is not live, for a sentence. A field
+# iso_lock_alive refused (and named) is `gone`, or `expired` for a bad seen-time.
 iso_lock_liveness() {  # $1 lock file
-  local owner pid
+  local owner pid lstart
   if iso_lock_alive "$1"; then echo alive; return 0; fi
   owner="$(iso_lock_get "$1" owner)"
   if iso_is_pid "$owner"; then echo gone; return 0; fi
-  pid="$(iso_lock_get "$1" owner_pid)"
-  if [[ -n "$pid" ]] && ! iso_owner_alive "$pid" "$(iso_lock_get "$1" owner_started)"; then
+  pid="$(iso_lock_num "$1" owner_pid 2>/dev/null)" || { echo gone; return 0; }
+  lstart="$(iso_lock_lstart "$1" 2>/dev/null)" || { echo gone; return 0; }
+  if [[ -n "$pid" ]] && ! iso_owner_alive "$pid" "$lstart"; then
     echo gone
   else
     echo expired
@@ -920,7 +1093,12 @@ iso_lock_touch() {
   lock="$(iso_lock_path "$1")" || return 0
   [[ -f "$lock" ]] || return 0
   iso_lock_bind "$1" "${2:-$(iso_owner)}"
-  iso_lock_set "$lock" owner_seen "$(date +%s)"
+  # a refused lock fails the caller; a seen-time python3 could not write (rc 2, said on
+  # stderr) is only a liveness refresh missed, and is not
+  local rc=0
+  iso_lock_set "$lock" owner_seen "$(date +%s)" || rc=$?
+  [[ "$rc" -eq 2 ]] && return 0
+  return "$rc"
 }
 
 # --- the pair hand-over -------------------------------------------------------
@@ -951,6 +1129,10 @@ import os, stat, sys, time
 
 NAME = "isolated-session.lock"
 NOFOLLOW_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+# every key a lock writer writes: iso_lock_write's twelve, then the hand-over's two
+ALLOWED = {"owner", "owner_pid", "owner_started", "owner_comm", "owner_kind", "owner_seen",
+           "kind", "branch", "task", "started", "started_iso", "host",
+           "owner_worker", "handed_over"}
 
 
 def read_lock(dfd):
@@ -1063,6 +1245,78 @@ elif mode == "bind":
         put(pairs, "owner_comm", comm)
         put(pairs, "owner_seen", str(int(time.time())))
         write_lock(dfd, pairs)
+    finally:
+        os.close(dfd)
+elif mode == "set":
+    # argv: lock dir, lock name, key, value. iso_lock_set: one key rewritten, every other
+    # line kept byte for byte; a lock with a line outside ALLOWED is refused untouched.
+    ldir, name, key, val = sys.argv[2:6]
+    lock = os.path.join(ldir, name)
+
+    def refuse(why):
+        # 3, not 1: iso_lock_set tells a refusal from a python3 that could not run
+        sys.stderr.write("iso_lock_set: refusing: the lock %s %s; it is left as it is\n" % (lock, why))
+        sys.exit(3)
+
+    if key not in ALLOWED:
+        refuse("would get the key %r, which no lock writer writes" % key)
+    try:
+        dfd = os.open(ldir, NOFOLLOW_DIR)
+    except OSError as e:
+        refuse("has no directory that can be opened without following a link (%s)" % e.strerror)
+    try:
+        tries = 0
+        while True:
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=dfd)
+            except FileNotFoundError:
+                raw = None
+            except OSError:
+                refuse("is not a regular file (a symlink, FIFO or other)")
+            else:
+                try:
+                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                        refuse("is not a regular file (a symlink, FIFO or other)")
+                    chunks = []
+                    while True:
+                        b = os.read(fd, 65536)
+                        if not b:
+                            break
+                        chunks.append(b)
+                    raw = b"".join(chunks)
+                finally:
+                    os.close(fd)
+            # a lock that reads empty while it exists is being replaced: read it again
+            if raw == b"" and tries < 5:
+                tries += 1
+                time.sleep(0.1)
+                continue
+            break
+        lines = (raw or b"").split(b"\n")
+        if lines and lines[-1] == b"":
+            lines.pop()
+        for line in lines:
+            k, sep, _ = line.partition(b"=")
+            if not sep or k.decode("ascii", "replace") not in ALLOWED:
+                refuse("carries a line no lock writer writes (%r)" % line[:80])
+        prefix = key.encode() + b"="
+        kept = [ln for ln in lines if not ln.startswith(prefix)]
+        kept.append(prefix + val.replace("\n", " ").replace("\r", " ").encode("utf-8", "surrogateescape"))
+        tmp = "%s.tmp.%s" % (name, os.urandom(8).hex())
+        try:
+            tfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+        except OSError as e:
+            refuse("could not get a temporary file beside it (%s)" % e.strerror)
+        try:
+            with os.fdopen(tfd, "wb") as f:
+                f.write(b"".join(ln + b"\n" for ln in kept))
+            os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        except OSError as e:
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                pass
+            refuse("could not be replaced (%s)" % e.strerror)
     finally:
         os.close(dfd)
 PY
@@ -1300,24 +1554,70 @@ iso_land_lock_path() {  # $1 primary (or any path in the checkout)
   printf '%s/landing.lock\n' "$gd"
 }
 
-iso_land_lock_state() {  # $1 primary, $2 me -> free|mine|dead|other
-  local lock owner
+# The landing lock belongs to the finish process that CREATED it, not to its owner key
+# (ISSUE 20261010T225456Z, amendment 20261011T005233Z). owner_pid is that process, so its
+# liveness is the holder's: a second finish pass under the same key -- nested, a launcher
+# retry, a second landing of the same worker -- is `other` while the creator lives and
+# `dead` once it is gone, and never `mine`. The key alone used to answer `mine`, and that
+# pass then removed the creator's lock and merged beside it.
+iso_land_lock_alive() {  # $1 lock file
+  local owner pid lstart
+  owner="$(iso_lock_get "$1" owner)"
+  if iso_is_pid "$owner"; then
+    # a pid owner's lock is judged by its owner in iso_lock_alive; the landing lock's
+    # holder is the recorded finish process when there is one
+    pid="$(iso_lock_num "$1" owner_pid)" || return 1
+    if [[ -n "$pid" ]]; then
+      lstart="$(iso_lock_lstart "$1")" || return 1
+      iso_owner_alive "$pid" "$lstart"
+      return $?
+    fi
+  fi
+  iso_lock_alive "$1"
+}
+
+# alive | gone | expired, by iso_land_lock_alive
+iso_land_lock_liveness() {  # $1 lock file
+  if iso_land_lock_alive "$1"; then echo alive; return 0; fi
+  if iso_lock_alive "$1"; then echo gone; return 0; fi
+  iso_lock_liveness "$1"
+}
+
+iso_land_lock_state() {  # $1 primary, $2 me, $3 my finish pid -> free|mine|dead|other
+  local lock owner pid
   lock="$(iso_land_lock_path "$1")" || { echo free; return 0; }
   [[ -f "$lock" ]] || { echo free; return 0; }
   owner="$(iso_lock_get "$lock" owner)"
-  if [[ "$owner" == "$2" ]]; then
+  pid="$(iso_lock_get "$lock" owner_pid)"
+  if [[ "$owner" == "$2" && -n "${3:-}" && "$pid" == "$3" ]]; then
     echo mine
-  elif iso_lock_alive "$lock"; then
+  elif iso_land_lock_alive "$lock"; then
     echo other
   else
     echo dead
   fi
 }
 
-iso_land_lock_take() {  # $1 primary, $2 owner, $3 branch -> 0 when this call created it
+# Remove a landing lock judged dead -- only while it is still that dead lock. Two takers
+# can both see `dead`; the one that comes second must not remove the lock the first has
+# just created in its place.
+iso_land_lock_take_over() {  # $1 primary
+  local lock before
+  lock="$(iso_land_lock_path "$1")" || return 0
+  [[ -f "$lock" ]] || return 0
+  before="$(cat "$lock" 2>/dev/null)" || return 0
+  iso_land_lock_alive "$lock" && return 0
+  [[ "$(cat "$lock" 2>/dev/null)" == "$before" ]] || return 0
+  rm -f "$lock"
+}
+
+iso_land_lock_take() {  # $1 primary, $2 owner, $3 branch, $4 the creating finish pid -> 0 when this call created it
   local lock pid
   lock="$(iso_land_lock_path "$1")" || return 1
-  if iso_is_pid "$2"; then pid="$2"; else pid="$(iso_keyed_pid)"; fi
+  if iso_is_pid "${4:-}"; then pid="$4"; elif iso_is_pid "$2"; then pid="$2"; else pid="$(iso_keyed_pid)"; fi
+  # The create's own error (the lock path and the shell's reason) reaches stderr: the
+  # 2>/dev/null comes after the > and so only quiets the lines' commands. A take refused
+  # by a wall over .git used to fail silently (intake 20261026T142951Z).
   (
     set -o noclobber
     {
@@ -1325,7 +1625,7 @@ iso_land_lock_take() {  # $1 primary, $2 owner, $3 branch -> 0 when this call cr
       echo "owner_pid=$pid"
       echo "owner_started=$(iso_proc_start "$pid")"
       echo "owner_comm=$(iso_proc_comm "$pid")"
-      echo "owner_kind=$(iso_owner_kind "$2" "$pid")"
+      echo "owner_kind=$(iso_owner_kind "$2")"
       echo "owner_seen=$(date +%s)"
       echo "kind=landing"
       echo "branch=$3"
@@ -1333,8 +1633,8 @@ iso_land_lock_take() {  # $1 primary, $2 owner, $3 branch -> 0 when this call cr
       echo "started=$(date +%s)"
       echo "started_iso=$(date '+%Y-%m-%d %H:%M')"
       echo "host=$(hostname)"
-    } > "$lock"
-  ) 2>/dev/null
+    } > "$lock" 2>/dev/null
+  )
 }
 
 iso_land_lock_release() {
@@ -1350,7 +1650,7 @@ iso_land_lock_describe() {
   owner="$(iso_lock_get "$lock" owner)"
   printf 'landing of %s by owner %s (%s, %s, %s) since %s\n' \
     "$(iso_lock_get "$lock" branch)" "$owner" "$(iso_lock_get "$lock" owner_kind)" \
-    "$(iso_lock_get "$lock" owner_comm)" "$(iso_lock_liveness "$lock")" "$(iso_lock_get "$lock" started_iso)"
+    "$(iso_lock_get "$lock" owner_comm)" "$(iso_land_lock_liveness "$lock")" "$(iso_lock_get "$lock" started_iso)"
 }
 
 # --- the landing queue ------------------------------------------------------
@@ -1527,13 +1827,17 @@ iso_land_queue_drop() {  # $1 absolute ticket path
   return 0
 }
 
+# A malformed seen-time is `unknown`, quietly: the verdict beside it (iso_lock_liveness)
+# has already named the field.
 iso_seen_ago() {  # $1 lock file -> "3m ago"
   local seen now d
-  seen="$(iso_lock_get "$1" owner_seen)"
-  [[ -n "$seen" ]] || seen="$(iso_lock_get "$1" started)"
+  seen="$(iso_lock_num "$1" owner_seen 2>/dev/null)" || { echo "unknown"; return 0; }
+  if [[ -z "$seen" ]]; then
+    seen="$(iso_lock_num "$1" started 2>/dev/null)" || { echo "unknown"; return 0; }
+  fi
   [[ -n "$seen" ]] || { echo "never"; return 0; }
   now="$(date +%s)"
-  d=$(( now - seen ))
+  d=$(( 10#$now - 10#$seen ))
   if (( d < 120 )); then echo "${d}s ago"
   elif (( d < 7200 )); then echo "$(( d / 60 ))m ago"
   else echo "$(( d / 3600 ))h ago"; fi

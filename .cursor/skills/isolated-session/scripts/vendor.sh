@@ -8,9 +8,11 @@
 #                     commit it points at and every digest. The contract test is
 #                     taken from tests/test_isolated_session.py and written at the
 #                     same relative path (creating tests/ in the consumer). A stale
-#                     root copy in the consumer is removed. The APPL skill's two entry
-#                     points, .claude/skills/appl/SKILL.md and .cursor/rules/appl.mdc,
-#                     are the only other paths outside the skill it carries.
+#                     root copy in the consumer is removed. The APPL skill's entry
+#                     points, .claude/skills/appl/SKILL.md, .cursor/rules/appl.mdc,
+#                     .claude/skills/project-priority/SKILL.md and
+#                     .cursor/rules/project-priority.mdc, are the only other paths
+#                     outside the skill it carries.
 #   vendor.sh pull --ref main
 #                     the same, from the home's main -- spelled out, never implied
 #   vendor.sh check   hold the copies to VENDOR.json's digests; needs no home checkout.
@@ -134,28 +136,47 @@ FILES = [
     f"{skill}/scripts/landing-lease.sh",
     f"{skill}/scripts/landing-lease.py",
     f"{skill}/scripts/lease_core.py",
+    # appl.toml's reader, a COPY of appl/config.py: a consumer's BASE carries no appl/, so
+    # finish-worktree.sh reads the [tests] command through this one from BASE's gate copy
+    f"{skill}/scripts/appl_config.py",
     f"{skill}/scripts/dispatch-init.sh",
     f"{skill}/scripts/stale.sh",
     f"{skill}/scripts/session-guard.sh",
     f"{skill}/scripts/vendor.sh",
     f"{skill}/scripts/herd-spawn.sh",
+    # herd-spawn.sh reaches this as `$here/grok_rules.py` when it builds the grok argv
+    f"{skill}/scripts/grok_rules.py",
     # the path-first runners the briefs and the worker allow rules name. run-node.sh is
-    # the JavaScript spelling; run-test.sh is its Python twin. A consumer that never
-    # received them cannot run the pairs those briefs tell it to run.
+    # the JavaScript spelling; run-test.sh is its Python twin and run-php.sh its PHP twin.
+    # A consumer that never received them cannot run the pairs those briefs tell it to run.
     f"{skill}/scripts/run-test.sh",
     f"{skill}/scripts/run-node.sh",
+    f"{skill}/scripts/run-php.sh",
     # the path-first receipt writer the reviewer brief and the reviewer allow rule name.
     # A consumer that never received it cannot run the receipt step that brief tells a
     # reviewer to run.
     f"{skill}/scripts/write-receipt.sh",
+    # the weekly hunt's full-receipt writer, the one rule the weekly profile adds and the
+    # one its brief names
+    f"{skill}/scripts/write-weekly-receipt.sh",
     # the coordinator's own scripts the vendored brief names. A consumer runs its own
     # coordinator, so the brief must name only scripts the pull carries. appl-answer.sh
     # reaches appl-status.sh, and appl-split-check.sh reaches appl-split-check.py.
     f"{skill}/scripts/appl-status.sh",
     f"{skill}/scripts/appl-answer.sh",
     f"{skill}/scripts/appl-close.sh",
+    f"{skill}/scripts/appl-note.sh",
+    # the coordinator's artifact fetch, bundle and publish-grant, one relative
+    # allow rule, confined to coordinator/reference/
+    f"{skill}/scripts/appl-artifact.sh",
     f"{skill}/scripts/appl-split-check.sh",
     f"{skill}/scripts/appl-split-check.py",
+    # the one intake-id resolver and owner-P0 chain walk: appl-split-check.py and the two
+    # filing copies below reach it as `intake_id.py` beside themselves
+    f"{skill}/scripts/intake_id.py",
+    # the one coordinator identities reader: appl-answer.sh and appl-hook.sh load it beside
+    # themselves, never from <repo>/tools, and refuse by its name when it is missing
+    f"{skill}/scripts/coordinator_identities.py",
     # the landing the spawner copies beside the wall (herd-spawn.sh reaches it as `$here/land.sh`)
     f"{skill}/scripts/land.sh",
     # the worker wall's platform plug and its one profile template (herd-spawn.sh reaches
@@ -165,6 +186,12 @@ FILES = [
     f"{skill}/scripts/dispatch-take.sh",
     f"{skill}/scripts/dispatch-capacity.sh",
     f"{skill}/scripts/herd-watch.sh",
+    # the herd-dir reader and writer herd-watch.sh (and appl-hook.sh) load beside them
+    f"{skill}/scripts/herd_files.py",
+    # the one read-only command list and its loader: herd-spawn.sh renders it into every
+    # harness profile and herd-watch.sh derives its SAFE table from it, each from beside itself
+    f"{skill}/scripts/readonly-commands.tsv",
+    f"{skill}/scripts/readonly_commands.py",
     # every role brief, each on its own line: the contract test reads them, and v0.1.0
     # shipped only two, so every consumer's contract test failed at the first missing one
     f"{skill}/briefs/coordinator.md",
@@ -173,6 +200,7 @@ FILES = [
     f"{skill}/briefs/reviewer.md",
     f"{skill}/briefs/test-author.md",
     f"{skill}/briefs/worker.md",
+    f"{skill}/briefs/fast.md",
     # the invocable APPL skill: the one parser, its phrase table and the two filing
     # scripts it runs (the entry points below name the parser by this path); the filing
     # scripts are the COPIES below
@@ -195,6 +223,7 @@ FILES = [
 COPIES = {
     f"{skill}/scripts/appl-add.sh": "tools/appl-add.sh",
     f"{skill}/scripts/appl-backlog-add.sh": "tools/appl-backlog-add.sh",
+    f"{skill}/scripts/appl_config.py": "appl/config.py",
 }
 
 CONTRACT = "tests/test_isolated_session.py"
@@ -204,7 +233,9 @@ CONTRACT = "tests/test_isolated_session.py"
 # carries each one the home has at the ref (a release from before they existed has none).
 ENTRY_POINTS = (
     ".claude/skills/appl/SKILL.md",
+    ".claude/skills/project-priority/SKILL.md",
     ".cursor/rules/appl.mdc",
+    ".cursor/rules/project-priority.mdc",
 )
 pin = repo / skill / "VENDOR.json"
 

@@ -179,7 +179,7 @@ allowlist mode and registers `appl-hook.sh` for UserPromptSubmit and SessionStar
 the pane read a shared file, is still exit 2, one line naming appl-hook and cli.json,
 before a tab exists. `cursor-agent` still reads the user's own rules and skills; the
 spawn says so on stderr and in `wall.log` rather than pretending the private directory
-covers them. A cursor session still reviews nothing. Codex does not coordinate: it has
+covers them. A cursor reviewer is allowed when [[harness.order.reviewer]] names cursor; it still reads those user rules. Codex does not coordinate: it has
 no per-command deny list and no session-guard hook. Grok does not coordinate or review:
 which instruction files it reads from the directory it opens is not yet known, and
 `appl-hook.sh` has no per-pane slot on it. A grok worker is started with `--cwd <worktree>`

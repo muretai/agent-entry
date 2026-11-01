@@ -47,6 +47,7 @@ SKILL_DIR = SCRIPTS.parent
 # scan has nothing to refuse in it.
 PUSH_ENV = {"ISOLATED_SESSION_PUSH": "1"}
 FORCE_ENV = {"ISOLATED_SESSION_FORCE": "1"}
+LAND_MERGE_ENV = {"ISOLATED_SESSION_LAND_MERGE": "1"}
 
 _passed = 0
 
@@ -124,6 +125,12 @@ def _env(**extra: str) -> dict:
               "ISOLATED_SESSION_LAND_WAIT", "HERD_SPAWN_MODEL", "HERD_SPAWN_PERMISSION_MODE", "HERD_SPAWN_BIN", "HERD_DIR",
               "LANDING_LEASE", "LANDING_LEASE_CLI", "LANDING_LEASE_AS", "LANDING_LEASE_REPO", "DISPATCH_DIR", "DISPATCH_CLI",
               "MURETAI_STATE_DIR"):
+        env.pop(k, None)
+    # vendor.sh prefers a set APPL_HOME over the MURETAI_CORE a case passes and
+    # over $HOME/appl. The gate and run-test.sh both start this file with the
+    # operator's environment, and this dict is what every child receives, so
+    # the home is cleared here. A case that names a home passes it in extra.
+    for k in ("APPL_HOME", "MURETAI_CORE"):
         env.pop(k, None)
     env.update(extra)
     return env
@@ -859,12 +866,15 @@ def plant_spawner(primary: Path) -> None:
     it out of BASE's blobs, never off the primary's working tree."""
     scripts = primary / ".cursor" / "skills" / "isolated-session" / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
-    for name in ("herd-spawn.sh", "lib.sh", "claim-worktree.sh", "assert-head.sh"):
+    for name in ("herd-spawn.sh", "lib.sh", "claim-worktree.sh", "assert-head.sh", "wake-adapter.sh"):
         shutil.copy(SCRIPTS / name, scripts / name)
     # ... and BASE's real walls/: HERD_WALL unset is require, so a BASE with no plug
     # beside its spawner starts no reviewer (REVIEW=needed), which is not this case
     if not (scripts / "walls").exists():
         shutil.copytree(SCRIPTS / "walls", scripts / "walls")
+    # ... and BASE's harness declarations: the spawner reads its spawn line from them
+    if not (scripts / "wake-adapters").exists():
+        shutil.copytree(SCRIPTS / "wake-adapters", scripts / "wake-adapters")
 
 
 def plant_review_gear(primary: Path) -> None:
@@ -970,7 +980,7 @@ def test_landing_scans_the_diff_and_spawns_its_review(tmp: Path) -> None:
     # brief text itself travels on no argv
     bfile = herd / name / "brief.md"
     one_line = ("agent prompt " + name + " Read " + str(bfile) + " and follow it. Your report goes to "
-                + str(herd / name / "report.md") + ".")
+                + str(herd / name / "report.md") + ". Open the brief with your Read tool, not with a shell command.")
     ok("--label " + name + " --no-focus" in calls and "--env HERD_BRIEF=" + str(bfile) + " " in calls,
        "herdr got the reviewer's name and the brief path")
     m = re.search(r"tab create --cwd (\S+) ", calls)
@@ -995,7 +1005,8 @@ def test_landing_scans_the_diff_and_spawns_its_review(tmp: Path) -> None:
     ok(brief.exists() and "{{" not in brief.read_text(), "the rendered brief has no placeholder left")
     rules = json.loads((herd / name / "permissions.json").read_text())["permissions"]
     ok("--permission-mode auto" in calls and "--settings " + str(herd / name / "permissions.json") in calls
-       and "Bash(python3 tools/audit_scope.py write-receipt:*)" in rules["allow"]
+       and "Bash(bash .cursor/skills/isolated-session/scripts/write-receipt.sh:*)" in rules["allow"]
+       and not [a for a in rules["allow"] if "audit_scope" in a]
        and "Bash(python3 test_:*)" not in rules["allow"] and "Bash(python3 tools/run_tests.py:*)" not in rules["allow"],
        "the reviewer is started with the reviewer profile (a settings file): the receipt tools, no test runner, no test files")
     ok("--add-dir " + str(herd / name) + " " in calls
@@ -1197,7 +1208,8 @@ def test_landing_judges_the_diff_with_base_guards(tmp: Path) -> None:
     typed = calls.split("agent prompt " + name + " ", 1)[1].split("\n--\n", 1)[0]
     typed = re.sub(r"(?: --wait| --timeout \d+| --until \S+)+\s*$", "", typed)
     bfile = herd / name / "brief.md"
-    ok(typed == "Read " + str(bfile) + " and follow it. Your report goes to " + str(herd / name / "report.md") + ".",
+    ok(typed == "Read " + str(bfile) + " and follow it. Your report goes to " + str(herd / name / "report.md") + "."
+       " Open the brief with your Read tool, not with a shell command.",
        "the typed prompt is the one line naming brief.md (P1): " + typed[:200])
     # what the reviewer is told is brief.md; the brief text rides on no argv
     prompt = bfile.read_text().rstrip("\n") if bfile.is_file() else ""
@@ -1358,7 +1370,10 @@ def test_review_checkouts_are_named_placed_and_cleaned(tmp: Path) -> None:
        "a world-writable directory above HERD_DIR (a CLAUDE.md there would reach the reviewer): REVIEW=needed naming it: "
        + rc4e.get("REVIEW", ""))
     ok(not (open_dir / "herd" / "review").exists(), "and no checkout was opened under it")
-    r4f, rc4f, _, _, _ = land("a landing with neither HERD_DIR nor HOME", HERD_DIR="", HOME="")
+    scratch4f = tmp / "revco" / "gate-scratch"
+    scratch4f.mkdir(mode=0o700)
+    r4f, rc4f, _, _, _ = land("a landing with neither HERD_DIR nor HOME", HERD_DIR="", HOME="",
+                              MURETAI_GATE_SCRATCH_DIR=str(scratch4f))
     ok(r4f.returncode == 0 and rc4f.get("MERGED") == "yes"
        and rc4f.get("REVIEW", "").startswith("needed -- neither HERD_DIR nor HOME is set"),
        "no HERD_DIR and no HOME: merged, exit 0, REVIEW=needed -- not an unbound-variable death after the merge: "
@@ -1384,6 +1399,9 @@ def test_review_checkouts_are_named_placed_and_cleaned(tmp: Path) -> None:
     (primary / ".security" / "review-cadence").write_text("daily\n")
     git("add", ".security/review-cadence", cwd=primary)
     git("commit", "-m", "review once a day", cwd=primary)
+    daily_agents = _private_home() / "Library" / "LaunchAgents"
+    daily_agents.mkdir(parents=True, exist_ok=True)
+    (daily_agents / "com.muretai.security-daily.plist").write_text("<plist/>\n")
     r6a, rc6a, _, _, _ = land("a landing under the daily cadence")
     ok(r6a.returncode == 0 and rc6a.get("REVIEW", "").startswith("deferred -- daily cadence") and "security_daily.sh" in rc6a.get("REVIEW", "")
        and not stub_log.exists(),
@@ -3233,6 +3251,9 @@ def test_the_review_cadence_comes_from_base(tmp: Path) -> None:
     got = parse(script("ensure-worktree.sh", "count the inbox", cwd=primary).stdout)
     wt2, branch2 = Path(got["WORKTREE"]), got["BRANCH"]
     commit_in(wt2, "counted.txt")
+    daily_agents = _private_home() / "Library" / "LaunchAgents"
+    daily_agents.mkdir(parents=True, exist_ok=True)
+    (daily_agents / "com.muretai.security-daily.plist").write_text("<plist/>\n")
     r = script("finish-worktree.sh", branch2, str(wt2), cwd=primary,
                FAKE_SEC_VERDICT="needs-eyes", **herdr_up)
     receipt = parse(r.stdout)
@@ -4378,7 +4399,7 @@ def test_the_spawner_runs_under_the_landings_wall(tmp: Path) -> None:
         ok(bfile.is_file() and FORGED not in bfile.read_text()
            and "Reviewer " + name + " for " + branch in bfile.read_text()
            and ("agent prompt " + name + " Read " + str(bfile) + " and follow it. Your report goes to "
-                + str(herd / name / "report.md") + ".") in calls
+                + str(herd / name / "report.md") + ". Open the brief with your Read tool, not with a shell command.") in calls
            and "Reviewer " + name + " for " not in calls,
            "the prompt is the rendered template: " + repr(calls[-240:]))
 
@@ -4425,8 +4446,9 @@ def test_the_spawner_runs_under_the_landings_wall(tmp: Path) -> None:
         ok(any(d.startswith("Bash(git push") for d in rules.get("deny", [])),
            "and it is the spawner's own list, `git push` denied: "
            + repr(rules.get("deny", [])[:6]))
-        ok("Bash(python3 tools/audit_scope.py write-receipt:*)" in rules.get("allow", []),
-           "with the receipt tool allowed, as the reviewer profile says: "
+        ok("Bash(bash .cursor/skills/isolated-session/scripts/write-receipt.sh:*)" in rules.get("allow", [])
+           and not [a for a in rules.get("allow", []) if "audit_scope" in a],
+           "with the receipt wrapper allowed and no audit_scope.py rule, as the reviewer profile says: "
            + repr(rules.get("allow", [])[:6]))
 
 

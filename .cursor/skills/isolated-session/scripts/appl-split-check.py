@@ -24,6 +24,14 @@ Accepted: exit 0, and stdout is the input lines byte for byte (each with a final
 newline), so the coordinator files from this output and nothing else. Refused: exit 1, one
 reason on stderr, NOTHING on stdout -- nothing is filed from a refused answer.
 
+    python3 appl-split-check.py --intake <intake dir> <intake id> < <answer>
+
+(appl-split-check.sh passes it for briefs/<intake id>.split): when that intake is owner P0
+(intake_id.owner_p0: its header's `owner-priority: P0`, or its `parent:` chain's), every
+accepted item line is printed with its priority field as `priority: P0` -- an owner
+chain's split items inherit the owner's priority whatever the splitter wrote. For any
+other intake, or `ONE`, stdout is the input byte for byte, as above.
+
 Stdlib only. Python 3.9+. ASCII-only source.
 """
 
@@ -113,12 +121,30 @@ def check(data):
     return lines
 
 
+def owner_p0(intake_dir, ident):
+    """intake_id.owner_p0, loaded from beside this file"""
+    import importlib.util
+    import os
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location(
+        "intake_id", os.path.join(os.path.dirname(os.path.abspath(__file__)), "intake_id.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.owner_p0(intake_dir, ident)
+
+
 def main():
+    argv = sys.argv[1:]
+    if argv and (len(argv) != 3 or argv[0] != "--intake"):
+        sys.stderr.write("usage: appl-split-check.py [--intake <intake dir> <intake id>] < <answer>\n")
+        return 2
     try:
         lines = check(sys.stdin.buffer.read())
     except Refused as e:
         sys.stderr.write("appl-split-check: refused: %s; nothing may be filed from it\n" % e)
         return 1
+    if argv and lines != ["ONE"] and owner_p0(argv[1], argv[2]):
+        lines = [ln.rsplit(SEP, 1)[0] + SEP + "priority: P0" for ln in lines]
     sys.stdout.buffer.write("".join(ln + "\n" for ln in lines).encode("utf-8"))
     return 0
 

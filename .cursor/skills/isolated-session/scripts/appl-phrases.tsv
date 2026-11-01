@@ -14,9 +14,13 @@
 #   note    <word>                              A5: --note; the target is the next token
 #   ruling  <word>                              A5: --needs-ruling
 #   solo    <word>                              A6: --solo
+#   lane    <word>                              intake: --lane fast, and the word is removed
 #   msg     <key>  en|ja  <text>                what the parser says; {name} {prio} {path} {a} {b}
 #
-# Every word stays in the requirement text: only the trigger phrase is removed (A8, C3).
+# Every word stays in the requirement text except a lane word, which is removed.
+# Only the trigger phrase and a lane word leave the text (A8, C3). The lane words,
+# quoted as data, are "fast lane", "ファストレーン", "急ぎで" and "低リスク".
+# ASCII case is ignored, so "FAST LANE" counts. "fastlane" does not.
 
 intake	suffix	を APPL して
 intake	suffix	を APPLして
@@ -66,10 +70,17 @@ ruling	needs a ruling
 solo	記録だけ
 solo	records only
 
+lane	fast lane
+lane	ファストレーン
+lane	急ぎで
+lane	低リスク
+
 msg	filed-intake	en	APPL: filed an intake for {name} -> {path}
 msg	filed-intake	ja	APPL: {name} のインテークを登録しました -> {path}
 msg	filed-inbox	en	APPL: queued to the {name} backlog inbox at {prio} -> {path}
 msg	filed-inbox	ja	APPL: {name} のバックログ inbox に {prio} で積みました -> {path}
+msg	filed-inbox-after	en	APPL: queued to the {name} backlog inbox at {prio}, after: {after} -> {path}
+msg	filed-inbox-after	ja	APPL: {name} のバックログ inbox に {prio} で積みました、after: {after} -> {path}
 msg	ask-both	en	That says both an APPL intake now and the backlog inbox -- which one did you mean?
 msg	ask-both	ja	今すぐ APPL するのとバックログに積むのが両方入っています。どちらにしますか？
 msg	ask-priorities	en	Which priority did you mean, {a} or {b}?

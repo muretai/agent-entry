@@ -185,24 +185,37 @@ def wait_in(after: int, timeout: float = 12.0) -> list:
     return list(d.get("messages") or [])
 
 
-# Room: --room, else a group overlay on any inbox row, else dispatch/room.
+# Room: --room, else the configured dispatch/room file, never an inbox row's
+# unsigned group overlay (group.room_id / group.host): anyone can send such a row,
+# and the Room holds the take-lock. A symlinked, empty or did-less room file is no
+# Room, and with none the take refuses below with nothing sent.
 # Consulted BEFORE "is this mine" so a third desk that can see /mem exits 4
 # (already taken) instead of 2 (not mine). The 1:1 ticket is not on Carol's
 # inbox; the board record is.
+room_why = ""
+
+
 def room_did() -> str:
+    global room_why
     if room_arg:
         return room_arg
-    for m in rows:
-        g = m.get("group") or {}
-        if isinstance(g, dict):
-            rid = g.get("room_id") or g.get("host")
-            if isinstance(rid, str) and rid.startswith("did:"):
-                return rid
     room_file = dispatch_dir / "room"
-    if room_file.is_file() and not room_file.is_symlink():
-        for line in room_file.read_text(encoding="utf-8").splitlines():
-            if line.startswith("did="):
-                return line.split("=", 1)[1].strip()
+    if room_file.is_symlink():
+        room_why = "%s is a symlink, not a room file" % room_file
+        return ""
+    if not room_file.is_file():
+        return ""
+    try:
+        text = room_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        room_why = "%s is unreadable: %s" % (room_file, e)
+        return ""
+    for line in text.splitlines():
+        if line.startswith("did="):
+            did = line.split("=", 1)[1].strip()
+            if did.startswith("did:"):
+                return did
+    room_why = "%s has no did=<did> line" % room_file
     return ""
 
 
@@ -481,8 +494,8 @@ if not os.path.isdir(resolved):
     die(2, "resolved repo path is not a directory: %s" % resolved)
 
 if not room:
-    die(2, "no Room to consult: pass --room <did> or set did= in %s/room"
-        % dispatch_dir)
+    die(2, "no Room to consult: pass --room <did> or set did= in %s/room%s"
+        % (dispatch_dir, " (%s)" % room_why if room_why else ""))
 
 
 # -- the ticket's worktree, opened HERE, before any spawn -------------------------

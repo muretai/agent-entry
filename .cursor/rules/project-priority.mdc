@@ -1,0 +1,12 @@
+---
+description: "Which APPL project starts next: read coordinator/project-priority, top line first. Do not invent an order from age, P0, or taste."
+alwaysApply: true
+---
+
+# Which project APPL starts next
+
+The order of projects is `$HERD_DIR/coordinator/project-priority` (`~/.cache/muretai-herd/coordinator/project-priority` when `HERD_DIR` is unset). One project per line. The top line is first. A line is the repository directory's basename or its absolute path. A basename matches the last component of the intake's `repo:` header. No file: the older intake file name is first. Inside one listed project, the older file name is first.
+
+A free slot (the coordinator idle or done, and fewer workers `working` or `blocked` than `coordinator/worker-cap`) starts the one intake herd-watch types and logs as `slot`. Spawn that intake. Eligible means status exactly `blocked after`, or a first word `new` still inside 300 seconds, and no live worker named in the status.
+
+Do not reorder projects because an intake says P0 or `owner-priority: P0`. Those words do not move a line in this file. Do not write `blocked after` to rank a project or to end a turn while a slot is free. Do not edit the file unless the owner stated the order.

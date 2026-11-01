@@ -155,13 +155,13 @@ case "$event_lc" in
     wt="$(iso_worktree_of "$path")" || allow
     rel="${path#"$primary"/}"
     if ! iso_is_linked "$wt"; then
-      deny "isolated-session: refusing to edit ${rel} in the primary checkout ${primary}. The primary is read-only for sessions. Run: bash .cursor/skills/isolated-session/scripts/ensure-worktree.sh \"<task>\" and edit inside the WORKTREE it prints."
+      deny "isolated-session: refusing to edit ${rel} in the primary checkout ${primary}. The primary is read-only for sessions. Run: bash \"${here}/ensure-worktree.sh\" \"<task>\" and edit inside the WORKTREE it prints."
     fi
     case "$(iso_lock_state "$wt" "$owner")" in
       mine) iso_lock_touch "$wt" "$owner"; allow ;;
       free) deny "isolated-session: no session holds ${wt}. Run: bash .cursor/skills/isolated-session/scripts/claim-worktree.sh \"${wt}\" (or ensure-worktree.sh with this task) before editing there." ;;
       dead) deny "isolated-session: ${wt} is held by a session that is gone ($(iso_lock_describe "$wt")). Run: bash .cursor/skills/isolated-session/scripts/claim-worktree.sh \"${wt}\" to take it over." ;;
-      other) deny "isolated-session: ${wt} is open in another live session -- $(iso_lock_describe "$wt"). Two chats must not share a folder. Open your own: bash .cursor/skills/isolated-session/scripts/ensure-worktree.sh \"<task>\". $(iso_lock_fix_hint "$wt" "$owner" | tr '\n' ' ')" ;;
+      other) deny "isolated-session: ${wt} is open in another live session -- $(iso_lock_describe "$wt"). Two chats must not share a folder. Open your own: bash \"${here}/ensure-worktree.sh\" \"<task>\". $(iso_lock_fix_hint "$wt" "$owner" | tr '\n' ' ')" ;;
     esac
     allow
     ;;

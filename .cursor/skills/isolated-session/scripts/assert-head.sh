@@ -26,7 +26,13 @@ if ! iso_is_linked "$wt"; then
   fi
 else
   case "$(iso_lock_state "$wt" "$owner")" in
-    mine) iso_lock_touch "$wt" "$owner" ;;
+    mine)
+      # a lock iso_lock_set refuses (a line no writer wrote, not a regular file) fails closed
+      if ! iso_lock_touch "$wt" "$owner"; then
+        echo "abort: the lock $(iso_lock_path "$wt") of ${wt} was refused and left as it is -- nothing is committed; a lock no writer wrote is a finding: report it rather than repair it" >&2
+        exit 1
+      fi
+      ;;
     free)
       echo "abort: no session holds ${wt} -- run claim-worktree.sh (or ensure-worktree.sh) first" >&2
       exit 1
@@ -38,6 +44,11 @@ else
     other)
       { echo "abort: ${wt} is held by another live session: $(iso_lock_describe "$wt")"
         iso_lock_fix_hint "$wt" "$owner"; } >&2
+      exit 1
+      ;;
+    *)
+      # an empty or unknown answer is a lock check that failed: never a pass
+      echo "abort: the lock of ${wt} could not be judged -- nothing is committed; run claim-worktree.sh to take it over if its holder is gone" >&2
       exit 1
       ;;
   esac
