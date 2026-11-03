@@ -1,1 +1,2 @@
-gate = "github"
+# The github gate returns with the APPL v0.1.11 re-vendor, once 20261102T052515Z gives a consumer the hand-off path and 20261102T052536Z proves it on a fixture. Until then, vendored APPL v0.1.10 lands a gate-github branch into local main while the publisher in github mode never pushes main.
+gate = "local"
