@@ -7044,53 +7044,79 @@ function robotsDisallowing(text, path) {
 
 /** Read the store's robots.txt and refuse when it disallows `url`'s path to agent-entry, or when it
  *  answers a server error (the store cannot say now what it allows). No answer at all, a redirect
- *  or a 4xx means no rules; the products request that follows reports an unreachable store. */
-async function wooRobotsAllow(url) {
+ *  or a 4xx means no rules; the products request that follows reports an unreachable store.
+ *  Returns the text, or null when the store states no rules. `budget`, when passed, is the one
+ *  byte budget of `init <store>`: the body is charged to it and not read past what remains. */
+async function wooRobotsAllow(url, budget = null) {
   const robots = new URL('/robots.txt', url);
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 30000);
+  const note = (text) => {
+    if (budget) budget.robots = text;
+    return text;
+  };
   try {
     let res;
     try {
       res = await fetch(robots, { redirect: 'manual', signal: ctrl.signal,
         headers: { accept: 'text/plain', 'user-agent': WOO_USER_AGENT } });
     } catch {
-      return;
+      return note(null);
     }
     if (res.status >= 500) {
       ctrl.abort();
       throw new CliRefusal(`robots.txt on ${url.host} answered status ${res.status}, so init cannot tell whether it may read `
         + `${url.pathname}; it asked nothing more. Try again later. Nothing was written.`);
     }
-    if (res.status !== 200) { ctrl.abort(); return; }
+    if (res.status !== 200) { ctrl.abort(); return note(null); }
+    const declared = Number(res.headers.get('content-length'));
+    const hasLength = res.headers.has('content-length') && Number.isFinite(declared);
+    const cap = budget
+      ? Math.min(WOO_ROBOTS_MAX_BYTES, Math.max(0, budget.maxBytes - budget.spent))
+      : WOO_ROBOTS_MAX_BYTES;
+    if (budget && (cap <= 0 || (hasLength && declared > cap))) {
+      ctrl.abort();
+      budget.spent = budget.maxBytes;
+      return note(null);
+    }
     const chunks = [];
     let total = 0;
     if (res.body) {
       const reader = res.body.getReader();
       for (;;) {
+        if (budget && total >= cap) { ctrl.abort(); break; }
         let step;
         try { step = await reader.read(); } catch { break; }
         if (step.done) break;
+        const n = step.value.byteLength;
+        if (budget && total + n > cap) {
+          ctrl.abort();
+          total += n;
+          break;
+        }
         chunks.push(step.value);
-        total += step.value.byteLength;
+        total += n;
         if (total >= WOO_ROBOTS_MAX_BYTES) { ctrl.abort(); break; }
       }
     }
+    if (budget) budget.spent += total;
     const text = Buffer.concat(chunks).subarray(0, WOO_ROBOTS_MAX_BYTES).toString('utf8').replace(/^﻿/, '');
     const rule = robotsDisallowing(text, url.pathname);
     if (rule !== null) {
       throw new CliRefusal(`robots.txt on ${url.host} disallows ${url.pathname} to ${WOO_ROBOTS_AGENT} (Disallow: ${rule.slice(0, 120)}), `
         + 'so init does not read the store. Nothing was written.');
     }
+    return note(text);
   } finally {
     clearTimeout(timer);
   }
 }
 
 /** One products page, asked once (no retry, no redirect followed): { products, bytes, totalPages }
- *  (totalPages null when x-wp-totalpages is absent or not a positive integer), { over } when the
- *  body passes `cap` bytes (counted as it streams; init stops reading there), or { failed } naming
- *  why the page is no Store API page. */
+ *  (totalPages null when x-wp-totalpages is absent or not a positive integer), { over, bytes } when
+ *  the body passes `cap` bytes (counted as it streams; init stops reading there and does not pull
+ *  a further byte once `cap` is reached), or { failed, bytes } naming why the page is no Store API
+ *  page. `bytes` is what this response's body pulled. */
 async function wooPage(url, cap) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 30000);
@@ -7100,43 +7126,51 @@ async function wooPage(url, cap) {
       res = await fetch(url, { redirect: 'manual', signal: ctrl.signal,
         headers: { accept: 'application/json', 'user-agent': WOO_USER_AGENT } });
     } catch (e) {
-      return { failed: `got no answer (${shortError(e.cause ?? e)})` };
+      return { failed: `got no answer (${shortError(e.cause ?? e)})`, bytes: 0 };
     }
     if (res.status !== 200) {
       ctrl.abort();
       if (res.status >= 300 && res.status < 400) {
         let to = '';
         try { to = ` to ${new URL(res.headers.get('location'), url).host}`; } catch { /* no usable Location */ }
-        return { failed: `answered status ${res.status} (a redirect${to}, not followed)`, redirect: true };
+        return { failed: `answered status ${res.status} (a redirect${to}, not followed)`, redirect: true, bytes: 0 };
       }
-      return { failed: `answered status ${res.status}` };
+      return { failed: `answered status ${res.status}`, bytes: 0 };
     }
     const declared = Number(res.headers.get('content-length'));
-    if (res.headers.has('content-length') && Number.isFinite(declared) && declared > cap) {
+    const hasLength = res.headers.has('content-length') && Number.isFinite(declared);
+    if (hasLength && declared > cap) {
       ctrl.abort();
-      return { over: `Content-Length declares ${declared}` };
+      return { over: `Content-Length declares ${declared}`, bytes: 0 };
     }
     const chunks = [];
     let total = 0;
     if (res.body) {
       const reader = res.body.getReader();
       for (;;) {
-        let step;
-        try { step = await reader.read(); } catch (e) { return { failed: `broke off mid-answer (${shortError(e.cause ?? e)})` }; }
-        if (step.done) break;
-        total += step.value.byteLength;
-        if (total > cap) {
+        if (!hasLength && total >= cap) {
           ctrl.abort();
-          return { over: 'more than that arrived' };
+          return { over: 'more than that arrived', bytes: total };
+        }
+        let step;
+        try { step = await reader.read(); } catch (e) {
+          return { failed: `broke off mid-answer (${shortError(e.cause ?? e)})`, bytes: total };
+        }
+        if (step.done) break;
+        const n = step.value.byteLength;
+        if (total + n > cap) {
+          ctrl.abort();
+          return { over: 'more than that arrived', bytes: total + n };
         }
         chunks.push(step.value);
+        total += n;
       }
     }
     let products;
     try { products = JSON.parse(Buffer.concat(chunks).toString('utf8').replace(/^﻿/, '')); } catch {
-      return { failed: 'answered something that is not JSON' };
+      return { failed: 'answered something that is not JSON', bytes: total };
     }
-    if (!Array.isArray(products)) return { failed: 'answered JSON that is not a list of products' };
+    if (!Array.isArray(products)) return { failed: 'answered JSON that is not a list of products', bytes: total };
     const header = res.headers.get('x-wp-totalpages');
     const totalPages = header !== null && /^[1-9]\d*$/.test(header.trim()) ? Number(header.trim()) : null;
     return { products, bytes: total, totalPages };
@@ -7145,11 +7179,19 @@ async function wooPage(url, cap) {
   }
 }
 
-/** robots.txt, then page 1 of the Store API products, read as wooPage reads any page. */
-async function wooFirstPage(base, maxBytes) {
+/** robots.txt, then page 1 of the Store API products, read as wooPage reads any page.
+ *  `budget` is the one byte budget shared with the site walk: robots.txt is charged to it, and
+ *  the products body is capped at what remains. Without `budget` the cap is `maxBytes`. */
+async function wooFirstPage(base, maxBytes, budget = null) {
   const first = new URL(WOO_PRODUCTS_PATH, base);
-  await wooRobotsAllow(first);
-  return wooPage(first, Math.min(WOO_PAGE_MAX_BYTES, maxBytes));
+  await wooRobotsAllow(first, budget);
+  const room = budget
+    ? Math.min(WOO_PAGE_MAX_BYTES, budget.maxBytes - budget.spent)
+    : Math.min(WOO_PAGE_MAX_BYTES, maxBytes);
+  if (!(room > 0)) return { over: 'the byte budget is spent', bytes: 0 };
+  const got = await wooPage(first, room);
+  if (budget) budget.spent += got.bytes || 0;
+  return got;
 }
 
 /** The store's public Store API products, page 1 then ?page=2 ... in order, each asked once, from
@@ -7404,8 +7446,18 @@ async function siteFetch(base, url, cap, robots, options) {
   return siteBody(url, cap, options);
 }
 
-async function discoveryText(base, url, robots) {
-  const got = await siteFetch(base, url, WOO_PAGE_MAX_BYTES, robots);
+async function discoveryText(base, url, robots, ledger = null) {
+  let cap = WOO_PAGE_MAX_BYTES;
+  if (ledger) {
+    if (ledger.bytes >= ledger.maxBytes) {
+      ledger.stopped = ledger.stopped || 'byte-bound';
+      return null;
+    }
+    cap = Math.min(WOO_PAGE_MAX_BYTES, ledger.maxBytes - ledger.bytes);
+  }
+  const got = await siteFetch(base, url, cap, robots);
+  if (ledger) ledger.bytes += got.bytes || 0;
+  if (ledger && (got.over || ledger.bytes >= ledger.maxBytes)) ledger.stopped = ledger.stopped || 'byte-bound';
   if (got.failed || got.over) return null;
   return got.text ?? null;
 }
@@ -7533,8 +7585,8 @@ async function takeProduct(base, url, state, robots) {
   return true;
 }
 
-async function genericProductUrls(base, robots) {
-  const text = await discoveryText(base, new URL('/sitemap.xml', base), robots);
+async function genericProductUrls(base, robots, ledger = null) {
+  const text = await discoveryText(base, new URL('/sitemap.xml', base), robots, ledger);
   if (text === null || isSitemapIndex(text)) return [];
   return xmlLocs(text).map((loc) => sameOriginHttps(base, loc)).filter(Boolean);
 }
@@ -7625,20 +7677,30 @@ async function walkSquarespace(base, robots, state) {
 /** The site reader's not-a-store: detection reads it as "site does not answer". */
 class NotAStore extends CliRefusal {}
 
-async function siteWalk(base, hint, bounds) {
-  const robots = await loadRobots(base);
+/** `prior`, when passed, is the byte budget `init <store>` already spent on detection (robots.txt
+ *  once, then the Store API probe). The walk continues that count, reuses the robots text, and
+ *  charges discovery as well, so the whole run stays within maxBytes. Without `prior` the walk
+ *  reads robots.txt itself and discovery stays uncounted, as `init --from site` specifies. */
+async function siteWalk(base, hint, bounds, prior = null) {
+  const robots = prior && Object.hasOwn(prior, 'robots') ? prior.robots : await loadRobots(base);
   const state = { rows: [], pages: 0, products: 0, bytes: 0, stopped: null, next: null, partial: null, ...bounds };
+  if (prior) state.bytes = prior.spent;
+  const ledger = prior ? state : null;
   if (hint === 'squarespace') await walkSquarespace(base, robots, state);
   else {
     const urls = hint === 'wix' ? await wixProductUrls(base, robots)
       : hint === 'base' ? await baseItemUrls(base, robots)
-        : await genericProductUrls(base, robots);
+        : await genericProductUrls(base, robots, ledger);
     for (const url of urls) {
       const keep = await takeProduct(base, url, state, robots);
       if (!keep || state.stopped) break;
     }
   }
   if (state.products === 0) {
+    if (prior && (state.stopped === 'byte-bound' || state.bytes >= state.maxBytes)) {
+      throw new CliRefusal(`Stopped at the byte bound (--max-bytes ${state.maxBytes}, ${state.bytes} bytes read): `
+        + 'the store was not read further. Nothing was written.');
+    }
     throw new NotAStore('not-a-store: no product sitemap and no Product JSON-LD. Nothing was written.');
   }
   return state;
@@ -7649,20 +7711,29 @@ async function siteWalk(base, hint, bounds) {
 const STORE_DEFAULT_BOUNDS = Object.freeze({ maxPages: WOO_DEFAULT_MAX_PAGES, maxBytes: WOO_DEFAULT_MAX_BYTES });
 
 /** The sources `init <store>` detects, tried in this order; the first that answers is read. Each
- *  detect(base, { bounds, found }) reads the store exactly as its forced flag's reader does and
+ *  detect(base, { bounds, found, budget }) reads the store as its forced flag's reader does and
  *  resolves true when the source answers, leaving what it read in `found` under its name, so the
- *  reader asks nothing twice. A next source (a products.json feed, say) is one more entry here and
- *  one more reader in STORE_READERS. Refusals other than "not this source" (robots.txt) stand. */
+ *  reader asks nothing twice. `budget` is one byte count shared by every detector in a run:
+ *  robots.txt is read once, and a probe that spends it stops the run. A next source (a
+ *  products.json feed, say) is one more entry here and one more reader in STORE_READERS.
+ *  Refusals other than "not this source" (robots.txt, the byte bound) stand. */
 export const SOURCE_DETECTORS = [
-  { name: WOO_FROM, async detect(base, { bounds = STORE_DEFAULT_BOUNDS, found = null } = {}) {
-    const got = await wooFirstPage(base, bounds.maxBytes);
-    if (got.failed) return false;
+  { name: WOO_FROM, async detect(base, { bounds = STORE_DEFAULT_BOUNDS, found = null, budget = null } = {}) {
+    const got = await wooFirstPage(base, bounds.maxBytes, budget);
+    if (got.failed) {
+      if (budget && budget.spent >= budget.maxBytes) {
+        throw new CliRefusal(`Stopped at the byte bound (--max-bytes ${budget.maxBytes}, ${budget.spent} bytes read): `
+          + 'the store was not read further. Nothing was written.');
+      }
+      return false;
+    }
     found?.set(WOO_FROM, got);
     return true;
   } },
-  { name: SITE_FROM, async detect(base, { bounds = STORE_DEFAULT_BOUNDS, found = null } = {}) {
+  { name: SITE_FROM, async detect(base, { bounds = STORE_DEFAULT_BOUNDS, found = null, budget = null } = {}) {
     let walk;
-    try { walk = await siteWalk(base, null, bounds); } catch (e) {
+    const prior = budget && Object.hasOwn(budget, 'robots') ? { robots: budget.robots, spent: budget.spent } : null;
+    try { walk = await siteWalk(base, null, bounds, prior); } catch (e) {
       if (e instanceof NotAStore) return false;
       throw e;
     }
@@ -7676,10 +7747,11 @@ const STORE_READERS = { [WOO_FROM]: initFromWoo, [SITE_FROM]: initFromSite };
 /** The first answering detector's name and what it read, or a refusal naming the store. */
 async function detectIn(base, bounds) {
   const found = new Map();
+  const budget = { maxBytes: bounds.maxBytes, spent: 0 };
   const tried = [];
   for (const detector of SOURCE_DETECTORS) {
     tried.push(detector.name);
-    if (await detector.detect(base, { bounds, found })) return { name: detector.name, found: found.get(detector.name) ?? null };
+    if (await detector.detect(base, { bounds, found, budget })) return { name: detector.name, found: found.get(detector.name) ?? null };
   }
   throw new CliRefusal(`no source detected at ${base.href}: none of ${tried.join(', ')} answered (the WooCommerce Store API `
     + `at ${WOO_PRODUCTS_PATH}, then Product JSON-LD on the store's own pages). Check the URL is the shop's own address. `
