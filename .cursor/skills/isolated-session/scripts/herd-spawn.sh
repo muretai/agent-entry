@@ -74,7 +74,8 @@
 #               It is the spawn's own code, run with herdr left out: herdr is never
 #               found or asked anything (so it need not be installed or up), no tab is
 #               made, no agent started, nothing typed. It holds no worker state: no
-#               worktree is opened or handed over (--open-worktree is refused), no owner
+#               worktree is opened or handed over (--open-worktree without --cwd is
+#               refused; with --cwd it only selects the brief text), no owner
 #               key is judged against live workers, and no .roles, .repos, .keys or
 #               .resume record is written or removed. The wall profile carries no
 #               deny-connect line for herdr's socket, which only herdr can name. Every
@@ -247,7 +248,12 @@
 #               It is the coordinator's sanctioned way to open a SOLO worker's worktree: its
 #               seat may not set ISOLATED_SESSION_OWNER itself. With --cwd, or with a --var
 #               WORKTREE/BRANCH/PRIMARY of the caller's, it is exit 2: two answers to one
-#               question. A refused ensure-worktree is exit 2 with its last words, no tab.
+#               question. A --render may pass --cwd with it: --cwd is the worktree already
+#               open, nothing is opened, and the brief is filled from that directory.
+#               When a worktree was opened, or a render names one this way, a test-author
+#               brief's step 2 runs assert-head.sh with that branch and that worktree
+#               and tells the worker never to probe the primary .git. Other briefs stay
+#               as rendered. A refused ensure-worktree is exit 2 with its last words, no tab.
 #   --repo PRIMARY
 #               with --open-worktree only (alone it is exit 2): open the worktree in THAT
 #               repository instead of this script's -- for the coordinator seat, which runs
@@ -427,12 +433,12 @@ ledger_line() {
   local mod="$here/run_ledger.py" event="$1" who="$2"
   shift 2
   [[ -f "$mod" && ! -L "$mod" ]] || return 0
-  python3 -I "$mod" "${herd_dir:-${HERD_DIR:-${HOME:-}/.cache/muretai-herd}}" "$event" "" "$who" "$@" \
+  python3 -I "$mod" "${herd_dir:-${HERD_DIR:-${HOME:-}/.cache/muretai-herd}}" "$event" "${intake_id:-}" "$who" "$@" \
     >/dev/null 2>&1 || true
 }
 
 usage() {
-  echo "usage: herd-spawn.sh <name> <brief-file> [--cwd DIR] [--profile worker|reviewer|weekly|coordinator|release] [--env K=V ...] [--var KEY=VALUE ...] [--allow 'Bash(...)' ...] [--muretai-agent NAME] [--role solo] [--p0] [--lane fast] [--open-worktree TITLE [--base REV]]" >&2
+  echo "usage: herd-spawn.sh <name> <brief-file> [--cwd DIR] [--profile worker|reviewer|weekly|coordinator|release] [--env K=V ...] [--var KEY=VALUE ...] [--allow 'Bash(...)' ...] [--muretai-agent NAME] [--role solo] [--p0] [--lane fast] [--intake-id ID] [--intake-repo REPO] [--open-worktree TITLE [--base REV]]" >&2
   echo "       HERD_SPAWN_HARNESS=codex requires --cwd <worktree>: a codex session's writable sandbox root IS the directory it opens in, and no session guard runs on that harness" >&2
   echo "       HERD_SPAWN_HARNESS=grok requires --cwd <worktree>: grok reads its instruction files from the directory it opens, and a primary checkout is refused" >&2
   echo "       herd-spawn.sh --resume <name>   (a spawn that stopped at a first-run prompt, once the prompt is answered; same HERD_DIR)" >&2
@@ -1174,8 +1180,10 @@ deliver_brief() {
   # the harness and the model are on the line, so a landing's REVIEW= and its note can say
   # which eyes read the diff; and whether the worker is walled, with the network said
   # plainly (wall v1 leaves it open), so nobody reads "walled" as "offline"
-  ledger_line spawn "$name" "role=${profile:-worker}" "harness=$harness" "model=${model:-default}" \
-    "attempt=$(( ${order_index:-0} + 1 ))"
+  local spawn_keys=("role=${profile:-worker}" "harness=$harness" "model=${model:-default}"
+    "attempt=$(( ${order_index:-0} + 1 ))")
+  [[ -n "${intake_repo:-}" ]] && spawn_keys+=("repo=$intake_repo")
+  ledger_line spawn "$name" "${spawn_keys[@]}"
   echo "worker=${name} pane=${pane} tab=${tab_id} report=${report} harness=${harness} model=${model:-default} wall=${wall_state} egress=open"
 }
 
@@ -1834,15 +1842,26 @@ role=""
 cwd_given=no
 open_title=""
 open_given=no
+render_opened=no
 open_repo=""
 repo_given=no
 open_base=""
 base_given=no
 p0=no
 lane=""
+intake_id=""
+intake_id_given=no
+intake_repo=""
+intake_repo_given=no
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --cwd) [[ $# -ge 2 ]] || usage; cwd="$2"; cwd_given=yes; shift 2 ;;
+    # The intake this spawn serves and the repository it is for (the intake's `repo:`
+    # header, a basename or an absolute path): written as intake_id and repo on every spawn
+    # line of runs.jsonl. Omitted, the spawn goes on as before (coordinator ruling on intake
+    # 20261101T072343Z); given empty, it is refused below, before any agent starts.
+    --intake-id) [[ $# -ge 2 ]] || usage; intake_id="$2"; intake_id_given=yes; shift 2 ;;
+    --intake-repo) [[ $# -ge 2 ]] || usage; intake_repo="$2"; intake_repo_given=yes; shift 2 ;;
     # A priority-0 spawn. The capacity check below never holds one. No value.
     --p0) p0=yes; shift ;;
     --lane)
@@ -1899,6 +1918,16 @@ while [[ $# -gt 0 ]]; do
     *) echo "herd-spawn: unknown argument: $1" >&2; usage ;;
   esac
 done
+# An explicitly empty intake id or repo is refused here, before herdr is asked anything:
+# a spawn line without them could not be joined to its intake.
+if [[ "$intake_id_given" == yes && -z "$intake_id" ]]; then
+  echo "herd-spawn: --intake-id is empty: the spawn line needs its intake_id; the worker ${name} was not started" >&2
+  exit 2
+fi
+if [[ "$intake_repo_given" == yes && -z "$intake_repo" ]]; then
+  echo "herd-spawn: --intake-repo is empty: the spawn line needs its repo; the worker ${name} was not started" >&2
+  exit 2
+fi
 if [[ -n "$muretai_agent" ]]; then
   case "$muretai_agent" in
     *[!a-z0-9_-]*|[!a-z]*)
@@ -1975,8 +2004,15 @@ if [[ "$open_given" == "yes" ]]; then
     exit 2
   fi
   if [[ "$cwd_given" == "yes" ]]; then
-    echo "herd-spawn: --open-worktree and --cwd both say where the worker opens; pass one; the worker ${name} was not started" >&2
-    exit 2
+    if [[ "$render" == "yes" ]]; then
+      # A render holds nothing. --cwd is the worktree already open and --open-worktree
+      # only selects the brief text. The branch is HEAD there. ensure-worktree.sh does
+      # not run, and no hold is taken.
+      render_opened=yes
+    else
+      echo "herd-spawn: --open-worktree and --cwd both say where the worker opens; pass one; the worker ${name} was not started" >&2
+      exit 2
+    fi
   fi
   for kv in ${vars[@]+"${vars[@]}"}; do
     case "${kv%%=*}" in
@@ -3299,7 +3335,7 @@ PY
 fi
 # A render holds no worker state, and opening a worktree takes a hold on it. Judged here,
 # after the cursor test author's own open was decided and before anything is opened.
-if [[ "$render" == "yes" && "$open_given" == "yes" ]]; then
+if [[ "$render" == "yes" && "$open_given" == "yes" && "$render_opened" != "yes" ]]; then
   echo "herd-spawn: --render takes --cwd <worktree>, never --open-worktree: opening the worktree would take a hold, and a render holds no worker state; nothing was rendered for ${name}" >&2
   exit 2
 fi
@@ -3389,7 +3425,7 @@ fi
 # the title reaches it as one argument and is never evaluated.
 # With --repo (judged above) the primary is that repository's and so is the script: its own
 # ensure-worktree.sh, from its own primary.
-if [[ "$open_given" == "yes" ]]; then
+if [[ "$open_given" == "yes" && "$render_opened" != "yes" ]]; then
   if [[ -n "$open_repo_primary" ]]; then
     open_primary="$open_repo_primary"
     open_ensure="$repo_ensure"
@@ -3465,6 +3501,19 @@ if [[ "$open_given" == "yes" ]]; then
   done
   [[ "$open_has_title" == "yes" ]] || vars+=("TITLE=${open_title}")
   echo "herd-spawn: opened ${open_wt} on ${open_branch} for ${name} (owner key $(iso_safe_text "$open_key" || echo '?'))" >&2
+fi
+# --render --cwd --open-worktree: the worktree is already open at --cwd, byte for byte.
+# HEAD's branch name is what the brief's assert-head.sh step names. WORKTREE and BRANCH
+# are filled the way a real open fills them. PRIMARY stays the cwd's own primary, the
+# same value a render without --open-worktree writes, so other briefs stay byte-identical.
+if [[ "$render_opened" == "yes" ]]; then
+  open_wt="$cwd"
+  open_branch="$(git -C "$open_wt" rev-parse --abbrev-ref HEAD 2>/dev/null)" || open_branch=""
+  if [[ -z "$open_branch" ]]; then
+    echo "herd-spawn: --open-worktree render could not read the branch of ${open_wt}; nothing was rendered for ${name}" >&2
+    exit 2
+  fi
+  vars=("WORKTREE=${open_wt}" "BRANCH=${open_branch}" ${vars[@]+"${vars[@]}"})
 fi
 if [[ -z "$cwd" ]]; then
   cwd="$(iso_primary_of "$here")" || {
@@ -6092,6 +6141,64 @@ except OSError as e:
           + (e.strerror or type(e).__name__) + "); the worker was not started", file=sys.stderr)
     sys.exit(2)
 PY
+elif [[ "$open_given" == "yes" ]]; then
+  # A spawn that opened a worktree, or a render of one already open, rewrites only the
+  # test-author step 2. fast.md and implementer.md are left as the filler wrote them.
+  opened_first=""
+  IFS= read -r opened_first < "$bfile" || true
+  case "$opened_first" in
+    "You are a Muretai test-author session"*)
+      python3 -I - "$rendered" "$bfile" "$open_wt" "$open_branch" <<'PY' || exit $?
+import os, re, sys
+rendered, bfile, wt, branch = sys.argv[1:5]
+
+
+def shell_quote(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+probe = "never list, stat, test or write anything under the primary .git"
+repl = ("2. `bash .cursor/skills/isolated-session/scripts/assert-head.sh %s %s` "
+        "and %s." % (shell_quote(branch), shell_quote(wt), probe))
+pat = re.compile(r"^2\. `?bash [^\n]*ensure-worktree\.sh[^\n]*$", re.M)
+
+
+def rewrite(text):
+    text, n = pat.subn(repl, text, count=1)
+    if n != 1:
+        return None
+    if not text.endswith("\n"):
+        text += "\n"
+    return text
+
+
+def write(path, text):
+    fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+try:
+    with open(bfile, encoding="utf-8") as f:
+        out = rewrite(f.read())
+except (OSError, UnicodeDecodeError) as e:
+    print("herd-spawn: the rendered brief could not be read (" + type(e).__name__
+          + "); the worker was not started", file=sys.stderr)
+    sys.exit(2)
+if out is None:
+    print("herd-spawn: the rendered test-author brief has no step-2 ensure-worktree.sh "
+          "line to replace with assert-head.sh; the worker was not started", file=sys.stderr)
+    sys.exit(2)
+try:
+    write(rendered, out)
+    write(bfile, out)
+except OSError as e:
+    print("herd-spawn: the rendered brief could not be rewritten ("
+          + (e.strerror or type(e).__name__) + "); the worker was not started", file=sys.stderr)
+    sys.exit(2)
+PY
+      ;;
+  esac
 fi
 # brief.md is this spawn's own from here: a failure below where nothing was typed into the
 # pane removes it (a refusal above never reaches this line, and leaves the file that was
@@ -7237,6 +7344,37 @@ def cursor_worker_commit_deny(herd, name):
     ]
 
 
+# Off since ISSUE 20261103T214259Z: once a328b705 wrote these rules into a cursor
+# pane's cli.json, every git commit in a walled cursor pane was refused. The
+# function stays, unused, until a cursor pane proves a commit under its rules.
+CURSOR_PRIMARY_GIT_PROBE_DENY_ON = False
+
+
+def cursor_primary_git_probe_deny(primary):
+    """Deny probes of this spawn's primary .git from a cursor pane.
+
+    test -w and test -O are denied as their own tokens, so a path that merely
+    contains -w is not a probe. stat, ls and mkdir are denied
+    only when an argument is that .git or a path under it. The path is the one
+    iso_primary_of reads: the caller passes it as one string, so a space or a
+    bracket stays inside the path and is not a glob. A sibling whose name only
+    extends the primary, the primary's .gitignore, the worker's own worktree
+    and any git command are not named here."""
+    if not primary:
+        return []
+    git = primary + "/.git"
+    rules = [
+        "Shell(test:-w *)",
+        "Shell(test:* -w *)",
+        "Shell(test:-O *)",
+        "Shell(test:* -O *)",
+    ]
+    for base in ("stat", "ls", "mkdir"):
+        rules.append("Shell(" + base + ":*" + git + ")")
+        rules.append("Shell(" + base + ":*" + git + "/*)")
+    return rules
+
+
 def cursor_reviewer_commit_denies(deny):
     """Step 7 of the reviewer brief, with the slug and the count filled in.
 
@@ -7570,6 +7708,11 @@ if os.environ.get("HS_HARNESS") == "cursor" and os.environ.get("HS_PROFILE") != 
         cursor_allow = cursor_drop_receipt_allows(cursor_allow)
     if primary:
         cursor_deny.append("Read(" + os.path.join(primary, "keys") + "/**)")
+        # Cursor only. Claude's permissions.json is written above and stays the
+        # shared list. HS_PRIMARY is one quoted value, so the path below is the
+        # same string iso_primary_of printed, spaces and brackets included.
+        if CURSOR_PRIMARY_GIT_PROBE_DENY_ON:
+            cursor_deny.extend(cursor_primary_git_probe_deny(primary))
     cursor_allow = cursor_allow_without_banned(cursor_allow)
     # Reviewer cursor render only. The worker render (test author and
     # implementer) keeps the broad commit deny and its two report Writes.

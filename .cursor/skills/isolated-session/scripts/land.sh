@@ -8,6 +8,8 @@
 #
 #   land.sh <run.json>                 do the landing
 #   land.sh --repair <run.json> <why>  ask the worker once to fix the branch
+# Any other argument is a test option and is refused by name. Under gate github the
+# GitHub test check is the landing's test run, so no test option is taken.
 #
 # A landing that fails asks that worker once, then stops. A person lands only
 # after that attempt. This program never tells anyone to run finish-worktree.sh.
@@ -577,6 +579,9 @@ GATE_ENTRIES = ("tools/ledger.py", "tools/sec_lint.py", "tools/invariants.py",
 # finish-worktree.sh's `gate_tools` -- tests/test_gate_closure_lists.py holds the two
 # to each other (ISSUE(gate-copy-lacks-the-ledgers-import)).
 GATE_CLOSURE = ("company/ops/backlog_to_core.py",)
+# The gate's config reader, which finish-worktree.sh runs out of the gate copy (gate_config):
+# not imported by any gate program, so the closure walk never reaches it.
+GATE_CONFIG = ("appl/config.py",)
 
 
 def imported_names(path, source=None):
@@ -930,6 +935,25 @@ def extract(common, gate_sha, wall, skip=(), need_skill=True):
                 return bail("BASE's %s is not a regular file" % path)
             if not put(path, fields[0].decode()):
                 return bail("BASE's %s could not be read" % path)
+    # BASE's gate config: finish-worktree.sh reads the gate word, lands-locally and the
+    # hand-off's [tests] command out of <copy>/appl/config.py, so a copy without it landed a
+    # gate = "github" branch locally. Copied when BASE carries it as a regular blob; absent
+    # (a consumer) is fine, anything but a regular blob is refused by name.
+    for path in GATE_CONFIG:
+        rec = subprocess.run(["git", "--git-dir", common, "ls-tree", "-z", "--full-tree",
+                              gate_sha, "--", path], capture_output=True)
+        if rec.returncode != 0:
+            return bail("BASE's tree could not be listed at %s" % path)
+        head, _, rawpath = rec.stdout.rstrip(b"\0").partition(b"\t")
+        if rawpath.decode("utf-8", "replace") != path:
+            continue
+        fields = head.split()
+        if (len(fields) != 3 or fields[1] != b"blob"
+                or fields[0].decode() not in ("100644", "100755")):
+            return bail("BASE's %s is not a regular file" % path)
+        if not os.path.exists(os.path.join(dest, *path.split("/"))):
+            if not put(path, fields[0].decode()):
+                return bail("BASE's %s could not be read" % path)
     try:
         seal(dest)
     except OSError as e:
@@ -1132,6 +1156,11 @@ def main(argv):
             say("land: a repair needs the spawn record and a reason")
             return 1
         return repair(argv[2], argv[3])
+    # A test option (--affected, a tests/ path, anything after the record) is refused
+    # by name before a lock, a test, or a push. --repair is the only other form.
+    if len(argv) > 2:
+        say("land: refusing %s: a test option is not taken" % " ".join(argv[2:]))
+        return 1
     runjson = runjson_of(argv)
     if not runjson or os.path.islink(runjson) or not os.path.isfile(runjson):
         say("land: the spawn record is not a regular file")
@@ -1376,7 +1405,7 @@ def main(argv):
     sys.stdout.write(landed.stdout)
     if landed.stderr:
         sys.stderr.write(landed.stderr)
-    merged, kind, review = "no", "", ""
+    merged, kind, review, handed = "no", "", "", ""
     saw_merged = False
     for line in landed.stdout.splitlines():
         if line.startswith("MERGED="):
@@ -1386,6 +1415,15 @@ def main(argv):
             kind = line.split("=", 1)[1].strip()
         elif line.startswith("REVIEW="):
             review = line.split("=", 1)[1].strip().split(" ", 1)[0]
+        elif line.startswith("HANDED=github"):
+            handed = line.split("=", 1)[1].strip()
+    # A gate = "github" hand-off is a success that leaves BASE alone: finish printed one
+    # HANDED=github line and no MERGED=yes, and exited 0. Nothing landed here, so there is
+    # no landing receipt, no main verdict and no repair ask.
+    if landed.returncode == 0 and handed and merged != "yes":
+        log(wall, "land: %s handed off: %s; %s was not merged into" % (branch, handed, base_ref))
+        emit_runner_stderr(runner_err)
+        return 0
     if landed.returncode != 0 or merged != "yes":
         # finish already printed MERGED=no with the reason. A second one makes the
         # receipt look like two refusals. Keep land's own line and the repair ask.

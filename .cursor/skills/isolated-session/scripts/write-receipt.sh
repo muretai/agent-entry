@@ -118,51 +118,145 @@ notes="$(cat -- "$resolved")"
 # The pinned install's audit_scope.py into $audit. Returns 1, with the reason in $why,
 # when there is no pin to follow or its install is absent; refuses outright on a pin or
 # install that is there but wrong.
+#
+# <v> is taken in this order (intake 20261101T103611Z):
+#   1. a top-level `version = "X.Y.Z"` pin;
+#   2. `version = "latest"`: the numerically highest ~/.appl/X.Y.Z that is a real
+#      directory, not a symlink (latest_version);
+#   3. no pin at all (no appl.toml, or no top-level version line): the vendored tag of
+#      the cwd-relative .cursor/skills/isolated-session/VENDOR.json (vendor_version).
+# Nothing under the repository, the worktree or the branch under review is ever taken as
+# the audit tool on these paths: only ~/.appl/<v>/tools/audit_scope.py, with HOME absolute.
+
+# The highest ~/.appl/X.Y.Z into $ver. Each part is 1-9 digits, compared as base-10
+# numbers, so 0.1.10 beats 0.1.9. Symlinks, files and any other name are skipped.
+latest_version() {
+  local appl="$HOME/.appl" cand name a b c best="" ba=0 bb=0 bc=0
+  if [[ -L "$appl" ]]; then
+    refuse ".appl is a symlink, so the latest APPL install is not looked for"
+  fi
+  if [[ ! -d "$appl" ]]; then
+    why="appl.toml pins version \"latest\" but there is no .appl directory under HOME; run: appl install"
+    return 1
+  fi
+  for cand in "$appl"/*; do
+    name="${cand##*/}"
+    [[ "$name" =~ ^([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})$ ]] || continue
+    if [[ -L "$cand" || ! -d "$cand" ]]; then
+      continue
+    fi
+    a=$((10#${BASH_REMATCH[1]}))
+    b=$((10#${BASH_REMATCH[2]}))
+    c=$((10#${BASH_REMATCH[3]}))
+    if [[ -z "$best" ]] || (( a > ba || (a == ba && b > bb) || (a == ba && b == bb && c > bc) )); then
+      best="$name"
+      ba=$a
+      bb=$b
+      bc=$c
+    fi
+  done
+  if [[ -z "$best" ]]; then
+    why="appl.toml pins version \"latest\" but .appl holds no installed X.Y.Z directory; run: appl install"
+    return 1
+  fi
+  ver="$best"
+}
+
+# The vendored tag of .cursor/skills/isolated-session/VENDOR.json (cwd-relative) into
+# $ver: a regular file, reached with no symlink step, holding a JSON object whose "from"
+# is "appl" and whose "ref" is vX.Y.Z. The file is parsed as data by python's json module.
+vendor_version() {
+  local vj=".cursor/skills/isolated-session/VENDOR.json" step out
+  if [[ ! -e "$vj" && ! -L "$vj" ]]; then
+    why="this repository has no tools/audit_scope.py, its appl.toml pins no version, and it has no $vj to find an installed one by"
+    return 1
+  fi
+  for step in .cursor .cursor/skills .cursor/skills/isolated-session "$vj"; do
+    if [[ -L "$step" ]]; then
+      refuse "$vj is reached through a symlink ($step)"
+    fi
+  done
+  if [[ ! -f "$vj" ]]; then
+    refuse "$vj is not a regular file"
+  fi
+  out="$(python3 -I -c '
+import json, re, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        d = json.load(f)
+except (OSError, ValueError) as e:
+    sys.stderr.write("unparsable: %s\n" % type(e).__name__)
+    sys.exit(3)
+if not isinstance(d, dict):
+    sys.stderr.write("not a JSON object\n")
+    sys.exit(3)
+if d.get("from") != "appl":
+    sys.stderr.write("its from is not appl\n")
+    sys.exit(3)
+ref = d.get("ref")
+if not isinstance(ref, str) or not re.fullmatch(r"v[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}", ref):
+    sys.stderr.write("its ref is not a vX.Y.Z tag\n")
+    sys.exit(3)
+sys.stdout.write(ref[1:])
+' "$vj" 2>&1)" || refuse "$vj names no APPL vX.Y.Z tag: ${out//$'\n'/ }"
+  if [[ ! "$out" =~ ^[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}$ ]]; then
+    refuse "$vj names no APPL vX.Y.Z tag"
+  fi
+  ver="$out"
+}
+
 pinned_audit() {
-  if [[ ! -e appl.toml && ! -L appl.toml ]]; then
-    why="this repository has no tools/audit_scope.py and no appl.toml pin to find an installed one by"
+  local pin="" pin_seen=no line compact ver="" install
+  if [[ -e appl.toml || -L appl.toml ]]; then
+    if [[ -L appl.toml || ! -f appl.toml ]]; then
+      refuse "appl.toml is a symlink or not a regular file"
+    fi
+    if [[ ! -r appl.toml ]]; then
+      refuse "appl.toml is unreadable"
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      case "$line" in
+        ''|\#*) continue ;;
+        [[:space:]]\#*) continue ;;
+      esac
+      compact="$(printf '%s' "$line" | tr -d ' \t')"
+      case "$compact" in
+        \[*) break ;;
+        version=*)
+          pin="${compact#version=}"
+          pin_seen=yes
+          break
+          ;;
+      esac
+    done < appl.toml || refuse "appl.toml could not be read"
+  fi
+  if [[ "$pin_seen" == "yes" && "$pin" != '"latest"' && ! "$pin" =~ ^\"[0-9]+\.[0-9]+\.[0-9]+\"$ ]]; then
+    why="the appl.toml version pin is not a plain X.Y.Z version string or \"latest\""
     return 1
   fi
-  if [[ -L appl.toml || ! -f appl.toml ]]; then
-    refuse "appl.toml is a symlink or not a regular file"
-  fi
-  if [[ ! -r appl.toml ]]; then
-    refuse "appl.toml is unreadable"
-  fi
-  local pin="" pin_seen=no line compact ver install
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    case "$line" in
-      ''|\#*) continue ;;
-      [[:space:]]\#*) continue ;;
-    esac
-    compact="$(printf '%s' "$line" | tr -d ' \t')"
-    case "$compact" in
-      \[*) break ;;
-      version=*)
-        pin="${compact#version=}"
-        pin_seen=yes
-        break
-        ;;
-    esac
-  done < appl.toml || refuse "appl.toml could not be read"
   if [[ "$pin_seen" != "yes" ]]; then
-    why="this repository has no tools/audit_scope.py and its appl.toml pins no version"
-    return 1
+    vendor_version || return 1
   fi
-  if [[ ! "$pin" =~ ^\"[0-9]+\.[0-9]+\.[0-9]+\"$ ]]; then
-    why="the appl.toml version pin is not a plain X.Y.Z version string"
-    return 1
-  fi
-  ver="${pin#\"}"
-  ver="${ver%\"}"
   if [[ -z "${HOME-}" || "$HOME" != /* ]]; then
-    why="HOME is unset or not absolute, so .appl/${ver} is unknown"
+    why="HOME is unset or not absolute, so the APPL install under .appl is unknown"
     return 1
   fi
-  install="$HOME/.appl/$ver"
+  case "$HOME/" in
+    */../*|*/./*)
+      why="HOME has a dot step, so the APPL install under .appl is unknown"
+      return 1
+      ;;
+  esac
   if [[ -L "$HOME/.appl" ]]; then
     refuse ".appl is a symlink"
   fi
+  if [[ "$pin" == '"latest"' ]]; then
+    latest_version || return 1
+  elif [[ "$pin_seen" == "yes" ]]; then
+    ver="${pin#\"}"
+    ver="${ver%\"}"
+  fi
+  install="$HOME/.appl/$ver"
   if [[ -L "$install" ]]; then
     refuse ".appl/${ver} is a symlink"
   fi
@@ -176,6 +270,9 @@ pinned_audit() {
   audit="$install/tools/audit_scope.py"
   if [[ -L "$audit" || ! -f "$audit" ]]; then
     refuse ".appl/${ver} has no regular tools/audit_scope.py"
+  fi
+  if [[ "$pin" == '"latest"' ]]; then
+    receipt_from_latest="$ver"
   fi
 }
 
@@ -211,10 +308,16 @@ spawner_audit() {
 
 audit="tools/audit_scope.py"
 why=""
+receipt_from_latest=""
 if [[ ! -f "$audit" ]]; then
   if ! pinned_audit; then
     spawner_audit || refuse "$why"
   fi
+fi
+
+# A latest pin names the install this receipt actually ran, so the landing stays reproducible.
+if [[ -n "$receipt_from_latest" ]]; then
+  printf 'APPL=%s resolved from latest\n' "$receipt_from_latest"
 fi
 
 exec python3 -I "$audit" write-receipt \
