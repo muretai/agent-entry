@@ -2,9 +2,9 @@
   "_": "Written by .cursor/skills/isolated-session/scripts/vendor.sh pull --ref; never edit the copies by hand. `vendor.sh check` holds them to these digests, and to the closure of what the scripts reference, with no home checkout present. The skill's home is APPL; edit it there, tag a release, and pull again.",
   "from": "appl",
   "repository": "private",
-  "ref": "v0.1.10",
-  "commit": "3a26fee5acc3f4cfe1d81f1bbb6fe68f21eb4e60",
-  "date": "2026-11-01",
+  "ref": "main",
+  "commit": "037c1df8cf79da4d2df00a27bdcce417f90ff07f",
+  "date": "2026-11-04",
   "files": {
     ".cursor/skills/isolated-session/SKILL.md": {
       "sha256": "14ffd870525cb910027e192a613a489abc1d253a31925c8b664800b487623cac",
@@ -27,7 +27,7 @@
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/finish-worktree.sh": {
-      "sha256": "bcaae8023e2c0bbbb5cd98cd6cfd8810d4a71235436c2a0e5fef483af3cfeb3a",
+      "sha256": "a091cd257a84b347340bd18cefb47871c3175742fbfb7f2f6e91add015decdb5",
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/landing-lease.sh": {
@@ -35,7 +35,7 @@
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/landing-lease.py": {
-      "sha256": "70ee57b26adc7e6d54ae47dd5ee9e89d3e089a2dea623bdd8c2eb1628c212dae",
+      "sha256": "7186d077a9e92356a7eb9eda2538afd860033ef132a2e2103aa197726604ecc3",
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/lease_core.py": {
@@ -43,7 +43,7 @@
       "mode": "100644"
     },
     ".cursor/skills/isolated-session/scripts/appl_config.py": {
-      "sha256": "48d57f70092a61081b50afdb3e6006bce8581b50de541d55b9768e301c1273f3",
+      "sha256": "d5e5f2f1afb20d23d8067fa802a32fe39ad77a9ee2c370ea9ef4034bfd85e118",
       "mode": "100644"
     },
     ".cursor/skills/isolated-session/scripts/dispatch-init.sh": {
@@ -59,11 +59,11 @@
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/vendor.sh": {
-      "sha256": "625c9f6b7268ed5425658bad89e2f9b837f3f3fc58c325948e54966f61dcf8c7",
+      "sha256": "11f10701766a52e1ede88f4b0d158b8d546283da8180b34bfec326d8e126ec78",
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/herd-spawn.sh": {
-      "sha256": "85efe427120edc667748287021f110407a89524760b5f520f245cc5d6949488b",
+      "sha256": "b358fbc89ec5bbbf8a4bdbde558ac7ba6ac63fee2a6dea78f6c66214357af7c1",
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/grok_rules.py": {
@@ -83,7 +83,7 @@
       "mode": "100644"
     },
     ".cursor/skills/isolated-session/scripts/write-receipt.sh": {
-      "sha256": "f9226d410e4572b632797b5c3290894ddd59eecbbec9ebdfadacbe08f5306d5b",
+      "sha256": "6ffc87fb75e1aaf1652460bc1f2c8930528d3f918192a4a7e6bf092cd92dc360",
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/write-weekly-receipt.sh": {
@@ -127,7 +127,7 @@
       "mode": "100644"
     },
     ".cursor/skills/isolated-session/scripts/land.sh": {
-      "sha256": "9c8355314a2884bb2f254b1692761ef1b396f06b7c7640cb26815b7b5d8bd371",
+      "sha256": "c991f203126edec9c65646e70e6f16d9b75fb29cbbe72fa42dc6751ccd5b3e7c",
       "mode": "100755"
     },
     ".cursor/skills/isolated-session/scripts/walls/darwin.sh": {
@@ -227,7 +227,7 @@
       "mode": "100644"
     },
     ".cursor/skills/isolated-session/scripts/run_ledger.py": {
-      "sha256": "9756ede04e2c041d3d5546880b71e10bf9a956e03ed5434e693a2ff5f3df27f2",
+      "sha256": "5f8f526fe45a4f618f3880e8d59031d610d86ad948acc2e487552a7e72f2bea6",
       "mode": "100644"
     },
     ".cursor/skills/isolated-session/scripts/trust/claude.sh": {
@@ -271,7 +271,7 @@
       "mode": "100644"
     },
     "tests/test_isolated_session.py": {
-      "sha256": "14b44b394609b63bfb54c2cdfc14f81ef736be7e3f6e841ddcf5edf51721d2f4",
+      "sha256": "31ceda87a5214d0ed1eaa05a2ecee834d060528e03702e54025be99ccea56dfa",
       "mode": "100644"
     }
   }

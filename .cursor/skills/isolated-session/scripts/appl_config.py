@@ -19,16 +19,23 @@ only (Python 3.9+).
     agent        = "dispatch-mac-a"
     herd_dir     = "~/.cache/muretai-herd"
     dispatch_dir = "~/.muretai/dispatch"
+    [backlog]
+    path      = "docs/BACKLOG.md"   # each unset key: BACKLOG_DEFAULTS; a relative path inside
+                                    # the repository: never empty, absolute, .. or NUL
+    section   = "## Next"           # the heading the next items sit under; never empty
+    max_items = 5                   # a bare TOML integer above zero, the one non-string value
 
     cfg = load(path)    # a missing file is the defaults; a refused one raises ConfigError
     names = muretai(path)
                         # the four [muretai] values as written (no ~ expansion); never
                         # raises: a missing, unreadable or refused appl.toml gives
                         # MURETAI_DEFAULTS. No consumer reads them yet.
+    cfg.backlog         # the three [backlog] settings, each the file's or its default. No
+                        # consumer reads them yet.
 
 The subset read: blank lines, `#` comments, `[section]` headers, and `key = "value"` lines
 whose value is a basic ("...") or literal ('...') one-line string, optionally followed by a
-comment. Anything else -- an unknown section or key, a dotted or quoted key, a duplicate,
+comment -- or, for [backlog] max_items alone, a bare decimal integer. Anything else -- an unknown section or key, a dotted or quoted key, a duplicate,
 a bare or multi-line value, a backend word lease_core does not build -- is refused, naming
 it. Values are data: nothing read here is ever evaluated.
 
@@ -76,6 +83,7 @@ SCHEMA = {
     "ledger": ("command",),
     "lease": ("backend",),
     "muretai": ("coordinator", "agent", "herd_dir", "dispatch_dir"),
+    "backlog": ("path", "section", "max_items"),
 }
 MURETAI_DEFAULTS = {
     "coordinator": "muretai-coordinator",
@@ -83,6 +91,14 @@ MURETAI_DEFAULTS = {
     "herd_dir": "~/.cache/muretai-herd",
     "dispatch_dir": "~/.muretai/dispatch",
 }
+BACKLOG_DEFAULTS = {
+    "path": "docs/BACKLOG.md",
+    "section": "## Next",
+    "max_items": 5,
+}
+# The one [backlog] value that is not a string: TOML's decimal integer, no sign, no leading
+# zero, no underscore -- and only above zero is it accepted.
+BACKLOG_INT = re.compile(r"([1-9][0-9]*)[ \t]*(#.*)?")
 # The skill's scripts/appl_config.py is a byte-identical copy of this file, the reader a
 # consumer's landing gate trusts: there lease_core.py is its sibling.
 LEASE_CORE = (Path(__file__).resolve().parent / "lease_core.py"
@@ -137,6 +153,8 @@ class Config:
         self.lease_backend_set: Optional[str] = values.get("lease", {}).get("backend")
         # The four [muretai] values, each the file's or its default.
         self.muretai: Dict[str, str] = dict(MURETAI_DEFAULTS, **values.get("muretai", {}))
+        # The three [backlog] settings, each the file's or its default.
+        self.backlog: Dict[str, object] = dict(BACKLOG_DEFAULTS, **values.get("backlog", {}))
 
     @property
     def lease_backend(self) -> str:
@@ -192,8 +210,26 @@ def _string(rest: str, where: str) -> str:
     return value
 
 
+def _backlog_value(key: str, rest: str, where: str):
+    """One [backlog] value: path and section are strings, max_items an integer above zero."""
+    if key == "max_items":
+        m = BACKLOG_INT.fullmatch(rest)
+        if m is None:
+            raise ConfigError("%s: the value must be an integer above zero, got %r" % (where, rest))
+        return int(m.group(1))
+    value = _string(rest, where)
+    if not value:
+        raise ConfigError("%s: the value is empty" % where)
+    if key == "path":
+        if value.startswith("/") or value.startswith("\\"):
+            raise ConfigError("%s: the path %r is absolute" % (where, value))
+        if ".." in re.split(r"[/\\]", value):
+            raise ConfigError("%s: the path %r holds a .. component" % (where, value))
+    return value
+
+
 def parse(text: str, name: str = "appl.toml") -> Config:
-    values: Dict[str, Dict[str, str]] = {}
+    values: Dict[str, Dict[str, object]] = {}
     section = None
     seen_sections = set()
     pinned = False
@@ -252,6 +288,9 @@ def parse(text: str, name: str = "appl.toml") -> Config:
         got = values.setdefault(section, {})
         if key in got:
             raise ConfigError("%s: key %r in [%s] given twice" % (where, key, section))
+        if section == "backlog":
+            got[key] = _backlog_value(key, rest.strip(), "%s: [%s] %s" % (where, section, key))
+            continue
         value = _string(rest.strip(), "%s: [%s] %s" % (where, section, key))
         if section == "lease" and key == "backend" and value not in BACKEND_WORDS:
             raise ConfigError("%s: unknown lease backend %r (known: %s)"

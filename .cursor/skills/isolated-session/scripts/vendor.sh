@@ -34,8 +34,11 @@
 # same-named tag or branch they carry -- and every git call runs with the inherited
 # repository variables (GIT_DIR, GIT_WORK_TREE, ...) cleared, so a pull from a hook works.
 #
-# What is copied is the explicit FILES list below -- the reviewed contract -- and its
-# CLOSURE: every sibling a copied script reaches (`$here/<name>`, a `source` of
+# What is copied is the explicit FILES list -- the reviewed contract -- of vendor.sh AT THE
+# REF (read from the tag's blob, never run; the list below is this copy's own, which `check`
+# holds a copy to), and its CLOSURE. A path the old VENDOR.json recorded that the ref's
+# list no longer carries is removed; a consumer file no pin recorded is never touched. The
+# CLOSURE is every sibling a copied script reaches (`$here/<name>`, a `source` of
 # `$(dirname ...)/<name>`, Python's `HERE / "<name>"`), transitively. A reference that
 # names a DIRECTORY reaches every file under it (herd-spawn.sh's trust adapter, a
 # `<harness>.sh` under scripts/trust, reaches that directory), and those are walked in turn. `pull` refuses a
@@ -560,6 +563,58 @@ if CONTRACT not in entries:
     print(f"vendor: no {CONTRACT} at {home} at {ref} -- the contract test lives under tests/", file=sys.stderr)
     sys.exit(1)
 REGULAR = {"100644": 0o644, "100755": 0o755}
+
+def tag_files(text: str):
+    """The FILES list of a vendor.sh's text: (list, None), or (None, why). Read with ast,
+    never run: each entry is a string literal or an f-string whose only placeholder is
+    `{skill}`, which stands for this skill's directory."""
+    import ast
+    m = re.search(r"^FILES = \[\n(.*?)^\]$", text, re.M | re.S)
+    if not m:
+        return None, "it has no `FILES = [ ... ]` list"
+    try:
+        node = ast.parse("FILES = [\n" + m.group(1) + "]\n").body[0].value
+    except SyntaxError as e:
+        return None, f"its FILES list does not parse ({e.msg})"
+    out = []
+    for elt in node.elts:
+        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+            out.append(elt.value)
+            continue
+        if isinstance(elt, ast.JoinedStr):
+            parts = []
+            for v in elt.values:
+                if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                    parts.append(v.value)
+                elif (isinstance(v, ast.FormattedValue) and isinstance(v.value, ast.Name)
+                      and v.value.id == "skill" and v.conversion == -1 and v.format_spec is None):
+                    parts.append(skill)
+                else:
+                    return None, "a FILES entry uses a placeholder other than {skill}"
+            out.append("".join(parts))
+            continue
+        return None, "a FILES entry is neither a string nor an f-string over {skill}"
+    return out, None
+
+# What is copied is the FILES list of vendor.sh AT THE REF, never this running copy's own:
+# a consumer pulls with its old vendored vendor.sh, whose FILES is the old release's list
+# (agent-entry-wordpress's re-vendor to v0.1.10 missed scripts/run-php.sh this way).
+VENDOR_REL = f"{skill}/scripts/vendor.sh"
+if entries.get(VENDOR_REL, ("", ""))[0] not in REGULAR:
+    fail("refusing to pull:", [f"{VENDOR_REL}: not a regular file in the home at {ref} -- "
+                               "its FILES list is what a pull copies"])
+rc, data = git("cat-file", "blob", entries[VENDOR_REL][1])
+if rc != 0:
+    fail("refusing to pull:", [f"{VENDOR_REL}: cannot read blob {entries[VENDOR_REL][1]} at {ref}"])
+FILES, why = tag_files(data.decode("utf-8", "replace"))
+if FILES is None:
+    fail("refusing to pull:", [f"{VENDOR_REL} at {ref}: {why}"])
+bad = [f"{rel}: {why} -- named by {VENDOR_REL} FILES at {ref}"
+       for rel in FILES for why in [not_plain(rel)] if why]
+if bad:
+    fail("refusing to pull: a FILES entry at the ref is not a plain path under the skill:", bad)
+bad += [f"{rel}: named by {VENDOR_REL} FILES at {ref} but not in the home's tree at {ref}"
+        for rel in FILES if rel not in entries]
 # The closure is walked on the skill's regular files at the ref, laid out in a scratch
 # directory; a symlink or submodule there is never materialised, so nothing points out,
 # but its path is still known from the tree -- a reference reaching it is refused below.
@@ -586,6 +641,8 @@ for rel in pulled:
     tree_mode = entries.get(rel, ("", ""))[0]
     if rel not in entries and rel in reached:
         bad.append(f"{rel}: referenced by {reached[rel]} but no file or directory in the home at {ref}")
+    elif rel not in entries:
+        pass  # a FILES entry the tree lacks, named above
     elif tree_mode == "120000":
         bad.append(f"{rel}: a symlink in the home at {ref} -- refusing to copy what it points at")
     elif tree_mode not in REGULAR or not_plain(rel):
@@ -598,8 +655,30 @@ for rel in pulled:
         bad.append(f"{rel}: the consumer's copy is a symlink or not a file")
     elif os.path.realpath(str(anc)) != str(repo_real / anc.relative_to(repo)):
         bad.append(f"{rel}: the consumer's directory resolves elsewhere")
+# What the old pin recorded and the ref's list no longer carries is removed -- only those:
+# a consumer file no pin ever recorded is never touched. A recorded path that is not plain
+# is never followed; one whose directory resolves elsewhere is refused like a copy.
+dropped = []
+try:
+    old_files = json.loads(pin.read_text()).get("files", {}) if pin.is_file() else {}
+except (OSError, ValueError, AttributeError):
+    old_files = {}
+for rel in sorted(set(old_files if isinstance(old_files, dict) else ()) - set(pulled)):
+    if not isinstance(rel, str) or not_plain(rel):
+        continue
+    dst = repo / rel
+    if not os.path.lexists(str(dst)):
+        continue
+    if os.path.realpath(str(dst.parent)) != str(repo_real / dst.parent.relative_to(repo)):
+        bad.append(f"{rel}: recorded by the old VENDOR.json, but the consumer's directory resolves elsewhere")
+    elif not dst.is_symlink() and not dst.is_file():
+        bad.append(f"{rel}: recorded by the old VENDOR.json, but the consumer's copy is not a file")
+    else:
+        dropped.append(dst)
 if bad:
     fail("refusing to pull:", bad)
+for dst in dropped:
+    dst.unlink()
 files = {}
 for rel in pulled:
     data, perm = blobs[rel]

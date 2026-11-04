@@ -21,7 +21,8 @@ The events and their keys:
 
   intake-filed     any keys (tools/appl-add.sh writes intake)
   status-change    old, new, category             (appl-status.sh)
-  spawn            role, harness, model, attempt  (herd-spawn.sh; the worker is the line's worker)
+  spawn            role, harness, model, attempt, and repo when known
+                                                  (herd-spawn.sh; the worker is the line's worker)
   spawn-failure    from, to, why                  (herd-spawn.sh)
   failover         from, to, why                  (herd-spawn.sh)
   worker-report    verdict                        (appl-hook.sh; the worker is the line's worker)
@@ -33,7 +34,8 @@ The events and their keys:
   runner-result    cost, turns, session_id, permission_denials, run_id, role_def, outcome,
                    exit_code                      (appl-run.py; the worker is the line's worker)
 
-Every event but intake-filed takes exactly its keys: a missing or an unknown key is
+Every event but intake-filed takes exactly its keys (and its OPTIONAL_KEYS, which may be
+left out): a missing or an unknown key is
 refused, and so is a spawn, a worker-report, a stuck, a dead, a respawn or a runner-result
 with no worker name.
 
@@ -69,6 +71,11 @@ EVENT_KEYS = {
     "respawn": (),
     "runner-result": ("cost", "turns", "session_id", "permission_denials", "run_id", "role_def",
                       "outcome", "exit_code"),
+}
+# event -> keys it may carry beyond EVENT_KEYS, none of them required: a spawn's repo is
+# written when herd-spawn.sh is given --intake-repo, and a back-filled spawn has none
+OPTIONAL_KEYS = {
+    "spawn": ("repo",),
 }
 EVENTS = tuple(EVENT_KEYS)
 # events whose line names a worker: an empty worker is a missing key
@@ -144,7 +151,8 @@ def _line(event: str, intake_id: str, worker: str, keys: dict) -> bytes:
         missing = [k for k in want if k not in keys]
         if missing:
             raise LedgerRefused("event %s needs key(s) %s" % (event, ", ".join(missing)))
-        extra = sorted(str(k) for k in keys if k not in want)
+        may = OPTIONAL_KEYS.get(event, ())
+        extra = sorted(str(k) for k in keys if k not in want and k not in may)
         if extra:
             raise LedgerRefused("event %s takes no key(s) %s" % (event, ", ".join(extra)))
     if event in NEEDS_WORKER and not worker:

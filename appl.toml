@@ -1,1 +1,5 @@
+# The github gate returned with the vendor pull of appl main.
 gate = "github"
+
+[tests]
+command = "npm test"

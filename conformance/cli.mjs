@@ -2588,9 +2588,14 @@ await section('woo-doctor', async () => {
     declaration.entry.baseUrl = door.origin;
     writeFileSync(join(dir, 'agent-entry.json'), `${JSON.stringify(declaration, null, 2)}\n`);
     door.state.ids = ids;
-    door.state.entry = createAgentEntry({ seedHex: WOO6_SEED, name: declaration.entry.name, baseUrl: door.origin, declaration,
-      catalogFile: join(dir, SNAPSHOT_FILE), signedRatePerMin: 0, signedRatePerMinTotal: 0,
-      observer: (e) => { door.state.events.push(e); } });
+    // Each doctor run knocks hold_item once as the same visitor, and a door holds at most
+    // MAX_UNDECIDED_RECEIPTS_PER_PARTY undecided receipts per party: each run gets a fresh door.
+    const freshEntry = () => {
+      door.state.entry = createAgentEntry({ seedHex: WOO6_SEED, name: declaration.entry.name, baseUrl: door.origin, declaration,
+        catalogFile: join(dir, SNAPSHOT_FILE), signedRatePerMin: 0, signedRatePerMinTotal: 0,
+        observer: (e) => { door.state.events.push(e); } });
+    };
+    freshEntry();
     const storeHitsBefore = store.hits.length;
     const secrets = () => {
       const out = [WOO6_SEED, WOO6_CK, WOO6_CS];
@@ -2600,8 +2605,9 @@ await section('woo-doctor', async () => {
     };
 
     /** One doctor run: rows, the door's knocks, and every shared refusal pinned. */
-    async function doctor(tag, { json = true, port = door.port } = {}) {
+    async function doctor(tag, { json = true, port = door.port, fresh = true } = {}) {
       const tl = `${label}/${tag}`;
+      if (fresh) freshEntry();
       door.state.posts = [];
       const before = treeState(dir);
       const run = await runCli(['doctor', '--from', 'woocommerce', ...(json ? ['--json'] : [])],
@@ -2660,9 +2666,11 @@ await section('woo-doctor', async () => {
     {
       const tl = `${label}/pending-receipt`;
       door.state.events = [];
+      // The fixture hold and the doctor run share one fresh door, so the doctor meets the held receipt.
+      freshEntry();
       const k = await knockHold(door.state.entry, 'hold item {"id":101}');
       check(k.reply?.status === 'pending_confirmation', `${tl}/setup-fixture-hold-pending`, String(k.replyText).slice(0, 300));
-      const { run, said } = await doctor('pending-receipt');
+      const { run, said } = await doctor('pending-receipt', { fresh: false });
       check(run.code === 0, `${tl}/exit-0`, `exit ${run.code}`);
       check(!said.includes(k.messageId) && !said.includes(String(k.reply?.deal?.termsHash ?? '\0')),
         `${tl}/refused/the-fixture-receipt-never-handled`, said.slice(0, 300));

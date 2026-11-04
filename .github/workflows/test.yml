@@ -19,4 +19,9 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
+      # conformance/seam-twin.mjs fails, by design, when no agent-seam checkout sits beside
+      # the primary checkout: its sibling rows prove the vendored seam is what the pinned
+      # commit produces. A full clone, tags included, so the pinned commit and ref resolve.
+      - name: Clone agent-seam beside this checkout
+        run: git clone --quiet https://github.com/muretai/agent-seam "$GITHUB_WORKSPACE/../agent-seam"
       - run: npm test

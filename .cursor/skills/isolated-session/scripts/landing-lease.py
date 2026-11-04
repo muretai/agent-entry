@@ -82,7 +82,8 @@ INIT_HINT = ("%s --as <agent> --repo <name>=<path> --node <absolute path of this
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 USAGE = ("usage: landing-lease.sh take|renew|release --as <agent> --repo <name> "
-         "[--epoch <n>]   (--epoch is required for renew and release)")
+         "[--epoch <n>]   (--epoch is required for renew, and for a release from a take "
+         "that granted one)")
 
 
 class Refusal(Exception):
@@ -495,9 +496,19 @@ def parse_args(argv: List[str]) -> tuple:
         raise lease_core.ConfigError(USAGE)
     if not REPO_RE.match(repo):
         raise lease_core.ConfigError("--repo %r is not a repository name" % repo)
-    if verb != "take" and epoch is None:
+    # A release may come without --epoch: a take from the none backend, or a command take
+    # that answered no epoch=, grants none. The do and host backends still refuse it, in
+    # need_epoch below, before anything is sent, so no other holder's row is freed.
+    if verb == "renew" and epoch is None:
         raise lease_core.ConfigError("%s needs --epoch <n>, the epoch the take was granted" % verb)
     return verb, as_name, repo, epoch
+
+
+def need_epoch(verb: str, epoch: Optional[int], backend: str) -> None:
+    """The do and host backends fence by epoch: a renew or release without one is refused."""
+    if verb != "take" and epoch is None:
+        raise lease_core.ConfigError("%s needs --epoch <n>, the epoch the take was granted "
+                                     "(backend = %s grants one on every take)" % (verb, backend))
 
 
 def lease_main(argv: List[str]) -> int:
@@ -524,6 +535,7 @@ def lease_main(argv: List[str]) -> int:
         return check_lease(node, name, as_name)
 
     def build_host(cfg: Dict[str, str]) -> lease_core.Backend:
+        need_epoch(verb, epoch, "host")
         url = host_url(cfg)
         if not url:
             raise lease_core.ConfigError(
@@ -539,6 +551,7 @@ def lease_main(argv: List[str]) -> int:
         return HostBackend(url, room, repo, did, seed, crypto, epoch)
 
     def build_do(cfg: Dict[str, str]) -> lease_core.Backend:
+        need_epoch(verb, epoch, "do")
         crypto, seed, did = lease_identity()
         url = lease_url(cfg, ddir)
         if not url:

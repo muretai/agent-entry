@@ -3635,12 +3635,18 @@ def says_the_byte_fallback_was_used(stderr: str) -> bool:
 
 def path_without_python3(where: Path) -> str:
     """A PATH with every executable the host has EXCEPT python3 -- the machine requirement
-    C keeps the `tr` path for. Symlinks, so git still finds its own helpers."""
+    C keeps the `tr` path for. Symlinks, so git still finds its own helpers. A directory
+    whose listing raises OSError is skipped, so a host folder the runner cannot read
+    does not fail the check."""
     where.mkdir(parents=True, exist_ok=True)
     for d in os.environ.get("PATH", "").split(os.pathsep):
         if not d or not os.path.isdir(d):
             continue
-        for name in os.listdir(d):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
             if name.startswith("python"):
                 continue
             link = where / name
@@ -4952,6 +4958,45 @@ def test_every_renderer_fills_the_published_brief(tmp: Path) -> None:
            "carries, so the other renderer's review still starts: " + repr(missing))
 
 
+def test_path_without_python3_skips_an_unreadable_entry(tmp: Path) -> None:
+    """A PATH entry whose listing raises OSError is skipped.
+
+    The GitHub check raised PermissionError on a Documents folder macOS denies
+    the launchd runner. Mode 000 is that failure on a directory this case
+    creates, and the mode is put back before the tree is removed. A readable
+    entry later on PATH keeps today's handling.
+    """
+    blocked = tmp / "unreadable-path-entry"
+    readable = tmp / "readable-path-entry"
+    blocked.mkdir()
+    readable.mkdir()
+    (readable / "hosttool").write_text("")
+    (readable / "python3").write_text("")
+    where = tmp / "nopy-skip"
+    had_path = "PATH" in os.environ
+    saved = os.environ.get("PATH", "")
+    blocked.chmod(0)
+    try:
+        ok(blocked.is_dir(), "the planted entry is still a directory")
+        listed = True
+        try:
+            os.listdir(blocked)
+        except OSError:
+            listed = False
+        ok(not listed, "listing the planted entry raises OSError")
+        os.environ["PATH"] = str(blocked) + os.pathsep + str(readable)
+        got = path_without_python3(where)
+        ok(got == str(where), "the helper returns without raising")
+        ok((where / "hosttool").is_symlink(), "a later readable entry is still linked")
+        ok(not (where / "python3").exists(), "a python name is still left out")
+    finally:
+        blocked.chmod(0o755)
+        if had_path:
+            os.environ["PATH"] = saved
+        else:
+            os.environ.pop("PATH", None)
+
+
 def main() -> int:
     ok(SCRIPTS.is_dir(), "isolated-session scripts found at " + str(SCRIPTS))
     # under the home, not TMPDIR: the runner's TMPDIR is under /tmp, and a herd directory
@@ -5036,6 +5081,8 @@ def main() -> int:
              test_the_lent_backend_directory_says_whose_it_is),
             ("every renderer fills the published brief",
              test_every_renderer_fills_the_published_brief),
+            ("an unreadable PATH entry is skipped",
+             test_path_without_python3_skips_an_unreadable_entry),
         ]:
             print("\n" + name)
             fn(tmp)
