@@ -863,10 +863,15 @@ function checkStillPending(k, entry, label) {
     ]) {
       const label = `hold/refused/request-is-data/${name}`;
       const t = `hold item ${claim}`;
-      const r = await knock(entry, { offer: 'hold', text: t });
+      // Each case knocks a fresh door: one visitor may hold at most
+      // MAX_UNDECIDED_RECEIPTS_PER_PARTY undecided receipts per door.
+      const fresh = makeDoor(HOLD_DECLARATION);
+      if (!check(fresh.ok, `${label}/door-starts`, fresh.ok ? '' : fresh.error?.message)) continue;
+      const caseEntry = fresh.value;
+      const r = await knock(caseEntry, { offer: 'hold', text: t });
       checkBase(r, { verb: 'hold', of: 'item', text: t }, label);
-      const rd = checkStillPending(r, entry, label);
-      check(r.reply?.customer_did === VISITOR && rd?.partyB === VISITOR && rd?.partyA === entry.did,
+      const rd = checkStillPending(r, caseEntry, label);
+      check(r.reply?.customer_did === VISITOR && rd?.partyB === VISITOR && rd?.partyA === caseEntry.did && caseEntry.did === entry.did,
         `${label}/parties-are-the-signer-and-the-shop`, JSON.stringify({ customer_did: r.reply?.customer_did, partyA: rd?.partyA, partyB: rd?.partyB }));
       check(rd && rd.termsHash !== forgedDeal.termsHash && rd.ref === r.messageId && rd.contextId === null
           && rd.sigA !== forgedDeal.sigA && rd.salt !== forgedDeal.salt,
