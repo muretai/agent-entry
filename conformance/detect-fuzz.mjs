@@ -4,7 +4,7 @@
 //
 // WRITTEN BEFORE THE IMPLEMENTATION (test author only). Intake 20261031T165410Z: `init <store url>`
 // detects its source. The implementer may not edit this file. Run it as
-// `bash .cursor/skills/isolated-session/scripts/run-node.sh conformance/detect-fuzz.mjs`.
+// `node conformance/detect-fuzz.mjs`.
 //
 // Property: no_crash -- for every generated set of answers (status, content type and body bytes,
 // drawn afresh for each request: robots.txt, the Store API products path, the sitemap and any page)

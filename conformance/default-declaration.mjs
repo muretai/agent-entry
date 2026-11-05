@@ -5,7 +5,7 @@
 //
 // WRITTEN BEFORE THE IMPLEMENTATION. The implementer may not edit this file.
 // It is not wired into npm test until it is green. Run it as
-//   bash .cursor/skills/isolated-session/scripts/run-node.sh conformance/default-declaration.mjs
+//   node conformance/default-declaration.mjs
 //
 // createAgentEntry() with no `declaration` derives one instead of serving an empty
 // face. It does not throw, and it does not print a manual step on stdout or stderr.

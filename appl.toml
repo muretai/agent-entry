@@ -1,3 +1,5 @@
+version = "latest"
+
 # The github gate returned with the vendor pull of appl main.
 gate = "github"
 

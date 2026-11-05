@@ -3,21 +3,21 @@
   "hooks": {
     "sessionStart": [
       {
-        "command": ".cursor/skills/isolated-session/scripts/session-guard.sh",
+        "command": "\"$HOME/.appl/bin/appl\" guard",
         "timeout": 10,
         "failClosed": false
       }
     ],
     "sessionEnd": [
       {
-        "command": ".cursor/skills/isolated-session/scripts/session-guard.sh",
+        "command": "\"$HOME/.appl/bin/appl\" guard",
         "timeout": 10,
         "failClosed": false
       }
     ],
     "preToolUse": [
       {
-        "command": ".cursor/skills/isolated-session/scripts/session-guard.sh",
+        "command": "\"$HOME/.appl/bin/appl\" guard",
         "timeout": 10,
         "failClosed": false
       }

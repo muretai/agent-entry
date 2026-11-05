@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.cursor/skills/isolated-session/scripts/session-guard.sh\"",
+            "command": "\"$HOME/.appl/bin/appl\" guard",
             "timeout": 10
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.cursor/skills/isolated-session/scripts/session-guard.sh\"",
+            "command": "\"$HOME/.appl/bin/appl\" guard",
             "timeout": 10
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.cursor/skills/isolated-session/scripts/session-guard.sh\"",
+            "command": "\"$HOME/.appl/bin/appl\" guard",
             "timeout": 10
           }
         ]

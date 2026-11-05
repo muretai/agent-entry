@@ -6,7 +6,7 @@
 // WRITTEN BEFORE THE IMPLEMENTATION (test author only). Intake 20261028T210658Z, finding D2 of the
 // security review secrev-entry-6059-0363-2 (decidedOverCap never evicts an undecided row, so every
 // signed pending knock adds one, without bound). The implementer may not edit this file. Run it as
-// `bash .cursor/skills/isolated-session/scripts/run-node.sh conformance/receipt-undecided-caps.mjs`.
+// `node conformance/receipt-undecided-caps.mjs`.
 //
 // The caps, named here because the requirement leaves the names and values to the test author:
 //   export const MAX_UNDECIDED_RECEIPTS_PER_PARTY = 5;    undecided rows one partyB may hold

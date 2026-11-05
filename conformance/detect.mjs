@@ -5,7 +5,7 @@
 // sources already go beyond Woo, so the script decides the source, never the user). The implementer
 // may not edit this file. The stores are local fixtures on 127.0.0.1, and the in-process cases
 // answer from a stubbed globalThis.fetch. Nothing here dials a live site. Run it as
-// `bash .cursor/skills/isolated-session/scripts/run-node.sh conformance/detect.mjs`.
+// `node conformance/detect.mjs`.
 //
 //   agent-entry init <https store url> [--facts <file>] [--max-pages <n>] [--max-bytes <n>]
 //       [--name <name>] [--json]
