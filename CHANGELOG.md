@@ -36,6 +36,17 @@ field and the claimant flags are gone. These notes were gathered as 1.14.0 befor
     the decision text verbatim once decided, partyB only, no writes.
   - `knock --offer track --ref <ref>` collects the decision, and `checkedBookingReceipt` refuses
     a decision whose sigA, signer or terms do not check out.
+- added: quote terms on a confirmed reply, a priced acceptance the door signs.
+  - `confirmReceipt(seedHex, receiptText, terms)` on a pending `quote` adds a top-level `terms`
+    object `{price, currency, leadTime, validUntil, note?}` and one signed deal field,
+    `quoteHash`, so the door's sigA commits to the terms. Without terms the bytes are unchanged.
+  - The fields: price a decimal string, currency three upper-case letters (ISO 4217), leadTime
+    an ISO 8601 duration, validUntil a zoned ISO 8601 date-time after the decision time, note
+    optional under the decline note's rule. Anything else is refused by name.
+  - `decide <ref> approve --terms <file.json> --store <file>` reads the terms from a JSON file;
+    `--note` stays decline-only.
+  - `checkedBookingReceipt` accepts terms only on a confirmed quote whose quoteHash and sigA
+    hold, and the booking and `knock --offer track` return them exactly as signed.
 - added: `first_contact` on the envelope, the observer row and both sinks, and counts split into
   new versus returning knocks (Analytics-2).
 - added: hosted counts (S6a-2, S6a-3, S6a-4). `entry.counts` in `agent-entry.json` is now accepted, an absolute https
@@ -154,7 +165,8 @@ Choices made in the implementation, where the tests left room:
 ### Follow-ups (named, not built here)
 
 - Steps page action (a multi-step page action).
-- Negotiation on `quote` / `hold` (coordination turns, R9, after the pilot shop).
+- Negotiation on `hold`, and counter-offers on `quote` (coordination turns, R9, after the pilot
+  shop). A signed priced acceptance of a quote landed in 2.0.0 as the quote terms object.
 - WordPress plugin and serverless templates render the same declaration.
 - Hosted no-code tier.
 - Python twin (declaration, compile vectors, envelope, responder, collector).

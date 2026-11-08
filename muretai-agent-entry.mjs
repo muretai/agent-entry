@@ -4003,10 +4003,71 @@ const hasExactKeys = (obj, keys) => Object.keys(obj).length === keys.length && k
  * The deal's sigA is verified under the key `seedHex` derives BEFORE anything else is read from
  * the receipt; then it must be exactly the door's pending shape, and its termsHash must still
  * commit to its terms. Anything else throws, and nothing is confirmed. No field comes from the
- * caller beyond the signed receipt.
+ * caller beyond the signed receipt, except `terms`.
+ *
+ * confirmReceipt(seedHex, receiptText, terms) -> text, on a pending `quote` only: a priced
+ * acceptance. `terms` is { price, currency, leadTime, validUntil, note? } (see quoteTermsProblem);
+ * it rides as the reply's top-level `terms` key exactly as given, and the deal gains one signed
+ * field, `quoteHash`, the sha256 of canonical {"quoteTerms": terms}, so the door's sigA commits to
+ * the terms. Without `terms` the bytes are what they were.
  */
-export function confirmReceipt(seedHex, receiptText) {
-  return followUpReceipt('confirmReceipt', 'confirmed', seedHex, receiptText);
+export function confirmReceipt(seedHex, receiptText, terms) {
+  return followUpReceipt('confirmReceipt', 'confirmed', seedHex, receiptText, undefined, terms);
+}
+
+/** The keys a quote's terms object may carry; every one but `note` is required. */
+const QUOTE_TERMS_KEYS = Object.freeze(['price', 'currency', 'leadTime', 'validUntil', 'note']);
+/** A confirmed quote with terms signs this extra deal field: the hash of the terms. */
+const QUOTE_DEAL_KEYS = Object.freeze([...DEAL_RECEIPT_KEYS, 'quoteHash']);
+const QUOTE_PRICE = /^\d{1,24}(\.\d{1,12})?$/;
+const QUOTE_CURRENCY = /^[A-Z]{3}$/;
+const QUOTE_DURATION = /^P(?!$)(\d+Y)?(\d+M)?(\d+W)?(\d+D)?(T(?=\d)(\d+H)?(\d+M)?(\d+S)?)?$/;
+const QUOTE_DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,3})?(Z|[+-](\d{2}):(\d{2}))$/;
+
+/** The epoch milliseconds of `value`, an ISO 8601 date-time with a zone; NaN when it is not one. */
+function zonedDateTimeMs(value) {
+  if (typeof value !== 'string') return NaN;
+  const m = QUOTE_DATE_TIME.exec(value);
+  if (!m) return NaN;
+  const [year, month, day, hour, minute, second] = m.slice(1, 7).map(Number);
+  const daysIn = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  if (month < 1 || month > 12 || day < 1 || day > daysIn || hour > 23 || minute > 59 || second > 59) return NaN;
+  if (m[8] !== 'Z' && (Number(m[9]) > 23 || Number(m[10]) > 59)) return NaN;
+  return Date.parse(value);
+}
+
+/**
+ * Why `terms` cannot ride on a confirmed quote decided at epoch second `ts`, or null when it can:
+ * a plain object of QUOTE_TERMS_KEYS only; price a plain decimal string; currency three upper-case
+ * letters (ISO 4217 shape); leadTime an ISO 8601 duration; validUntil an ISO 8601 date-time with a
+ * zone, strictly after `ts`; note optional, the decline note's rule.
+ */
+function quoteTermsProblem(terms, ts) {
+  if (!isPlainObject(terms)) return 'terms must be a plain object';
+  for (const key of Object.keys(terms)) {
+    if (!QUOTE_TERMS_KEYS.includes(key)) return `terms carry an unknown key ${JSON.stringify(key.slice(0, 40))}`;
+  }
+  if (typeof terms.price !== 'string' || !QUOTE_PRICE.test(terms.price)) return 'terms price must be a plain decimal string';
+  if (typeof terms.currency !== 'string' || !QUOTE_CURRENCY.test(terms.currency)) {
+    return 'terms currency must be three upper-case letters (ISO 4217)';
+  }
+  if (typeof terms.leadTime !== 'string' || !QUOTE_DURATION.test(terms.leadTime)) {
+    return 'terms leadTime must be an ISO 8601 duration';
+  }
+  const until = zonedDateTimeMs(terms.validUntil);
+  if (!Number.isFinite(until)) return 'terms validUntil must be an ISO 8601 date-time with a zone';
+  if (until <= ts * 1000) return 'terms validUntil must be after the decision time';
+  if (Object.hasOwn(terms, 'note')) {
+    const problem = declineNoteProblem(terms.note);
+    if (problem) return `terms ${problem}`;
+    if (!terms.note.isWellFormed()) return 'terms the note is not well-formed text';
+  }
+  return null;
+}
+
+/** The hash a confirmed quote's deal signs as `quoteHash`: sha256 over the canonical terms. */
+function quoteTermsHash(terms) {
+  return createHash('sha256').update(canonicalBytes({ quoteTerms: terms })).digest('hex');
 }
 
 /** A declined reply's note: at most this many characters (code points). */
@@ -4037,7 +4098,7 @@ export function declineReceipt(seedHex, receiptText, note) {
 }
 
 /** confirmReceipt and declineReceipt: the follow-on reply with `status`, refusals named `name`. */
-function followUpReceipt(name, nextStatus, seedHex, receiptText, note) {
+function followUpReceipt(name, nextStatus, seedHex, receiptText, note, quoteTerms) {
   if (typeof seedHex !== 'string' || !/^[0-9a-f]{64}$/i.test(seedHex)) throw new TypeError(`${name}: seedHex must be 64 hex characters`);
   if (typeof receiptText !== 'string') throw new TypeError(`${name}: receiptText must be the reply text`);
   const shop = didFromSeedHex(seedHex);
@@ -4080,9 +4141,17 @@ function followUpReceipt(name, nextStatus, seedHex, receiptText, note) {
   const ts = Math.max(nowEpoch(), deal.ts);
   const next = { type: 'DealReceipt', partyA: shop, partyB: deal.partyB, termsHash: deal.termsHash,
     contextId: deal.contextId, ref: deal.ref, ts };
+  // 4. A quote's terms, when given: checked against the decision time, then signed as quoteHash.
+  if (quoteTerms !== undefined) {
+    if (verb !== 'quote') throw new TypeError(`${name}: terms ride only on a confirmed quote, not on ${verb.slice(0, 40)}`);
+    const problem = quoteTermsProblem(quoteTerms, ts);
+    if (problem) throw new TypeError(`${name}: ${problem}`);
+    next.quoteHash = quoteTermsHash(quoteTerms);
+  }
   return JSON.stringify({ verb, of, customer_did: customerDid, request, status: nextStatus,
     deal: { ...next, salt: deal.salt, sigA: signBytes(seedHex, canonicalBytes(next)).toString('base64') },
-    ...(note !== undefined ? { note } : {}) });
+    ...(note !== undefined ? { note } : {}),
+    ...(quoteTerms !== undefined ? { terms: quoteTerms } : {}) });
 }
 
 /** The input values a visitor wrote as a JSON object after the words (the skill example's
@@ -6403,14 +6472,24 @@ const DECISION_STATUSES = new Set(['confirmed', 'declined']);
  * visitor at this shop: the pending reply's keys (and, when declined, an optional note), a deal
  * of dealBlock's keys with partyA the shop and partyB the visitor, a sigA by the shop over the
  * seven fields, and a termsHash that still commits to the pending terms the reply names.
+ * A confirmed quote may also carry `terms` (confirmReceipt's priced acceptance): then the deal
+ * carries `quoteHash` among the signed fields, the terms must be well formed and after the
+ * decision's ts, and quoteHash must commit to them exactly. Terms anywhere else, a quoteHash
+ * without terms, or terms without one, are refused.
  * Anything else throws; nothing about it is reported as a booking.
  */
 function checkDecision(parsed, visitorDid, shopDid) {
   const refuse = () => { throw new Error('knock: the shop\'s decision does not check out against its signature and terms'); };
   const { verb, of, customer_did: customerDid, request, status, deal } = parsed;
-  const keys = status === 'declined' && Object.hasOwn(parsed, 'note') ? [...PENDING_REPLY_KEYS, 'note'] : PENDING_REPLY_KEYS;
-  if (!isPlainObject(deal) || !hasExactKeys(parsed, keys) || !hasExactKeys(deal, DEAL_RECEIPT_KEYS)) refuse();
-  if (keys !== PENDING_REPLY_KEYS && declineNoteProblem(parsed.note) !== null) refuse();
+  const noted = status === 'declined' && Object.hasOwn(parsed, 'note');
+  const priced = status === 'confirmed' && verb === 'quote' && Object.hasOwn(parsed, 'terms');
+  const keys = noted ? [...PENDING_REPLY_KEYS, 'note'] : priced ? [...PENDING_REPLY_KEYS, 'terms'] : PENDING_REPLY_KEYS;
+  if (!isPlainObject(deal) || !hasExactKeys(parsed, keys) || !hasExactKeys(deal, priced ? QUOTE_DEAL_KEYS : DEAL_RECEIPT_KEYS)) refuse();
+  if (noted && declineNoteProblem(parsed.note) !== null) refuse();
+  if (priced && (!Number.isSafeInteger(deal.ts) || quoteTermsProblem(parsed.terms, deal.ts) !== null
+      || deal.quoteHash !== quoteTermsHash(parsed.terms))) {
+    refuse();
+  }
   if (typeof shopDid !== 'string' || deal.type !== 'DealReceipt' || deal.partyA !== shopDid
       || deal.partyB !== visitorDid || customerDid !== visitorDid
       || typeof verb !== 'string' || typeof of !== 'string' || typeof request !== 'string'
@@ -6423,6 +6502,7 @@ function checkDecision(parsed, visitorDid, shopDid) {
   const sigA = Buffer.from(deal.sigA, 'base64');
   const signed = { type: deal.type, partyA: deal.partyA, partyB: deal.partyB, termsHash: deal.termsHash,
     contextId: deal.contextId, ref: deal.ref, ts: deal.ts };
+  if (priced) signed.quoteHash = deal.quoteHash;
   let verified = false;
   try {
     verified = sigA.length === 64
@@ -6445,7 +6525,8 @@ function checkDecision(parsed, visitorDid, shopDid) {
  * termsHash commits to the reply minus `deal`, so they must not be rewritten); sale fields such
  * as paid/amount are dropped from both shapes.
  * A Suite reply whose status is a decision (confirmed, declined) must pass checkDecision against
- * `shopDid`, the card's DID, or this throws; a declined one keeps the shop's note.
+ * `shopDid`, the card's DID, or this throws; a declined one keeps the shop's note, and a confirmed
+ * quote keeps its signed terms.
  */
 function checkedBookingReceipt(replyText, visitorDid, shopDid) {
   let parsed;
@@ -6476,6 +6557,7 @@ function checkedBookingReceipt(replyText, visitorDid, shopDid) {
   if (typeof type !== 'string' && DECISION_STATUSES.has(status)) {
     checkDecision(parsed, visitorDid, shopDid);
     if (Object.hasOwn(parsed, 'note')) booking.note = parsed.note;
+    if (Object.hasOwn(parsed, 'terms')) booking.terms = parsed.terms;
   }
   return booking;
 }
@@ -6790,10 +6872,12 @@ const USAGE = {
     + '  Per offer: asked on the page, asked at the door, completed, receipts; referrals by engine; returning\n'
     + '  customers (a count); door knocks by stage and client class; platforms, the bearer issuer hosts.\n'
     + '  --serve renders one page on loopback only.',
-  decide: 'usage: agent-entry decide <ref> approve|decline [--note <text>] --store <file store>\n'
+  decide: 'usage: agent-entry decide <ref> approve|decline [--terms <file.json>] [--note <text>] --store <file store>\n'
     + '  The owner\'s verdict on a pending receipt the door issued, by its deal ref in the door\'s store: prints\n'
     + '  confirmReceipt\'s confirmed reply (approve) or declineReceipt\'s declined one (decline, with --note of at\n'
-    + '  most 500 characters) and stores it as the row\'s decision. A repeat prints the same. Nothing is sent.',
+    + '  most 500 characters) and stores it as the row\'s decision. A repeat prints the same. Nothing is sent.\n'
+    + '  --terms (approve of a quote only) reads a JSON file {"price","currency","leadTime","validUntil","note"?}\n'
+    + '  and signs a priced acceptance carrying those terms.',
   serve: 'usage: agent-entry serve --proof-path /.well-known/<file> --proof-body <text> [--port <p>] [--host 127.0.0.1]\n'
     + '  Runs this site\'s door on 127.0.0.1 only and serves the ownership proof: GET of exactly --proof-path\n'
     + `  answers --proof-body as text/plain. The seed is ${SEED_NAME}, from the project's env files or the environment.`,
@@ -9245,7 +9329,7 @@ async function serveMain(argv) {
  *  pending_text as signed, stored on that row only as {status, text, decided_ts}. A repeat of the
  *  same verdict returns the stored text and writes nothing; another verdict is refused.
  *  Everything that can refuse is decided before anything is written. */
-function decideStoredReceipt(store, seedHex, ref, verdict, note) {
+function decideStoredReceipt(store, seedHex, ref, verdict, note, terms) {
   const status = verdict === 'approve' ? 'confirmed' : 'declined';
   const row = store.getReceipt(ref);
   if (!row || typeof row !== 'object' || row.ref !== ref || typeof row.pending_text !== 'string') {
@@ -9262,22 +9346,40 @@ function decideStoredReceipt(store, seedHex, ref, verdict, note) {
   }
   let text;
   try {
-    text = verdict === 'approve' ? confirmReceipt(seedHex, row.pending_text) : declineReceipt(seedHex, row.pending_text, note);
+    text = verdict === 'approve' ? confirmReceipt(seedHex, row.pending_text, terms) : declineReceipt(seedHex, row.pending_text, note);
   } catch (e) { throw new CliRefusal(shortError(e)); }
   store.putReceipt(ref, { ...row, decision: { status, text, decided_ts: nowEpoch() } });
   return text;
 }
 
-/** `decide <ref> approve|decline [--note <text>] --store <file>`: the owner's verdict on a pending
- *  receipt this door issued, looked up by ref in its file store and never sent. Prints the
- *  follow-up text. */
+/** The largest `decide --terms` file read, in bytes. */
+const MAX_TERMS_FILE_BYTES = 16 * 1024;
+
+/** The terms object a `decide --terms <file>` names: the file's JSON value, unchecked (confirmReceipt checks it). */
+function readTermsFile(root, path) {
+  let bytes;
+  try {
+    const full = resolve(root, path);
+    if (statSync(full).size > MAX_TERMS_FILE_BYTES) throw new CliRefusal(`the terms file is larger than ${MAX_TERMS_FILE_BYTES} bytes`);
+    bytes = readFileSync(full, 'utf8');
+  } catch (e) {
+    if (e instanceof CliRefusal) throw e;
+    throw new CliRefusal(`cannot read the terms file ${path.slice(0, 200)}: ${e?.code || 'read error'}`);
+  }
+  try { return JSON.parse(bytes); } catch { throw new CliRefusal('the terms file is not JSON'); }
+}
+
+/** `decide <ref> approve|decline [--terms <file.json>] [--note <text>] --store <file>`: the owner's
+ *  verdict on a pending receipt this door issued, looked up by ref in its file store and never
+ *  sent. `--terms` (approve of a quote only) signs a priced acceptance. Prints the follow-up text. */
 async function decideMain(argv) {
   const positionals = [];
-  const flags = parseFlags(argv, { store: 'string', note: 'string' }, positionals);
+  const flags = parseFlags(argv, { store: 'string', note: 'string', terms: 'string' }, positionals);
   if (positionals.length !== 2 || !['approve', 'decline'].includes(positionals[1])) {
-    throw new CliMisuse('expected <ref> approve|decline [--note <text>] --store <file>');
+    throw new CliMisuse('expected <ref> approve|decline [--terms <file.json>] [--note <text>] --store <file>');
   }
   if (flags.note !== undefined && positionals[1] !== 'decline') throw new CliMisuse('--note goes with decline only');
+  if (flags.terms !== undefined && positionals[1] !== 'approve') throw new CliMisuse('--terms goes with approve only');
   if (typeof flags.store !== 'string') throw new CliMisuse('--store is required');
   const root = process.cwd();
   const seed = findSeed(root, detectFramework(root));
@@ -9289,7 +9391,8 @@ async function decideMain(argv) {
   if (!existsSync(storePath)) throw new CliRefusal(`no store at ${flags.store.slice(0, 200)}`);
   let store;
   try { store = createFileStore(storePath); } catch (e) { throw new CliRefusal(shortError(e)); }
-  const text = decideStoredReceipt(store, seed.hex, positionals[0], positionals[1], flags.note);
+  const terms = flags.terms !== undefined ? readTermsFile(root, flags.terms) : undefined;
+  const text = decideStoredReceipt(store, seed.hex, positionals[0], positionals[1], flags.note, terms);
   process.stdout.write(`${text}\n`);
   return 0;
 }
