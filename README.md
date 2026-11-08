@@ -437,6 +437,44 @@ refusal** — and neither does an address, a vendor range, a country, or a recog
 signature. A UA string is written by the client; a door that trusted it would be a
 door anyone could talk their way through.
 
+### Who introduced them
+
+A signed knock may carry an introduction: a muretai `AgentIntroduction` credential in
+`metadata.vc`, unsigned metadata next to `from`, `to`, `sig` and `timestamp`. Someone the
+visitor knows signed it with their own `did:key`, naming the visitor and naming your door. The
+door checks it with `verifyIntroduction(vc, { expectedSubject, expectedRecipient, now })`, the
+JavaScript port of the muretai core's verifier, held to the core's own vectors
+(`conformance/vectors/intro-vectors.json`):
+
+- the issuer's Ed25519 signature over the canonical JSON of the credential without `proof`;
+- `credentialSubject.id` is the knock's verified `from`, and `introducedTo` is this door's DID,
+  so a credential cannot be replayed by another visitor or shown at another door;
+- `validUntil` is still in the future;
+- provenance `proactive` passes, `requested` must embed the visitor's own signed request, and
+  any other mode fails;
+- the credential has an `id`, a non-empty string of at most 256 UTF-8 bytes.
+
+When it holds, the visitor's account row gains one entry in `introductions`:
+
+```js
+entry.ledger.get(visitorDid)
+// { first_seen: 1781000000, last_seen: 1781000000, messages: 1,
+//   introductions: [{ introducer: 'did:key:z6Mk...', id: 'urn:uuid:...', verified_at: 1781000000 }] }
+```
+
+`introducer` is the issuer DID, `id` the credential id and `verified_at` the door's clock in
+epoch seconds. The credential itself is never stored: no signature, no subject, no expertise.
+A row keeps the newest 16 introductions, and the same introducer and id again refreshes its
+entry. Anything that does not verify is ignored and the knock is answered exactly as one
+without it: it is never refused for a bad introduction. The door also ignores a `vc` that is
+not an object, one whose JSON is over 8192 bytes, and one whose issuer is the visitor itself,
+because vouching for yourself adds nothing your signature on the knock did not already say. An
+unsigned knock on the anonymous lane never has its `metadata.vc` read.
+
+Known gap: revocation is not checked yet. The door has no revocation list, so an introduction
+its issuer has revoked still verifies until its `validUntil`. The credential `id` is kept so a
+later release can revoke by id.
+
 ## Knock from any runtime
 
 If your agent can run Node 20, the card URL is all it needs:
