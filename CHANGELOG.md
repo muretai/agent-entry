@@ -47,6 +47,9 @@ field and the claimant flags are gone. These notes were gathered as 1.14.0 befor
     `--note` stays decline-only.
   - `checkedBookingReceipt` accepts terms only on a confirmed quote whose quoteHash and sigA
     hold, and the booking and `knock --offer track` return them exactly as signed.
+  - A lapsed quote is marked, not refused: past validUntil by the visitor's clock the booking
+    adds `termsExpired: true`. A repeat approve with other terms is refused, and the terms file
+    is read once as a regular file of at most 16 KiB in strict UTF-8.
 - added: `first_contact` on the envelope, the observer row and both sinks, and counts split into
   new versus returning knocks (Analytics-2).
 - added: hosted counts (S6a-2, S6a-3, S6a-4). `entry.counts` in `agent-entry.json` is now accepted, an absolute https

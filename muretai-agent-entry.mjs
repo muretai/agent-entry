@@ -54,8 +54,8 @@ import {
 import { createServer } from 'node:http';
 import { Buffer } from 'node:buffer';
 import {
-  appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync,
-  realpathSync, renameSync, statSync, writeFileSync,
+  appendFileSync, chmodSync, closeSync, constants as fsConstants, copyFileSync, existsSync, fstatSync,
+  mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, statSync, writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
@@ -6526,7 +6526,8 @@ function checkDecision(parsed, visitorDid, shopDid) {
  * as paid/amount are dropped from both shapes.
  * A Suite reply whose status is a decision (confirmed, declined) must pass checkDecision against
  * `shopDid`, the card's DID, or this throws; a declined one keeps the shop's note, and a confirmed
- * quote keeps its signed terms.
+ * quote keeps its signed terms, with `termsExpired: true` added when the visitor's clock is past
+ * their validUntil (a lapsed quote, still verified, never refused).
  */
 function checkedBookingReceipt(replyText, visitorDid, shopDid) {
   let parsed;
@@ -6557,7 +6558,12 @@ function checkedBookingReceipt(replyText, visitorDid, shopDid) {
   if (typeof type !== 'string' && DECISION_STATUSES.has(status)) {
     checkDecision(parsed, visitorDid, shopDid);
     if (Object.hasOwn(parsed, 'note')) booking.note = parsed.note;
-    if (Object.hasOwn(parsed, 'terms')) booking.terms = parsed.terms;
+    if (Object.hasOwn(parsed, 'terms')) {
+      booking.terms = parsed.terms;
+      // The signature is still true once validUntil passes; the quote has only lapsed. Say so
+      // by the visitor's own clock rather than refuse.
+      if (nowEpoch() * 1000 > zonedDateTimeMs(parsed.terms.validUntil)) booking.termsExpired = true;
+    }
   }
   return booking;
 }
@@ -9327,7 +9333,8 @@ async function serveMain(argv) {
 /** The owner's verdict on the receipt the store keeps under `ref` (AT-28): confirmReceipt
  *  (approve) or declineReceipt (decline, with the shop's note when given) over the row's
  *  pending_text as signed, stored on that row only as {status, text, decided_ts}. A repeat of the
- *  same verdict returns the stored text and writes nothing; another verdict is refused.
+ *  same verdict returns the stored text and writes nothing; another verdict is refused, and so is
+ *  a repeat approve whose terms (or their absence) are not canonically the stored decision's.
  *  Everything that can refuse is decided before anything is written. */
 function decideStoredReceipt(store, seedHex, ref, verdict, note, terms) {
   const status = verdict === 'approve' ? 'confirmed' : 'declined';
@@ -9340,7 +9347,20 @@ function decideStoredReceipt(store, seedHex, ref, verdict, note, terms) {
     if (problem && row.decision !== null && row.decision !== undefined) throw new CliRefusal(problem);
   }
   if (row.decision !== null && row.decision !== undefined) {
-    if (row.decision.status === status && typeof row.decision.text === 'string') return row.decision.text;
+    if (row.decision.status === status && typeof row.decision.text === 'string') {
+      if (verdict === 'approve') {
+        let same = false;
+        try {
+          const stored = JSON.parse(row.decision.text);
+          same = termsIdentity(terms) === termsIdentity(Object.hasOwn(stored, 'terms') ? stored.terms : undefined);
+        } catch { same = false; }
+        if (!same) {
+          throw new CliRefusal(`ref ${JSON.stringify(ref.slice(0, 120))} is already approved with other terms; `
+            + 'a repeat approve must carry the stored terms, or none when it has none');
+        }
+      }
+      return row.decision.text;
+    }
     throw new CliRefusal(`ref ${JSON.stringify(ref.slice(0, 120))} is already decided: `
       + `${String(row.decision.status).slice(0, 40)}; ${verdict} does not overwrite it`);
   }
@@ -9355,18 +9375,37 @@ function decideStoredReceipt(store, seedHex, ref, verdict, note, terms) {
 /** The largest `decide --terms` file read, in bytes. */
 const MAX_TERMS_FILE_BYTES = 16 * 1024;
 
-/** The terms object a `decide --terms <file>` names: the file's JSON value, unchecked (confirmReceipt checks it). */
+/** The terms object a `decide --terms <file>` names: the file's JSON value, unchecked (confirmReceipt checks it).
+ *  Opened once (non-blocking, so a FIFO cannot stall it), required to be a regular file by fstat
+ *  on that fd, read to at most MAX_TERMS_FILE_BYTES + 1 bytes from it (so a file that grows after
+ *  the check is still capped), and decoded as strict UTF-8: the door never signs a U+FFFD the
+ *  owner did not write. */
 function readTermsFile(root, path) {
+  const tooLarge = () => new CliRefusal(`the terms file is larger than ${MAX_TERMS_FILE_BYTES} bytes`);
   let bytes;
+  let fd = null;
   try {
-    const full = resolve(root, path);
-    if (statSync(full).size > MAX_TERMS_FILE_BYTES) throw new CliRefusal(`the terms file is larger than ${MAX_TERMS_FILE_BYTES} bytes`);
-    bytes = readFileSync(full, 'utf8');
+    fd = openSync(resolve(root, path), fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+    if (!fstatSync(fd).isFile()) throw new CliRefusal(`the terms file ${path.slice(0, 200)} is not a regular file`);
+    const buf = Buffer.alloc(MAX_TERMS_FILE_BYTES + 1);
+    let got = 0;
+    for (let n; got < buf.length && (n = readSync(fd, buf, got, buf.length - got, null)) > 0;) got += n;
+    if (got > MAX_TERMS_FILE_BYTES) throw tooLarge();
+    bytes = buf.subarray(0, got);
   } catch (e) {
     if (e instanceof CliRefusal) throw e;
     throw new CliRefusal(`cannot read the terms file ${path.slice(0, 200)}: ${e?.code || 'read error'}`);
+  } finally {
+    if (fd !== null) closeSync(fd);
   }
-  try { return JSON.parse(bytes); } catch { throw new CliRefusal('the terms file is not JSON'); }
+  let text;
+  try { text = UTF8_STRICT.decode(bytes); } catch { throw new CliRefusal('the terms file is not valid UTF-8'); }
+  try { return JSON.parse(text); } catch { throw new CliRefusal('the terms file is not JSON'); }
+}
+
+/** The canonical bytes of a decision's terms, or of their absence, for comparing a repeat approve. */
+function termsIdentity(terms) {
+  return terms === undefined ? 'none' : canonicalBytes({ quoteTerms: terms }).toString('hex');
 }
 
 /** `decide <ref> approve|decline [--terms <file.json>] [--note <text>] --store <file>`: the owner's
