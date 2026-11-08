@@ -315,7 +315,13 @@ moment you decide; `note` is optional, at most 500 characters. The confirmed rep
 `terms` object as given and the deal signs its hash as `quoteHash`, so a visitor who changes any
 field after signing sees the decision fail verification. In code, the same is
 `confirmReceipt(seedHex, pendingText, terms)`. Terms go on a quote's approve only: on a hold, a
-decline or another verb they are refused.
+decline or another verb they are refused. A repeat approve of the same ref must carry the same
+terms (or none, when the first had none); other terms are refused, never re-priced. The terms
+file must be a regular file of at most 16 KiB in UTF-8.
+
+A quote lapses: when a visitor reads a priced acceptance after its `validUntil` by the visitor's
+own clock, the booking keeps the verified terms and adds `termsExpired: true`. The decision is
+not refused, because the signature is still true; only the price is no longer on offer.
 
 ## Who is knocking
 
