@@ -298,6 +298,25 @@ npx @muretai/agent-entry decide <ref> decline --note "Sold this morning; we rest
 The declined reply keeps the receipt's deal and termsHash, signed afresh. A ref keeps its first
 verdict: approving a declined ref, or declining an approved one, is refused.
 
+A `quote` can be approved with a price. Put the terms in a JSON file:
+
+```json
+{ "price": "120.00", "currency": "EUR", "leadTime": "P3D",
+  "validUntil": "2026-12-01T18:00:00Z", "note": "Parts in stock." }
+```
+
+```bash
+npx @muretai/agent-entry decide <ref> approve --terms quote-terms.json --store var/ledger.json
+```
+
+`price` is a decimal string, never a number; `currency` is three upper-case letters (ISO 4217);
+`leadTime` is an ISO 8601 duration; `validUntil` is an ISO 8601 date-time with a zone, after the
+moment you decide; `note` is optional, at most 500 characters. The confirmed reply carries the
+`terms` object as given and the deal signs its hash as `quoteHash`, so a visitor who changes any
+field after signing sees the decision fail verification. In code, the same is
+`confirmReceipt(seedHex, pendingText, terms)`. Terms go on a quote's approve only: on a hold, a
+decline or another verb they are refused.
+
 ## Who is knocking
 
 Observation, never identity. The person who found you often never opens a browser:
