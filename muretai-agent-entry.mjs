@@ -1268,11 +1268,15 @@ const INTRO_REQUEST_SKEW_S = 300;
 
 /** shared/vc.py _parse_iso, for the forms Python's fromisoformat accepts that an issuer
  *  actually writes: a date, or a date and time with optional seconds, fraction and offset.
- *  No offset is UTC, as in the core. Anything else answers NaN (which fails every check). */
+ *  No offset is UTC, as in the core. Anything else answers NaN (which fails every check).
+ *  The edges are Python's, not JavaScript's: the string is stripped by wbaPyStrip (Python's
+ *  str.strip, which keeps a leading U+FEFF that String.prototype.trim would drop, and drops a
+ *  trailing \x1c that trim would keep), and a fraction is exactly 3 or 6 digits, the only
+ *  lengths Python 3.9's fromisoformat (the core's floor) accepts. */
 function parseIsoMs(s) {
   if (typeof s !== 'string') return Number.NaN;
-  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?)?(Z|[+-]\d{2}:\d{2})?$/
-    .exec(s.trim());
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{3}|\d{6}))?)?)?(Z|[+-]\d{2}:\d{2})?$/
+    .exec(wbaPyStrip(s));
   if (!m) return Number.NaN;
   if (m[8] && m[4] === undefined) return Number.NaN;
   const [y, mo, d, h = '0', mi = '0', sec = '0'] = m.slice(1, 7);
@@ -1300,7 +1304,13 @@ function verifyIntroRequest(record, { expectedSubject, expectedIntroducer, nowMs
   try {
     if (!record || typeof record !== 'object' || Array.isArray(record)) return false;
     const { from, to, messageId, text, sig, timestamp } = record;
-    if (!(from && to && messageId && text && sig) || timestamp === undefined || timestamp === null) return false;
+    // Each a non-empty STRING. Python's truthiness check lets a number through to a signature
+    // check that then refuses it, and treats {} and [] as empty; JS objects are truthy, so a
+    // non-string here would verify (and an array `text` would skip the target binding).
+    for (const v of [from, to, messageId, text, sig]) {
+      if (typeof v !== 'string' || v === '') return false;
+    }
+    if (timestamp === undefined || timestamp === null) return false;
     // Fail closed where Python's float() would coerce: the timestamp is a finite number.
     if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) return false;
     const ks = record.keystate && typeof record.keystate === 'object' && !Array.isArray(record.keystate)
@@ -1321,7 +1331,9 @@ function verifyIntroRequest(record, { expectedSubject, expectedIntroducer, nowMs
 function introRequestTarget(record) {
   const text = record.text;
   if (typeof text !== 'string' || !text.startsWith(INTRO_REQUEST_PREFIX)) return null;
-  return text.slice(INTRO_REQUEST_PREFIX.length).trim() || null;
+  // Python's str.strip, not trim(): trim() drops a U+FEFF that Python keeps, which would let
+  // "introduce-me-to:﻿<this door>" name this door here and not in the core.
+  return wbaPyStrip(text.slice(INTRO_REQUEST_PREFIX.length)) || null;
 }
 
 /**
@@ -5256,17 +5268,45 @@ export function createAgentEntry({
     return kept.slice(-MAX_INTRODUCTIONS_PER_ACCOUNT);
   }
 
+  /** A device row's introductions folded into its owner's: an entry whose introducer is the
+   *  owner is dropped (it is a self-introduction once the rows are one account), a repeat of
+   *  the same (introducer, id) keeps the later verified_at, and the merged list is ordered by
+   *  verified_at, oldest first, keeping the newest MAX_INTRODUCTIONS_PER_ACCOUNT. Appending the
+   *  device's entries last instead would let older device entries evict newer owner ones. */
+  function foldIntroductions(ownerList, deviceList, ownerDid) {
+    const byKey = new Map();
+    const all = [...(Array.isArray(ownerList) ? ownerList : []), ...(Array.isArray(deviceList) ? deviceList : [])];
+    for (const e of all) {
+      if (!e || typeof e !== 'object' || e.introducer === ownerDid) continue;
+      const key = JSON.stringify([e.introducer, e.id]);
+      const prev = byKey.get(key);
+      if (!prev || (Number(e.verified_at) || 0) >= (Number(prev.verified_at) || 0)) byKey.set(key, e);
+    }
+    // Array.prototype.sort is stable: equal times keep owner-then-device order.
+    return [...byKey.values()]
+      .sort((a, b) => (Number(a.verified_at) || 0) - (Number(b.verified_at) || 0))
+      .slice(-MAX_INTRODUCTIONS_PER_ACCOUNT);
+  }
+
   /**
    * The introduction a SIGNED knock carries in `metadata.vc`, as the one ledger entry the door
    * keeps: `{ introducer, id, verified_at }`, or null. Called only after the knock's signature
    * verified, so `from` is proven. Never the credential body: the introducer DID and the id
-   * are all a later revocation needs. Null (an ordinary unintroduced knock, never a refusal)
-   * when there is no vc, it is not an object, its JSON is over MAX_VC_BYTES, it does not verify
-   * for this visitor and this door, or its issuer is the visitor itself: a self-introduction
-   * adds nothing the knock's own signature did not prove, and would let any key mint an
-   * "introduced" mark for free. Revocation is not checked yet. Never throws.
+   * are all a later revocation needs.
+   *
+   * The entry means only "this introducer signed for this visitor". It is not earned trust: a
+   * did:key costs nothing, so a visitor can always mint a second key and introduce itself
+   * with it, and the door cannot tell that key from a stranger's. Whoever reads the ledger
+   * must judge the introducer. What the door does refuse is the issuers it KNOWS are the
+   * visitor: `from`, the bound account, and the op key the knock was verified under (`opDid`,
+   * resolved from the visitor's keystate when it has one).
+   *
+   * Null (an ordinary unintroduced knock, never a refusal) when there is no vc, it is not an
+   * object, its JSON is over MAX_VC_BYTES, it does not verify for this visitor and this door,
+   * or its issuer is one of the visitor's own keys above. Revocation is not checked yet.
+   * Never throws.
    */
-  function introductionOf(meta, from, account) {
+  function introductionOf(meta, from, account, opDid = null) {
     try {
       if (!Object.hasOwn(meta, 'vc')) return null;
       const vc = meta.vc;
@@ -5277,7 +5317,7 @@ export function createAgentEntry({
         return null;
       }
       const introducer = vc.issuer;
-      if (introducer === from || introducer === account) return null;
+      if (introducer === from || introducer === account || (opDid && introducer === opDid)) return null;
       return { introducer, id: vc.id, verified_at: Math.floor(nowMs / 1000) };
     } catch {
       return null;
@@ -5293,16 +5333,19 @@ export function createAgentEntry({
       if (!devRow) return undefined;
       return then1(state.putAccount(deviceDid, null), () =>
         then1(state.getAccount(ownerDid), (ownerRow) => {
-          if (!ownerRow) return state.putAccount(ownerDid, devRow);
+          const devIntros = Array.isArray(devRow.introductions) && devRow.introductions.length
+            ? devRow.introductions : null;
+          if (!ownerRow) {
+            const moved = { ...devRow };
+            if (devIntros) moved.introductions = foldIntroductions([], devIntros, ownerDid);
+            return state.putAccount(ownerDid, moved);
+          }
           const merged = {
             ...ownerRow,
             messages: (ownerRow.messages || 0) + (devRow.messages || 0),
             first_seen: Math.min(ownerRow.first_seen, devRow.first_seen),
           };
-          if (Array.isArray(devRow.introductions) && devRow.introductions.length) {
-            merged.introductions = devRow.introductions.reduce(
-              (list, e) => withIntroduction(list, e), ownerRow.introductions);
-          }
+          if (devIntros) merged.introductions = foldIntroductions(ownerRow.introductions, devIntros, ownerDid);
           return state.putAccount(ownerDid, merged);
         }));
     });
@@ -5849,7 +5892,7 @@ export function createAgentEntry({
           ? state.putKeyState(from, nextKeyState) : undefined;
         // A valid introduction in the UNSIGNED metadata.vc adds one ledger entry; an invalid
         // one is ignored and the knock is answered exactly as without it.
-        const intro = introductionOf(meta, from, account);
+        const intro = introductionOf(meta, from, account, signerDid);
         return then1(pinnedWrite, () => then1(noteContact(account, intro), (firstContact) =>
             // T107: `wba_did` may legitimately differ from `peer_did` (the transport signer
             // vs the message signer) — both facts are honest, and the schema says which is

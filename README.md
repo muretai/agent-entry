@@ -467,9 +467,16 @@ epoch seconds. The credential itself is never stored: no signature, no subject, 
 A row keeps the newest 16 introductions, and the same introducer and id again refreshes its
 entry. Anything that does not verify is ignored and the knock is answered exactly as one
 without it: it is never refused for a bad introduction. The door also ignores a `vc` that is
-not an object, one whose JSON is over 8192 bytes, and one whose issuer is the visitor itself,
-because vouching for yourself adds nothing your signature on the knock did not already say. An
+not an object, one whose JSON is over 8192 bytes, and one whose issuer is a key the door knows
+is the visitor's own: its `from`, its bound owner, or the op key the knock was signed with. An
 unsigned knock on the anonymous lane never has its `metadata.vc` read.
+
+An entry says only that this introducer signed for this visitor. It is not trust the visitor
+has earned: a `did:key` costs nothing, so a visitor can mint a second key and introduce itself,
+and the door cannot tell that key from anyone else's. Judge the introducer before you act on
+an entry, for example by keeping your own list of introducers you know. When a device's row
+folds into its owner's, an entry whose introducer is the owner is dropped and the merged list
+keeps the newest 16 by `verified_at`.
 
 Known gap: revocation is not checked yet. The door has no revocation list, so an introduction
 its issuer has revoked still verifies until its `validUntil`. The credential `id` is kept so a
