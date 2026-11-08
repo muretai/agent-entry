@@ -1,0 +1,307 @@
+{
+ "cases": [
+  {
+   "expect": true,
+   "expectedRecipient": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+   "expectedSubject": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+   "name": "valid proactive introduction",
+   "vc": {
+    "credentialSubject": {
+     "expertise": [
+      "photography"
+     ],
+     "id": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+     "introducedTo": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+     "trustLevelBp": 800,
+     "validUntil": "2026-12-31T00:00:00Z"
+    },
+    "id": "urn:uuid:bcfe75815db3472eb22f0751aaf3a09e",
+    "issuanceDate": "2026-11-08T22:24:53Z",
+    "issuer": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+    "proof": {
+     "created": "2026-11-08T22:24:53Z",
+     "jws": "zr54aifsfBYZ32FB1oiYbKkbOz1ziclksS3EaQHNFdnca3ugypzAKrndKur90LdNQvyoDEqcPAtx0DNB1dEhCw==",
+     "type": "Ed25519Signature2020",
+     "verificationMethod": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+    },
+    "provenance": {
+     "mode": "proactive"
+    },
+    "type": [
+     "VerifiableCredential",
+     "AgentIntroduction"
+    ]
+   }
+  },
+  {
+   "expect": false,
+   "expectedRecipient": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+   "expectedSubject": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+   "name": "tampered trust level",
+   "vc": {
+    "credentialSubject": {
+     "expertise": [
+      "photography"
+     ],
+     "id": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+     "introducedTo": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+     "trustLevel": 1.0,
+     "trustLevelBp": 800,
+     "validUntil": "2026-12-31T00:00:00Z"
+    },
+    "id": "urn:uuid:bcfe75815db3472eb22f0751aaf3a09e",
+    "issuanceDate": "2026-11-08T22:24:53Z",
+    "issuer": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+    "proof": {
+     "created": "2026-11-08T22:24:53Z",
+     "jws": "zr54aifsfBYZ32FB1oiYbKkbOz1ziclksS3EaQHNFdnca3ugypzAKrndKur90LdNQvyoDEqcPAtx0DNB1dEhCw==",
+     "type": "Ed25519Signature2020",
+     "verificationMethod": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+    },
+    "provenance": {
+     "mode": "proactive"
+    },
+    "type": [
+     "VerifiableCredential",
+     "AgentIntroduction"
+    ]
+   }
+  },
+  {
+   "expect": false,
+   "expectedRecipient": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+   "expectedSubject": "did:key:z6Mkt6316e2PN3mZdB6N9CrzomJYUd1s5yBZi1XYHmwT9TUP",
+   "name": "wrong subject (replay for another visitor)",
+   "vc": {
+    "credentialSubject": {
+     "expertise": [
+      "photography"
+     ],
+     "id": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+     "introducedTo": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+     "trustLevelBp": 800,
+     "validUntil": "2026-12-31T00:00:00Z"
+    },
+    "id": "urn:uuid:bcfe75815db3472eb22f0751aaf3a09e",
+    "issuanceDate": "2026-11-08T22:24:53Z",
+    "issuer": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+    "proof": {
+     "created": "2026-11-08T22:24:53Z",
+     "jws": "zr54aifsfBYZ32FB1oiYbKkbOz1ziclksS3EaQHNFdnca3ugypzAKrndKur90LdNQvyoDEqcPAtx0DNB1dEhCw==",
+     "type": "Ed25519Signature2020",
+     "verificationMethod": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+    },
+    "provenance": {
+     "mode": "proactive"
+    },
+    "type": [
+     "VerifiableCredential",
+     "AgentIntroduction"
+    ]
+   }
+  },
+  {
+   "expect": false,
+   "expectedRecipient": "did:key:z6Mkt6316e2PN3mZdB6N9CrzomJYUd1s5yBZi1XYHmwT9TUP",
+   "expectedSubject": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+   "name": "wrong recipient (shown to another door)",
+   "vc": {
+    "credentialSubject": {
+     "expertise": [
+      "photography"
+     ],
+     "id": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+     "introducedTo": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+     "trustLevelBp": 800,
+     "validUntil": "2026-12-31T00:00:00Z"
+    },
+    "id": "urn:uuid:bcfe75815db3472eb22f0751aaf3a09e",
+    "issuanceDate": "2026-11-08T22:24:53Z",
+    "issuer": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+    "proof": {
+     "created": "2026-11-08T22:24:53Z",
+     "jws": "zr54aifsfBYZ32FB1oiYbKkbOz1ziclksS3EaQHNFdnca3ugypzAKrndKur90LdNQvyoDEqcPAtx0DNB1dEhCw==",
+     "type": "Ed25519Signature2020",
+     "verificationMethod": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+    },
+    "provenance": {
+     "mode": "proactive"
+    },
+    "type": [
+     "VerifiableCredential",
+     "AgentIntroduction"
+    ]
+   }
+  },
+  {
+   "expect": false,
+   "expectedRecipient": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+   "expectedSubject": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+   "name": "expired",
+   "vc": {
+    "credentialSubject": {
+     "expertise": [
+      "photography"
+     ],
+     "id": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+     "introducedTo": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+     "trustLevelBp": 800,
+     "validUntil": "2026-11-01T00:00:00Z"
+    },
+    "id": "urn:uuid:179b59b4abdc4f6a9e55c159e0a43bb1",
+    "issuanceDate": "2026-11-08T22:24:53Z",
+    "issuer": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+    "proof": {
+     "created": "2026-11-08T22:24:53Z",
+     "jws": "U8fKIv3R8nJE3K0GER+qx8+tLNmsuRjawYoIx+k0eNkN+l4S1oERMTaoGogvAagaRDkutQi3oocSIcusze0ZBw==",
+     "type": "Ed25519Signature2020",
+     "verificationMethod": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+    },
+    "provenance": {
+     "mode": "proactive"
+    },
+    "type": [
+     "VerifiableCredential",
+     "AgentIntroduction"
+    ]
+   }
+  },
+  {
+   "expect": false,
+   "expectedRecipient": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+   "expectedSubject": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+   "name": "no id (unrevokable)",
+   "vc": {
+    "credentialSubject": {
+     "expertise": [
+      "photography"
+     ],
+     "id": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+     "introducedTo": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+     "trustLevelBp": 800,
+     "validUntil": "2026-12-31T00:00:00Z"
+    },
+    "issuanceDate": "2026-11-08T22:24:53Z",
+    "issuer": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+    "proof": {
+     "created": "2026-11-08T22:24:53Z",
+     "jws": "zr54aifsfBYZ32FB1oiYbKkbOz1ziclksS3EaQHNFdnca3ugypzAKrndKur90LdNQvyoDEqcPAtx0DNB1dEhCw==",
+     "type": "Ed25519Signature2020",
+     "verificationMethod": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+    },
+    "provenance": {
+     "mode": "proactive"
+    },
+    "type": [
+     "VerifiableCredential",
+     "AgentIntroduction"
+    ]
+   }
+  },
+  {
+   "expect": false,
+   "expectedRecipient": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+   "expectedSubject": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+   "name": "signature of zeros",
+   "vc": {
+    "credentialSubject": {
+     "expertise": [
+      "photography"
+     ],
+     "id": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+     "introducedTo": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+     "trustLevelBp": 800,
+     "validUntil": "2026-12-31T00:00:00Z"
+    },
+    "id": "urn:uuid:bcfe75815db3472eb22f0751aaf3a09e",
+    "issuanceDate": "2026-11-08T22:24:53Z",
+    "issuer": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+    "proof": {
+     "created": "2026-11-08T22:24:53Z",
+     "jws": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+     "type": "Ed25519Signature2020",
+     "verificationMethod": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+    },
+    "provenance": {
+     "mode": "proactive"
+    },
+    "type": [
+     "VerifiableCredential",
+     "AgentIntroduction"
+    ]
+   }
+  },
+  {
+   "expect": false,
+   "expectedRecipient": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+   "expectedSubject": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+   "name": "issuer swapped",
+   "vc": {
+    "credentialSubject": {
+     "expertise": [
+      "photography"
+     ],
+     "id": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+     "introducedTo": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+     "trustLevelBp": 800,
+     "validUntil": "2026-12-31T00:00:00Z"
+    },
+    "id": "urn:uuid:bcfe75815db3472eb22f0751aaf3a09e",
+    "issuanceDate": "2026-11-08T22:24:53Z",
+    "issuer": "did:key:z6Mkt6316e2PN3mZdB6N9CrzomJYUd1s5yBZi1XYHmwT9TUP",
+    "proof": {
+     "created": "2026-11-08T22:24:53Z",
+     "jws": "zr54aifsfBYZ32FB1oiYbKkbOz1ziclksS3EaQHNFdnca3ugypzAKrndKur90LdNQvyoDEqcPAtx0DNB1dEhCw==",
+     "type": "Ed25519Signature2020",
+     "verificationMethod": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+    },
+    "provenance": {
+     "mode": "proactive"
+    },
+    "type": [
+     "VerifiableCredential",
+     "AgentIntroduction"
+    ]
+   }
+  },
+  {
+   "expect": false,
+   "expectedRecipient": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+   "expectedSubject": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+   "name": "unknown provenance mode",
+   "vc": {
+    "credentialSubject": {
+     "expertise": [
+      "photography"
+     ],
+     "id": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+     "introducedTo": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+     "trustLevelBp": 800,
+     "validUntil": "2026-12-31T00:00:00Z"
+    },
+    "id": "urn:uuid:bcfe75815db3472eb22f0751aaf3a09e",
+    "issuanceDate": "2026-11-08T22:24:53Z",
+    "issuer": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+    "proof": {
+     "created": "2026-11-08T22:24:53Z",
+     "jws": "zr54aifsfBYZ32FB1oiYbKkbOz1ziclksS3EaQHNFdnca3ugypzAKrndKur90LdNQvyoDEqcPAtx0DNB1dEhCw==",
+     "type": "Ed25519Signature2020",
+     "verificationMethod": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+    },
+    "provenance": {
+     "mode": "unknown"
+    },
+    "type": [
+     "VerifiableCredential",
+     "AgentIntroduction"
+    ]
+   }
+  }
+ ],
+ "door": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+ "generator": "muretai core shared/vc.py + shared/introid.py (trunk), test seeds 0x01/0x02/0x03/0x04 * 32",
+ "introducer": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+ "now": "2026-11-09T00:00:00Z",
+ "other": "did:key:z6Mkt6316e2PN3mZdB6N9CrzomJYUd1s5yBZi1XYHmwT9TUP",
+ "subject": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH"
+}

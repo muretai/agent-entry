@@ -1240,6 +1240,193 @@ export function verifyEnvelope(fields, opts = {}) {
   }
 }
 
+// ================================================================ introductions (AgentIntroduction VC)
+//
+// The JS port of the muretai core's admission check for an introduction: shared/vc.py
+// verify_introduction plus shared/introid.py's id rule. An introduction is a W3C-style
+// credential, type AgentIntroduction, signed Ed25519 by the issuer's did:key over
+// canonicalJSON(credential without `proof`), carried as standard base64 in proof.jws. It rides
+// on a knock as UNSIGNED metadata (`metadata.vc`), so everything it says is checked here and
+// nothing about it is taken from the knock except the two expectations the caller names.
+
+/** Upper bound on an introduction id, in UTF-8 bytes (shared/introid.py MAX_VC_ID_BYTES):
+ *  revocation is by id, and an id longer than this could never be named by a revoke. */
+export const MAX_VC_ID_BYTES = 256;
+
+/** The largest `metadata.vc` the door reads, in UTF-8 bytes of its JSON. A larger one is
+ *  ignored unread, valid or not: an issued introduction is well under 1 KiB, and the bound
+ *  keeps an attacker's credential from buying an Ed25519 verify over megabytes. */
+export const MAX_VC_BYTES = 8192;
+
+/** How many introductions one account row keeps. The newest win; a repeat of the same
+ *  (introducer, id) refreshes its entry instead of adding one. */
+export const MAX_INTRODUCTIONS_PER_ACCOUNT = 16;
+
+const INTRO_REQUEST_PREFIX = 'introduce-me-to:';
+const INTRO_REQUEST_TTL_S = 30 * 86400;
+const INTRO_REQUEST_SKEW_S = 300;
+
+/** shared/vc.py _parse_iso, for the forms Python's fromisoformat accepts that an issuer
+ *  actually writes: a date, or a date and time with optional seconds, fraction and offset.
+ *  No offset is UTC, as in the core. Anything else answers NaN (which fails every check).
+ *  The edges are Python's, not JavaScript's: the string is stripped by wbaPyStrip (Python's
+ *  str.strip, which keeps a leading U+FEFF that String.prototype.trim would drop, and drops a
+ *  trailing \x1c that trim would keep), and a fraction is exactly 3 or 6 digits, the only
+ *  lengths Python 3.9's fromisoformat (the core's floor) accepts. */
+function parseIsoMs(s) {
+  if (typeof s !== 'string') return Number.NaN;
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{3}|\d{6}))?)?)?(Z|[+-]\d{2}:\d{2})?$/
+    .exec(wbaPyStrip(s));
+  if (!m) return Number.NaN;
+  if (m[8] && m[4] === undefined) return Number.NaN;
+  const [y, mo, d, h = '0', mi = '0', sec = '0'] = m.slice(1, 7);
+  const frac = m[7] ? Number(`0.${m[7]}`) * 1000 : 0;
+  const ms = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(sec));
+  const back = new Date(ms);
+  if (back.getUTCFullYear() !== Number(y) || back.getUTCMonth() !== Number(mo) - 1
+      || back.getUTCDate() !== Number(d) || back.getUTCHours() !== Number(h)
+      || back.getUTCMinutes() !== Number(mi) || back.getUTCSeconds() !== Number(sec)) {
+    return Number.NaN;
+  }
+  let offsetMs = 0;
+  if (m[8] && m[8] !== 'Z') {
+    const oh = Number(m[8].slice(1, 3));
+    const om = Number(m[8].slice(4, 6));
+    if (oh > 23 || om > 59) return Number.NaN;
+    offsetMs = (oh * 60 + om) * 60000 * (m[8][0] === '-' ? -1 : 1);
+  }
+  return ms + frac - offsetMs;
+}
+
+/** shared/vc.py verify_intro_request: the subject's signed "introduce me" record embedded in a
+ *  requested introduction, checked at the VC's issuance time `nowMs`. Never throws. */
+function verifyIntroRequest(record, { expectedSubject, expectedIntroducer, nowMs }) {
+  try {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) return false;
+    const { from, to, messageId, text, sig, timestamp } = record;
+    // Each a non-empty STRING. Python's truthiness check lets a number through to a signature
+    // check that then refuses it, and treats {} and [] as empty; JS objects are truthy, so a
+    // non-string here would verify (and an array `text` would skip the target binding).
+    for (const v of [from, to, messageId, text, sig]) {
+      if (typeof v !== 'string' || v === '') return false;
+    }
+    if (timestamp === undefined || timestamp === null) return false;
+    // Fail closed where Python's float() would coerce: the timestamp is a finite number.
+    if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) return false;
+    const ks = record.keystate && typeof record.keystate === 'object' && !Array.isArray(record.keystate)
+      ? record.keystate : null;
+    const op = resolveOpDid(from, ks, nowEpoch());
+    if (!verifyEnvelopeSignature({ from, to, messageId, contextId: record.contextId ?? null,
+      timestamp, text, sig }, { signerDid: op })) return false;
+    if (from !== expectedSubject || to !== expectedIntroducer) return false;
+    const age = nowMs / 1000 - timestamp;
+    if (!(age >= -INTRO_REQUEST_SKEW_S) || age > INTRO_REQUEST_TTL_S) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** shared/vc.py intro_request_target: the DID a targeted request names, or null. */
+function introRequestTarget(record) {
+  const text = record.text;
+  if (typeof text !== 'string' || !text.startsWith(INTRO_REQUEST_PREFIX)) return null;
+  // Python's str.strip, not trim(): trim() drops a U+FEFF that Python keeps, which would let
+  // "introduce-me-to:﻿<this door>" name this door here and not in the core.
+  return wbaPyStrip(text.slice(INTRO_REQUEST_PREFIX.length)) || null;
+}
+
+/**
+ * Is `vc` a valid AgentIntroduction of `expectedSubject`, addressed to `expectedRecipient`,
+ * live at `now` (a Date)? The verdicts of the core's shared/introid.py verify_introduction,
+ * checked against its own vectors (conformance/vectors/intro-vectors.json):
+ *
+ *   1. structure: an object whose `type` array holds "AgentIntroduction", with an issuer, a
+ *      credentialSubject object and a proof object;
+ *   2. proof.jws verifies under the issuer's did:key over canonicalJSON(vc without proof);
+ *   3. credentialSubject.id === expectedSubject, credentialSubject.introducedTo ===
+ *      expectedRecipient (both REQUIRED here: an unnamed expectation fails closed);
+ *   4. credentialSubject.validUntil strictly after `now`;
+ *   5. provenance, when present: "proactive" passes, "requested" must embed the subject's
+ *      signed request (bound to this subject and issuer, live at issuanceDate, and naming
+ *      this recipient when targeted), any other mode fails closed;
+ *   6. a top-level `id` that is a non-empty string of at most MAX_VC_ID_BYTES UTF-8 bytes.
+ *
+ * Where the core is looser on a malformed input it is stricter here, never the other way:
+ * `type` must be an array (Python's `in` also matches a substring of a string or a key of a
+ * dict), proof.jws must be canonical base64 (Python's b64decode drops stray characters), and a
+ * request timestamp must be a number. Revocation is not checked: that is the caller's.
+ *
+ * The input is read once through a JSON round trip, so a getter, a Proxy, a cycle or an
+ * inherited property is what JSON would carry or a failure. Returns exactly true or false and
+ * never throws.
+ */
+export function verifyIntroduction(vc, opts = {}) {
+  try {
+    if (!opts || typeof opts !== 'object') return false;
+    const { expectedSubject, expectedRecipient, now } = opts;
+    if (typeof expectedSubject !== 'string' || !expectedSubject) return false;
+    if (typeof expectedRecipient !== 'string' || !expectedRecipient) return false;
+    if (!(now instanceof Date)) return false;
+    const nowMs = now.getTime();
+    if (!Number.isFinite(nowMs)) return false;
+    if (!vc || typeof vc !== 'object' || Array.isArray(vc)) return false;
+    const c = JSON.parse(JSON.stringify(vc));
+    if (!c || typeof c !== 'object' || Array.isArray(c)) return false;
+
+    // 6. the id rule (introid.py), first because it is the cheapest.
+    if (typeof c.id !== 'string' || c.id === '') return false;
+    assertEncodable(c.id);
+    if (Buffer.byteLength(c.id, 'utf8') > MAX_VC_ID_BYTES) return false;
+
+    // 1. structure and type.
+    if (!Array.isArray(c.type) || !c.type.includes('AgentIntroduction')) return false;
+    const { issuer, credentialSubject: subj, proof } = c;
+    if (typeof issuer !== 'string' || !issuer) return false;
+    if (!subj || typeof subj !== 'object' || Array.isArray(subj)) return false;
+    if (!proof || typeof proof !== 'object' || Array.isArray(proof)) return false;
+
+    // 2. the issuer's signature over the body without `proof`.
+    const sig = strictB64(proof.jws);
+    if (sig === null || sig.length !== 64) return false;
+    const body = { ...c };
+    delete body.proof;
+    if (!verifyBytes(publicKeyFromDid(issuer), sig, canonicalBytes(body))) return false;
+
+    // 3. anti-replay: this subject, this recipient.
+    if (subj.id !== expectedSubject || subj.introducedTo !== expectedRecipient) return false;
+
+    // 4. expiry.
+    if (!subj.validUntil) return false;
+    const until = parseIsoMs(subj.validUntil);
+    if (!(until > nowMs)) return false;
+
+    // 5. provenance. Absent is tolerated (a pre-provenance credential), as in the core.
+    if (Object.hasOwn(c, 'provenance') && c.provenance !== null) {
+      const prov = c.provenance;
+      if (typeof prov !== 'object' || Array.isArray(prov)) return false;
+      if (prov.mode === 'proactive') {
+        // nothing further
+      } else if (prov.mode === 'requested') {
+        const req = prov.request;
+        if (!c.issuanceDate) return false;
+        const anchor = parseIsoMs(c.issuanceDate);
+        if (!Number.isFinite(anchor)) return false;
+        if (!verifyIntroRequest(req, { expectedSubject: subj.id, expectedIntroducer: issuer, nowMs: anchor })) {
+          return false;
+        }
+        const named = introRequestTarget(req);
+        if (named !== null && named !== subj.introducedTo) return false;
+      } else {
+        return false;   // unknown mode: fail closed
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ================================================================ KeyState (inline op-key, T142 A2)
 //
 // A persisted muretai identity enrolls a genesis KeyState at birth and signs
@@ -5051,7 +5238,7 @@ export function createAgentEntry({
   /** Record contact from an account. Returns whether this was its FIRST contact — the store
    *  held no row for it — (or a promise of that, with a store). Analytics-2 reads it as
    *  `first_contact`; the row itself stays `{first_seen, last_seen, messages}`. */
-  function noteContact(accountDid) {
+  function noteContact(accountDid, intro = null) {
     const now = nowEpoch();
     return then1(state.getAccount(accountDid), (row) => {
       if (row) {
@@ -5059,6 +5246,7 @@ export function createAgentEntry({
         // store hands back the live object and the write is a no-op re-set of the same
         // reference — one code path, correct for both.
         const updated = { ...row, messages: (row.messages || 0) + 1, last_seen: now };
+        if (intro) updated.introductions = withIntroduction(row.introductions, intro);
         return then1(state.putAccount(accountDid, updated), () => false);
       }
       // FIRST CONTACT IS ACCOUNT CREATION. There is no signup form: the sender proved
@@ -5066,8 +5254,74 @@ export function createAgentEntry({
       // The row is keyed by the ACCOUNT (the owner when bound), so sibling devices are one
       // customer.
       const fresh = { first_seen: now, last_seen: now, messages: 1 };
+      if (intro) fresh.introductions = withIntroduction([], intro);
       return then1(state.putAccount(accountDid, fresh), () => true);
     });
+  }
+
+  /** The account row's `introductions` with `intro` added: a repeat of the same (introducer,
+   *  id) replaces its older entry, and only the newest MAX_INTRODUCTIONS_PER_ACCOUNT stay. */
+  function withIntroduction(list, intro) {
+    const kept = (Array.isArray(list) ? list : []).filter((e) => e && typeof e === 'object'
+      && !(e.introducer === intro.introducer && e.id === intro.id));
+    kept.push(intro);
+    return kept.slice(-MAX_INTRODUCTIONS_PER_ACCOUNT);
+  }
+
+  /** A device row's introductions folded into its owner's: an entry whose introducer is the
+   *  owner is dropped (it is a self-introduction once the rows are one account), a repeat of
+   *  the same (introducer, id) keeps the later verified_at, and the merged list is ordered by
+   *  verified_at, oldest first, keeping the newest MAX_INTRODUCTIONS_PER_ACCOUNT. Appending the
+   *  device's entries last instead would let older device entries evict newer owner ones. */
+  function foldIntroductions(ownerList, deviceList, ownerDid) {
+    const byKey = new Map();
+    const all = [...(Array.isArray(ownerList) ? ownerList : []), ...(Array.isArray(deviceList) ? deviceList : [])];
+    for (const e of all) {
+      if (!e || typeof e !== 'object' || e.introducer === ownerDid) continue;
+      const key = JSON.stringify([e.introducer, e.id]);
+      const prev = byKey.get(key);
+      if (!prev || (Number(e.verified_at) || 0) >= (Number(prev.verified_at) || 0)) byKey.set(key, e);
+    }
+    // Array.prototype.sort is stable: equal times keep owner-then-device order.
+    return [...byKey.values()]
+      .sort((a, b) => (Number(a.verified_at) || 0) - (Number(b.verified_at) || 0))
+      .slice(-MAX_INTRODUCTIONS_PER_ACCOUNT);
+  }
+
+  /**
+   * The introduction a SIGNED knock carries in `metadata.vc`, as the one ledger entry the door
+   * keeps: `{ introducer, id, verified_at }`, or null. Called only after the knock's signature
+   * verified, so `from` is proven. Never the credential body: the introducer DID and the id
+   * are all a later revocation needs.
+   *
+   * The entry means only "this introducer signed for this visitor". It is not earned trust: a
+   * did:key costs nothing, so a visitor can always mint a second key and introduce itself
+   * with it, and the door cannot tell that key from a stranger's. Whoever reads the ledger
+   * must judge the introducer. What the door does refuse is the issuers it KNOWS are the
+   * visitor: `from`, the bound account, and the op key the knock was verified under (`opDid`,
+   * resolved from the visitor's keystate when it has one).
+   *
+   * Null (an ordinary unintroduced knock, never a refusal) when there is no vc, it is not an
+   * object, its JSON is over MAX_VC_BYTES, it does not verify for this visitor and this door,
+   * or its issuer is one of the visitor's own keys above. Revocation is not checked yet.
+   * Never throws.
+   */
+  function introductionOf(meta, from, account, opDid = null) {
+    try {
+      if (!Object.hasOwn(meta, 'vc')) return null;
+      const vc = meta.vc;
+      if (!vc || typeof vc !== 'object' || Array.isArray(vc)) return null;
+      if (Buffer.byteLength(JSON.stringify(vc), 'utf8') > MAX_VC_BYTES) return null;
+      const nowMs = Date.now();
+      if (!verifyIntroduction(vc, { expectedSubject: from, expectedRecipient: did, now: new Date(nowMs) })) {
+        return null;
+      }
+      const introducer = vc.issuer;
+      if (introducer === from || introducer === account || (opDid && introducer === opDid)) return null;
+      return { introducer, id: vc.id, verified_at: Math.floor(nowMs / 1000) };
+    } catch {
+      return null;
+    }
   }
 
   /** When a device that ALREADY has an unbound ledger row first proves its owner, move that
@@ -5079,12 +5333,19 @@ export function createAgentEntry({
       if (!devRow) return undefined;
       return then1(state.putAccount(deviceDid, null), () =>
         then1(state.getAccount(ownerDid), (ownerRow) => {
-          if (!ownerRow) return state.putAccount(ownerDid, devRow);
+          const devIntros = Array.isArray(devRow.introductions) && devRow.introductions.length
+            ? devRow.introductions : null;
+          if (!ownerRow) {
+            const moved = { ...devRow };
+            if (devIntros) moved.introductions = foldIntroductions([], devIntros, ownerDid);
+            return state.putAccount(ownerDid, moved);
+          }
           const merged = {
             ...ownerRow,
             messages: (ownerRow.messages || 0) + (devRow.messages || 0),
             first_seen: Math.min(ownerRow.first_seen, devRow.first_seen),
           };
+          if (devIntros) merged.introductions = foldIntroductions(ownerRow.introductions, devIntros, ownerDid);
           return state.putAccount(ownerDid, merged);
         }));
     });
@@ -5629,7 +5890,10 @@ export function createAgentEntry({
         // itself has now proved possession of the op-key it names.
         const pinnedWrite = nextKeyState
           ? state.putKeyState(from, nextKeyState) : undefined;
-        return then1(pinnedWrite, () => then1(noteContact(account), (firstContact) =>
+        // A valid introduction in the UNSIGNED metadata.vc adds one ledger entry; an invalid
+        // one is ignored and the knock is answered exactly as without it.
+        const intro = introductionOf(meta, from, account, signerDid);
+        return then1(pinnedWrite, () => then1(noteContact(account, intro), (firstContact) =>
             // T107: `wba_did` may legitimately differ from `peer_did` (the transport signer
             // vs the message signer) — both facts are honest, and the schema says which is
             // which.

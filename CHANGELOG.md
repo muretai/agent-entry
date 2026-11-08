@@ -50,6 +50,22 @@ field and the claimant flags are gone. These notes were gathered as 1.14.0 befor
   - A lapsed quote is marked, not refused: past validUntil by the visitor's clock the booking
     adds `termsExpired: true`. A repeat approve with other terms is refused, and the terms file
     is read once as a regular file of at most 16 KiB in strict UTF-8.
+- added: a knock that carries an introduction credential.
+  - `verifyIntroduction(vc, { expectedSubject, expectedRecipient, now })`, the JS port of the
+    muretai core's verify_introduction plus its id rule, reproduces the core's verdict on every
+    vector in `conformance/vectors/intro-vectors.json`. It returns true or false and never throws.
+  - A signed knock may carry `metadata.vc`, an `AgentIntroduction`. When it verifies for the
+    knock's `from` and this door, the account row gains `introductions`, entries of exactly
+    `{introducer, id, verified_at}`. The credential body is never stored.
+  - An invalid, non-object, over 8192 byte or self-issued vc is ignored, never refused, and an
+    unsigned knock's vc is never read. Self-issued includes the visitor's own op key.
+  - An entry means "this introducer signed for this visitor", not earned trust: a visitor can
+    mint another key and introduce itself, so consumers must judge the introducer.
+  - Parity with the core verifier: an embedded request's from, to, messageId, text and sig must
+    be strings, and dates are stripped as Python's str.strip does, with a 3 or 6 digit fraction.
+  - A device row folded into its owner drops entries introduced by the owner and keeps the
+    newest 16 by verified_at.
+  - Known gap: revocation is not checked yet. The id is kept so a later item can revoke by id.
 - added: `first_contact` on the envelope, the observer row and both sinks, and counts split into
   new versus returning knocks (Analytics-2).
 - added: hosted counts (S6a-2, S6a-3, S6a-4). `entry.counts` in `agent-entry.json` is now accepted, an absolute https
