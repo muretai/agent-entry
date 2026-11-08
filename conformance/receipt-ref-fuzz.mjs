@@ -4,7 +4,7 @@
 //
 // WRITTEN BEFORE THE IMPLEMENTATION (test author only). Intake 20261028T210658Z, finding D1 of the
 // security review secrev-entry-6059-0363-2. The implementer may not edit this file. Run it as
-// `bash .cursor/skills/isolated-session/scripts/run-node.sh conformance/receipt-ref-fuzz.mjs`.
+// `node conformance/receipt-ref-fuzz.mjs`.
 //
 // Property: no_crash -- for every generated messageId the door answers a JSON-RPC 2.0 object with
 // exactly one of result and error, and never throws -- plus one invariant: a repeated messageId

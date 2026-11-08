@@ -9,7 +9,7 @@
 // that already exists. Options (a) (a door-minted ref) and (b) (rows keyed by partyB and messageId)
 // are NOT taken, and nothing here needs them: the ref stays the visitor's messageId. The
 // implementer may not edit this file. Run it as
-// `bash .cursor/skills/isolated-session/scripts/run-node.sh conformance/receipt-ref-owned.mjs`.
+// `node conformance/receipt-ref-owned.mjs`.
 //
 // Where the refusal lives: on the door's pending-hold write. The store seam's own putReceipt keeps
 // replacing a row when called directly -- conformance/receipts.mjs, decide.mjs, decide-ref.mjs and

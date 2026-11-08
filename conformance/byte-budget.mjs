@@ -5,7 +5,7 @@
 // 20261101T163125Z (ISSUE security-audit-2026-11-01-gate-github-and-revendor-v0-1-10-2).
 // The implementer may not edit this file. The stores are local fixtures on 127.0.0.1.
 // Nothing here dials a live site. Run it as
-// `bash .cursor/skills/isolated-session/scripts/run-node.sh conformance/byte-budget.mjs`.
+// `node conformance/byte-budget.mjs`.
 //
 // `init <store url> --max-bytes <n>` reads at most n body bytes in the whole run. That
 // total counts every body detection reads (robots.txt and the Store API products body)
