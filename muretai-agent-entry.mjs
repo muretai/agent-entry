@@ -5313,10 +5313,18 @@ export function createAgentEntry({
   }
 
   /** `intro`, or null when its introducer is a sibling device of `account`: the device-owner
-   *  table maps the issuer to the visitor's own account. A promise of that with a store. */
+   *  table maps the issuer to the visitor's own account. A promise of that with a store.
+   *  Fails closed: a read that throws or rejects records no introduction, and the knock is
+   *  answered as without one. Never throws, never rejects. */
   function unlessSibling(intro, account) {
     if (!intro) return null;
-    return then1(state.getDeviceOwner(intro.introducer), (owner) => (owner === account ? null : intro));
+    try {
+      const owner = state.getDeviceOwner(intro.introducer);
+      const pick = (o) => (o === account ? null : intro);
+      return isThenable(owner) ? Promise.resolve(owner).then(pick, () => null) : pick(owner);
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -5366,31 +5374,38 @@ export function createAgentEntry({
   /** When a device that ALREADY has an unbound ledger row first proves its owner, move that
    *  row's history into the owner row — ONCE. Never the reverse: a later stripped binding
    *  resolves to the device DID and must not merge, or stripping a binding would become a
-   *  way to read the owner's history. */
+   *  way to read the owner's history.
+   *
+   *  Every read (the device row, the owner row, the sibling reads) happens before any write,
+   *  and the device row is deleted only after the owner row is written: a read or write that
+   *  fails leaves the device row whole. The caller runs this BEFORE it writes the device pin,
+   *  so a fold that failed runs again on the next bound knock. `deviceDid` itself counts as
+   *  a sibling of `ownerDid` here, as the pin about to be written will say. */
   function foldDeviceIntoOwner(deviceDid, ownerDid) {
     return then1(state.getAccount(deviceDid), (devRow) => {
       if (!devRow) return undefined;
-      return then1(state.putAccount(deviceDid, null), () =>
-        then1(state.getAccount(ownerDid), (ownerRow) => {
-          const devIntros = Array.isArray(devRow.introductions) && devRow.introductions.length
-            ? devRow.introductions : null;
-          const ownerIntros = ownerRow ? ownerRow.introductions : [];
-          const siblings = devIntros ? siblingIntroducers([ownerIntros, devIntros], ownerDid) : null;
-          return then1(siblings, (sibs) => {
-            if (!ownerRow) {
-              const moved = { ...devRow };
-              if (devIntros) moved.introductions = foldIntroductions([], devIntros, ownerDid, sibs);
-              return state.putAccount(ownerDid, moved);
-            }
-            const merged = {
+      return then1(state.getAccount(ownerDid), (ownerRow) => {
+        const devIntros = Array.isArray(devRow.introductions) && devRow.introductions.length
+          ? devRow.introductions : null;
+        const ownerIntros = ownerRow ? ownerRow.introductions : [];
+        const siblings = devIntros ? siblingIntroducers([ownerIntros, devIntros], ownerDid) : null;
+        return then1(siblings, (sibs) => {
+          if (sibs) sibs.add(deviceDid);
+          let next;
+          if (!ownerRow) {
+            next = { ...devRow };
+            if (devIntros) next.introductions = foldIntroductions([], devIntros, ownerDid, sibs);
+          } else {
+            next = {
               ...ownerRow,
               messages: (ownerRow.messages || 0) + (devRow.messages || 0),
               first_seen: Math.min(ownerRow.first_seen, devRow.first_seen),
             };
-            if (devIntros) merged.introductions = foldIntroductions(ownerIntros, devIntros, ownerDid, sibs);
-            return state.putAccount(ownerDid, merged);
-          });
-        }));
+            if (devIntros) next.introductions = foldIntroductions(ownerIntros, devIntros, ownerDid, sibs);
+          }
+          return then1(state.putAccount(ownerDid, next), () => state.putAccount(deviceDid, null));
+        });
+      });
     });
   }
 
@@ -5446,8 +5461,10 @@ export function createAgentEntry({
           + '— a new owner means a new device key)' };
       }
       if (pinned === null || pinned === undefined) {
-        return then1(state.putDeviceOwner(from, rootDid), () =>
-          then1(foldDeviceIntoOwner(from, rootDid), () => ({ ok: true, account: rootDid })));
+        // Fold first, pin second: a fold that fails leaves the pin unwritten, so the next
+        // bound knock folds again instead of stranding the device row.
+        return then1(foldDeviceIntoOwner(from, rootDid), () =>
+          then1(state.putDeviceOwner(from, rootDid), () => ({ ok: true, account: rootDid })));
       }
       return { ok: true, account: rootDid };
     });
@@ -5935,9 +5952,12 @@ export function createAgentEntry({
           ? state.putKeyState(from, nextKeyState) : undefined;
         // A valid introduction in the UNSIGNED metadata.vc adds one ledger entry; an invalid
         // one is ignored and the knock is answered exactly as without it.
-        // So is one whose issuer the device-owner table maps to this same account.
-        const intro = unlessSibling(introductionOf(meta, from, account, signerDid), account);
-        return then1(pinnedWrite, () => then1(intro, (kept) => then1(noteContact(account, kept), (firstContact) =>
+        // So is one whose issuer the device-owner table maps to this same account. That read
+        // starts only once the keystate write has resolved: started earlier, its rejection
+        // would sit unhandled while the write is pending, and Node exits on that.
+        const intro = introductionOf(meta, from, account, signerDid);
+        return then1(pinnedWrite, () => then1(unlessSibling(intro, account), (kept) =>
+          then1(noteContact(account, kept), (firstContact) =>
             // T107: `wba_did` may legitimately differ from `peer_did` (the transport signer
             // vs the message signer) — both facts are honest, and the schema says which is
             // which.
