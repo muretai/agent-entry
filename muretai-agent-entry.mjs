@@ -5269,15 +5269,18 @@ export function createAgentEntry({
   }
 
   /** A device row's introductions folded into its owner's: an entry whose introducer is the
-   *  owner is dropped (it is a self-introduction once the rows are one account), a repeat of
-   *  the same (introducer, id) keeps the later verified_at, and the merged list is ordered by
-   *  verified_at, oldest first, keeping the newest MAX_INTRODUCTIONS_PER_ACCOUNT. Appending the
-   *  device's entries last instead would let older device entries evict newer owner ones. */
-  function foldIntroductions(ownerList, deviceList, ownerDid) {
+   *  owner, or a sibling device the device-owner table maps to the owner (`siblings`, a Set),
+   *  is dropped (it is a self-introduction once the rows are one account), a repeat of the
+   *  same (introducer, id) keeps the later verified_at (and the valid_until that came with
+   *  it: the entry is kept whole), and the merged list is ordered by verified_at, oldest
+   *  first, keeping the newest MAX_INTRODUCTIONS_PER_ACCOUNT. Appending the device's entries
+   *  last instead would let older device entries evict newer owner ones. A legacy entry with
+   *  no valid_until is kept as written: its expiry is unknown, never invented. */
+  function foldIntroductions(ownerList, deviceList, ownerDid, siblings = new Set()) {
     const byKey = new Map();
     const all = [...(Array.isArray(ownerList) ? ownerList : []), ...(Array.isArray(deviceList) ? deviceList : [])];
     for (const e of all) {
-      if (!e || typeof e !== 'object' || e.introducer === ownerDid) continue;
+      if (!e || typeof e !== 'object' || e.introducer === ownerDid || siblings.has(e.introducer)) continue;
       const key = JSON.stringify([e.introducer, e.id]);
       const prev = byKey.get(key);
       if (!prev || (Number(e.verified_at) || 0) >= (Number(prev.verified_at) || 0)) byKey.set(key, e);
@@ -5288,9 +5291,41 @@ export function createAgentEntry({
       .slice(-MAX_INTRODUCTIONS_PER_ACCOUNT);
   }
 
+  /** The introducers named in `lists` that the device-owner table maps to `ownerDid`: sibling
+   *  devices of that owner. A Set, or a promise of one with a store. One read per distinct
+   *  introducer, in order, so a store sees no concurrent burst. */
+  function siblingIntroducers(lists, ownerDid) {
+    const dids = [];
+    for (const list of lists) {
+      for (const e of Array.isArray(list) ? list : []) {
+        if (e && typeof e === 'object' && typeof e.introducer === 'string' && !dids.includes(e.introducer)) {
+          dids.push(e.introducer);
+        }
+      }
+    }
+    const found = new Set();
+    const step = (i) => (i >= dids.length ? found
+      : then1(state.getDeviceOwner(dids[i]), (owner) => {
+        if (owner === ownerDid) found.add(dids[i]);
+        return step(i + 1);
+      }));
+    return step(0);
+  }
+
+  /** `intro`, or null when its introducer is a sibling device of `account`: the device-owner
+   *  table maps the issuer to the visitor's own account. A promise of that with a store. */
+  function unlessSibling(intro, account) {
+    if (!intro) return null;
+    return then1(state.getDeviceOwner(intro.introducer), (owner) => (owner === account ? null : intro));
+  }
+
   /**
    * The introduction a SIGNED knock carries in `metadata.vc`, as the one ledger entry the door
-   * keeps: `{ introducer, id, verified_at }`, or null. Called only after the knock's signature
+   * keeps: `{ introducer, id, verified_at, valid_until }`, or null. valid_until is the
+   * credential's credentialSubject.validUntil as integer epoch seconds (floored, the unit of
+   * verified_at), so a reader can tell that an introduction has lapsed; nothing is refused
+   * for lapsing after it was recorded. An entry written before this key existed has none, and
+   * a reader treats that as unknown. Called only after the knock's signature
    * verified, so `from` is proven. Never the credential body: the introducer DID and the id
    * are all a later revocation needs.
    *
@@ -5299,7 +5334,8 @@ export function createAgentEntry({
    * with it, and the door cannot tell that key from a stranger's. Whoever reads the ledger
    * must judge the introducer. What the door does refuse is the issuers it KNOWS are the
    * visitor: `from`, the bound account, and the op key the knock was verified under (`opDid`,
-   * resolved from the visitor's keystate when it has one).
+   * resolved from the visitor's keystate when it has one). A sibling device of the visitor's
+   * own account is refused by the caller through `unlessSibling`, since it needs a store read.
    *
    * Null (an ordinary unintroduced knock, never a refusal) when there is no vc, it is not an
    * object, its JSON is over MAX_VC_BYTES, it does not verify for this visitor and this door,
@@ -5318,7 +5354,10 @@ export function createAgentEntry({
       }
       const introducer = vc.issuer;
       if (introducer === from || introducer === account || (opDid && introducer === opDid)) return null;
-      return { introducer, id: vc.id, verified_at: Math.floor(nowMs / 1000) };
+      // verifyIntroduction has already proved this parses to an instant after nowMs.
+      const untilS = Math.floor(parseIsoMs(vc.credentialSubject.validUntil) / 1000);
+      if (!Number.isSafeInteger(untilS)) return null;
+      return { introducer, id: vc.id, verified_at: Math.floor(nowMs / 1000), valid_until: untilS };
     } catch {
       return null;
     }
@@ -5335,18 +5374,22 @@ export function createAgentEntry({
         then1(state.getAccount(ownerDid), (ownerRow) => {
           const devIntros = Array.isArray(devRow.introductions) && devRow.introductions.length
             ? devRow.introductions : null;
-          if (!ownerRow) {
-            const moved = { ...devRow };
-            if (devIntros) moved.introductions = foldIntroductions([], devIntros, ownerDid);
-            return state.putAccount(ownerDid, moved);
-          }
-          const merged = {
-            ...ownerRow,
-            messages: (ownerRow.messages || 0) + (devRow.messages || 0),
-            first_seen: Math.min(ownerRow.first_seen, devRow.first_seen),
-          };
-          if (devIntros) merged.introductions = foldIntroductions(ownerRow.introductions, devIntros, ownerDid);
-          return state.putAccount(ownerDid, merged);
+          const ownerIntros = ownerRow ? ownerRow.introductions : [];
+          const siblings = devIntros ? siblingIntroducers([ownerIntros, devIntros], ownerDid) : null;
+          return then1(siblings, (sibs) => {
+            if (!ownerRow) {
+              const moved = { ...devRow };
+              if (devIntros) moved.introductions = foldIntroductions([], devIntros, ownerDid, sibs);
+              return state.putAccount(ownerDid, moved);
+            }
+            const merged = {
+              ...ownerRow,
+              messages: (ownerRow.messages || 0) + (devRow.messages || 0),
+              first_seen: Math.min(ownerRow.first_seen, devRow.first_seen),
+            };
+            if (devIntros) merged.introductions = foldIntroductions(ownerIntros, devIntros, ownerDid, sibs);
+            return state.putAccount(ownerDid, merged);
+          });
         }));
     });
   }
@@ -5892,13 +5935,14 @@ export function createAgentEntry({
           ? state.putKeyState(from, nextKeyState) : undefined;
         // A valid introduction in the UNSIGNED metadata.vc adds one ledger entry; an invalid
         // one is ignored and the knock is answered exactly as without it.
-        const intro = introductionOf(meta, from, account, signerDid);
-        return then1(pinnedWrite, () => then1(noteContact(account, intro), (firstContact) =>
+        // So is one whose issuer the device-owner table maps to this same account.
+        const intro = unlessSibling(introductionOf(meta, from, account, signerDid), account);
+        return then1(pinnedWrite, () => then1(intro, (kept) => then1(noteContact(account, kept), (firstContact) =>
             // T107: `wba_did` may legitimately differ from `peer_did` (the transport signer
             // vs the message signer) — both facts are honest, and the schema says which is
             // which.
             respond(backendEnvelope(msg, { verified: true, peerDid: from, ownerDid,
-              wbaDid: wbaIdentify(reqHeaders), firstContact }), reqId, msg, from, chosen)));
+              wbaDid: wbaIdentify(reqHeaders), firstContact }), reqId, msg, from, chosen))));
       });
       });
     });
