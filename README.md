@@ -459,24 +459,32 @@ When it holds, the visitor's account row gains one entry in `introductions`:
 ```js
 entry.ledger.get(visitorDid)
 // { first_seen: 1781000000, last_seen: 1781000000, messages: 1,
-//   introductions: [{ introducer: 'did:key:z6Mk...', id: 'urn:uuid:...', verified_at: 1781000000 }] }
+//   introductions: [{ introducer: 'did:key:z6Mk...', id: 'urn:uuid:...', verified_at: 1781000000,
+//                     valid_until: 1781086400 }] }
 ```
 
-`introducer` is the issuer DID, `id` the credential id and `verified_at` the door's clock in
-epoch seconds. The credential itself is never stored: no signature, no subject, no expertise.
+`introducer` is the issuer DID, `id` the credential id, `verified_at` the door's clock in
+epoch seconds and `valid_until` the credential's `credentialSubject.validUntil` in the same
+unit, so you can tell when an introduction has lapsed. A lapsed entry stays on the row: it is a
+record of what was verified. An entry recorded before `valid_until` existed has none; treat
+that as unknown. The credential itself is never stored: no signature, no subject, no expertise.
 A row keeps the newest 16 introductions, and the same introducer and id again refreshes its
-entry. Anything that does not verify is ignored and the knock is answered exactly as one
+entry, `verified_at` and `valid_until` together. Anything that does not verify is ignored and the knock is answered exactly as one
 without it: it is never refused for a bad introduction. The door also ignores a `vc` that is
 not an object, one whose JSON is over 8192 bytes, and one whose issuer is a key the door knows
-is the visitor's own: its `from`, its bound owner, or the op key the knock was signed with. An
+is the visitor's own: its `from`, its bound owner, the op key the knock was signed with, or a
+sibling device the door has already bound to the visitor's own owner. An
 unsigned knock on the anonymous lane never has its `metadata.vc` read.
 
 An entry says only that this introducer signed for this visitor. It is not trust the visitor
 has earned: a `did:key` costs nothing, so a visitor can mint a second key and introduce itself,
 and the door cannot tell that key from anyone else's. Judge the introducer before you act on
 an entry, for example by keeping your own list of introducers you know. When a device's row
-folds into its owner's, an entry whose introducer is the owner is dropped and the merged list
-keeps the newest 16 by `verified_at`.
+folds into its owner's, an entry whose introducer is the owner, or a device bound to that
+owner, is dropped and the merged list
+keeps the newest 16 by `verified_at`. The owner row then lists that device in `folded_from`
+(the newest 32 devices), so a fold that is retried after a failed write never counts the
+device's messages twice.
 
 Known gap: revocation is not checked yet. The door has no revocation list, so an introduction
 its issuer has revoked still verifies until its `validUntil`. The credential `id` is kept so a

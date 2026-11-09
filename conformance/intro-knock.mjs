@@ -11,8 +11,10 @@
 //   - a SIGNED knock whose metadata.vc is a valid AgentIntroduction for the knock's verified `from`
 //     DID, introduced to this door's own DID, is answered as usual AND the visitor's account row
 //     gains `introductions`: an array of entries, each exactly
-//       { introducer: <issuer DID>, id: <credential id>, verified_at: <integer epoch seconds> }
-//     (verified_at is the door's clock at verification, the same unit as first_seen/last_seen);
+//       { introducer: <issuer DID>, id: <credential id>, verified_at: <integer epoch seconds>,
+//         valid_until: <integer epoch seconds> }
+//     (verified_at is the door's clock at verification, the same unit as first_seen/last_seen;
+//     valid_until is credentialSubject.validUntil in that unit, added by intake 20261109T015407Z);
 //   - the credential body is never stored: no proof, no jws, no credentialSubject, no type list,
 //     no expertise, in the account row, the default ledger, or the createFileStore file on disk.
 // Refusals (each is answered as an ordinary unintroduced knock: not refused, the visitor's row is
@@ -173,12 +175,16 @@ test('a signed knock with a valid introduction records the introducer, the id an
   assert.ok(Array.isArray(row.introductions), `row.introductions is an array: ${JSON.stringify(row)}`);
   assert.equal(row.introductions.length, 1);
   const [intro] = row.introductions;
-  assert.deepEqual(Object.keys(intro).sort(), ['id', 'introducer', 'verified_at'],
-    'the entry is exactly introducer, id, verified_at');
+  assert.deepEqual(Object.keys(intro).sort(), ['id', 'introducer', 'valid_until', 'verified_at'],
+    'the entry is exactly introducer, id, verified_at, valid_until');
   assert.equal(intro.introducer, INTRODUCER);
   assert.equal(intro.id, vc.id);
   assert.ok(Number.isInteger(intro.verified_at) && intro.verified_at >= t0 && intro.verified_at <= t1,
     `verified_at is the door's epoch second: ${intro.verified_at}`);
+  // intake 20261109T015407Z: valid_until is credentialSubject.validUntil in integer epoch seconds.
+  assert.ok(Number.isInteger(intro.valid_until), `valid_until is an integer: ${intro.valid_until}`);
+  assert.equal(intro.valid_until, Date.parse(vc.credentialSubject.validUntil) / 1000,
+    'valid_until is the vector validUntil in seconds');
   // the plain row fields keep their meaning
   assert.equal(row.messages, 1);
 });

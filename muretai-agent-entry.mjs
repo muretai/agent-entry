@@ -1261,6 +1261,8 @@ export const MAX_VC_BYTES = 8192;
 /** How many introductions one account row keeps. The newest win; a repeat of the same
  *  (introducer, id) refreshes its entry instead of adding one. */
 export const MAX_INTRODUCTIONS_PER_ACCOUNT = 16;
+/** How many device DIDs an owner row's `folded_from` keeps (the newest). */
+const FOLDED_FROM_CAP = 32;
 
 const INTRO_REQUEST_PREFIX = 'introduce-me-to:';
 const INTRO_REQUEST_TTL_S = 30 * 86400;
@@ -5269,15 +5271,18 @@ export function createAgentEntry({
   }
 
   /** A device row's introductions folded into its owner's: an entry whose introducer is the
-   *  owner is dropped (it is a self-introduction once the rows are one account), a repeat of
-   *  the same (introducer, id) keeps the later verified_at, and the merged list is ordered by
-   *  verified_at, oldest first, keeping the newest MAX_INTRODUCTIONS_PER_ACCOUNT. Appending the
-   *  device's entries last instead would let older device entries evict newer owner ones. */
-  function foldIntroductions(ownerList, deviceList, ownerDid) {
+   *  owner, or a sibling device the device-owner table maps to the owner (`siblings`, a Set),
+   *  is dropped (it is a self-introduction once the rows are one account), a repeat of the
+   *  same (introducer, id) keeps the later verified_at (and the valid_until that came with
+   *  it: the entry is kept whole), and the merged list is ordered by verified_at, oldest
+   *  first, keeping the newest MAX_INTRODUCTIONS_PER_ACCOUNT. Appending the device's entries
+   *  last instead would let older device entries evict newer owner ones. A legacy entry with
+   *  no valid_until is kept as written: its expiry is unknown, never invented. */
+  function foldIntroductions(ownerList, deviceList, ownerDid, siblings = new Set()) {
     const byKey = new Map();
     const all = [...(Array.isArray(ownerList) ? ownerList : []), ...(Array.isArray(deviceList) ? deviceList : [])];
     for (const e of all) {
-      if (!e || typeof e !== 'object' || e.introducer === ownerDid) continue;
+      if (!e || typeof e !== 'object' || e.introducer === ownerDid || siblings.has(e.introducer)) continue;
       const key = JSON.stringify([e.introducer, e.id]);
       const prev = byKey.get(key);
       if (!prev || (Number(e.verified_at) || 0) >= (Number(prev.verified_at) || 0)) byKey.set(key, e);
@@ -5288,9 +5293,49 @@ export function createAgentEntry({
       .slice(-MAX_INTRODUCTIONS_PER_ACCOUNT);
   }
 
+  /** The introducers named in `lists` that the device-owner table maps to `ownerDid`: sibling
+   *  devices of that owner. A Set, or a promise of one with a store. One read per distinct
+   *  introducer, in order, so a store sees no concurrent burst. */
+  function siblingIntroducers(lists, ownerDid) {
+    const dids = [];
+    for (const list of lists) {
+      for (const e of Array.isArray(list) ? list : []) {
+        if (e && typeof e === 'object' && typeof e.introducer === 'string' && !dids.includes(e.introducer)) {
+          dids.push(e.introducer);
+        }
+      }
+    }
+    const found = new Set();
+    const step = (i) => (i >= dids.length ? found
+      : then1(state.getDeviceOwner(dids[i]), (owner) => {
+        if (owner === ownerDid) found.add(dids[i]);
+        return step(i + 1);
+      }));
+    return step(0);
+  }
+
+  /** `intro`, or null when its introducer is a sibling device of `account`: the device-owner
+   *  table maps the issuer to the visitor's own account. A promise of that with a store.
+   *  Fails closed: a read that throws or rejects records no introduction, and the knock is
+   *  answered as without one. Never throws, never rejects. */
+  function unlessSibling(intro, account) {
+    if (!intro) return null;
+    try {
+      const owner = state.getDeviceOwner(intro.introducer);
+      const pick = (o) => (o === account ? null : intro);
+      return isThenable(owner) ? Promise.resolve(owner).then(pick, () => null) : pick(owner);
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * The introduction a SIGNED knock carries in `metadata.vc`, as the one ledger entry the door
-   * keeps: `{ introducer, id, verified_at }`, or null. Called only after the knock's signature
+   * keeps: `{ introducer, id, verified_at, valid_until }`, or null. valid_until is the
+   * credential's credentialSubject.validUntil as integer epoch seconds (floored, the unit of
+   * verified_at), so a reader can tell that an introduction has lapsed; nothing is refused
+   * for lapsing after it was recorded. An entry written before this key existed has none, and
+   * a reader treats that as unknown. Called only after the knock's signature
    * verified, so `from` is proven. Never the credential body: the introducer DID and the id
    * are all a later revocation needs.
    *
@@ -5299,7 +5344,8 @@ export function createAgentEntry({
    * with it, and the door cannot tell that key from a stranger's. Whoever reads the ledger
    * must judge the introducer. What the door does refuse is the issuers it KNOWS are the
    * visitor: `from`, the bound account, and the op key the knock was verified under (`opDid`,
-   * resolved from the visitor's keystate when it has one).
+   * resolved from the visitor's keystate when it has one). A sibling device of the visitor's
+   * own account is refused by the caller through `unlessSibling`, since it needs a store read.
    *
    * Null (an ordinary unintroduced knock, never a refusal) when there is no vc, it is not an
    * object, its JSON is over MAX_VC_BYTES, it does not verify for this visitor and this door,
@@ -5318,7 +5364,10 @@ export function createAgentEntry({
       }
       const introducer = vc.issuer;
       if (introducer === from || introducer === account || (opDid && introducer === opDid)) return null;
-      return { introducer, id: vc.id, verified_at: Math.floor(nowMs / 1000) };
+      // verifyIntroduction has already proved this parses to an instant after nowMs.
+      const untilS = Math.floor(parseIsoMs(vc.credentialSubject.validUntil) / 1000);
+      if (!Number.isSafeInteger(untilS)) return null;
+      return { introducer, id: vc.id, verified_at: Math.floor(nowMs / 1000), valid_until: untilS };
     } catch {
       return null;
     }
@@ -5327,27 +5376,51 @@ export function createAgentEntry({
   /** When a device that ALREADY has an unbound ledger row first proves its owner, move that
    *  row's history into the owner row — ONCE. Never the reverse: a later stripped binding
    *  resolves to the device DID and must not merge, or stripping a binding would become a
-   *  way to read the owner's history. */
+   *  way to read the owner's history.
+   *
+   *  Every read (the device row, the owner row, the sibling reads) happens before any write,
+   *  and the device row is deleted only after the owner row is written: a read or write that
+   *  fails leaves the device row whole. The caller runs this BEFORE it writes the device pin,
+   *  so a fold that failed runs again on the next bound knock. `deviceDid` itself counts as
+   *  a sibling of `ownerDid` here, as the pin about to be written will say.
+   *
+   *  Idempotent: the owner row lists the devices folded into it in `folded_from`, written in
+   *  the same putAccount as the merged data. A device already listed is not merged again;
+   *  its leftover row (a delete that failed after the owner write) is only deleted. The list
+   *  keeps the newest FOLDED_FROM_CAP devices; past that the oldest is dropped, and a dropped
+   *  device whose delete failed and whose pin is still unwritten would merge a second time.
+   *  The window is one fold, so that needs FOLDED_FROM_CAP other folds into the same owner
+   *  between a failed delete and its retry. A legacy owner row without the list folds as
+   *  before and gains it. */
   function foldDeviceIntoOwner(deviceDid, ownerDid) {
     return then1(state.getAccount(deviceDid), (devRow) => {
       if (!devRow) return undefined;
-      return then1(state.putAccount(deviceDid, null), () =>
-        then1(state.getAccount(ownerDid), (ownerRow) => {
-          const devIntros = Array.isArray(devRow.introductions) && devRow.introductions.length
-            ? devRow.introductions : null;
+      return then1(state.getAccount(ownerDid), (ownerRow) => {
+        const foldedFrom = ownerRow && Array.isArray(ownerRow.folded_from)
+          ? ownerRow.folded_from.filter((d) => typeof d === 'string') : [];
+        if (foldedFrom.includes(deviceDid)) return state.putAccount(deviceDid, null);
+        const devIntros = Array.isArray(devRow.introductions) && devRow.introductions.length
+          ? devRow.introductions : null;
+        const ownerIntros = ownerRow ? ownerRow.introductions : [];
+        const siblings = devIntros ? siblingIntroducers([ownerIntros, devIntros], ownerDid) : null;
+        return then1(siblings, (sibs) => {
+          if (sibs) sibs.add(deviceDid);
+          let next;
           if (!ownerRow) {
-            const moved = { ...devRow };
-            if (devIntros) moved.introductions = foldIntroductions([], devIntros, ownerDid);
-            return state.putAccount(ownerDid, moved);
+            next = { ...devRow };
+            if (devIntros) next.introductions = foldIntroductions([], devIntros, ownerDid, sibs);
+          } else {
+            next = {
+              ...ownerRow,
+              messages: (ownerRow.messages || 0) + (devRow.messages || 0),
+              first_seen: Math.min(ownerRow.first_seen, devRow.first_seen),
+            };
+            if (devIntros) next.introductions = foldIntroductions(ownerIntros, devIntros, ownerDid, sibs);
           }
-          const merged = {
-            ...ownerRow,
-            messages: (ownerRow.messages || 0) + (devRow.messages || 0),
-            first_seen: Math.min(ownerRow.first_seen, devRow.first_seen),
-          };
-          if (devIntros) merged.introductions = foldIntroductions(ownerRow.introductions, devIntros, ownerDid);
-          return state.putAccount(ownerDid, merged);
-        }));
+          next.folded_from = [...foldedFrom, deviceDid].slice(-FOLDED_FROM_CAP);
+          return then1(state.putAccount(ownerDid, next), () => state.putAccount(deviceDid, null));
+        });
+      });
     });
   }
 
@@ -5396,18 +5469,41 @@ export function createAgentEntry({
     if (!verifyDeviceBindingV2(binding, { now, expectedDeviceDid: from })) {
       return { ok: false, reason: 'device binding does not verify' };
     }
-    return then1(state.getDeviceOwner(from), (pinned) => {
+    const checkPin = (pinned, unpinned) => {
       if (pinned !== null && pinned !== undefined && pinned !== rootDid) {
         return { ok: false, reason:
           'device is already bound to a different owner (a device DID is never re-owned '
           + '— a new owner means a new device key)' };
       }
-      if (pinned === null || pinned === undefined) {
-        return then1(state.putDeviceOwner(from, rootDid), () =>
-          then1(foldDeviceIntoOwner(from, rootDid), () => ({ ok: true, account: rootDid })));
-      }
-      return { ok: true, account: rootDid };
+      return (pinned === null || pinned === undefined) ? unpinned() : { ok: true, account: rootDid };
+    };
+    return then1(state.getDeviceOwner(from), (pinned) => checkPin(pinned, () =>
+      // Unpinned: take the per-device fold lock and read the pin again, so a concurrent first
+      // knock that pinned meanwhile is seen (same owner: no second fold; another owner: refused).
+      underFoldLock(from, () => then1(state.getDeviceOwner(from), (again) => checkPin(again, () =>
+        // Fold first, pin second: a fold that fails leaves the pin unwritten, so the next
+        // bound knock folds again instead of stranding the device row.
+        then1(foldDeviceIntoOwner(from, rootDid), () =>
+          then1(state.putDeviceOwner(from, rootDid), () => ({ ok: true, account: rootDid }))))))));
+  }
+
+  /** In-flight first-binding folds, keyed by device DID: one fold per device at a time in this
+   *  process. Only an async store ever leaves an entry here; a sync fold finishes before it
+   *  returns. Not a cross-process lock: two door processes sharing one store can still race. */
+  const foldsInFlight = new Map();
+  function underFoldLock(deviceDid, fn) {
+    const prior = foldsInFlight.get(deviceDid);
+    if (prior) return prior.then(() => underFoldLock(deviceDid, fn));
+    const result = fn();
+    if (!isThenable(result)) return result;
+    const run = Promise.resolve(result);
+    // Released on every path: `tail` settles whether the fold resolved or rejected, and never
+    // rejects itself, so a waiter never inherits the first knock's error.
+    const tail = run.then(() => {}, () => {}).then(() => {
+      if (foldsInFlight.get(deviceDid) === tail) foldsInFlight.delete(deviceDid);
     });
+    foldsInFlight.set(deviceDid, tail);
+    return run;
   }
 
   /** The FROZEN backend-handoff shape (agent/webhookwake.py::_envelope). The site's own
@@ -5892,13 +5988,17 @@ export function createAgentEntry({
           ? state.putKeyState(from, nextKeyState) : undefined;
         // A valid introduction in the UNSIGNED metadata.vc adds one ledger entry; an invalid
         // one is ignored and the knock is answered exactly as without it.
+        // So is one whose issuer the device-owner table maps to this same account. That read
+        // starts only once the keystate write has resolved: started earlier, its rejection
+        // would sit unhandled while the write is pending, and Node exits on that.
         const intro = introductionOf(meta, from, account, signerDid);
-        return then1(pinnedWrite, () => then1(noteContact(account, intro), (firstContact) =>
+        return then1(pinnedWrite, () => then1(unlessSibling(intro, account), (kept) =>
+          then1(noteContact(account, kept), (firstContact) =>
             // T107: `wba_did` may legitimately differ from `peer_did` (the transport signer
             // vs the message signer) — both facts are honest, and the schema says which is
             // which.
             respond(backendEnvelope(msg, { verified: true, peerDid: from, ownerDid,
-              wbaDid: wbaIdentify(reqHeaders), firstContact }), reqId, msg, from, chosen)));
+              wbaDid: wbaIdentify(reqHeaders), firstContact }), reqId, msg, from, chosen))));
       });
       });
     });
