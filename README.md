@@ -482,7 +482,9 @@ and the door cannot tell that key from anyone else's. Judge the introducer befor
 an entry, for example by keeping your own list of introducers you know. When a device's row
 folds into its owner's, an entry whose introducer is the owner, or a device bound to that
 owner, is dropped and the merged list
-keeps the newest 16 by `verified_at`.
+keeps the newest 16 by `verified_at`. The owner row then lists that device in `folded_from`
+(the newest 32 devices), so a fold that is retried after a failed write never counts the
+device's messages twice.
 
 Known gap: revocation is not checked yet. The door has no revocation list, so an introduction
 its issuer has revoked still verifies until its `validUntil`. The credential `id` is kept so a

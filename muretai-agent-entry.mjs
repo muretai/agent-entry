@@ -1261,6 +1261,8 @@ export const MAX_VC_BYTES = 8192;
 /** How many introductions one account row keeps. The newest win; a repeat of the same
  *  (introducer, id) refreshes its entry instead of adding one. */
 export const MAX_INTRODUCTIONS_PER_ACCOUNT = 16;
+/** How many device DIDs an owner row's `folded_from` keeps (the newest). */
+const FOLDED_FROM_CAP = 32;
 
 const INTRO_REQUEST_PREFIX = 'introduce-me-to:';
 const INTRO_REQUEST_TTL_S = 30 * 86400;
@@ -5380,11 +5382,23 @@ export function createAgentEntry({
    *  and the device row is deleted only after the owner row is written: a read or write that
    *  fails leaves the device row whole. The caller runs this BEFORE it writes the device pin,
    *  so a fold that failed runs again on the next bound knock. `deviceDid` itself counts as
-   *  a sibling of `ownerDid` here, as the pin about to be written will say. */
+   *  a sibling of `ownerDid` here, as the pin about to be written will say.
+   *
+   *  Idempotent: the owner row lists the devices folded into it in `folded_from`, written in
+   *  the same putAccount as the merged data. A device already listed is not merged again;
+   *  its leftover row (a delete that failed after the owner write) is only deleted. The list
+   *  keeps the newest FOLDED_FROM_CAP devices; past that the oldest is dropped, and a dropped
+   *  device whose delete failed and whose pin is still unwritten would merge a second time.
+   *  The window is one fold, so that needs FOLDED_FROM_CAP other folds into the same owner
+   *  between a failed delete and its retry. A legacy owner row without the list folds as
+   *  before and gains it. */
   function foldDeviceIntoOwner(deviceDid, ownerDid) {
     return then1(state.getAccount(deviceDid), (devRow) => {
       if (!devRow) return undefined;
       return then1(state.getAccount(ownerDid), (ownerRow) => {
+        const foldedFrom = ownerRow && Array.isArray(ownerRow.folded_from)
+          ? ownerRow.folded_from.filter((d) => typeof d === 'string') : [];
+        if (foldedFrom.includes(deviceDid)) return state.putAccount(deviceDid, null);
         const devIntros = Array.isArray(devRow.introductions) && devRow.introductions.length
           ? devRow.introductions : null;
         const ownerIntros = ownerRow ? ownerRow.introductions : [];
@@ -5403,6 +5417,7 @@ export function createAgentEntry({
             };
             if (devIntros) next.introductions = foldIntroductions(ownerIntros, devIntros, ownerDid, sibs);
           }
+          next.folded_from = [...foldedFrom, deviceDid].slice(-FOLDED_FROM_CAP);
           return then1(state.putAccount(ownerDid, next), () => state.putAccount(deviceDid, null));
         });
       });
@@ -5454,20 +5469,41 @@ export function createAgentEntry({
     if (!verifyDeviceBindingV2(binding, { now, expectedDeviceDid: from })) {
       return { ok: false, reason: 'device binding does not verify' };
     }
-    return then1(state.getDeviceOwner(from), (pinned) => {
+    const checkPin = (pinned, unpinned) => {
       if (pinned !== null && pinned !== undefined && pinned !== rootDid) {
         return { ok: false, reason:
           'device is already bound to a different owner (a device DID is never re-owned '
           + '— a new owner means a new device key)' };
       }
-      if (pinned === null || pinned === undefined) {
+      return (pinned === null || pinned === undefined) ? unpinned() : { ok: true, account: rootDid };
+    };
+    return then1(state.getDeviceOwner(from), (pinned) => checkPin(pinned, () =>
+      // Unpinned: take the per-device fold lock and read the pin again, so a concurrent first
+      // knock that pinned meanwhile is seen (same owner: no second fold; another owner: refused).
+      underFoldLock(from, () => then1(state.getDeviceOwner(from), (again) => checkPin(again, () =>
         // Fold first, pin second: a fold that fails leaves the pin unwritten, so the next
         // bound knock folds again instead of stranding the device row.
-        return then1(foldDeviceIntoOwner(from, rootDid), () =>
-          then1(state.putDeviceOwner(from, rootDid), () => ({ ok: true, account: rootDid })));
-      }
-      return { ok: true, account: rootDid };
+        then1(foldDeviceIntoOwner(from, rootDid), () =>
+          then1(state.putDeviceOwner(from, rootDid), () => ({ ok: true, account: rootDid }))))))));
+  }
+
+  /** In-flight first-binding folds, keyed by device DID: one fold per device at a time in this
+   *  process. Only an async store ever leaves an entry here; a sync fold finishes before it
+   *  returns. Not a cross-process lock: two door processes sharing one store can still race. */
+  const foldsInFlight = new Map();
+  function underFoldLock(deviceDid, fn) {
+    const prior = foldsInFlight.get(deviceDid);
+    if (prior) return prior.then(() => underFoldLock(deviceDid, fn));
+    const result = fn();
+    if (!isThenable(result)) return result;
+    const run = Promise.resolve(result);
+    // Released on every path: `tail` settles whether the fold resolved or rejected, and never
+    // rejects itself, so a waiter never inherits the first knock's error.
+    const tail = run.then(() => {}, () => {}).then(() => {
+      if (foldsInFlight.get(deviceDid) === tail) foldsInFlight.delete(deviceDid);
     });
+    foldsInFlight.set(deviceDid, tail);
+    return run;
   }
 
   /** The FROZEN backend-handoff shape (agent/webhookwake.py::_envelope). The site's own
