@@ -3725,6 +3725,15 @@ function poppyText(value, max) {
   return (points.length > max ? points.slice(0, max).join('') : cleaned).trim();
 }
 
+/** Characters that show nothing: whitespace, controls, format characters (zero-width space,
+ *  joiners, word joiner, BOM, ...) and every other default-ignorable code point. */
+const POPPY_INVISIBLE = /[\p{White_Space}\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu;
+
+/** True when the name, as the document would publish it, keeps at least one visible character. */
+function poppyVisibleName(value) {
+  return poppyText(value, POPPY_MAX_NAME).replace(POPPY_INVISIBLE, '') !== '';
+}
+
 /** An https URL string, or null. */
 function httpsUrl(value) {
   if (typeof value !== 'string') return null;
@@ -4688,11 +4697,18 @@ function defaultDeclaration({ name, baseUrl, facts, catalog }) {
  *                  byte for byte. Absent, no proof is served. Anything else throws TypeError.
  *   poppy          OPTIONAL boolean, default false. When true the door answers GET and HEAD of
  *                  exactly /.well-known/poppy.json (host root, no query) with the Poppy 1.0
- *                  discovery document `poppyDocument(card, <configured origin>)`. An http
- *                  origin publishes nothing (404). Off by default: a new public file for every
- *                  shop on upgrade is the maintainer's decision. Anything else throws TypeError.
- *                  poppy: true without an explicit `name` throws TypeError; without an
- *                  explicit, non-empty `description` the document has no agent entry.
+ *                  discovery document built by `poppyDocument(card, <configured origin>)`,
+ *                  with one difference: when no `description` was given explicitly the door
+ *                  builds it from the card WITHOUT the description, so the built-in copy is
+ *                  never published and the document has no agent entry. (An embedder calling
+ *                  the exported poppyDocument itself with a card that carries the built-in
+ *                  name or description gets them in the result; it must pass its own.) An
+ *                  http origin publishes nothing (404). Off by default: a new public file for
+ *                  every shop on upgrade is the maintainer's decision. Anything else throws
+ *                  TypeError. poppy: true without an explicit `name`, or with one that has no
+ *                  visible character (whitespace or invisible format characters only), throws
+ *                  TypeError; without an explicit, non-empty `description` the document has
+ *                  no agent entry.
  *
  * The returned `privateFact(key)` hands the embedding code a fact the declaration keeps under
  * `privateFacts`; that value is never in the contract, the card, a reply or an observer event.
@@ -4744,7 +4760,10 @@ export function createAgentEntry({
   const descriptionGiven = description !== undefined;
   if (!nameGiven) name = DEFAULT_CARD_NAME;
   if (!descriptionGiven) description = DEFAULT_CARD_DESCRIPTION;
-  if (poppy && !nameGiven) {
+  // A name with no visible character (whitespace, controls, zero-width or other invisible format
+  // characters only) is no name: refused as a missing one, so the door never starts with
+  // poppy: true and then silently publishes nothing.
+  if (poppy && (!nameGiven || !poppyVisibleName(name))) {
     throw new TypeError('createAgentEntry: poppy: true needs an explicit name (the shop\'s display name; the built-in one is the software\'s)');
   }
   if (poppy && proof !== null && proof.path === POPPY_PATH) {
