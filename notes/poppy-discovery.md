@@ -1,0 +1,31 @@
+# Poppy discovery: the door publishes /.well-known/poppy.json
+
+## Why
+
+CMO request 652, ruled KEEP by Product as discovery only, owner go 2026-11-17. A Poppy 1.0 Personal Agent (https://personalagentprotocol.org/docs/1.0/spec) looks for a Company at https://{domain}/.well-known/poppy.json. This change lets a door publish that file for its shop, built from its own Agent Card and nothing else. No Poppy session, no auth, no Poppy conversation protocol.
+
+## Design notes
+
+- The document is built by a pure function, `poppyDocument(card, servedOrigin)`, from what the door already knows. No new copy: `organization.name` is the card's name, `organization.domain` is the host of the configured origin (with its port when the port is not 443), `agent.protocols` is one entry, and `web` is `{}`.
+- The agent protocol type is `a2a`. Poppy 1.0 does not define it; the only type the spec defines is `poppy`, and a Personal Agent skips a type it does not know. This is the same pattern Shopify uses today with `ucp` (https://allbirds.com/.well-known/poppy.json, read 2026-11-17, lists `{"type": "ucp", ...}` and `"web": {}`). The entry's endpoint is the door's own HTTPS endpoint as the card states it (the JSON-RPC interface url, else the card's `url`), and its description is the card's description.
+- `web` is an empty object. It keeps the document valid (the spec requires at least one of `agent`, `apis`, `web`) for an agent that skips `a2a`, and when the card has no description and the agent entry is omitted rather than invented.
+- The door is never listed under `apis`: the spec keeps that for `openapi` and `mcp` servers that accept the Poppy Session header, and a door is neither.
+- Default OFF. The option is `poppy`, `true` or `false` only (anything else refuses to start, as for `trustProxy`). Nothing in the existing options made a default obvious, and publishing a new public file for every shop on upgrade is the maintainer's decision.
+- The domain is the CONFIGURED origin (`baseUrl`), never the request's `Host`, `X-Forwarded-Host` or an absolute-form target. The document is built once at start, so nothing a request carries can move a byte of it, and nobody who can reach the process can make the shop claim another domain.
+- HTTPS only. An `http://` origin, or a card endpoint that is not https, publishes nothing: the ordinary 404.
+- The route matches the RAW request target byte for byte against `/.well-known/poppy.json`, at the host root whatever the mount. A query, a trailing slash, another case, an encoded or dot-segment spelling, and absolute-form or `//` targets get the door's existing 404. GET and HEAD share the card route's headers (`application/json; charset=utf-8`, Content-Length, CORS).
+- The card's name and description are copied with lone surrogates replaced, control characters (C0, DEL, C1, U+2028, U+2029) removed, and cut to 200 and 800 code points; `<`, `>` and `&` are escaped in the served bytes. A 64 KiB name cannot bloat the file or break the JSON.
+- `ownershipProof` with path `/.well-known/poppy.json` and `poppy: true` together refuse to start, so the two files cannot shadow each other.
+- No new dependency, and no existing wire field, route or verdict changes: the card, tools and proof routes are pinned byte for byte by conformance/poppy.mjs.
+- Tests: conformance/poppy.mjs and conformance/poppy-fuzz.mjs, both in package.json's test script.
+
+## Open issues
+
+- A hosted door that serves many shops on one hostname cannot use this route. The spec allows one poppy.json per host, naming one organization, so a multi-tenant host has no way to list each shop. Each shop needs its own host (or a subdomain whose door answers at its root).
+- A door mounted below the root (`baseUrl: https://shop.example.com/support`) cannot serve the host-root path by itself. The README documents the one rewrite or redirect the site owner adds; the final path must be exactly `/.well-known/poppy.json` with no query, so a redirect to `/support/.well-known/poppy.json` does not work.
+- `a2a` is not a Poppy 1.0 type. If a later Poppy version defines how a Company lists an A2A endpoint, the type string may need to change.
+- Turning it on by default is left to the maintainer.
+
+## Decisions
+
+- Coordinator ruling (2026-11-17): absolute-form and `//` targets keep the door's existing 404 for the poppy path; the test author changed fuzz case (a) to accept it in 2ae2dc1.
