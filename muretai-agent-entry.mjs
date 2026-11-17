@@ -3699,6 +3699,10 @@ function ownershipProofSpec(ownershipProof) {
  *  Agent fetches at the HOST ROOT, whatever this door's mount. Exact: the spec uses the
  *  document only when the final path is this string with no query. */
 export const POPPY_PATH = '/.well-known/poppy.json';
+/** The card's built-in copy when `createAgentEntry` is given none. The software's words, never
+ *  published in a Poppy document as the shop's. */
+const DEFAULT_CARD_NAME = 'Muretai AgentEntry';
+const DEFAULT_CARD_DESCRIPTION = 'Signed agent-to-agent messaging. Send an A2A message and get a signed reply.';
 /** Bounds on the two strings the document copies from the card, in code points. Every code
  *  point serialises to at most 6 bytes (`<` as <), so the document stays well under
  *  8 KiB however long the card's name and description are. */
@@ -3741,9 +3745,10 @@ function httpsUrl(value) {
  *     agent: { protocols: [{ type: 'a2a', endpoint, description }] },   omitted without a description
  *     web: {} }
  *
- * No `apis`: the spec allows only openapi and mcp there, each accepting the Poppy Session
- * header, and a door is neither. `a2a` is not a type the spec defines; a Personal Agent skips
- * an unfamiliar type, and `web: {}` keeps the document valid for it.
+ * No `apis`: the spec defines two API types there, openapi and mcp, each accepting the Poppy
+ * Session header, and agents skip API types they do not recognise; a door is neither. `a2a` is
+ * not a type the spec defines; a Personal Agent skips an unfamiliar type, and `web: {}` keeps
+ * the document valid for it.
  */
 export function poppyDocument(card, servedOrigin) {
   const origin = httpsUrl(servedOrigin);
@@ -4686,15 +4691,17 @@ function defaultDeclaration({ name, baseUrl, facts, catalog }) {
  *                  discovery document `poppyDocument(card, <configured origin>)`. An http
  *                  origin publishes nothing (404). Off by default: a new public file for every
  *                  shop on upgrade is the maintainer's decision. Anything else throws TypeError.
+ *                  poppy: true without an explicit `name` throws TypeError; without an
+ *                  explicit, non-empty `description` the document has no agent entry.
  *
  * The returned `privateFact(key)` hands the embedding code a fact the declaration keeps under
  * `privateFacts`; that value is never in the contract, the card, a reply or an observer event.
  */
 export function createAgentEntry({
   seedHex,
-  name = 'Muretai AgentEntry',
+  name = undefined,
   baseUrl,
-  description = 'Signed agent-to-agent messaging. Send an A2A message and get a signed reply.',
+  description = undefined,
   version = '1',
   responder = () => 'Thanks — a human will follow up.',
   openDoor = true,
@@ -4730,6 +4737,15 @@ export function createAgentEntry({
   // door that silently publishes (or silently does not publish) a public file.
   if (poppy !== true && poppy !== false) {
     throw new TypeError('createAgentEntry: poppy must be true or false (it publishes /.well-known/poppy.json)');
+  }
+  // The card's built-in name and description are the SOFTWARE's words, not the shop's. The card
+  // keeps them as before; the Poppy document must not publish them as the Company's (spec 3.1).
+  const nameGiven = name !== undefined;
+  const descriptionGiven = description !== undefined;
+  if (!nameGiven) name = DEFAULT_CARD_NAME;
+  if (!descriptionGiven) description = DEFAULT_CARD_DESCRIPTION;
+  if (poppy && !nameGiven) {
+    throw new TypeError('createAgentEntry: poppy: true needs an explicit name (the shop\'s display name; the built-in one is the software\'s)');
   }
   if (poppy && proof !== null && proof.path === POPPY_PATH) {
     throw new TypeError(`createAgentEntry: ownershipProof path ${POPPY_PATH} is the file poppy: true publishes`);
@@ -4964,8 +4980,11 @@ export function createAgentEntry({
   const cardBytes = Buffer.from(JSON.stringify(card), 'utf8');   // identical bytes on both paths
   // Poppy discovery, built ONCE from the card and the CONFIGURED origin: nothing a request
   // carries (Host, X-Forwarded-Host, an absolute-form target) can move a byte of it. null --
-  // the ordinary 404 -- when switched off or when the origin or endpoint is not https.
-  const poppyDoc = poppy ? poppyDocument(card, doorOrigin) : null;
+  // the ordinary 404 -- when switched off or when the origin or endpoint is not https. The
+  // built-in description is the software's, so without the shop's own the document carries no
+  // agent entry (poppyDocument omits it for an empty description).
+  const poppyCard = descriptionGiven ? card : { ...card, description: '' };
+  const poppyDoc = poppy ? poppyDocument(poppyCard, doorOrigin) : null;
   const poppyServed = poppyDoc ? poppyBytes(poppyDoc) : null;
   // ACCOUNT DID -> {first_seen, last_seen, messages}. Keyed by the RESOLVED account (T102):
   // the OWNER DID when a valid v2 binding rides along, else the device DID — so an owner's
@@ -6392,7 +6411,10 @@ export function createAgentEntry({
    *  is speaking for the site's own front page, which is the one thing a guest mount must
    *  never do. Whatever the GET route does for an address we do not own (404), OPTIONS and
    *  the method table do the same. */
-  function allowFor(pathname) {
+  function allowFor(pathname, target) {
+    // Poppy discovery answers every method as the card route does, at the same RAW target its
+    // GET matches: a query or another spelling stays the unowned-path 404.
+    if (poppyServed !== null && target === POPPY_PATH) return ALLOW_CARD;
     if (isProofPath(pathname)) return ALLOW_CARD;
     const resource = toolsResource(pathname);
     if (resource) return resource.kind === 'events' ? ALLOW_DOOR : ALLOW_CARD;
@@ -6546,7 +6568,7 @@ export function createAgentEntry({
       // signature routes matched above, and a site-owning mount already returned its
       // notice. A path this entry does not own still falls through to 404, and a guest
       // mount still answers nothing it does not own.
-      const getAllow = allowFor(pathname);
+      const getAllow = allowFor(pathname, target);
       if (getAllow !== null) {
         return jsonResponse(405, { error: 'method not allowed' }, allowHeaders(getAllow));
       }
@@ -6605,7 +6627,7 @@ export function createAgentEntry({
     // 404 first — the same answer GET and POST give it. Before this, OPTIONS 204'd for
     // EVERY path (a guest mount would have spoken for the site's front page one verb over)
     // and the 405 carried no `Allow` at all, which RFC 9110 §15.5.6 REQUIRES.
-    const allow = allowFor(pathname);
+    const allow = allowFor(pathname, target);
     if (allow === null) return jsonResponse(404, { error: 'not found' });
     if (method === 'OPTIONS') {
       // The CORS PREFLIGHT lands here: a browser-resident agent POSTing application/json

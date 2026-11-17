@@ -617,12 +617,16 @@ createAgentEntry({ seedHex, baseUrl: 'https://shop.example.com', name, descripti
 - **Off by default.** Turning it on publishes a new public file; that is your decision, not an upgrade's.
 - **Discovery only.** No Poppy session, no auth, no Poppy conversation: the entry lists the
   door as an `a2a` endpoint (a Personal Agent skips a type it does not know) and `web: {}`.
-  The door is never listed under `apis`, which the spec keeps for OpenAPI and MCP servers
-  that accept the Poppy Session header.
+  The door is never listed under `apis`: the spec defines two API types there, `openapi` and
+  `mcp`, and agents skip API types they do not recognise.
+- **`poppy: true` needs an explicit `name`.** Without one the door refuses to start: the card's
+  built-in name is the software's, not your shop's.
 - **The domain is your configured origin**, the host of `baseUrl` with its port when that is
   not 443. A request's `Host` or `X-Forwarded-Host` never changes it, so nobody who can reach
   the process can make your shop claim another domain.
-- **No description, no agent entry.** The document is still valid through `web`.
+- **No description, no agent entry.** Without an explicit, non-empty `description` the
+  document has no `agent` entry (the card's built-in description is not copied). The document
+  is still valid through `web`.
 - **https only.** An `http://` `baseUrl` (a local dev origin) serves no file: 404.
 - The card's name and description are copied with control characters removed and cut to a
   few hundred characters; `<`, `>` and `&` are escaped.

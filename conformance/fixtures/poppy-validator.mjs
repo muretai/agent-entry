@@ -7,7 +7,8 @@
  *     port when the port is not 443, compared ignoring case;
  *   - at least one of agent, apis, web;
  *   - agent.protocols is a list, every entry with type, an https endpoint and a description (8.1);
- *   - apis types are openapi or mcp only;
+ *   - the spec defines two apis types, openapi and mcp, and agents skip API types they do not
+ *     recognise; this validator is stricter and accepts only those two;
  *   - every URL in the document is https.
  * Shared by conformance/poppy.mjs and conformance/poppy-fuzz.mjs. Test-author file.
  */

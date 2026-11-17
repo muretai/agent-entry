@@ -7,9 +7,11 @@ CMO request 652, ruled KEEP by Product as discovery only, owner go 2026-11-17. A
 ## Design notes
 
 - The document is built by a pure function, `poppyDocument(card, servedOrigin)`, from what the door already knows. No new copy: `organization.name` is the card's name, `organization.domain` is the host of the configured origin (with its port when the port is not 443), `agent.protocols` is one entry, and `web` is `{}`.
-- The agent protocol type is `a2a`. Poppy 1.0 does not define it; the only type the spec defines is `poppy`, and a Personal Agent skips a type it does not know. This is the same pattern Shopify uses today with `ucp` (https://allbirds.com/.well-known/poppy.json, read 2026-11-17, lists `{"type": "ucp", ...}` and `"web": {}`). The entry's endpoint is the door's own HTTPS endpoint as the card states it (the JSON-RPC interface url, else the card's `url`), and its description is the card's description.
-- `web` is an empty object. It keeps the document valid (the spec requires at least one of `agent`, `apis`, `web`) for an agent that skips `a2a`, and when the card has no description and the agent entry is omitted rather than invented.
-- The door is never listed under `apis`: the spec keeps that for `openapi` and `mcp` servers that accept the Poppy Session header, and a door is neither.
+- `organization.name` is the shop's own words only: `poppy: true` refuses to start without an explicit `name`, because the card's built-in name is the software's, not the Company's display name (spec 3.1).
+- The agent protocol type is `a2a`. Poppy 1.0 does not define it. Spec section 8.1: an agent skips agent protocol types it is not familiar with, and the only type the spec defines today is `poppy`. The entry's endpoint is the door's own HTTPS endpoint as the card states it (the JSON-RPC interface url, else the card's `url`), and its description is the card's description, but only when `createAgentEntry` was given an explicit, non-empty `description`.
+- `web` is an empty object. It keeps the document valid (the spec requires at least one of `agent`, `apis`, `web`) for an agent that skips `a2a`, and when the agent entry is omitted: the door was given no explicit description (the card's built-in one is not copied) or an empty one.
+- The door is never listed under `apis`: the spec defines two API types there, `openapi` and `mcp`, and agents skip API types they do not recognise; a door is neither.
+- Every method other than GET and HEAD on the poppy path answers as the card route does (same status and `Allow`); with `poppy: false` the path is an unknown path for every method.
 - Default OFF. The option is `poppy`, `true` or `false` only (anything else refuses to start, as for `trustProxy`). Nothing in the existing options made a default obvious, and publishing a new public file for every shop on upgrade is the maintainer's decision.
 - The domain is the CONFIGURED origin (`baseUrl`), never the request's `Host`, `X-Forwarded-Host` or an absolute-form target. The document is built once at start, so nothing a request carries can move a byte of it, and nobody who can reach the process can make the shop claim another domain.
 - HTTPS only. An `http://` origin, or a card endpoint that is not https, publishes nothing: the ordinary 404.
@@ -25,6 +27,9 @@ CMO request 652, ruled KEEP by Product as discovery only, owner go 2026-11-17. A
 - A door mounted below the root (`baseUrl: https://shop.example.com/support`) cannot serve the host-root path by itself. The README documents the one rewrite or redirect the site owner adds; the final path must be exactly `/.well-known/poppy.json` with no query, so a redirect to `/support/.well-known/poppy.json` does not work.
 - `a2a` is not a Poppy 1.0 type. If a later Poppy version defines how a Company lists an A2A endpoint, the type string may need to change.
 - Turning it on by default is left to the maintainer.
+- Poppy fetches are not tallied or passed to the observer, unlike card fetches.
+- Nothing guarantees that any agent recognises the `a2a` type.
+- An empty `web` object is valid by implication only: the spec requires one of `agent`, `apis`, `web` and does not say an empty `web` is enough.
 
 ## Decisions
 
