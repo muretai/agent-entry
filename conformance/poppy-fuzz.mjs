@@ -11,7 +11,9 @@
 //   (a) for every generated request target and Host header, the door answers without throwing;
 //       the answer is 200 only when the target is exactly '/.well-known/poppy.json', and then
 //       its bytes are equal to the bytes of the plain request (Host never moves a byte); every
-//       other target is the ordinary 404, `{"error":"not found"}`.
+//       other target is the ordinary 404, `{"error":"not found"}`, except an absolute-form or
+//       '//'-prefixed target: that is 404, not the document, and byte-identical to the answer
+//       of the same door with the poppy option off (coordinator ruling, fix round 1).
 //   (b) for every generated card name and description, createAgentEntry either refuses with a
 //       TypeError or starts; a started door answers 404 or a document that parses, passes the
 //       spec validator, carries no control character in any string, has no raw '<' or control
@@ -30,6 +32,8 @@ const PATH = '/.well-known/poppy.json';
 const NOT_FOUND = '{"error":"not found"}';
 const FUZZ_SEED = 0x90bb1e5;
 const CASES = 400;
+// Absolute-form or '//'-prefixed request target: the door's existing origin-form-only refusal.
+const MALFORMED = (t) => /^[A-Za-z][A-Za-z0-9+.-]*:/.test(t) || t.startsWith('//');
 
 function mulberry32(seed) {
   let a = seed >>> 0;
@@ -90,6 +94,8 @@ test('fuzz (a): only the exact path answers, and Host never moves a byte', () =>
   const rand = mulberry32(FUZZ_SEED);
   const e = door.createAgentEntry({ seedHex: SEED, name: 'Poppy Shop', description: 'Flowers.',
     baseUrl: 'https://shop.example', poppy: true });
+  const off = door.createAgentEntry({ seedHex: SEED, name: 'Poppy Shop', description: 'Flowers.',
+    baseUrl: 'https://shop.example', poppy: false });
   const plain = call(e, 'GET', PATH, {});
   assert.equal(plain.status, 200, 'the plain request is not served');
   for (let i = 0; i < CASES; i += 1) {
@@ -97,8 +103,9 @@ test('fuzz (a): only the exact path answers, and Host never moves a byte', () =>
     if (path.includes('#') || /\?$/.test(path)) continue;
     const host = pick(rand, HOSTS);
     const method = rand() < 0.5 ? 'GET' : 'HEAD';
+    const headers = { host, 'x-forwarded-host': pick(rand, HOSTS) };
     let r;
-    try { r = call(e, method, path, { host, 'x-forwarded-host': pick(rand, HOSTS) }); } catch (err) {
+    try { r = call(e, method, path, headers); } catch (err) {
       assert.fail(`case ${i}: ${method} ${JSON.stringify(path)} Host ${JSON.stringify(host)} threw ${err?.stack || err}`);
     }
     const label = `case ${i}: ${method} ${JSON.stringify(path)} Host ${JSON.stringify(host)}`;
@@ -108,7 +115,24 @@ test('fuzz (a): only the exact path answers, and Host never moves a byte', () =>
     } else {
       assert.notEqual(r.status, 200, `${label}: answered 200`);
       assert.ok(!r.body.toString('utf8').includes('protocol_version'), `${label}: leaked the document`);
-      if (r.status === 404) assert.equal(r.body.toString('utf8'), NOT_FOUND, label);
+      if (MALFORMED(path)) {
+        // Coordinator ruling (fix round 1): an absolute-form or '//'-prefixed target has been
+        // answered 404 with a diagnostic body since before this branch, and the task forbids
+        // moving existing wire behaviour. So assert only what this item owns: 404, not the
+        // document, and byte-identical to the same door with the poppy option off.
+        assert.equal(r.status, 404, `${label}: malformed target not 404`);
+        const raw = r.body.toString('utf8');
+        let parsed = null;
+        try { parsed = JSON.parse(raw); } catch { parsed = null; }
+        if (parsed !== null && typeof parsed === 'object') {
+          assert.ok(!Object.hasOwn(parsed, 'protocol_version'), `${label}: protocol_version in the 404`);
+          assert.ok(!Object.hasOwn(parsed, 'organization'), `${label}: organization in the 404`);
+          assert.notDeepEqual(poppyProblems(parsed, 'https://shop.example'), [], `${label}: the 404 parses as a poppy document`);
+        }
+        const o = call(off, method, path, headers);
+        assert.equal(o.status, r.status, `${label}: status differs from the poppy-off door`);
+        assert.ok(r.body.equals(o.body), `${label}: bytes differ from the poppy-off door`);
+      } else if (r.status === 404) assert.equal(r.body.toString('utf8'), NOT_FOUND, label);
     }
   }
 });
