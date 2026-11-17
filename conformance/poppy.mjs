@@ -484,3 +484,168 @@ test('README documents the switch, the mounted-door rewrite and the exact-path r
     'README does not state that the final path must be exactly /.well-known/poppy.json');
   assert.ok(/\bquery\b/i.test(section), 'README does not say the final URL carries no query');
 });
+
+// ---------------------------------------------------------------------------------------------
+// round 2: what an independent review of Poppy 1.0 found unpinned or wrong. Every test below
+// reaches the document or the refusal through createAgentEntry and handleRequest only.
+
+const SHOP = 'https://shop.example';
+
+/** The card's built-in defaults, read off a door that was given neither (poppy off). */
+function cardDefaults() {
+  const e = createAgentEntry({ seedHex: SEED, baseUrl: SHOP });
+  return { name: e.card.name, description: e.card.description };
+}
+
+test('r2-1 default identity: poppy: true with no explicit name refuses to start, naming the option', () => {
+  // Spec 3.1: organization.name is the Company's display name. The door's built-in name is the
+  // software's, so publishing it would tell every Personal Agent the shop is called that.
+  const defaults = cardDefaults();
+  assert.ok(typeof defaults.name === 'string' && defaults.name, 'the door has no built-in name to guard against');
+  let started = null;
+  assert.throws(() => { started = createAgentEntry({ seedHex: SEED, baseUrl: SHOP, poppy: true }); },
+    (err) => err instanceof TypeError && /\bname\b/.test(err.message),
+    'poppy: true with no name started a door');
+  if (started) {
+    const r = get(started, PATH);
+    assert.ok(!(r.status === 200 && JSON.parse(r.body.toString('utf8')).organization?.name === defaults.name),
+      `the door published its built-in name ${JSON.stringify(defaults.name)} as the shop's`);
+  }
+  // The refusal is the poppy switch's: without it the same options still start.
+  assert.doesNotThrow(() => createAgentEntry({ seedHex: SEED, baseUrl: SHOP }));
+  assert.doesNotThrow(() => createAgentEntry({ seedHex: SEED, baseUrl: SHOP, poppy: false }));
+});
+
+test('r2-2a default description: no explicit description publishes no agent entry with the built-in text', () => {
+  const defaults = cardDefaults();
+  assert.ok(typeof defaults.description === 'string' && defaults.description, 'the door has no built-in description');
+  const e = createAgentEntry({ seedHex: SEED, baseUrl: SHOP, name: NAME, poppy: true });
+  const r = served(e);
+  const protocols = (r.doc.agent && r.doc.agent.protocols) || [];
+  for (const p of protocols) {
+    assert.notEqual(p && p.description, defaults.description,
+      'an agent.protocols entry carries the door\'s built-in description, not the shop\'s words');
+  }
+  assert.deepEqual(poppyProblems(r.doc, SHOP), []);
+  assert.deepEqual(r.doc.web, {}, 'the document without an agent entry must keep web');
+  assert.equal(r.doc.organization.name, NAME);
+});
+
+test('r2-2b explicit description: a non-empty one is the agent entry\'s description', () => {
+  const e = createAgentEntry({ seedHex: SEED, baseUrl: SHOP, name: NAME, description: DESCRIPTION, poppy: true });
+  const r = served(e);
+  assert.deepEqual(poppyProblems(r.doc, SHOP), []);
+  assert.ok(r.doc.agent && Array.isArray(r.doc.agent.protocols), 'no agent entry for an explicit description');
+  assert.equal(r.doc.agent.protocols.length, 1);
+  assert.equal(r.doc.agent.protocols[0].description, DESCRIPTION);
+});
+
+test('r2-2c explicit empty description: no agent entry, still valid via web', () => {
+  const e = createAgentEntry({ seedHex: SEED, baseUrl: SHOP, name: NAME, description: '', poppy: true });
+  const r = served(e);
+  assert.equal('agent' in r.doc, false, 'agent entry present for description: \'\'');
+  assert.deepEqual(r.doc.web, {});
+  assert.deepEqual(poppyProblems(r.doc, SHOP), []);
+});
+
+const OTHER_METHODS = ['OPTIONS', 'POST', 'PUT', 'DELETE', 'PATCH'];
+
+test('r2-3a methods: with poppy: true the path answers OPTIONS and non-GET methods as the card route does', () => {
+  const e = entry({ poppy: true });
+  for (const method of OTHER_METHODS) {
+    const headers = { 'content-type': 'application/json', origin: 'https://agent.example' };
+    const card = get(e, AGENT_CARD_PATH, headers, method);
+    const poppy = get(e, PATH, headers, method);
+    assert.equal(poppy.status, card.status,
+      `${method} ${PATH} is ${poppy.status}, the card route answers ${card.status}`);
+    assert.equal(header(poppy.headers, 'allow'), header(card.headers, 'allow'),
+      `${method} ${PATH} Allow differs from the card route`);
+    assert.equal(header(poppy.headers, 'access-control-allow-methods'), header(card.headers, 'access-control-allow-methods'),
+      `${method} ${PATH} Access-Control-Allow-Methods differs from the card route`);
+    assert.ok(!poppy.body.toString('utf8').includes('protocol_version'), `${method} leaked the document`);
+  }
+});
+
+test('r2-3b methods: with poppy: false every method on the path is byte-identical to an unknown path', () => {
+  for (const poppy of [undefined, false]) {
+    const e = poppy === undefined ? entry() : entry({ poppy });
+    for (const method of ['GET', 'HEAD', ...OTHER_METHODS]) {
+      const headers = { 'content-type': 'application/json', origin: 'https://agent.example' };
+      const a = get(e, PATH, headers, method);
+      const b = get(e, '/.well-known/unknown-r2.json', headers, method);
+      assert.equal(a.status, b.status, `poppy=${poppy} ${method}`);
+      assert.deepEqual(a.headers, b.headers, `poppy=${poppy} ${method} headers`);
+      assert.ok(a.body.equals(b.body), `poppy=${poppy} ${method} body`);
+    }
+  }
+});
+
+test('r2-4 mounted door: the document is at the HOST ROOT, and <mount>/.well-known/poppy.json is 404', () => {
+  for (const guest of [false, true]) {
+    const e = createAgentEntry({ seedHex: SEED, name: NAME, description: DESCRIPTION,
+      baseUrl: `${SHOP}/support`, guest, poppy: true });
+    for (const method of ['GET', 'HEAD']) {
+      const root = get(e, PATH, {}, method);
+      assert.equal(root.status, 200, `guest=${guest} ${method} ${PATH} at the host root is ${root.status}`);
+      const under = get(e, `/support${PATH}`, {}, method);
+      assert.equal(under.status, 404, `guest=${guest} ${method} /support${PATH} is ${under.status}`);
+      assert.ok(!under.body.toString('utf8').includes('protocol_version'), `guest=${guest} the mount leaked the document`);
+    }
+    const r = served(e);
+    assert.deepEqual(poppyProblems(r.doc, SHOP), []);
+    assert.equal(r.doc.organization.domain, 'shop.example');
+    assert.ok(r.doc.agent.protocols[0].endpoint.startsWith(`${SHOP}/support`), r.doc.agent.protocols[0].endpoint);
+  }
+});
+
+test('r2-5 path clash: poppy: true with an ownershipProof on the poppy path refuses to start', () => {
+  const clash = { path: PATH, body: 'proof-7731' };
+  // The proof alone is a valid one, so the refusal below is the clash and nothing else.
+  const alone = entry({ ownershipProof: clash });
+  assert.equal(get(alone, PATH).status, 200);
+  assert.throws(() => entry({ poppy: true, ownershipProof: clash }),
+    (err) => err instanceof TypeError, 'poppy: true and a proof on the same path both started');
+});
+
+// The per-field caps, as the implementation states them (POPPY_MAX_NAME, POPPY_MAX_DESCRIPTION
+// in muretai-agent-entry.mjs, in code points): an over-long value is cut, not refused.
+const NAME_CAP = 200;
+const DESCRIPTION_CAP = 800;
+
+/** `n` code points, no whitespace at either end, every 50th an astral character (two code units). */
+function codePoints(n, seed) {
+  const out = [];
+  for (let i = 0; i < n; i += 1) out.push(i % 50 === 49 ? String.fromCodePoint(0x1f33a) : String.fromCharCode(0x41 + ((i + seed) % 26)));
+  return out;
+}
+
+test('r2-6a cap: a name at the cap is kept whole, one over is cut to exactly the cap (code points)', () => {
+  const atCap = codePoints(NAME_CAP, 0).join('');
+  const a = served(createAgentEntry({ seedHex: SEED, baseUrl: SHOP, name: atCap, description: DESCRIPTION, poppy: true }));
+  assert.equal(a.doc.organization.name, atCap);
+  for (const extra of [1, 57]) {
+    const long = codePoints(NAME_CAP + extra, 0);
+    const r = served(createAgentEntry({ seedHex: SEED, baseUrl: SHOP, name: long.join(''), description: DESCRIPTION, poppy: true }));
+    assert.ok(r.body.length < 8192 / 2, 'the total cap, not the name cap, would decide this case');
+    assert.deepEqual(poppyProblems(r.doc, SHOP), []);
+    assert.equal(Array.from(r.doc.organization.name).length, NAME_CAP, `name of ${NAME_CAP + extra} code points`);
+    assert.equal(r.doc.organization.name, long.slice(0, NAME_CAP).join(''));
+    assert.equal(r.doc.agent.protocols[0].description, DESCRIPTION, 'the description moved with the name cap');
+  }
+});
+
+test('r2-6b cap: a description at the cap is kept whole, one over is cut to exactly the cap (code points)', () => {
+  const atCap = codePoints(DESCRIPTION_CAP, 3).join('');
+  const a = served(createAgentEntry({ seedHex: SEED, baseUrl: SHOP, name: NAME, description: atCap, poppy: true }));
+  assert.equal(a.doc.agent.protocols[0].description, atCap);
+  for (const extra of [1, 57]) {
+    const long = codePoints(DESCRIPTION_CAP + extra, 3);
+    const r = served(createAgentEntry({ seedHex: SEED, baseUrl: SHOP, name: NAME, description: long.join(''), poppy: true }));
+    assert.ok(r.body.length < 8192 / 2, 'the total cap, not the description cap, would decide this case');
+    assert.deepEqual(poppyProblems(r.doc, SHOP), []);
+    const got = r.doc.agent.protocols[0].description;
+    assert.equal(Array.from(got).length, DESCRIPTION_CAP, `description of ${DESCRIPTION_CAP + extra} code points`);
+    assert.equal(got, long.slice(0, DESCRIPTION_CAP).join(''));
+    assert.equal(r.doc.organization.name, NAME, 'the name moved with the description cap');
+  }
+});
