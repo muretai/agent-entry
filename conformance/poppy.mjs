@@ -649,3 +649,68 @@ test('r2-6b cap: a description at the cap is kept whole, one over is cut to exac
     assert.equal(r.doc.organization.name, NAME, 'the name moved with the description cap');
   }
 });
+
+// ---------------------------------------------------------------------------------------------
+// round 3: two pins from the re-verification. createAgentEntry and handleRequest only.
+
+// Names with no visible character, and the card body sha256 each one gives today (4f7b546) with
+// SEED, SHOP and DESCRIPTION, poppy off. Recorded by running the door, not computed by hand.
+const INVISIBLE_NAMES = [
+  ['   ', '673e7e4366fc99ae0f9c355fa1aa90606cac9458c6b93eb1927a1072c0edfe8c'],
+  ['\t\t', '4556551b633b8773e998c592b5fb8c064f3e81c072b5d5789aebc43457529a61'],
+  ['\n', '2bc38f058005d98e69564dd8af359d38cd1d0bb1bc490e12551ce7a3d649a5ba'],
+  [' \t\n ', '716abc5638968685ff541d08e6447371546d46e05c155a824833c3caef0052cd'],
+  ['​', '49e3d08279fc452be6780b498ee1cb16789b89bd221a983bc7c5d3c97bb4cfe6'],
+  ['‌', '8bacce75164f7bfbd8478965073ab5e49daed3661f2f4999ea3930d15a9290e3'],
+  ['‍', '55ad7b2a6f630ef8d3b9e66dc8baa2f6758494530244b9d52e763a10602effba'],
+  ['⁠', '67455c99a4a1c6d1301ae7bcd99bb7de5a2d01980d3ff79b251fde44d50b0216'],
+  ['﻿', '2097ea78137e2d45ce82e3fabc267dc69ef1538f3272ef844a220d339e45faab'],
+  ['​‌‍⁠﻿', '2b570388be5624a08a5761effe31d35b1323893302caba5e19ac195cedd4070f'],
+];
+
+test('r3-1a invisible name: poppy: true with a name that has no visible character refuses to start, naming the option', () => {
+  for (const [name] of INVISIBLE_NAMES) {
+    let started = null;
+    assert.throws(() => { started = createAgentEntry({ seedHex: SEED, baseUrl: SHOP, name, description: DESCRIPTION, poppy: true }); },
+      (err) => err instanceof TypeError && /\bname\b/.test(err.message),
+      `poppy: true with name ${JSON.stringify(name)} started a door`);
+    if (started) {
+      const r = get(started, PATH);
+      assert.notEqual(r.status, 200, `name ${JSON.stringify(name)} published a document with no visible name`);
+    }
+  }
+});
+
+test('r3-1b invisible name without poppy: the door starts exactly as at 4f7b546', () => {
+  for (const [name, cardSha] of INVISIBLE_NAMES) {
+    for (const poppy of [undefined, false]) {
+      const opts = { seedHex: SEED, baseUrl: SHOP, name, description: DESCRIPTION };
+      if (poppy !== undefined) opts.poppy = poppy;
+      const label = `name ${JSON.stringify(name)} poppy=${poppy}`;
+      let e;
+      assert.doesNotThrow(() => { e = createAgentEntry(opts); }, label);
+      assert.equal(e.card.name, name, `${label}: the card name is no longer the given string`);
+      const card = get(e, AGENT_CARD_PATH);
+      assert.equal(card.status, 200, label);
+      assert.equal(sha(card.body), cardSha, `${label}: card bytes moved`);
+      for (const method of ['GET', 'HEAD']) {
+        const p = get(e, PATH, {}, method);
+        assert.equal(p.status, 404, `${label} ${method}`);
+      }
+      assert.equal(get(e, PATH).body.toString('utf8'), NOT_FOUND, label);
+    }
+  }
+});
+
+test('r3-2 query: with poppy: true every method on the path with a query is byte-identical to an unknown path', () => {
+  const e = entry({ poppy: true });
+  for (const method of ['GET', 'HEAD', ...OTHER_METHODS]) {
+    const headers = { 'content-type': 'application/json', origin: 'https://agent.example' };
+    const a = get(e, `${PATH}?x=1`, headers, method);
+    const b = get(e, '/.well-known/unknown-r3.json?x=1', headers, method);
+    assert.equal(a.status, b.status, `${method} ${PATH}?x=1 is ${a.status}, an unknown path is ${b.status}`);
+    assert.deepEqual(a.headers, b.headers, `${method} ${PATH}?x=1 headers`);
+    assert.ok(a.body.equals(b.body), `${method} ${PATH}?x=1 body: ${a.body.toString('utf8').slice(0, 200)}`);
+    assert.ok(!a.body.toString('utf8').includes('protocol_version'), `${method} ${PATH}?x=1 leaked the document`);
+  }
+});
