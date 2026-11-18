@@ -3694,6 +3694,94 @@ function ownershipProofSpec(ownershipProof) {
   if (typeof body !== 'string' || !body) throw refuse('body must be a non-empty string');
   return { path, body: Buffer.from(body, 'utf8') };
 }
+
+/** Poppy 1.0 discovery (personalagentprotocol.org/docs/1.0/spec): the one path a Personal
+ *  Agent fetches at the HOST ROOT, whatever this door's mount. Exact: the spec uses the
+ *  document only when the final path is this string with no query. */
+export const POPPY_PATH = '/.well-known/poppy.json';
+/** The card's built-in copy when `createAgentEntry` is given none. The software's words, never
+ *  published in a Poppy document as the shop's. */
+const DEFAULT_CARD_NAME = 'Muretai AgentEntry';
+const DEFAULT_CARD_DESCRIPTION = 'Signed agent-to-agent messaging. Send an A2A message and get a signed reply.';
+/** Bounds on the two strings the document copies from the card, in code points. Every code
+ *  point serialises to at most 6 bytes (`<` as <), so the document stays well under
+ *  8 KiB however long the card's name and description are. */
+const POPPY_MAX_NAME = 200;
+const POPPY_MAX_DESCRIPTION = 800;
+// C0, DEL, C1 and the two JS line terminators: none belongs in a published name, and each is a
+// way to break a reader that splices the string into a line or a page.
+const POPPY_CONTROLS = new RegExp(`[\\x00-\\x1f\\x7f-\\x9f${String.fromCharCode(0x2028, 0x2029)}]+`, 'g');
+const POPPY_REPLACEMENT = String.fromCharCode(0xfffd);
+const POPPY_LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+
+/** A card string as the document publishes it: well-formed, no control character (a run of
+ *  them is one space), trimmed, at most `max` code points. '' when nothing is left. */
+function poppyText(value, max) {
+  if (typeof value !== 'string') return '';
+  // Cut early so a 64 KiB name costs nothing; four code units per kept code point is slack
+  // enough for every surrogate pair and every control run the cleaning below removes.
+  const cleaned = value.slice(0, max * 4).replace(POPPY_LONE_SURROGATE, POPPY_REPLACEMENT).replace(POPPY_CONTROLS, ' ').trim();
+  const points = Array.from(cleaned);
+  return (points.length > max ? points.slice(0, max).join('') : cleaned).trim();
+}
+
+/** Characters that show nothing: whitespace, controls, format characters (zero-width space,
+ *  joiners, word joiner, BOM, ...) and every other default-ignorable code point. */
+const POPPY_INVISIBLE = /[\p{White_Space}\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu;
+
+/** True when the name, as the document would publish it, keeps at least one visible character. */
+function poppyVisibleName(value) {
+  return poppyText(value, POPPY_MAX_NAME).replace(POPPY_INVISIBLE, '') !== '';
+}
+
+/** An https URL string, or null. */
+function httpsUrl(value) {
+  if (typeof value !== 'string') return null;
+  let url;
+  try { url = new URL(value); } catch { return null; }
+  return url.protocol === 'https:' ? url : null;
+}
+
+/**
+ * The Poppy 1.0 discovery document for a door, built from its own Agent Card and nothing else:
+ * no new copy. PURE. `servedOrigin` is the origin the document is served at; the door passes its
+ * CONFIGURED origin, never a request's Host (a Host header must not let a stranger make the door
+ * claim another domain). Returns null -- serve nothing -- when that origin or the card's
+ * endpoint is not https, or the card has no usable name.
+ *
+ *   { protocol_version: '1.0',
+ *     organization: { name, domain },            domain: the served host, port only when not 443
+ *     agent: { protocols: [{ type: 'a2a', endpoint, description }] },   omitted without a description
+ *     web: {} }
+ *
+ * No `apis`: the spec defines two API types there, openapi and mcp, each accepting the Poppy
+ * Session header, and agents skip API types they do not recognise; a door is neither. `a2a` is
+ * not a type the spec defines; a Personal Agent skips an unfamiliar type, and `web: {}` keeps
+ * the document valid for it.
+ */
+export function poppyDocument(card, servedOrigin) {
+  const origin = httpsUrl(servedOrigin);
+  if (!origin || !card || typeof card !== 'object') return null;
+  // The endpoint a visitor POSTs to, as the card states it: the JSON-RPC interface, else `url`.
+  const interfaces = Array.isArray(card.supportedInterfaces) ? card.supportedInterfaces : [];
+  const jsonRpc = interfaces.find((i) => i && i.protocolBinding === 'JSONRPC' && typeof i.url === 'string');
+  const endpoint = jsonRpc ? jsonRpc.url : card.url;
+  if (!httpsUrl(endpoint)) return null;
+  const name = poppyText(card.name, POPPY_MAX_NAME);
+  if (!name) return null;
+  const doc = { protocol_version: '1.0', organization: { name, domain: origin.host } };
+  const description = poppyText(card.description, POPPY_MAX_DESCRIPTION);
+  if (description) doc.agent = { protocols: [{ type: 'a2a', endpoint, description }] };
+  doc.web = {};
+  return doc;
+}
+
+/** The served bytes: JSON with `<`, `>` and `&` escaped, so no reader that splices the file into
+ *  a page can be handed markup. Still the same JSON value. */
+function poppyBytes(doc) {
+  const text = JSON.stringify(doc).replace(/[<>&]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+  return Buffer.from(text, 'utf8');
+}
 /** A NEW envelope type: an `agenttools` signature can never be replayed as an `agentcard` one,
  *  because `typ` is inside the signed bytes of both. */
 const TOOLS_ENVELOPE_TYPE = 'agenttools';
@@ -4607,15 +4695,29 @@ function defaultDeclaration({ name, baseUrl, facts, catalog }) {
  *                  The door answers GET of exactly `path` — one file name directly under
  *                  /.well-known/, at the ORIGIN whatever the mount — with `body` as text/plain,
  *                  byte for byte. Absent, no proof is served. Anything else throws TypeError.
+ *   poppy          OPTIONAL boolean, default false. When true the door answers GET and HEAD of
+ *                  exactly /.well-known/poppy.json (host root, no query) with the Poppy 1.0
+ *                  discovery document built by `poppyDocument(card, <configured origin>)`,
+ *                  with one difference: when no `description` was given explicitly the door
+ *                  builds it from the card WITHOUT the description, so the built-in copy is
+ *                  never published and the document has no agent entry. (An embedder calling
+ *                  the exported poppyDocument itself with a card that carries the built-in
+ *                  name or description gets them in the result; it must pass its own.) An
+ *                  http origin publishes nothing (404). Off by default: a new public file for
+ *                  every shop on upgrade is the maintainer's decision. Anything else throws
+ *                  TypeError. poppy: true without an explicit `name`, or with one that has no
+ *                  visible character (whitespace or invisible format characters only), throws
+ *                  TypeError; without an explicit, non-empty `description` the document has
+ *                  no agent entry.
  *
  * The returned `privateFact(key)` hands the embedding code a fact the declaration keeps under
  * `privateFacts`; that value is never in the contract, the card, a reply or an observer event.
  */
 export function createAgentEntry({
   seedHex,
-  name = 'Muretai AgentEntry',
+  name = undefined,
   baseUrl,
-  description = 'Signed agent-to-agent messaging. Send an A2A message and get a signed reply.',
+  description = undefined,
   version = '1',
   responder = () => 'Thanks — a human will follow up.',
   openDoor = true,
@@ -4641,11 +4743,32 @@ export function createAgentEntry({
   catalogFile = null,
   facts = undefined,
   ownershipProof = undefined,
+  poppy = false,
 } = {}) {
   if (!seedHex) throw new TypeError('createAgentEntry: seedHex is required');
   if (!baseUrl) throw new TypeError('createAgentEntry: baseUrl is required (it is signed into the card)');
   // Checked before anything else is built: a proof the seam cannot serve exactly refuses to start.
   const proof = ownershipProofSpec(ownershipProof);
+  // Poppy discovery: a boolean and nothing else, as for trustProxy, so a typo never starts a
+  // door that silently publishes (or silently does not publish) a public file.
+  if (poppy !== true && poppy !== false) {
+    throw new TypeError('createAgentEntry: poppy must be true or false (it publishes /.well-known/poppy.json)');
+  }
+  // The card's built-in name and description are the SOFTWARE's words, not the shop's. The card
+  // keeps them as before; the Poppy document must not publish them as the Company's (spec 3.1).
+  const nameGiven = name !== undefined;
+  const descriptionGiven = description !== undefined;
+  if (!nameGiven) name = DEFAULT_CARD_NAME;
+  if (!descriptionGiven) description = DEFAULT_CARD_DESCRIPTION;
+  // A name with no visible character (whitespace, controls, zero-width or other invisible format
+  // characters only) is no name: refused as a missing one, so the door never starts with
+  // poppy: true and then silently publishes nothing.
+  if (poppy && (!nameGiven || !poppyVisibleName(name))) {
+    throw new TypeError('createAgentEntry: poppy: true needs an explicit name (the shop\'s display name; the built-in one is the software\'s)');
+  }
+  if (poppy && proof !== null && proof.path === POPPY_PATH) {
+    throw new TypeError(`createAgentEntry: ownershipProof path ${POPPY_PATH} is the file poppy: true publishes`);
+  }
   // The ONE string this entry publishes as its card url. Canonicalised, not echoed: it must
   // equal what a visitor's Outbox.card_scope computes for the url they dialled, or the card
   // fails verification on THEIR machine with nothing on ours.
@@ -4874,6 +4997,14 @@ export function createAgentEntry({
   ];
 
   const cardBytes = Buffer.from(JSON.stringify(card), 'utf8');   // identical bytes on both paths
+  // Poppy discovery, built ONCE from the card and the CONFIGURED origin: nothing a request
+  // carries (Host, X-Forwarded-Host, an absolute-form target) can move a byte of it. null --
+  // the ordinary 404 -- when switched off or when the origin or endpoint is not https. The
+  // built-in description is the software's, so without the shop's own the document carries no
+  // agent entry (poppyDocument omits it for an empty description).
+  const poppyCard = descriptionGiven ? card : { ...card, description: '' };
+  const poppyDoc = poppy ? poppyDocument(poppyCard, doorOrigin) : null;
+  const poppyServed = poppyDoc ? poppyBytes(poppyDoc) : null;
   // ACCOUNT DID -> {first_seen, last_seen, messages}. Keyed by the RESOLVED account (T102):
   // the OWNER DID when a valid v2 binding rides along, else the device DID — so an owner's
   // sibling devices are ONE customer row. The entry never reads it back to gate, greet, or
@@ -6299,7 +6430,10 @@ export function createAgentEntry({
    *  is speaking for the site's own front page, which is the one thing a guest mount must
    *  never do. Whatever the GET route does for an address we do not own (404), OPTIONS and
    *  the method table do the same. */
-  function allowFor(pathname) {
+  function allowFor(pathname, target) {
+    // Poppy discovery answers every method as the card route does, at the same RAW target its
+    // GET matches: a query or another spelling stays the unowned-path 404.
+    if (poppyServed !== null && target === POPPY_PATH) return ALLOW_CARD;
     if (isProofPath(pathname)) return ALLOW_CARD;
     const resource = toolsResource(pathname);
     if (resource) return resource.kind === 'events' ? ALLOW_DOOR : ALLOW_CARD;
@@ -6372,6 +6506,11 @@ export function createAgentEntry({
     // appends a well-known path), so this is not a new convention; it is the one the
     // fetcher already follows. With mount === '' these are the original constants.
     if (method === 'GET' || method === 'HEAD') {
+      // Poppy discovery: the RAW target, byte-exact, so a query, a trailing slash, another case
+      // or any encoded or dot-segment spelling is the ordinary 404 below. Host root only.
+      if (poppyServed !== null && target === POPPY_PATH) {
+        return { status: 200, headers: cardHeaders(poppyServed.length), body: poppyServed };
+      }
       if (CARD_ROUTES.has(pathname)) {
         // Byte-identical on every path: the current A2A path, the legacy alias, and (on a
         // guest mount) the origin's well-known copy of both. Which address a client
@@ -6448,7 +6587,7 @@ export function createAgentEntry({
       // signature routes matched above, and a site-owning mount already returned its
       // notice. A path this entry does not own still falls through to 404, and a guest
       // mount still answers nothing it does not own.
-      const getAllow = allowFor(pathname);
+      const getAllow = allowFor(pathname, target);
       if (getAllow !== null) {
         return jsonResponse(405, { error: 'method not allowed' }, allowHeaders(getAllow));
       }
@@ -6507,7 +6646,7 @@ export function createAgentEntry({
     // 404 first — the same answer GET and POST give it. Before this, OPTIONS 204'd for
     // EVERY path (a guest mount would have spoken for the site's front page one verb over)
     // and the 405 carried no `Allow` at all, which RFC 9110 §15.5.6 REQUIRES.
-    const allow = allowFor(pathname);
+    const allow = allowFor(pathname, target);
     if (allow === null) return jsonResponse(404, { error: 'not found' });
     if (method === 'OPTIONS') {
       // The CORS PREFLIGHT lands here: a browser-resident agent POSTing application/json

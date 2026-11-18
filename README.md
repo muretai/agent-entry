@@ -211,6 +211,7 @@ Nothing is uploaded, and the Distiller is never imported by
 | `vendorRanges` | none | `{<vendor>: [CIDR, …]}` — whose network the client address belongs to, for the observer's `ip_vendor` and `entry.vendorStats()`. `scripts/vendor-ranges.mjs` writes one. An unknown vendor or a malformed CIDR refuses to start |
 | `observer` | none | called once per message with the same envelope your responder gets, plus `stage`, `identified`, `ua_family`, `client_class`, `ip_vendor`, `country` and `signature_agent`, **after** the verdict — for counting, logging, analytics. It cannot matter: its return is discarded, a throw is swallowed, a promise is never awaited, so a slow or broken watcher cannot delay or change one byte of the signed reply. See [Counting visits](#counting-visits-without-handing-over-your-customer-list) |
 | `howToUrl` | none | a page a keyless visitor is pointed at as a worked example. **Empty means omitted** — the refusal already teaches the whole recipe without it, and a reference implementation must not stamp somebody else's docs host into every door built from it. Only set it to a URL you operate, and only after checking it resolves |
+| `poppy` | `false` | publish the Poppy 1.0 discovery file at the host root, from the card's name and description (see [Be found by a Personal Agent](#be-found-by-a-personal-agent-poppy-discovery)). Only `true` or `false`; an `http://` origin serves no file |
 | `name`, `description`, `version` | — | the card's own words. `description` is the line a person reads in a directory listing — and the right place to say what you record about visitors, since it is fetched **before** the knock |
 
 `seedHex` and `baseUrl` are the two an entry refuses to start without: the seed **is** the
@@ -594,6 +595,59 @@ other shape. To try one on your own machine:
 ```bash
 npx @muretai/agent-entry serve --proof-path /.well-known/proof.txt --proof-body <text>   # 127.0.0.1 only
 ```
+
+### Be found by a Personal Agent (Poppy discovery)
+
+A [Poppy 1.0](https://personalagentprotocol.org/docs/1.0/spec) Personal Agent looks for a shop at
+`/.well-known/poppy.json` at the root of its https host, for example
+`https://shop.example.com/.well-known/poppy.json`. Pass `poppy: true` to `createAgentEntry` and the door
+answers GET and HEAD there with a document built from its own card, and nothing else:
+
+```js
+createAgentEntry({ seedHex, baseUrl: 'https://shop.example.com', name, description, poppy: true });
+```
+
+```json
+{"protocol_version":"1.0",
+ "organization":{"name":"<the card's name>","domain":"shop.example.com"},
+ "agent":{"protocols":[{"type":"a2a","endpoint":"https://shop.example.com/","description":"<the card's description>"}]},
+ "web":{}}
+```
+
+- **Off by default.** Turning it on publishes a new public file; that is your decision, not an upgrade's.
+- **Discovery only.** No Poppy session, no auth, no Poppy conversation: the entry lists the
+  door as an `a2a` endpoint (a Personal Agent skips a type it does not know) and `web: {}`.
+  The door is never listed under `apis`: the spec defines two API types there, `openapi` and
+  `mcp`, and agents skip API types they do not recognise.
+- **`poppy: true` needs an explicit `name`.** Without one the door refuses to start: the card's
+  built-in name is the software's, not your shop's.
+- **The domain is your configured origin**, the host of `baseUrl` with its port when that is
+  not 443. A request's `Host` or `X-Forwarded-Host` never changes it, so nobody who can reach
+  the process can make your shop claim another domain.
+- **No description, no agent entry.** Without an explicit, non-empty `description` the
+  document has no `agent` entry (the card's built-in description is not copied). The document
+  is still valid through `web`.
+- **https only.** An `http://` `baseUrl` (a local dev origin) serves no file: 404.
+- The card's name and description are copied with control characters removed and cut to a
+  few hundred characters; `<`, `>` and `&` are escaped.
+
+The spec uses the document only when the final URL's path is exactly `/.well-known/poppy.json`
+with no query string, after any redirects (https only). The door answers that one spelling
+and nothing else: no trailing slash, no other case, no query.
+
+**A door mounted below the root** (`baseUrl: 'https://shop.example.com/support'`) only sees
+requests under its own path, so the host-root file has to reach it. Add one rewrite at the
+front of your site, mapping the root path to the door's process unchanged:
+
+```nginx
+# 192.0.2.10:8787 stands for the address your door's process listens on
+location = /.well-known/poppy.json { proxy_pass http://192.0.2.10:8787; }
+```
+
+Or a redirect, which the spec allows over https as long as the final path is still exactly
+`/.well-known/poppy.json` with no query, for example to the same path on a subdomain whose
+door answers at its root. A redirect to `/support/.well-known/poppy.json` does not work:
+that final path is not the canonical one, and the door does not serve it.
 
 ### Install by hand
 

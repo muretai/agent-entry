@@ -76,6 +76,20 @@ field and the claimant flags are gone. These notes were gathered as 1.14.0 befor
     the card's `agentEntry.counts` beside its local beacon.
   - Both leave out offer ids trunk refuses, make one attempt, and never change a signed reply
     or the page.
+- added: Poppy 1.0 discovery, behind the `poppy` option of `createAgentEntry` (default off).
+  - With `poppy: true` the door answers GET and HEAD of exactly `/.well-known/poppy.json` at the
+    host root, whatever its mount, with a document built from its own card: the card's name, the
+    configured origin's host as the domain, one `a2a` agent entry and `web: {}`. Other methods
+    on that exact path answer as the card route does; with a query string the path is unknown
+    and every method gets the door's 404. An http origin serves no file.
+  - `poppy: true` refuses to start without an explicit `name`, or with one that has no visible
+    character (whitespace or invisible format characters only). Without an explicit, non-empty
+    `description` the document has no agent entry.
+  - New exports: `POPPY_PATH` and `poppyDocument(card, servedOrigin)`. The door serves
+    `poppyDocument(card, origin)` except that, when no `description` was given explicitly, it
+    passes the card without its description, so the built-in copy is never published. An
+    embedder calling `poppyDocument` with a card that carries the built-in name or description
+    gets them in the result, so it must pass its own.
 - changed: the released-version pins in `conformance/docs.mjs` and
   `conformance/muse-connector.mjs` read the version from the newest dated CHANGELOG section and
   assert `package.json` equals it.
